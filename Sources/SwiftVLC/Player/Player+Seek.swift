@@ -25,9 +25,19 @@ extension Player {
   ///   outside libVLC's millisecond range, or beyond known duration.
   public func seek(to time: Duration, fast: Bool = false) throws(VLCError) {
     let milliseconds = try checkedSeekMilliseconds(for: time, parameter: "time")
-    libvlc_media_player_set_time(pointer, milliseconds, fast)
-    currentTime = .milliseconds(milliseconds)
-    publishPosition(forTargetMilliseconds: milliseconds)
+    // Reserved *before* the native call: libVLC delivers events on its own
+    // thread, so a post-seek clock sample emitted while `set_time` is still
+    // returning would otherwise be stamped with the previous revision and
+    // then discarded as stale — losing the position the seek actually landed
+    // on, which after a fast (keyframe) seek is not the requested one.
+    let revision = eventBridge.advanceTimelineRevision()
+    // Publishing before checking the result reported a target libVLC had
+    // refused, leaving the observable timeline describing a position playback
+    // never reached.
+    guard libvlc_media_player_set_time(pointer, milliseconds, fast) == 0 else {
+      throw .operationFailed("Seek to \(milliseconds) ms")
+    }
+    commitSeekTarget(milliseconds: milliseconds, revision: revision)
   }
 
   /// Seeks to a fractional position in the current media.
@@ -79,9 +89,32 @@ extension Player {
       targetMs = Swift.min(targetMs, durationMs)
     }
 
-    libvlc_media_player_set_time(pointer, targetMs, fast)
-    currentTime = .milliseconds(targetMs)
-    publishPosition(forTargetMilliseconds: targetMs)
+    // See `seek(to:fast:)`: reserved before the native call so a post-seek
+    // sample cannot be stamped with the outgoing revision.
+    let revision = eventBridge.advanceTimelineRevision()
+    guard libvlc_media_player_set_time(pointer, targetMs, fast) == 0 else {
+      throw .operationFailed("Jump to \(targetMs) ms")
+    }
+    commitSeekTarget(milliseconds: targetMs, revision: revision)
+  }
+
+  /// Publishes an accepted seek target and marks `revision` as the
+  /// authoritative timeline.
+  ///
+  /// Advancing the revision is what lets the event consumer discard clock
+  /// samples libVLC produced before this seek. Without it those queued
+  /// samples are applied afterwards and snap the published time back — and
+  /// while paused no later native event is guaranteed to repair it.
+  ///
+  /// `revision` is reserved by the caller *before* it issues the native seek,
+  /// so it is only adopted here once libVLC has accepted the request. A
+  /// rejected seek leaves `acceptedTimelineRevision` alone; the reserved
+  /// value is simply never adopted, which keeps clock samples flowing exactly
+  /// as they did before the refused request.
+  func commitSeekTarget(milliseconds: Int64, revision: UInt64) {
+    acceptedTimelineRevision = revision
+    currentTime = .milliseconds(milliseconds)
+    publishPosition(forTargetMilliseconds: milliseconds)
   }
 
   // MARK: - Lenient Seeking
@@ -106,9 +139,15 @@ extension Player {
   @discardableResult
   public func seek(toPosition position: PlaybackPosition, fast: Bool = false) -> Bool {
     guard hasLenientSeekSession else { return false }
+    // Reserved before the native call for the same reason as the strict
+    // paths, and adopted only once libVLC accepts: a lenient seek publishes a
+    // position the same way a strict one does, so pre-seek samples must not
+    // overwrite it either.
+    let revision = eventBridge.advanceTimelineRevision()
     guard libvlc_media_player_set_position(pointer, position.rawValue, fast) == 0 else {
       return false
     }
+    acceptedTimelineRevision = revision
     withMutation(keyPath: \.position) {
       _position = position.rawValue
     }
