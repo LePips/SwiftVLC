@@ -17,14 +17,52 @@ extension Player {
   /// Awaits the **explicit-stop** path only: on the media-replacement
   /// path the outgoing handle's `Stopped` is unobservable (see
   /// ``events(policy:filter:)``), and ``recast(to:)`` awaits
-  /// new-session readiness instead. Returns immediately when the player
-  /// is already terminal. A defensive 10-second ceiling keeps a wedged
-  /// pipeline from hanging the caller.
-  public func stopAndWait() async {
+  /// new-session readiness instead. A defensive 10-second ceiling keeps a
+  /// wedged pipeline from hanging the caller.
+  ///
+  /// Only ``PlayerStopOutcome/stopped`` means the outputs were released.
+  /// A native error is **not** treated as completion: libVLC reports the
+  /// error first and the stopped state that performs the release arrives
+  /// afterwards, so this keeps waiting and reports
+  /// ``PlayerStopOutcome/failedButStillDraining`` if that follow-up never
+  /// comes. Check the result — or ``PlayerStopOutcome/isOutputSafe`` —
+  /// before deactivating an audio session or detaching a drawable.
+  ///
+  /// Concurrent callers join one in-flight stop and all receive the same
+  /// outcome. Cancelling a caller does not abandon the drain; the stop runs
+  /// to completion so no caller is ever told the outputs are free while
+  /// they are still live.
+  ///
+  /// - Returns: Why the wait ended. Only ``PlayerStopOutcome/stopped``
+  ///   establishes that the outputs were released; test it directly or
+  ///   through ``PlayerStopOutcome/isOutputSafe`` rather than treating a
+  ///   returned value as a success flag.
+  @discardableResult
+  public func stopAndWait() async -> PlayerStopOutcome {
+    // Concurrent callers join one in-flight stop and all observe the same
+    // outcome; a second caller must not be told the outputs are released
+    // just because someone else asked first.
+    if let inFlight = stopAndWaitTask {
+      return await inFlight.value
+    }
+    let task = Task { @MainActor [self] in
+      let outcome = await performStopAndWait()
+      stopAndWaitTask = nil
+      return outcome
+    }
+    stopAndWaitTask = task
+    return await task.value
+  }
+
+  private func performStopAndWait() async -> PlayerStopOutcome {
+    // `.error` is deliberately absent here. libVLC reports the error first
+    // and the stopped state that actually releases the outputs afterwards
+    // (see `PlayerEndReachedTests`), so returning on `.error` would promise
+    // output safety while the outputs are still draining.
     switch nativePlaybackState {
-    case .idle, .stopped, .error:
+    case .idle, .stopped:
       stop()
-      return
+      return .stopped
     default:
       break
     }
@@ -35,14 +73,14 @@ extension Player {
     // so an in-flight stop completing right here costs nothing instead
     // of the full defensive timeout.
     switch nativePlaybackState {
-    case .idle, .stopped, .error:
+    case .idle, .stopped:
       stop()
-      return
+      return .stopped
     default:
       break
     }
     stop()
-    await Self.awaitTerminalStop(on: stream, source: source)
+    let outcome = await Self.awaitOutputSafeStop(on: stream, source: source)
     // The internal consumer mirrors the same terminal event onto
     // `state` on its own main-actor schedule and may still be draining
     // its backlog when the dedicated wait resumes. Reconcile here so
@@ -53,35 +91,85 @@ extension Player {
     if terminal == .stopped || terminal == .error, state != terminal {
       handleEvent(.stateChanged(terminal))
     }
+    return Self.resolveStopOutcome(waitOutcome: outcome, nativeState: terminal)
   }
 
-  private static func awaitTerminalStop(
-    on stream: AsyncStream<SourcedPlayerEvent>,
-    source: UInt
+  /// Folds the native handle's resting state into the wait's verdict.
+  ///
+  /// A wait that ended without a stop means one of two different things, and
+  /// the caller needs them distinguished: the pipeline is merely slow, or the
+  /// session errored and the stop that releases the outputs never followed.
+  ///
+  /// Pure so the rule is testable without live playback, which CI cannot
+  /// drive (see `TestCondition.canPlayMedia`).
+  nonisolated static func resolveStopOutcome(
+    waitOutcome: PlayerStopOutcome,
+    nativeState: PlayerState
   )
-    async {
-    await withTaskGroup(of: Bool.self) { group in
+    -> PlayerStopOutcome {
+    if waitOutcome == .timedOut, nativeState == .error {
+      return .failedButStillDraining
+    }
+    return waitOutcome
+  }
+
+  /// Waits for the *output-safe* terminal state and reports why the wait
+  /// ended.
+  ///
+  /// Only `.stopped` releases the outputs. An observed `.error` is recorded
+  /// but does not end the wait, because libVLC emits the error before the
+  /// stopped state that performs the release; if no stopped state follows
+  /// within the ceiling, the error is what the caller needs to hear about.
+  /// - Parameter timeout: The defensive ceiling. Injectable so the decision
+  ///   logic can be exercised against a synthetic event stream, without
+  ///   needing live playback — CI cannot drive libVLC to `.playing`
+  ///   (see `TestCondition.canPlayMedia`).
+  nonisolated static func awaitOutputSafeStop(
+    on stream: AsyncStream<SourcedPlayerEvent>,
+    source: UInt,
+    timeout: Duration = .seconds(10)
+  )
+    async -> PlayerStopOutcome {
+    await withTaskGroup(of: PlayerStopOutcome?.self) { group in
       group.addTask {
         for await sourced in stream {
-          if
+          guard
             sourced.source == source,
-            case .stateChanged(let state) = sourced.event,
-            state == .stopped || state == .error {
-            return true
+            case .stateChanged(let state) = sourced.event
+          else { continue }
+          // Only `.stopped` ends the wait. An `.error` is ignored here: the
+          // release happens on the stopped state that follows it, and the
+          // caller learns about a stuck error from the native state read
+          // back in `performStopAndWait()`.
+          if state == .stopped {
+            return .stopped
           }
         }
-        return false
+        // The stream finished without a stopped state.
+        return nil
       }
       group.addTask {
-        try? await Task.sleep(for: .seconds(10))
-        return false
+        // This child only ends early when the group is cancelled after a
+        // verdict was already taken, so either way "no stop observed" is the
+        // honest report. The stop task itself is unstructured and is never
+        // cancelled by a caller, which is what keeps the drain protected.
+        try? await Task.sleep(for: timeout)
+        return .timedOut
       }
-      if let first = await group.next(), !first {
+      let outcome: PlayerStopOutcome = switch await group.next() {
+      case .some(.some(let first)):
+        first
+      default:
+        // The observer's stream finished without ever reporting a stop.
+        .timedOut
+      }
+      if outcome == .timedOut {
         #if DEBUG
         Signposts.signposter.emitEvent("Player.stopAndWait.timeout")
         #endif
       }
       group.cancelAll()
+      return outcome
     }
   }
 
