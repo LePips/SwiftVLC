@@ -365,35 +365,33 @@ public final class Player {
 
   /// Lossless stream of lifecycle state transitions — no firehose.
   ///
-  /// Equivalent to an `.unbounded` ``events(policy:filter:)``
-  /// subscription that keeps only `.stateChanged` payloads, so a lagging
-  /// consumer can never lose a one-shot terminal transition. Memory is
-  /// bounded in practice by the low rate of state changes.
+  /// Carries every change of ``state``, so a lagging consumer can never lose
+  /// a one-shot terminal transition. Memory is bounded in practice by the low
+  /// rate of state changes.
+  ///
+  /// Driven by the state itself rather than by the raw `.stateChanged` event,
+  /// which is what makes it *complete*. libVLC reports a native failure as
+  /// `.encounteredError` and buffering as `.bufferingProgress`, so neither
+  /// ever produced a `.stateChanged` to forward: a stream built by filtering
+  /// raw events silently omitted every transition to ``PlayerState/error``
+  /// and ``PlayerState/buffering``. Anything waiting on `.error` here waited
+  /// for something that could not arrive.
+  ///
+  /// Buffering is published at most once per entry into it — repeated
+  /// progress reports do not re-announce the state — so completeness does not
+  /// cost the no-firehose guarantee.
+  ///
+  /// Not de-duplicated: the same state published twice is delivered twice.
+  /// Same-player media replacement currently restarts a session on a repeated
+  /// `.playing`, so suppressing repeats would break it until events carry a
+  /// media generation to distinguish sessions by. Treat a value as "the
+  /// current state", not as "a value that differs from the last one".
   public nonisolated var stateTransitions: AsyncStream<PlayerState> {
-    let upstream = eventBridge.makeStream(
-      policy: .unbounded,
-      filter: { event in
-        if case .stateChanged = event {
-          return true
-        }
-        return false
-      }
-    )
-    let (stream, continuation) = AsyncStream<PlayerState>.makeStream(
-      bufferingPolicy: .unbounded
-    )
-    let pump = Task {
-      for await event in upstream {
-        if case .stateChanged(let state) = event {
-          continuation.yield(state)
-        }
-      }
-      continuation.finish()
-    }
-    continuation.onTermination = { _ in
-      pump.cancel()
-    }
-    return stream
+    // Explicitly unbounded. `subscribe()` defaults to newest-64, which would
+    // make a stream documented as lossless silently drop the oldest pending
+    // transitions under a stalled consumer — losing exactly the one-shot
+    // terminal states this exists to protect.
+    stateTransitionBridge.subscribe(policy: .unbounded)
   }
 
   nonisolated var playbackIntentEvents: AsyncStream<Bool> {
@@ -417,6 +415,8 @@ public final class Player {
   let eventBridge: EventBridge
   nonisolated let endCoordinator = PlaybackEndCoordinator()
   nonisolated let playbackIntentBridge: Broadcaster<Bool>
+  /// Carries normalized lifecycle transitions. See ``stateTransitions``.
+  nonisolated let stateTransitionBridge = Broadcaster<PlayerState>(defaultBufferSize: 64)
   /// ``isPlaybackRequestedActive`` mirrored for readers that cannot touch the
   /// main actor.
   ///
@@ -558,6 +558,7 @@ public final class Player {
     // The player is going away for good, so future subscribers must receive
     // an already-finished stream rather than one that can never emit.
     playbackIntentBridge.terminate()
+    stateTransitionBridge.terminate()
     #if os(iOS) || os(macOS)
     retireDirectPiPVideoCallbacksForHandleEnd()
     // No successor to move to here, unlike replacement and shutdown: the
