@@ -37,8 +37,20 @@ public final class RendererDiscoverer: Sendable {
 
   /// Stream of renderer discovery events. A new independent stream is
   /// returned per access; subscribers don't compete for events.
+  ///
+  /// Unbounded, because this stream is the *only* record of what was
+  /// discovered. There is no queryable list of current renderers to
+  /// reconcile against, so a dropped ``RendererEvent/itemAdded(_:)`` does not
+  /// resolve itself on the next event — that renderer stays invisible until it
+  /// disappears and is discovered again, which for a device already on the
+  /// network may be never.
+  ///
+  /// Discovery is low-rate, so unbounded costs nothing in practice. It matters
+  /// when a consumer stalls: building a device picker means touching UI, and a
+  /// newest-wins buffer would evict the earliest-found devices — the ones a
+  /// user is most likely to be waiting for.
   public var events: AsyncStream<RendererEvent> {
-    broadcaster.subscribe()
+    broadcaster.subscribe(policy: .unbounded)
   }
 
   /// Creates a renderer discoverer by service name.
