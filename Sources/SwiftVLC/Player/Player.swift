@@ -417,6 +417,7 @@ public final class Player {
   nonisolated let playbackIntentBridge: Broadcaster<Bool>
   /// Carries normalized lifecycle transitions. See ``stateTransitions``.
   nonisolated let stateTransitionBridge = Broadcaster<PlayerState>(defaultBufferSize: 64)
+  nonisolated let playbackStatusBridge = Broadcaster<PlaybackStatus>(defaultBufferSize: 64)
   /// ``isPlaybackRequestedActive`` mirrored for readers that cannot touch the
   /// main actor.
   ///
@@ -552,6 +553,10 @@ public final class Player {
     )
     playbackIntentBridge = Broadcaster<Bool>(defaultBufferSize: 16)
     startEventConsumer()
+    // Seeded so `playbackStatus` opens with the current pair from the moment
+    // the player exists: a subscriber attaching before any state change would
+    // otherwise replay nothing and wait, on an idle player forever.
+    publishPlaybackStatus()
   }
 
   static func makeNativePlayer(instance: VLCInstance) -> OpaquePointer {
@@ -568,6 +573,7 @@ public final class Player {
     // an already-finished stream rather than one that can never emit.
     playbackIntentBridge.terminate()
     stateTransitionBridge.terminate()
+    playbackStatusBridge.terminate()
     #if os(iOS) || os(macOS)
     retireDirectPiPVideoCallbacksForHandleEnd()
     // No successor to move to here, unlike replacement and shutdown: the
@@ -638,6 +644,7 @@ public final class Player {
     // Recorded so libVLC echoing this same change back as `.mediaChanged`
     // does not advance the generation a second time.
     sessionGenerationMedia = media.pointer
+    publishPlaybackStatus()
     resetMediaDerivedState()
     // No `markLibraryStop()` here: setting media on a *started* handle
     // replaces the input seamlessly — libVLC 4 emits `MediaStopping` for
@@ -684,6 +691,7 @@ public final class Player {
       sessionGeneration &+= 1
       currentMedia = media
       sessionGenerationMedia = media.pointer
+      publishPlaybackStatus()
       // No `notifyMediaDependentObservables()` here: the swap already issued
       // it, and the keypaths it refreshes read from the native handle rather
       // than from `currentMedia`, so a second pass is pure churn.
