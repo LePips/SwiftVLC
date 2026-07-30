@@ -106,6 +106,37 @@ extension Integration {
       #expect(received.last?.mediaGeneration == player.generation)
     }
 
+    /// Criterion 3: a snapshot taken before the AVKit controller was recreated
+    /// describes a controller that no longer exists. Pairing its active state
+    /// with the new controller's identity is the confusion being prevented.
+    @Test
+    func `The snapshot names which controller its flags describe`() async {
+      let player = Player(instance: TestInstance.makeAudioOnly())
+      let controller = PiPController(player: player)
+
+      let stream = controller.pipSnapshots
+      controller.updatePiPActive(true)
+      controller.pipSnapshotBroadcaster.terminate()
+
+      let received = await drain(stream)
+      #expect(received.allSatisfy { $0.controllerGeneration == controller.pipControllerGeneration })
+    }
+
+    /// Criterion 4: every AVKit signal reaches the main actor through a hop, so
+    /// a controller replaced in the meantime can still deliver. Its state
+    /// describes a session that is over and must not be applied.
+    @Test
+    func `A signal from a replaced controller is rejected`() {
+      let player = Player(instance: TestInstance.makeAudioOnly())
+      let controller = PiPController(player: player)
+
+      // Any identity that is not the installed controller will do. The player
+      // is reused rather than constructing a second `PiPController`, which
+      // would claim direct-PiP callback ownership on this same player as a
+      // side effect of the test.
+      #expect(controller.isCurrentAVController(ObjectIdentifier(player)) == false)
+    }
+
     /// Both flags travel in one value. Published from a single funnel they
     /// could otherwise describe a pair that was never simultaneously true.
     @Test
