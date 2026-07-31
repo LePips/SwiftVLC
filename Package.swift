@@ -18,8 +18,8 @@ let package = Package(
   targets: [
     .binaryTarget(
       name: "libvlc",
-      url: "https://github.com/harflabs/SwiftVLC/releases/download/v1.0.0/libvlc.xcframework.zip",
-      checksum: "23509b945aafb97634d2e66af24a377d7bd50b672aba8f5dec1d6f9ef8614045"
+      url: "https://github.com/harflabs/SwiftVLC/releases/download/v1.1.0-beta.1/libvlc.xcframework.zip",
+      checksum: "03a57454a6159c455406889c7867e0b284db028d2734a10bdf85a6a7285c862f"
     ),
     .target(
       name: "CLibVLC",
