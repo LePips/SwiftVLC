@@ -90,6 +90,18 @@ extension PiPController: AVPictureInPictureControllerDelegate {
     }
   }
 
+  /// How long ``PiPController/onRestoreUserInterface`` has to answer before
+  /// AVKit is told the restore did not complete.
+  ///
+  /// The hook is host application code performing a UI transition, so it should
+  /// answer in well under this. The bound exists so a hook that never answers
+  /// cannot stall PiP teardown indefinitely, not to police a slow one — hence a
+  /// ceiling generous enough that a legitimate restore is never cut short.
+  ///
+  /// Overridable so the bound itself can be tested without a ten second wait.
+  /// Production never changes it.
+  static var restoreCompletionTimeout: Duration = .seconds(10)
+
   /// Called when the user taps the PiP window's restore ("return to app")
   /// control. Forwards to ``PiPController/onRestoreUserInterface`` so the
   /// host app can bring its player UI back, then completes the AVKit
@@ -125,8 +137,41 @@ extension PiPController: AVPictureInPictureControllerDelegate {
         completionHandler(true)
         return
       }
-      onRestoreUserInterface { restored in
+
+      // AVKit's handler must run exactly once. The hook is host application
+      // code: it can answer twice, or never. Answering twice invokes a system
+      // completion handler more than once; never answering leaves PiP teardown
+      // waiting with no way out, which is the worse of the two because nothing
+      // surfaces it.
+      //
+      // The latch is read and written only on the main actor — both the hook's
+      // callback and the timeout below are `@MainActor` — so a plain box is
+      // enough.
+      let answered = RestoreAnswerLatch()
+      let answer: @MainActor @Sendable (Bool) -> Void = { restored in
+        guard !answered.value else { return }
+        answered.value = true
+        // Nothing left to bound. Without this the sleeping task, and the
+        // completion closure it retains, stay alive for the full timeout after
+        // even an immediate restore.
+        answered.timeout?.cancel()
+        answered.timeout = nil
         completionHandler(restored)
+      }
+
+      onRestoreUserInterface(answer)
+
+      // A hook that answered synchronously needs no timeout at all; starting
+      // one here would create a task whose only job is to wake up and find the
+      // latch already closed.
+      guard !answered.value else { return }
+
+      answered.timeout = Task { @MainActor in
+        try? await Task.sleep(for: Self.restoreCompletionTimeout)
+        guard !Task.isCancelled else { return }
+        // `false`: the interface was not restored within the bound. Reporting
+        // success would tell AVKit a restore happened that did not.
+        answer(false)
       }
     }
   }
@@ -445,6 +490,21 @@ func pipMainActorAsync(_ body: @escaping @MainActor @Sendable () -> Void) {
   DispatchQueue.main.async {
     MainActor.assumeIsolated(body)
   }
+}
+
+/// A once-only latch for AVKit's restore completion handler.
+///
+/// Confined to the main actor: both writers — the host's restore hook callback
+/// and the timeout — are `@MainActor`, so no synchronisation is needed beyond
+/// that isolation. A class rather than a captured `var` because two closures
+/// share it.
+@MainActor
+final class RestoreAnswerLatch {
+  var value = false
+  /// The bounded wait, held so the first answer can cancel it rather than
+  /// leaving it sleeping — and retaining the completion closure — for the full
+  /// timeout.
+  var timeout: Task<Void, Never>?
 }
 
 #endif
