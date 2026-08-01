@@ -56,13 +56,22 @@ typealias IOSNativePiPStateChangeEventHandler = @convention(block) (Bool) -> Voi
 /// while the SwiftUI view detaches, reattaches, or receives a replacement
 /// native window controller.
 final class IOSNativePiPCallbackGenerations: Sendable {
-  struct Attachment: Equatable {
+  struct Attachment: Equatable, Sendable {
     fileprivate let rawValue: UInt64
   }
 
-  struct ReadyCallback: Equatable {
+  struct ReadyCallback: Equatable, Sendable {
     fileprivate let attachment: Attachment
     fileprivate let rawValue: UInt64
+  }
+
+  /// Provenance captured when an explicit start reaches one exact native
+  /// window controller. Native active signals snapshot this value before
+  /// hopping to the main actor, so a later media load or accepted start cannot
+  /// relabel the signal that was already delivered.
+  struct AcceptedStart: Equatable, Sendable {
+    fileprivate let callback: ReadyCallback
+    let mediaGeneration: PlaybackGeneration
   }
 
   private struct State {
@@ -70,6 +79,7 @@ final class IOSNativePiPCallbackGenerations: Sendable {
     var currentAttachment: Attachment?
     var nextReadyCallback: UInt64 = 0
     var currentReadyCallback: ReadyCallback?
+    var acceptedStart: AcceptedStart?
   }
 
   private let state = Mutex(State())
@@ -81,6 +91,7 @@ final class IOSNativePiPCallbackGenerations: Sendable {
       let attachment = Attachment(rawValue: state.nextAttachment)
       state.currentAttachment = attachment
       state.currentReadyCallback = nil
+      state.acceptedStart = nil
       return attachment
     }
   }
@@ -90,6 +101,7 @@ final class IOSNativePiPCallbackGenerations: Sendable {
     state.withLock { state in
       state.currentAttachment = nil
       state.currentReadyCallback = nil
+      state.acceptedStart = nil
     }
   }
 
@@ -108,8 +120,51 @@ final class IOSNativePiPCallbackGenerations: Sendable {
         rawValue: state.nextReadyCallback
       )
       state.currentReadyCallback = callback
+      state.acceptedStart = nil
       return callback
     }
+  }
+
+  @MainActor
+  @discardableResult
+  func recordAcceptedStart(mediaGeneration: PlaybackGeneration) -> Bool {
+    state.withLock { state in
+      guard let callback = state.currentReadyCallback else { return false }
+      state.acceptedStart = AcceptedStart(
+        callback: callback,
+        mediaGeneration: mediaGeneration
+      )
+      return true
+    }
+  }
+
+  nonisolated func acceptedStart(
+    at callback: ReadyCallback
+  ) -> AcceptedStart? {
+    state.withLock { state in
+      guard
+        state.currentAttachment == callback.attachment,
+        state.currentReadyCallback == callback,
+        state.acceptedStart?.callback == callback
+      else { return nil }
+      return state.acceptedStart
+    }
+  }
+
+  @MainActor
+  func currentAcceptedStart() -> AcceptedStart? {
+    state.withLock { state in
+      guard
+        let callback = state.currentReadyCallback,
+        state.acceptedStart?.callback == callback
+      else { return nil }
+      return state.acceptedStart
+    }
+  }
+
+  @MainActor
+  func clearAcceptedStart() {
+    state.withLock { $0.acceptedStart = nil }
   }
 
   @MainActor
@@ -223,7 +278,11 @@ final class IOSNativePiPDrawableAttachment: UIView, IOSNativePiPDrawable {
   @objc(pictureInPictureReady)
   nonisolated func pictureInPictureReady() -> IOSNativePictureInPictureReadyBlock {
     let attachment = attachment
+    let nativeMediaController = nativeMediaController
     return { [weak nativePiPBackend] windowController in
+      let mediaGeneration = nativeMediaController.callbackSnapshot.withLock {
+        $0.playbackGeneration
+      }
       nonisolated(unsafe) let windowController = windowController
       Task { @MainActor in
         guard
@@ -234,7 +293,8 @@ final class IOSNativePiPDrawableAttachment: UIView, IOSNativePiPDrawable {
         else { return }
         nativePiPBackend.handlePictureInPictureReady(
           windowController,
-          generation: generation
+          generation: generation,
+          mediaGeneration: mediaGeneration
         )
       }
     }
@@ -596,9 +656,9 @@ final class IOSNativePiPBackend: NSObject, @unchecked Sendable {
   private var possibleObservation: NSKeyValueObservation?
   private var activeObservation: NSKeyValueObservation?
   private var stateChangeEventHandler: IOSNativePiPStateChangeEventHandler?
-
   private(set) var isPossible = false
   private(set) var isActive = false
+  private(set) var activeMediaGeneration: PlaybackGeneration?
   private(set) var requiresLinearPlayback = true
   private(set) var startsAutomaticallyFromInline = true
   private(set) var playbackStateInvalidationCount: UInt64 = 0
@@ -641,12 +701,20 @@ final class IOSNativePiPBackend: NSObject, @unchecked Sendable {
       let attachment = callbackGenerations.currentAttachment(),
       let generation = callbackGenerations.reserveReadyCallback(for: attachment)
     else { return }
-    handlePictureInPictureReady(controller, generation: generation)
+    let mediaGeneration = mediaController.callbackSnapshot.withLock {
+      $0.playbackGeneration
+    }
+    handlePictureInPictureReady(
+      controller,
+      generation: generation,
+      mediaGeneration: mediaGeneration
+    )
   }
 
   func handlePictureInPictureReady(
     _ controller: AnyObject,
-    generation: IOSNativePiPCallbackGenerations.ReadyCallback
+    generation: IOSNativePiPCallbackGenerations.ReadyCallback,
+    mediaGeneration: PlaybackGeneration?
   ) {
     guard let controller = controller as? NSObject else { return }
 
@@ -660,7 +728,11 @@ final class IOSNativePiPBackend: NSObject, @unchecked Sendable {
 
       windowController = controller
       installStateChangeHandler(on: controller, generation: generation)
-      observeAVPictureInPictureController(on: controller, generation: generation)
+      observeAVPictureInPictureController(
+        on: controller,
+        generation: generation,
+        initialActiveMediaGeneration: mediaGeneration
+      )
 
       if avPictureInPictureController == nil {
         setPossible(true)
@@ -677,7 +749,22 @@ final class IOSNativePiPBackend: NSObject, @unchecked Sendable {
       warnIfVideoOutputBlocksPictureInPicture()
       return .notPossible
     }
-    return performWindowControllerAction(IOSNativePiPSelector.start)
+    guard
+      let windowController,
+      windowController.responds(to: IOSNativePiPSelector.start)
+    else { return .backendUnavailable }
+
+    // Record before invoking the native selector. Its active callback may be
+    // synchronous, and that callback must be able to snapshot the request it
+    // is acknowledging. A repeated start while already active does not begin
+    // a new lifecycle and must not seed provenance for a future one.
+    if !isActive, let mediaGeneration = mediaController.player?.generation {
+      callbackGenerations.recordAcceptedStart(
+        mediaGeneration: mediaGeneration
+      )
+    }
+    _ = windowController.perform(IOSNativePiPSelector.start)
+    return .accepted
   }
 
   /// One-time diagnostic for the common misconfiguration where a custom
@@ -763,6 +850,7 @@ final class IOSNativePiPBackend: NSObject, @unchecked Sendable {
     activeObservation = nil
     avPictureInPictureController = nil
     stateChangeEventHandler = nil
+    callbackGenerations.clearAcceptedStart()
     windowController = nil
   }
 
@@ -772,11 +860,23 @@ final class IOSNativePiPBackend: NSObject, @unchecked Sendable {
   ) {
     guard controller.responds(to: IOSNativePiPSelector.setStateChangeEventHandler) else { return }
 
+    let mediaController = mediaController
+    let callbackGenerations = callbackGenerations
     let handler: IOSNativePiPStateChangeEventHandler = { [weak self] isStarted in
+      let mediaGeneration = isStarted
+        ? mediaController.callbackSnapshot.withLock { $0.playbackGeneration }
+        : nil
+      let acceptedStart = isStarted
+        ? callbackGenerations.acceptedStart(at: generation)
+        : nil
       Task { @MainActor in
         guard let self else { return }
         self.callbackGenerations.performIfCurrent(generation) {
-          self.setActive(isStarted)
+          self.setActiveFromNativeSignal(
+            isStarted,
+            mediaGeneration: mediaGeneration,
+            acceptedStart: acceptedStart
+          )
         }
       }
     }
@@ -786,7 +886,8 @@ final class IOSNativePiPBackend: NSObject, @unchecked Sendable {
 
   private func observeAVPictureInPictureController(
     on controller: NSObject,
-    generation: IOSNativePiPCallbackGenerations.ReadyCallback
+    generation: IOSNativePiPCallbackGenerations.ReadyCallback,
+    initialActiveMediaGeneration: PlaybackGeneration?
   ) {
     guard controller.responds(to: IOSNativePiPSelector.avPictureInPictureController) else { return }
     guard let avController = controller.value(forKey: "avPipController") as? AVPictureInPictureController else { return }
@@ -796,8 +897,13 @@ final class IOSNativePiPBackend: NSObject, @unchecked Sendable {
     avController.canStartPictureInPictureAutomaticallyFromInline =
       startsAutomaticallyFromInline
     setPossible(avController.isPictureInPicturePossible)
-    setActive(avController.isPictureInPictureActive)
+    setActiveFromNativeSignal(
+      avController.isPictureInPictureActive,
+      mediaGeneration: initialActiveMediaGeneration,
+      acceptedStart: nil
+    )
 
+    let callbackGenerations = callbackGenerations
     possibleObservation = avController.observe(
       \.isPictureInPicturePossible,
       options: [.initial, .new]
@@ -811,15 +917,26 @@ final class IOSNativePiPBackend: NSObject, @unchecked Sendable {
       }
     }
 
+    let mediaController = mediaController
     activeObservation = avController.observe(
       \.isPictureInPictureActive,
       options: [.initial, .new]
     ) { [weak self] controller, _ in
       let isActive = controller.isPictureInPictureActive
+      let mediaGeneration = isActive
+        ? mediaController.callbackSnapshot.withLock { $0.playbackGeneration }
+        : nil
+      let acceptedStart = isActive
+        ? callbackGenerations.acceptedStart(at: generation)
+        : nil
       Task { @MainActor [weak self] in
         guard let self else { return }
         callbackGenerations.performIfCurrent(generation) {
-          self.setActive(isActive)
+          self.setActiveFromNativeSignal(
+            isActive,
+            mediaGeneration: mediaGeneration,
+            acceptedStart: acceptedStart
+          )
         }
       }
     }
@@ -870,10 +987,42 @@ final class IOSNativePiPBackend: NSObject, @unchecked Sendable {
     owner?.handleNativePictureInPictureReady()
   }
 
-  private func setActive(_ isActive: Bool) {
+  func setActive(
+    _ isActive: Bool,
+    mediaGeneration: PlaybackGeneration? = nil
+  ) {
+    setActiveFromNativeSignal(
+      isActive,
+      mediaGeneration: mediaGeneration,
+      acceptedStart: isActive ? callbackGenerations.currentAcceptedStart() : nil
+    )
+  }
+
+  func setActiveFromNativeSignal(
+    _ isActive: Bool,
+    mediaGeneration: PlaybackGeneration?,
+    acceptedStart: IOSNativePiPCallbackGenerations.AcceptedStart?
+  ) {
     guard self.isActive != isActive else { return }
+    if isActive {
+      let signaledMediaGeneration = mediaGeneration
+        ?? owner?.player.generation
+        ?? mediaController.player?.generation
+      activeMediaGeneration = owner?.attributedNativePiPStartMediaGeneration(
+        signaledMediaGeneration: signaledMediaGeneration,
+        acceptedRequestMediaGeneration: acceptedStart?.mediaGeneration
+      ) ?? acceptedStart?.mediaGeneration ?? signaledMediaGeneration
+      callbackGenerations.clearAcceptedStart()
+    }
+    let lifecycleMediaGeneration = activeMediaGeneration
     self.isActive = isActive
-    owner?.handleNativePictureInPictureActiveChanged(isActive)
+    owner?.handleNativePictureInPictureActiveChanged(
+      isActive,
+      mediaGeneration: lifecycleMediaGeneration
+    )
+    if !isActive {
+      activeMediaGeneration = nil
+    }
   }
 }
 
@@ -938,11 +1087,13 @@ final class IOSNativePiPMediaController: NSObject, IOSNativePiPMediaControlling,
   @MainActor
   func refreshCallbackSnapshot() {
     let pointer = player?.pointer
+    let playbackGeneration = player?.generation
     callbackSnapshot.withLock { snapshot in
       if snapshot.playerPointer != pointer {
         snapshot.generation &+= 1
       }
       snapshot.playerPointer = pointer
+      snapshot.playbackGeneration = playbackGeneration
     }
   }
 
@@ -955,6 +1106,7 @@ final class IOSNativePiPMediaController: NSObject, IOSNativePiPMediaControlling,
         snapshot.generation &+= 1
       }
       snapshot.playerPointer = nil
+      snapshot.playbackGeneration = nil
     }
   }
 

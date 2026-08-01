@@ -151,7 +151,7 @@ public final class PiPController: NSObject {
   #endif
   #if os(macOS)
   @ObservationIgnored
-  private var nativeBackend: MacNativePiPBackend?
+  var nativeBackend: MacNativePiPBackend?
   #endif
 
   /// Whether AVKit may start PiP automatically when the app moves to
@@ -200,6 +200,8 @@ public final class PiPController: NSObject {
   @ObservationIgnored
   let pipEventBroadcaster = Broadcaster<PiPEvent>()
   @ObservationIgnored
+  let pipEventEnvelopeBroadcaster = Broadcaster<PiPEventEnvelope>()
+  @ObservationIgnored
   let pipSnapshotBroadcaster = Broadcaster<PiPSnapshot>()
   @ObservationIgnored
   private var pipSnapshotRevision: UInt64 = 0
@@ -208,6 +210,51 @@ public final class PiPController: NSObject {
   /// from a replaced one can be told apart from a current one.
   @ObservationIgnored
   private(set) var pipControllerGeneration: UInt64 = 0
+  /// Monotonic identity for start attempts within this controller. Controller
+  /// generation alone cannot order two overlapping requests issued to the
+  /// same AVKit controller.
+  @ObservationIgnored
+  var pipLifecycleSequence: UInt64 = 0
+  /// Identity captured when the current PiP lifecycle began. Kept until its
+  /// terminal `didStop`, so a delayed callback remains attributable after the
+  /// player has already adopted another media.
+  @ObservationIgnored
+  var pipLifecycleAttribution: PiPLifecycleAttribution?
+  /// Failed starts can each be followed by a trailing stop after newer starts
+  /// have already been accepted. Keep their identities and stop reasons in
+  /// accepted-start order outside the current lifecycle, so consuming an old
+  /// stop cannot relabel or clear a retry. A later terminal start outcome
+  /// retires only older failures for which AVKit never promised a stop.
+  @ObservationIgnored
+  var failedPiPLifecycles: [FailedPiPLifecycle] = []
+  /// A start accepted while an older lifecycle is still waiting for its stop.
+  /// Promoted only after that stop is consumed.
+  @ObservationIgnored
+  var queuedPiPStartAttribution: PiPLifecycleAttribution?
+  /// Which part of the attributed PiP lifecycle is in flight. This prevents a
+  /// redundant accepted start from stealing an active lifecycle while still
+  /// allowing a fresh request after a terminal start failure.
+  @ObservationIgnored
+  var pipLifecycleAttributionPhase: PiPLifecycleAttributionPhase = .idle
+
+  struct PiPLifecycleAttribution {
+    let mediaGeneration: PlaybackGeneration
+    let controllerGeneration: UInt64
+    let sequence: UInt64
+  }
+
+  struct FailedPiPLifecycle {
+    let attribution: PiPLifecycleAttribution
+    let stopReason: PiPStopReason
+    var willStopObserved = false
+  }
+
+  enum PiPLifecycleAttributionPhase: Equatable {
+    case idle
+    case awaitingStart
+    case started
+    case stopping
+  }
 
   /// The best-known reason for an in-flight PiP stop, recorded by the
   /// first discriminating signal (restore callback, start failure,
@@ -403,6 +450,7 @@ public final class PiPController: NSObject {
     self.nativeBackend = nativeBackend
 
     super.init()
+    pipControllerGeneration = 1
     // Seeded here, not on first change: a controller whose flags never move
     // would otherwise leave `pipSnapshots` with nothing to replay.
     publishPiPSnapshot()
@@ -429,6 +477,11 @@ public final class PiPController: NSObject {
     nativeBackend.reconcileRequiresLinearPlayback(ifOwnedBy: self)
     updatePiPPossible(nativeBackend.isPossible)
     updatePiPActive(nativeBackend.isActive)
+    if nativeBackend.isActive {
+      adoptActivePiPLifecycleAttribution(
+        mediaGeneration: nativeBackend.activeMediaGeneration
+      )
+    }
     startStateObserver()
     startPlaybackIntentObserver()
     player.registerNativeHandleSnapshotObserver(self)
@@ -454,6 +507,7 @@ public final class PiPController: NSObject {
     self.nativeBackend = nativeBackend
 
     super.init()
+    pipControllerGeneration = 1
     // Seeded here, not on first change: a controller whose flags never move
     // would otherwise leave `pipSnapshots` with nothing to replay.
     publishPiPSnapshot()
@@ -462,6 +516,11 @@ public final class PiPController: NSObject {
     nativeBackend.owner = self
     updatePiPPossible(nativeBackend.isPossible)
     updatePiPActive(nativeBackend.isActive)
+    if nativeBackend.isActive {
+      adoptActivePiPLifecycleAttribution(
+        mediaGeneration: nativeBackend.activeMediaGeneration
+      )
+    }
     startStateObserver()
     startPlaybackIntentObserver()
     player.registerNativeHandleSnapshotObserver(self)
@@ -506,6 +565,7 @@ public final class PiPController: NSObject {
 
   isolated deinit {
     pipEventBroadcaster.terminate()
+    pipEventEnvelopeBroadcaster.terminate()
     pipSnapshotBroadcaster.terminate()
     cancelDeferredPause()
     stateObserverTask?.cancel()
@@ -543,7 +603,8 @@ public final class PiPController: NSObject {
   /// not tell a request that reached AVKit from one that never left the
   /// controller — and therefore could not decide whether to fall back to
   /// full-screen playback. Asynchronous AVKit failure after an accepted start
-  /// stays where it belongs, on ``pipEvents``.
+  /// stays where it belongs, on ``pipEventEnvelopes`` (or the compatibility
+  /// ``pipEvents`` stream when generation attribution is not needed).
   @discardableResult
   public func start() -> PiPStartResult {
     guard player.currentMedia != nil else { return .noMedia }
@@ -558,18 +619,19 @@ public final class PiPController: NSObject {
       if nativeBackend.isPossible {
         activateAudioSessionIfNeeded()
       }
-      return nativeBackend.start()
+      return noteAcceptedPiPStartRequest(nativeBackend.start())
     }
     #endif
     #if os(macOS)
     if let nativeBackend {
-      return nativeBackend.start()
+      return noteAcceptedPiPStartRequest(nativeBackend.start())
     }
     #endif
     guard let pipController else { return .backendUnavailable }
+    guard isPossible else { return .notPossible }
     activateAudioSessionIfNeeded()
     pipController.startPictureInPicture()
-    return .accepted
+    return noteAcceptedPiPStartRequest(.accepted)
   }
 
   /// Stops Picture-in-Picture.
@@ -582,8 +644,8 @@ public final class PiPController: NSObject {
     // Recorded unconditionally: between AVKit beginning the start
     // animation and the didStart callback, `isActive` is still false,
     // and a stop issued in that window would otherwise be reported as
-    // the user's close tap. A stale record is harmless — the next
-    // willStart/didStart clears it.
+    // the user's close tap. If no lifecycle was actually in flight, the next
+    // accepted start (or an automatic willStart/didStart) clears it.
     notePendingStopReason(.unknown)
     #if os(iOS)
     if let nativeBackend {
@@ -672,7 +734,9 @@ public final class PiPController: NSObject {
     controller.canStartPictureInPictureAutomaticallyFromInline = startsAutomaticallyFromInline
     #endif
     pipControllerGeneration &+= 1
+    clearPiPLifecycleAttribution()
     pipController = controller
+    publishPiPSnapshot()
     updatePiPPossible(controller.isPictureInPicturePossible)
     updatePiPActive(controller.isPictureInPictureActive)
     observePiPState(of: controller)
@@ -1100,7 +1164,12 @@ public final class PiPController: NSObject {
   /// ``PiPStopReason/unknown`` — including for stops caused by a
   /// native-handle replacement (player swap, renderer recast) tearing
   /// PiP down. See ``pipEvents``.
-  func handleNativePictureInPictureActiveChanged(_ isActive: Bool) {
+  func handleNativePictureInPictureActiveChanged(
+    _ isActive: Bool,
+    mediaGeneration: PlaybackGeneration? = nil,
+    forceTransitionEvent: Bool = false,
+    preservesCurrentLifecycle: Bool = false
+  ) {
     #if os(iOS)
     if isActive {
       // Native auto-start does not deliver SwiftVLC's AVKit delegate
@@ -1112,11 +1181,18 @@ public final class PiPController: NSObject {
     #endif
     let changed = self.isActive != isActive
     updatePiPActive(isActive)
-    guard changed else { return }
+    guard changed || forceTransitionEvent else { return }
+    if preservesCurrentLifecycle {
+      publishTransferredNativePiPEvent(
+        isActive ? .didStart : .didStop(reason: .unknown),
+        mediaGeneration: mediaGeneration
+      )
+      return
+    }
     if isActive {
-      pipEventBroadcaster.broadcast(.didStart)
+      publishPiPEvent(.didStart, mediaGeneration: mediaGeneration)
     } else {
-      pipEventBroadcaster.broadcast(.didStop(reason: .unknown))
+      publishPiPEvent(.didStop(reason: .unknown), mediaGeneration: mediaGeneration)
       pendingStopReason = nil
     }
   }
