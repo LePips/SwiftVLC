@@ -61,9 +61,23 @@ public final class PiPController: NSObject {
   private nonisolated static let allowsPrivateMacOSAPIStorage = Atomic<Bool>(false)
 
   struct PlaybackDriver {
-    let pause: @MainActor () -> Bool
+    struct PauseAttempt {
+      let accepted: Bool
+      let playbackControlRevision: UInt64?
+    }
+
+    /// `nil` follows the current media; a concrete value binds deferred work
+    /// to the media generation that originally scheduled it.
+    let pause: @MainActor (
+      _ playbackGeneration: UInt64?,
+      _ recordsPlaybackControlIntent: Bool
+    ) -> PauseAttempt
     let resume: @MainActor () -> Bool
-    let cancelPendingPause: @MainActor () -> Void
+    let cancelPendingPause: @MainActor (
+      _ playbackGeneration: UInt64?,
+      _ playbackControlRevision: UInt64?,
+      _ restoringPlaybackControlIntent: Player.DeferredPauseCommand
+    ) -> Void
     let shouldResume: @MainActor () -> Bool
     /// Relative rather than absolute: see ``PiPController/performSkip(on:by:)``
     /// for why the interval AVKit requested is preserved instead of being
@@ -72,9 +86,25 @@ public final class PiPController: NSObject {
 
     static func live(player: Player) -> Self {
       Self(
-        pause: { player.issuePause() },
+        pause: {
+          let revisionBeforePause = player.playbackControlIntentRevision
+          let accepted = player.issuePause(
+            playbackGeneration: $0,
+            recordsPlaybackControlIntent: $1
+          )
+          return PauseAttempt(
+            accepted: accepted,
+            playbackControlRevision: $1 ? revisionBeforePause &+ 1 : nil
+          )
+        },
         resume: { player.issueResume() },
-        cancelPendingPause: { player.cancelPendingPause() },
+        cancelPendingPause: {
+          player.cancelPendingPause(
+            playbackGeneration: $0,
+            playbackControlRevision: $1,
+            restoringPlaybackControlIntent: $2
+          )
+        },
         shouldResume: { player.shouldResumeForExternalPlayRequest },
         skip: { PiPController.performSkip(on: player, by: $0) }
       )
@@ -86,7 +116,11 @@ public final class PiPController: NSObject {
   @ObservationIgnored
   let playbackDriver: PlaybackDriver
   @ObservationIgnored
-  private let pauseDebounce: Duration
+  let pauseDebounce: Duration
+  #if DEBUG
+  @ObservationIgnored
+  var _deferredPauseRetryHookForTesting: (() -> Void)?
+  #endif
   @ObservationIgnored
   let renderer: PixelBufferRenderer
   @ObservationIgnored
@@ -293,16 +327,15 @@ public final class PiPController: NSObject {
   /// counter rides inside `.scheduled` so a late-firing wake-up from
   /// a cancelled task can detect that it is stale and exit cleanly.
   @ObservationIgnored
-  private var deferredPause: DeferredPauseState = .idle
+  var deferredPause: DeferredPauseState = .idle
 
   /// How a deferred PiP pause finished.
   ///
   /// Not surfaced on ``PiPEvent`` because that is a public non-frozen enum and
-  /// adding a case would be source-breaking for exhaustive switches. The
-  /// user-visible half of the outcome is reconciled onto
-  /// ``Player/isPlaybackRequestedActive`` instead, which is already
-  /// observable.
-  enum DeferredPauseOutcome: Equatable {
+  /// adding a case would be source-breaking for exhaustive switches. Observe
+  /// ``deferredPauseOutcome`` separately for this command result; playback
+  /// intent is also reconciled onto ``Player/isPlaybackRequestedActive``.
+  public enum DeferredPauseOutcome: Sendable, Equatable {
     /// libVLC accepted the pause.
     case issued
     /// Superseded, or the session left a pausable state before it could be
@@ -313,13 +346,19 @@ public final class PiPController: NSObject {
     case rejected
   }
 
-  /// The outcome of the most recent deferred pause, or `nil` while one is in
-  /// flight. Internal rather than public: it exists so the bound and the
-  /// reconciliation are assertable.
-  @ObservationIgnored
-  private(set) var deferredPauseOutcome: DeferredPauseOutcome?
+  /// The outcome of the most recent deferred pause.
+  ///
+  /// This property is `nil` before the first attempt and while a new attempt
+  /// is in flight. Observe it to learn whether libVLC accepted the pause,
+  /// whether another command cancelled it, or whether SwiftVLC restored
+  /// active playback intent after exhausting the bounded retry window.
+  public private(set) var deferredPauseOutcome: DeferredPauseOutcome?
 
-  fileprivate enum DeferredPauseState {
+  func setDeferredPauseOutcome(_ outcome: DeferredPauseOutcome?) {
+    deferredPauseOutcome = outcome
+  }
+
+  enum DeferredPauseState {
     /// No deferred pause in flight; libVLC matches PiP intent.
     case idle
     /// A deferred-pause task is sleeping. `task` is the in-flight task,
@@ -854,141 +893,6 @@ public final class PiPController: NSObject {
     pipController?.invalidatePlaybackState()
   }
 
-  /// Cancels any in-flight scheduled pause. This **only** cancels the
-  /// `.scheduled` task; an already-`.issued` pause is preserved —
-  /// `requestResumeIfNeeded` reads it to decide whether to issue a libVLC
-  /// resume.
-  private func cancelDeferredPause() {
-    if case .scheduled(let task, _) = deferredPause {
-      task.cancel()
-      deferredPause = .idle
-      // A pause that is cancelled before it can be issued is a cancellation,
-      // whichever caller cancelled it. `scheduleDeferredPause` clears this
-      // again straight afterwards, so a supersede reads as "in flight"
-      // rather than as the superseded attempt's outcome.
-      deferredPauseOutcome = .cancelled
-    }
-  }
-
-  /// Schedules a deferred pause, replacing any in-flight one. The task
-  /// sleeps for `pauseDebounce`, re-checks intent and player state on
-  /// wake, and either issues the libVLC pause (transitioning to
-  /// `.issued`) or exits cleanly (transitioning back to `.idle`).
-  private func scheduleDeferredPause() {
-    cancelDeferredPause()
-    // A new attempt is in flight and has not finished yet. Without this the
-    // previous attempt's outcome would stay readable for the whole debounce,
-    // so a reader could not tell a settled result from a stale one.
-    deferredPauseOutcome = nil
-
-    let generation = DeferredPauseState.nextGeneration(after: deferredPause)
-    let debounce = pauseDebounce
-    let task = Task { @MainActor [weak self] in
-      var attemptsRemaining = Self.maxDeferredPauseAttempts
-      while !Task.isCancelled {
-        do {
-          try await Task.sleep(for: debounce)
-        } catch {
-          return
-        }
-
-        // Bind `self` after the suspension so the observer only keeps the
-        // controller alive while it is deciding whether to issue the pause.
-        guard let self else { return }
-        guard !Task.isCancelled, currentDeferredPauseGeneration == generation, !pipPlaybackActive else { return }
-
-        switch player.state {
-        case .playing:
-          if playbackDriver.pause() {
-            deferredPause = .issued
-            deferredPauseOutcome = .issued
-            return
-          }
-          // libVLC refused. Retry, but not forever.
-          attemptsRemaining -= 1
-        case .opening, .buffering:
-          // Avoid pausing libVLC while it is still stabilizing input state.
-          // Keep waiting unless AVKit changes its mind first — bounded, so an
-          // input that never stabilizes cannot retry indefinitely.
-          attemptsRemaining -= 1
-        default:
-          deferredPause = .idle
-          deferredPauseOutcome = .cancelled
-          return
-        }
-
-        if attemptsRemaining <= 0 {
-          deferredPause = .idle
-          settleUnpausableInput()
-          return
-        }
-      }
-    }
-    deferredPause = .scheduled(task: task, generation: generation)
-  }
-
-  /// How many debounce intervals a deferred pause may retry before the input
-  /// is treated as unpausable.
-  ///
-  /// At the default 250 ms debounce this is ten seconds — long enough for a
-  /// slow network open to stabilize, short enough that a permanently
-  /// unpausable input does not leave a paused UI over continuing playback
-  /// indefinitely.
-  static let maxDeferredPauseAttempts = 40
-
-  /// Reconciles after a deferred pause has been abandoned.
-  ///
-  /// The input never became pausable, so playback is still running. The
-  /// public intent was already published as inactive when PiP asked to pause;
-  /// leaving it there would show paused controls over playing media — the
-  /// visible half of this bug. Republish the truth on both surfaces.
-  private func settleUnpausableInput() {
-    deferredPauseOutcome = .rejected
-    guard player.state.isActive else { return }
-    player.setPlaybackIntentFromExternalControl(true)
-    pipPlaybackActive = true
-    invalidatePictureInPicturePlaybackState()
-  }
-
-  /// The generation id of an in-flight scheduled pause, or 0 if no
-  /// task is currently scheduled. Used by the deferred-pause loop to
-  /// detect when its scheduling slot has been replaced.
-  private var currentDeferredPauseGeneration: UInt64 {
-    if case .scheduled(_, let generation) = deferredPause {
-      generation
-    } else {
-      0
-    }
-  }
-
-  /// Clears the `.issued` flag without cancelling a scheduled pause.
-  /// Used when an external event (the user pressing play, the player
-  /// settling into `.playing` on its own) makes the PiP-issued pause
-  /// obsolete but we don't want to disturb a still-pending schedule.
-  func clearIssuedPauseFlag() {
-    if case .issued = deferredPause {
-      deferredPause = .idle
-    }
-  }
-
-  /// Returns whether PiP needs libVLC to resume, and whether the
-  /// playback driver accepted the resume request. Checks both the
-  /// `.issued` state (PiP actually paused libVLC) and the player's
-  /// own resume hint.
-  private func requestResumeIfNeeded() -> (needed: Bool, accepted: Bool) {
-    let pipIssuedPause = if case .issued = deferredPause {
-      true
-    } else {
-      false
-    }
-    let shouldResume = pipIssuedPause || playbackDriver.shouldResume()
-    if pipIssuedPause {
-      deferredPause = .idle
-    }
-    guard shouldResume else { return (needed: false, accepted: false) }
-    return (needed: true, accepted: playbackDriver.resume())
-  }
-
   // MARK: - State Observation
 
   /// Keeps the renderer's frame cadence in step with the source.
@@ -1077,7 +981,7 @@ public final class PiPController: NSObject {
     pendingPiPPlaybackState = playing
 
     if playing {
-      playbackDriver.cancelPendingPause()
+      playbackDriver.cancelPendingPause(nil, nil, .resume)
       let resumeRequest = requestResumeIfNeeded()
       if resumeRequest.needed, !resumeRequest.accepted {
         pendingPiPPlaybackState = nil

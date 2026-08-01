@@ -460,7 +460,27 @@ public final class Player {
   /// command, this survives a native playlist boundary so adoption can carry
   /// a pause or resume that raced with the media switch.
   @ObservationIgnored
-  var playbackControlIntent: DeferredPauseCommand?
+  var playbackControlIntent: DeferredPauseCommand? {
+    didSet { playbackControlIntentRevision &+= 1 }
+  }
+
+  /// Monotonic identity of the latest explicit transport command. PiP uses
+  /// this to retire only the pause it owns without erasing a newer app command
+  /// that happens to target the same media generation.
+  @ObservationIgnored
+  var playbackControlIntentRevision: UInt64 = 0
+
+  /// Receipt for the most recent pause that reached libVLC.
+  ///
+  /// A deferred pause can be issued by the event consumer while the PiP
+  /// controller is sleeping between retries. The intent revision alone says
+  /// which command is current, not whether that command actually crossed the
+  /// native boundary, so the controller needs this exact generation/revision
+  /// pair to distinguish an issued pause from a still-pending one.
+  @ObservationIgnored
+  var lastIssuedPausePlaybackGeneration: UInt64?
+  @ObservationIgnored
+  var lastIssuedPausePlaybackControlRevision: UInt64?
 
   #if DEBUG
   /// Lets deterministic tests advance the callback-lane generation at the
@@ -469,6 +489,7 @@ public final class Player {
   enum PauseProbeStage {
     case state
     case capability
+    case nativePause
     case pauseRollback
     case resumeState
     case resumeRollback
@@ -478,6 +499,10 @@ public final class Player {
   var _pauseProbeHookForTesting: ((PauseProbeStage) -> Void)?
   @ObservationIgnored
   var _nativePlaybackStateOverrideForTesting: PlayerState?
+  @ObservationIgnored
+  var _nativeCanPauseOverrideForTesting: Bool?
+  @ObservationIgnored
+  var _nativePauseSafetyOverrideForTesting: Bool?
   #endif
 
   var pauseTransition: PauseTransition? {
