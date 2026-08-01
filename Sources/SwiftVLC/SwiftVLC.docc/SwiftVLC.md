@@ -84,6 +84,8 @@ audio and video overlay APIs.
 - ``PlayerState``
 - ``PlayerEvent``
 - ``PlayerRole``
+- ``SeekRequest``
+- ``SeekOutcome``
 - ``VLCInstance``
 
 ### Media

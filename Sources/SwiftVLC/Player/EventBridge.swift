@@ -192,12 +192,14 @@ final class EventBridge: Sendable {
   func updateAuthoritativeTimeline(
     time: Duration,
     position: Double?,
-    playbackGeneration: UInt64
+    playbackGeneration: UInt64,
+    timelineRevision: UInt64
   ) {
     context.updateAuthoritativeTimeline(
       time: time,
       position: position,
-      playbackGeneration: playbackGeneration
+      playbackGeneration: playbackGeneration,
+      timelineRevision: timelineRevision
     )
   }
 
@@ -215,8 +217,9 @@ final class EventBridge: Sendable {
     )
   }
 
-  /// Marks a new authoritative timeline. Clock samples emitted before this
-  /// point carry a lower revision and are discarded by the consumer.
+  /// Marks a new authoritative timeline after native dispatch accepts.
+  /// Clock samples stamped before this lock-linearized point carry a lower
+  /// revision and are discarded by the consumer.
   @discardableResult
   func advanceTimelineRevision() -> UInt64 {
     context.advanceTimelineRevision()
@@ -228,12 +231,14 @@ final class EventBridge: Sendable {
   func _broadcastForTesting(
     _ event: PlayerEvent,
     nativeHandleGeneration: UInt64,
-    playbackGeneration: UInt64? = nil
+    playbackGeneration: UInt64? = nil,
+    emittedTimelineRevision: UInt64? = nil
   ) {
     context.broadcast(
       event,
       nativeHandleGeneration: nativeHandleGeneration,
-      playbackGeneration: playbackGeneration
+      playbackGeneration: playbackGeneration,
+      emittedTimelineRevision: emittedTimelineRevision
     )
   }
 
@@ -361,6 +366,7 @@ private final class EventBridgeCallbackContext: Sendable {
     var position: Double = 0
     var bufferFill: Float = 0
     var activeVideoOutputs = 0
+    var timelineRevision: UInt64 = 0
 
     var publicValue: PlaybackFinalTimeline {
       PlaybackFinalTimeline(
@@ -491,7 +497,8 @@ private final class EventBridgeCallbackContext: Sendable {
   func updateAuthoritativeTimeline(
     time: Duration,
     position: Double?,
-    playbackGeneration: UInt64
+    playbackGeneration: UInt64,
+    timelineRevision: UInt64
   ) {
     playbackLifecycle.withLock { state in
       guard
@@ -499,10 +506,12 @@ private final class EventBridgeCallbackContext: Sendable {
         playbackGeneration > state.lastEmittedGeneration
       else { return }
       var snapshot = state.snapshots[playbackGeneration] ?? TimelineSnapshot()
+      guard timelineRevision >= snapshot.timelineRevision else { return }
       snapshot.time = time
       if let position {
         snapshot.position = position
       }
+      snapshot.timelineRevision = timelineRevision
       state.snapshots[playbackGeneration] = snapshot
     }
   }
@@ -528,10 +537,16 @@ private final class EventBridgeCallbackContext: Sendable {
   func broadcast(
     _ event: PlayerEvent,
     nativeHandleGeneration: UInt64,
-    playbackGeneration: UInt64? = nil
+    playbackGeneration: UInt64? = nil,
+    emittedTimelineRevision: UInt64? = nil
   ) {
     let playbackGeneration = playbackGeneration ?? currentPlaybackGeneration
-    recordTimeline(event, generation: playbackGeneration)
+    let emittedTimelineRevision = emittedTimelineRevision ?? captureTimelineRevision()
+    recordTimeline(
+      event,
+      generation: playbackGeneration,
+      timelineRevision: emittedTimelineRevision
+    )
     // Each broadcaster is gated on its own emptiness so a libVLC event
     // with no consumers costs neither the lock-and-snapshot nor the
     // sourced-wrapper construction. The sourced broadcast (the player's
@@ -544,7 +559,7 @@ private final class EventBridgeCallbackContext: Sendable {
           nativeHandleGeneration: nativeHandleGeneration,
           playbackGeneration: playbackGeneration,
           event: event,
-          timelineRevision: timelineRevision.withLock { $0 }
+          timelineRevision: emittedTimelineRevision
         )
       )
     }
@@ -567,6 +582,12 @@ private final class EventBridgeCallbackContext: Sendable {
       revision &+= 1
       return revision
     }
+  }
+
+  /// Captures authority at native callback entry, before event classification
+  /// or lifecycle bookkeeping can delay delivery past a seek boundary.
+  func captureTimelineRevision() -> UInt64 {
+    timelineRevision.withLock { $0 }
   }
 
   /// Permanently closes both broadcasters, so streams handed out after this
@@ -738,14 +759,25 @@ private final class EventBridgeCallbackContext: Sendable {
     }
   }
 
-  private func recordTimeline(_ event: PlayerEvent, generation: UInt64) {
+  private func recordTimeline(
+    _ event: PlayerEvent,
+    generation: UInt64,
+    timelineRevision: UInt64
+  ) {
     guard generation > 0 else { return }
     playbackLifecycle.withLock { state in
+      guard generation > state.lastEmittedGeneration else { return }
       var snapshot = state.snapshots[generation] ?? TimelineSnapshot()
       switch event {
-      case .timeChanged(let time): snapshot.time = time
+      case .timeChanged(let time):
+        guard timelineRevision >= snapshot.timelineRevision else { return }
+        snapshot.time = time
+        snapshot.timelineRevision = timelineRevision
       case .lengthChanged(let duration): snapshot.duration = duration
-      case .positionChanged(let position): snapshot.position = position
+      case .positionChanged(let position):
+        guard timelineRevision >= snapshot.timelineRevision else { return }
+        snapshot.position = position
+        snapshot.timelineRevision = timelineRevision
       case .bufferingProgress(let fill): snapshot.bufferFill = fill
       case .voutChanged(let count): snapshot.activeVideoOutputs = count
       default: break
@@ -795,6 +827,11 @@ private func playerEventCallback(
   let attachment = Unmanaged<EventBridgeCallbackAttachment>.fromOpaque(opaque)
     .takeUnretainedValue()
   let context = attachment.context
+  // This lock acquisition and `advanceTimelineRevision()` form the evidence
+  // boundary. A callback that entered before native dispatch returned keeps
+  // the outgoing stamp even if mapping or lifecycle bookkeeping finishes
+  // after the accepted seek publishes its revision.
+  let emittedTimelineRevision = context.captureTimelineRevision()
 
   guard let mapped = mapEvent(event.pointee) else { return }
   let coordinator = context.endCoordinator
@@ -850,147 +887,15 @@ private func playerEventCallback(
   context.broadcast(
     mapped,
     nativeHandleGeneration: attachment.nativeHandleGeneration,
-    playbackGeneration: playbackGeneration
+    playbackGeneration: playbackGeneration,
+    emittedTimelineRevision: emittedTimelineRevision
   )
   if shouldSynthesizeEnd {
     context.broadcast(
       .endReached,
       nativeHandleGeneration: attachment.nativeHandleGeneration,
-      playbackGeneration: playbackGeneration
+      playbackGeneration: playbackGeneration,
+      emittedTimelineRevision: emittedTimelineRevision
     )
-  }
-}
-
-/// Maps a single libVLC `libvlc_event_t` to a typed `PlayerEvent`.
-///
-/// Internal rather than `private` so unit tests can synthesize each
-/// event variant with hand-built `libvlc_event_t` values. Most of
-/// these events don't fire in a headless test environment, so full
-/// switch coverage is impossible without direct invocation.
-func mapEvent(_ event: libvlc_event_t) -> PlayerEvent? {
-  let type = libvlc_event_e(rawValue: UInt32(event.type))
-
-  switch type {
-  case libvlc_MediaPlayerNothingSpecial:
-    return .stateChanged(.idle)
-
-  case libvlc_MediaPlayerOpening:
-    return .stateChanged(.opening)
-
-  case libvlc_MediaPlayerBuffering:
-    let pct = event.u.media_player_buffering.new_cache / 100.0
-    return .bufferingProgress(pct)
-
-  case libvlc_MediaPlayerPlaying:
-    return .stateChanged(.playing)
-
-  case libvlc_MediaPlayerPaused:
-    return .stateChanged(.paused)
-
-  case libvlc_MediaPlayerStopped:
-    return .stateChanged(.stopped)
-
-  case libvlc_MediaPlayerStopping:
-    return .stateChanged(.stopping)
-
-  case libvlc_MediaPlayerEncounteredError:
-    return .encounteredError
-
-  case libvlc_MediaPlayerTimeChanged:
-    let ms = event.u.media_player_time_changed.new_time
-    return .timeChanged(.milliseconds(ms))
-
-  case libvlc_MediaPlayerPositionChanged:
-    let pos = event.u.media_player_position_changed.new_position
-    return .positionChanged(pos)
-
-  case libvlc_MediaPlayerSeekableChanged:
-    let seekable = event.u.media_player_seekable_changed.new_seekable != 0
-    return .seekableChanged(seekable)
-
-  case libvlc_MediaPlayerPausableChanged:
-    let pausable = event.u.media_player_pausable_changed.new_pausable != 0
-    return .pausableChanged(pausable)
-
-  case libvlc_MediaPlayerLengthChanged:
-    let ms = event.u.media_player_length_changed.new_length
-    return .lengthChanged(.milliseconds(ms))
-
-  case libvlc_MediaPlayerVout:
-    let count = event.u.media_player_vout.new_count
-    return .voutChanged(Int(count))
-
-  case libvlc_MediaPlayerESAdded,
-       libvlc_MediaPlayerESDeleted,
-       libvlc_MediaPlayerESSelected,
-       libvlc_MediaPlayerESUpdated:
-    return .tracksChanged
-
-  case libvlc_MediaPlayerMediaChanged:
-    return .mediaChanged
-
-  case libvlc_MediaPlayerMuted:
-    return .muted
-
-  case libvlc_MediaPlayerUnmuted:
-    return .unmuted
-
-  case libvlc_MediaPlayerCorked:
-    return .corked
-
-  case libvlc_MediaPlayerUncorked:
-    return .uncorked
-
-  case libvlc_MediaPlayerAudioVolume:
-    let vol = event.u.media_player_audio_volume.volume
-    return .volumeChanged(vol)
-
-  case libvlc_MediaPlayerAudioDevice:
-    let device = event.u.media_player_audio_device.device.map { String(cString: $0) }
-    return .audioDeviceChanged(device)
-
-  case libvlc_MediaPlayerMediaStopping:
-    return .mediaStopping
-
-  case libvlc_MediaPlayerChapterChanged:
-    let chapter = event.u.media_player_chapter_changed.new_chapter
-    return .chapterChanged(Int(chapter))
-
-  case libvlc_MediaPlayerRecordChanged:
-    let recording = event.u.media_player_record_changed.recording
-    let path = event.u.media_player_record_changed.recorded_file_path
-      .map { String(cString: $0) }
-    return .recordingChanged(isRecording: recording, filePath: path)
-
-  case libvlc_MediaPlayerTitleListChanged:
-    return .titleListChanged
-
-  case libvlc_MediaPlayerTitleSelectionChanged:
-    let index = event.u.media_player_title_selection_changed.index
-    return .titleSelectionChanged(Int(index))
-
-  case libvlc_MediaPlayerSnapshotTaken:
-    let path = String(cString: event.u.media_player_snapshot_taken.psz_filename)
-    return .snapshotTaken(path)
-
-  case libvlc_MediaPlayerProgramAdded:
-    let id = event.u.media_player_program_changed.i_id
-    return .programAdded(Int(id))
-
-  case libvlc_MediaPlayerProgramDeleted:
-    let id = event.u.media_player_program_changed.i_id
-    return .programDeleted(Int(id))
-
-  case libvlc_MediaPlayerProgramSelected:
-    let unselected = event.u.media_player_program_selection_changed.i_unselected_id
-    let selected = event.u.media_player_program_selection_changed.i_selected_id
-    return .programSelected(unselectedId: Int(unselected), selectedId: Int(selected))
-
-  case libvlc_MediaPlayerProgramUpdated:
-    let id = event.u.media_player_program_changed.i_id
-    return .programUpdated(Int(id))
-
-  default:
-    return nil
   }
 }

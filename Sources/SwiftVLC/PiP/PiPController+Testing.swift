@@ -72,18 +72,26 @@ extension PiPController {
     lastSkipTimestamp != 0
   }
 
-  func _skipByIntervalForTesting(_ skipInterval: CMTime) {
-    handleSkip(by: skipInterval) {}
+  func _skipByIntervalForTesting(_ skipInterval: CMTime) async {
+    await withCheckedContinuation { continuation in
+      handleSkip(by: skipInterval) { continuation.resume() }
+    }
   }
 
   /// Returns how many times the completion handler ran, so "exactly once" is
   /// assertable rather than assumed.
-  func _skipCompletionCountForTesting(_ skipInterval: CMTime) -> Int {
+  func _skipCompletionCountForTesting(_ skipInterval: CMTime) async -> Int {
     // `handleSkip`'s completion is `@Sendable`, so the counter has to be
     // shared state rather than a captured `var`. It is called synchronously on
     // this actor today; the lock keeps the helper correct if that changes.
     let count = Mutex(0)
-    handleSkip(by: skipInterval) { count.withLock { $0 += 1 } }
+    await withCheckedContinuation { continuation in
+      handleSkip(by: skipInterval) {
+        count.withLock { $0 += 1 }
+        continuation.resume()
+      }
+    }
+    await Task.yield()
     return count.withLock { $0 }
   }
 

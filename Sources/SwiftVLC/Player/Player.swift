@@ -413,6 +413,7 @@ public final class Player {
   var directPiPVideoCallbackGeneration: UInt64 = 0
   #endif
   let eventBridge: EventBridge
+  let nativeSeekMonitor: NativeSeekMonitor
   nonisolated let endCoordinator = PlaybackEndCoordinator()
   nonisolated let playbackIntentBridge: Broadcaster<Bool>
   /// Carries normalized lifecycle transitions. See ``stateTransitions``.
@@ -503,6 +504,8 @@ public final class Player {
   var _nativeCanPauseOverrideForTesting: Bool?
   @ObservationIgnored
   var _nativePauseSafetyOverrideForTesting: Bool?
+  @ObservationIgnored
+  var _seekOverridesForTesting = PlayerSeekTestOverrides()
   #endif
 
   var pauseTransition: PauseTransition? {
@@ -592,9 +595,14 @@ public final class Player {
   /// media load. Clock samples stamped older than this are stale and are
   /// dropped rather than allowed to overwrite the seek target.
   var acceptedTimelineRevision: UInt64 = 0
+  /// The only seek still allowed to publish a terminal result.
+  var pendingSeekSettlement: PendingSeekSettlement?
   /// Bumped when ``recast(to:)`` is superseded so suspended work rejects stale restoration.
   var sessionGeneration: UInt64 = 0 {
     didSet {
+      if sessionGeneration != oldValue {
+        supersedePendingSeekSettlement()
+      }
       #if os(iOS) || os(macOS)
       refreshNativeHandleSnapshots()
       #endif
@@ -624,7 +632,9 @@ public final class Player {
       eventManager: libvlc_media_player_event_manager(p)!,
       endCoordinator: endCoordinator
     )
+    nativeSeekMonitor = NativeSeekMonitor(player: p)
     playbackIntentBridge = Broadcaster<Bool>(defaultBufferSize: 16)
+    configureNativeSeekMonitor()
     startEventConsumer()
     // Seeded so `playbackStatus` opens with the current pair from the moment
     // the player exists: a subscriber attaching before any state change would
@@ -640,6 +650,7 @@ public final class Player {
   }
 
   isolated deinit {
+    supersedePendingSeekSettlement()
     eventBridge.finishCurrentPlaybackGeneration(
       cause: .cancellation,
       playbackGeneration: sessionGeneration
@@ -679,6 +690,7 @@ public final class Player {
     // pointer is a plain value. invalidate() MUST run before release()
     // so the event manager is still valid when detaching callbacks.
     let bridge = eventBridge
+    let seekMonitor = nativeSeekMonitor
     // `AnyObject?` is not `Sendable` under Swift 6, but the capture is
     // write-once-read-never — the closure only holds the view alive,
     // it never reads or mutates it. `nonisolated(unsafe)` is the
@@ -696,6 +708,7 @@ public final class Player {
         p,
         lifetime: lifetime,
         bridge: bridge,
+        seekMonitor: seekMonitor,
         retainedDrawables: drawables,
         resumeBeforeStop: resumeBeforeRelease
       )
@@ -871,6 +884,7 @@ public final class Player {
   /// teardown must not race the audio/video output drain (for example
   /// before deactivating a shared `AVAudioSession`).
   public func stop() {
+    supersedePendingSeekSettlement()
     if shouldResumeNativePlayerBeforeStop {
       libvlc_media_player_set_pause(pointer, 0)
     }

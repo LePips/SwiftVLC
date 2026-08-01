@@ -112,6 +112,7 @@ extension PiPController {
       rate: rate,
       lastRate: lastObservedRate,
       hasTimebase: timebase != nil,
+      isSkipPending: pendingSkipCount > 0,
       secondsSinceSkip: CFAbsoluteTimeGetCurrent() - lastSkipTimestamp,
       playerSeconds: Double(time.components.seconds)
         + Double(time.components.attoseconds) / 1e18,
@@ -166,6 +167,7 @@ extension PiPController {
     rate: Float,
     lastRate: Float,
     hasTimebase: Bool,
+    isSkipPending: Bool,
     secondsSinceSkip: Double,
     playerSeconds: Double,
     timebaseSeconds: Double
@@ -179,7 +181,10 @@ extension PiPController {
     if retracking.adoptsRate {
       retracking.setsRate = rate
     }
-    if secondsSinceSkip > 1.0, abs(playerSeconds - timebaseSeconds) > 2.0 {
+    if
+      !isSkipPending,
+      secondsSinceSkip > 1.0,
+      abs(playerSeconds - timebaseSeconds) > 2.0 {
       retracking.setsTime = playerSeconds
     }
     return retracking

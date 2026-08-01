@@ -92,7 +92,7 @@ extension Player {
     }
     guard sourcedEvent.playbackGeneration == sessionGeneration else { return }
     guard isTimelineSampleCurrent(sourcedEvent) else { return }
-    handleEvent(sourcedEvent.event)
+    handleEvent(sourcedEvent.event, sourceTimelineRevision: sourcedEvent.timelineRevision)
   }
 
   /// Whether a clock sample still describes the authoritative timeline.
@@ -119,13 +119,20 @@ extension Player {
   /// `startEventConsumer`'s loop on every event the bridge yields.
   func handleEvent(
     _ event: PlayerEvent,
-    sourcePlaybackGeneration: UInt64? = nil
+    sourcePlaybackGeneration: UInt64? = nil,
+    sourceTimelineRevision: UInt64? = nil
   ) {
     let interval = Signposts.signposter.beginInterval("Player.handleEvent")
     defer { Signposts.signposter.endInterval("Player.handleEvent", interval) }
     switch event {
     case .stateChanged(let newState):
       publishPlaybackState(newState)
+      switch newState {
+      case .idle, .stopped, .stopping, .error:
+        supersedePendingSeekSettlement(ifNotPredating: sourceTimelineRevision)
+      case .opening, .buffering, .playing, .paused:
+        break
+      }
       updatePauseTransition(for: newState)
       reconcilePlaybackIntent(for: newState)
       if case .stopped = newState {
@@ -184,6 +191,7 @@ extension Player {
       let previousSessionGeneration = sessionGeneration
       let playbackControlIntent = playbackControlIntent
       syncCurrentMediaFromNative()
+      let changedMediaIdentity = currentMedia?.pointer != sessionGenerationMedia
       // A media change the wrapper did not initiate still has to supersede
       // whatever was restoring the previous session: a `MediaListPlayer`
       // advancing the list calls `libvlc_media_list_player_next` directly, so
@@ -198,7 +206,7 @@ extension Player {
         sessionGeneration = sourcePlaybackGeneration
         sessionGenerationMedia = currentMedia?.pointer
         publishPlaybackStatus()
-      } else if currentMedia?.pointer != sessionGenerationMedia {
+      } else if changedMediaIdentity {
         if sourcePlaybackGeneration == nil {
           sessionGeneration = eventBridge.synchronizePlaybackGeneration(
             sessionGeneration &+ 1,
@@ -212,7 +220,19 @@ extension Player {
       }
       let adoptedExternalGeneration = sessionGeneration > previousSessionGeneration
       let carriesPlaybackControl = adoptedExternalGeneration && playbackControlIntent != nil
-      resetMediaDerivedState(preservingPlaybackIntent: carriesPlaybackControl)
+      // `load(_:)` establishes the new generation and resets its timeline
+      // before calling `set_media`. The resulting native MediaChanged echo is
+      // stamped with that already-adopted generation, but can remain queued
+      // while a same-turn seek is accepted. Resetting on the echo would then
+      // supersede that valid seek and rotate away its native monitor token.
+      // Events without source attribution retain the conservative legacy
+      // behavior; sourced external changes always advance or replace identity.
+      let replacedTimeline = adoptedExternalGeneration
+        || changedMediaIdentity
+        || sourcePlaybackGeneration == nil
+      if replacedTimeline {
+        resetMediaDerivedState(preservingPlaybackIntent: carriesPlaybackControl)
+      }
       if adoptedExternalGeneration, let playbackControlIntent {
         reconcilePauseControlAfterExternalMediaAdoption(
           playbackGeneration: sessionGeneration,
@@ -224,6 +244,7 @@ extension Player {
 
     case .encounteredError:
       publishPlaybackState(.error)
+      supersedePendingSeekSettlement(ifNotPredating: sourceTimelineRevision)
       clearPauseControlState(for: sessionGeneration)
       reconcilePlaybackIntent(for: .error)
 
@@ -431,6 +452,8 @@ extension Player {
   /// times, duration, seek/pause flags, buffer fill. Called when media
   /// is loaded or replaced.
   func resetMediaDerivedState(preservingPlaybackIntent: Bool = false) {
+    supersedePendingSeekSettlement()
+    nativeSeekMonitor.resetForTimelineReplacement()
     // New media, new timeline: clock samples still queued from the previous
     // one describe a media that is no longer loaded and must not be applied.
     acceptedTimelineRevision = eventBridge.advanceTimelineRevision()
@@ -475,6 +498,12 @@ extension Player {
     withMutation(keyPath: \.position) {
       _position = 0
     }
+    eventBridge.updateAuthoritativeTimeline(
+      time: .zero,
+      position: 0,
+      playbackGeneration: sessionGeneration,
+      timelineRevision: acceptedTimelineRevision
+    )
     isSuppressingCapabilityPublish = false
     // New media, new capability generation. The bump and the reset values are
     // written under one lock acquisition, so a reader can never see the new

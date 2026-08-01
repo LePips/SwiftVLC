@@ -14,6 +14,7 @@ struct PiPTimebaseRetrackingTests {
     rate: Float = 1.0,
     lastRate: Float = 1.0,
     hasTimebase: Bool = true,
+    isSkipPending: Bool = false,
     secondsSinceSkip: Double = 5.0,
     playerSeconds: Double = 0,
     timebaseSeconds: Double = 0
@@ -24,6 +25,7 @@ struct PiPTimebaseRetrackingTests {
       rate: rate,
       lastRate: lastRate,
       hasTimebase: hasTimebase,
+      isSkipPending: isSkipPending,
       secondsSinceSkip: secondsSinceSkip,
       playerSeconds: playerSeconds,
       timebaseSeconds: timebaseSeconds
@@ -69,6 +71,21 @@ struct PiPTimebaseRetrackingTests {
   @Test
   func `A recent skip suppresses the resync`() {
     #expect(retracking(secondsSinceSkip: 0.5, playerSeconds: 40, timebaseSeconds: 10).setsTime == nil)
+  }
+
+  /// Settlement can legitimately outlast the historical one-second grace
+  /// period. Pending state, not elapsed time, keeps the optimistic Player
+  /// estimate from leaking into AVKit.
+  @Test
+  func `A pending skip suppresses resync beyond the grace period`() {
+    #expect(
+      retracking(
+        isSkipPending: true,
+        secondsSinceSkip: 5,
+        playerSeconds: 40,
+        timebaseSeconds: 10
+      ).setsTime == nil
+    )
   }
 
   /// Small drift is normal between a decoded clock and a host timebase.
