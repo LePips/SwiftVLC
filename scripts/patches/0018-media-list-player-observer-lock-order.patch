@@ -1,0 +1,85 @@
+# Serialize deferred playlist advancement with public list-player operations.
+#
+# NOT an upstream backport. The pinned libVLC playlist thread holds only
+# mp_callback_lock while set_current_playing_item() detaches the stopped-event
+# observer. That detach deliberately drops mp_callback_lock while waiting for
+# callbacks. A concurrent public stop or media-player replacement can then
+# enter under object_lock, detach the same observer, and make the first detach
+# hit libvlc_event_detach()'s unconditional missing-observer abort.
+#
+# The public order is object_lock -> mp_callback_lock. Capture and clear the
+# queued offset under mp_callback_lock, then reacquire in that order before
+# changing the item. Public operations advance a generation under both locks;
+# if one overtakes the handoff, the now-stale automatic advance is discarded
+# so it cannot skip the explicit selection. This keeps callback accumulation
+# lossless, preserves shutdown wakeups and command precedence, and prevents two
+# operations from uninstalling the same observer concurrently.
+diff --git a/lib/media_list_player.c b/lib/media_list_player.c
+index 0cc53613f0..ff04e42a1c 100644
+--- a/lib/media_list_player.c
++++ b/lib/media_list_player.c
+@@ -62,6 +62,7 @@ struct libvlc_media_list_player_t
+ {
+     libvlc_event_manager_t      event_manager;
+     int                         seek_offset;
++    uint64_t                    operation_generation;
+     bool                        dead;
+     /* Protect access to this structure. */
+     vlc_mutex_t                 object_lock;
+@@ -94,7 +95,7 @@ static void stop(libvlc_media_list_player_t * p_mlp);
+ /**************************************************************************
+  * Shortcuts
+  **************************************************************************/
+-static inline void lock(libvlc_media_list_player_t * p_mlp)
++static inline void lock_internal(libvlc_media_list_player_t * p_mlp)
+ {
+     // Obtain an access to this structure
+     vlc_mutex_lock(&p_mlp->object_lock);
+@@ -103,6 +104,12 @@ static inline void lock(libvlc_media_list_player_t * p_mlp)
+     vlc_mutex_lock(&p_mlp->mp_callback_lock);
+ }
+
++static inline void lock(libvlc_media_list_player_t * p_mlp)
++{
++    lock_internal(p_mlp);
++    p_mlp->operation_generation++;
++}
++
+ static inline void unlock(libvlc_media_list_player_t * p_mlp)
+ {
+     vlc_mutex_unlock(&p_mlp->mp_callback_lock);
+@@ -338,12 +345,28 @@ static void *playlist_thread(void *data)
+ 
+     while (!mlp->dead)
+     {
+-        if (mlp->seek_offset != 0)
+-        {
+-            set_relative_playlist_position_and_play(mlp, mlp->seek_offset);
+-            mlp->seek_offset = 0;
+-        }
+-        vlc_cond_wait(&mlp->seek_pending, &mlp->mp_callback_lock);
++        while (mlp->seek_offset == 0 && !mlp->dead)
++            vlc_cond_wait(&mlp->seek_pending, &mlp->mp_callback_lock);
++
++        if (mlp->dead)
++            break;
++
++        int seek_offset = mlp->seek_offset;
++        uint64_t operation_generation = mlp->operation_generation;
++        mlp->seek_offset = 0;
++
++        /* Public operations acquire object_lock before mp_callback_lock.
++         * Follow that same order here so uninstall_media_player_observer(),
++         * which temporarily drops the callback lock around event_detach(),
++         * cannot race another stop, item change, or media-player replacement
++         * and detach the same observer twice. */
++        vlc_mutex_unlock(&mlp->mp_callback_lock);
++        lock_internal(mlp);
++        if (!mlp->dead &&
++            operation_generation == mlp->operation_generation)
++            set_relative_playlist_position_and_play(mlp, seek_offset);
++        unlock(mlp);
++        vlc_mutex_lock(&mlp->mp_callback_lock);
+     }
+ 
+     vlc_mutex_unlock(&mlp->mp_callback_lock);

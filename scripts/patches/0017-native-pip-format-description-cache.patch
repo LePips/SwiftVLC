@@ -1,0 +1,179 @@
+# Cache compatible CoreMedia format descriptions in the native PiP display.
+#
+# NOT an upstream backport. SwiftVLC's native sample-buffer display is built by
+# patches 0002-0004; its RenderPicture callback currently calls
+# CMVideoFormatDescriptionCreateForImageBuffer for every decoded frame. At 60
+# fps that creates 3,600 equivalent CoreMedia objects per minute for a steady
+# stream even though the direct Swift renderer already reuses compatible
+# descriptions.
+#
+# This patch scopes one cache to each VLCSampleBufferDisplay (and therefore to
+# one vout generation). Every frame is checked with
+# CMVideoFormatDescriptionMatchesImageBuffer before reuse, so dimensions,
+# pixel format, colour metadata, HDR attachments, and other format-defining
+# image-buffer properties invalidate the cached description. close clears it
+# under the same displayLayerLock used by lookup. The render path receives its
+# own retain, keeping an in-flight frame safe if close clears the cache after
+# lookup.
+#
+# The cache algorithm lives in a small header so the engine build can execute
+# scripts/patches/validation/native-format-description-cache.m against the
+# exact production helper. That regression proves steady-frame reuse plus
+# invalidation on resolution, pixel-format, colour-metadata, and vout-generation
+# changes.
+diff --git a/modules/video_output/apple/VLCSampleBufferDisplay.m b/modules/video_output/apple/VLCSampleBufferDisplay.m
+index ebe5a3be95..94ce31d04c 100644
+--- a/modules/video_output/apple/VLCSampleBufferDisplay.m
++++ b/modules/video_output/apple/VLCSampleBufferDisplay.m
+@@ -42,6 +42,7 @@
+ 
+ #include "../../codec/vt_utils.h"
+ #include "vlc_pip_controller.h"
++#include "VLCSampleBufferFormatDescriptionCache.h"
+ #include "VLCSampleBufferGeometry.h"
+ 
+ #import <VideoToolbox/VideoToolbox.h>
+@@ -712,6 +713,7 @@ @interface VLCSampleBufferDisplay: NSObject
+     filter_t *converter;
+     atomic_uint geometryFailureCount;
+     CMSampleBufferRef pendingSampleBuffer;
++    vlc_samplebuffer_format_description_cache formatDescriptionCache;
+ }
+     @property (nonatomic, readonly, weak) VLCView *window;
+     @property (nonatomic, readonly) vout_display_t *vd;
+@@ -919,6 +921,8 @@ - (void)close {
+             CFRelease(pendingSampleBuffer);
+             pendingSampleBuffer = NULL;
+         }
++        vlc_samplebuffer_format_description_cache_Clear(
++            &formatDescriptionCache);
+     }
+     dispatch_async(dispatch_get_main_queue(), ^{
+         [sys.displayClipView removeFromSuperview];
+@@ -969,6 +973,32 @@ static void ReportGeometryFailure(vout_display_t *vd,
+                  reason, occurrence);
+ }
+ 
++/* Returns an owned description that matches every property CoreMedia derives
++ * from the image buffer. The display instance is scoped to one vout
++ * generation, so replacement naturally drops the cache; format, dimensions,
++ * colour metadata, and HDR attachment changes invalidate it within a
++ * generation. Retaining the returned value keeps an in-flight render safe if
++ * close releases the cache concurrently. */
++static CMVideoFormatDescriptionRef
++CopyCompatibleFormatDescription(vout_display_t *vd,
++                                VLCSampleBufferDisplay *sys,
++                                CVImageBufferRef imageBuffer)
++{
++    CMVideoFormatDescriptionRef result = NULL;
++
++    @synchronized(sys.displayLayerLock) {
++        if (sys.displayClosed)
++            return NULL;
++
++        OSStatus status = vlc_samplebuffer_format_description_cache_Copy(
++            &sys->formatDescriptionCache, imageBuffer, &result, NULL);
++        if (status != noErr)
++            msg_Err(vd, "Image buffer format description creation failed!");
++    }
++
++    return result;
++}
++
+ static void RenderPicture(vout_display_t *vd, picture_t *pic, vlc_tick_t date) {
+     VLCSampleBufferDisplay *sys;
+     sys = (__bridge VLCSampleBufferDisplay*)vd->sys;
+@@ -1159,10 +1189,9 @@ static void RenderPicture(vout_display_t *vd, picture_t *pic, vlc_tick_t date) {
+                           kCVAttachmentMode_ShouldPropagate);
+ 
+     CMSampleBufferRef sampleBuffer = NULL;
+-    CMVideoFormatDescriptionRef formatDesc = NULL;
+-    OSStatus err = CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, pixelBuffer, &formatDesc);
+-    if (err != noErr) {
+-        msg_Err(vd, "Image buffer format description creation failed!");
++    CMVideoFormatDescriptionRef formatDesc =
++        CopyCompatibleFormatDescription(vd, sys, pixelBuffer);
++    if (formatDesc == NULL) {
+         CVPixelBufferRelease(pixelBuffer);
+         return;
+     }
+@@ -1178,7 +1207,7 @@ static void RenderPicture(vout_display_t *vd, picture_t *pic, vlc_tick_t date) {
+         .presentationTimeStamp = CMTimeMakeWithSeconds(ca_date, 1000000)
+     };
+ 
+-    err = CMSampleBufferCreateReadyWithImageBuffer(kCFAllocatorDefault, pixelBuffer, formatDesc, &sampleTimingInfo, &sampleBuffer);
++    OSStatus err = CMSampleBufferCreateReadyWithImageBuffer(kCFAllocatorDefault, pixelBuffer, formatDesc, &sampleTimingInfo, &sampleBuffer);
+     CFRelease(formatDesc);
+     CVPixelBufferRelease(pixelBuffer);
+     if (err != noErr) {
+diff --git a/modules/video_output/apple/VLCSampleBufferFormatDescriptionCache.h b/modules/video_output/apple/VLCSampleBufferFormatDescriptionCache.h
+new file mode 100644
+index 0000000000..20679fa63d
+--- /dev/null
++++ b/modules/video_output/apple/VLCSampleBufferFormatDescriptionCache.h
+@@ -0,0 +1,65 @@
++/*****************************************************************************
++ * VLCSampleBufferFormatDescriptionCache.h: compatible CoreMedia description
++ *****************************************************************************
++ * Copyright (C) 2026 VLC authors and VideoLAN
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU Lesser General Public License as published by
++ * the Free Software Foundation; either version 2.1 of the License, or
++ * (at your option) any later version.
++ *****************************************************************************/
++
++#ifndef VLC_SAMPLEBUFFER_FORMAT_DESCRIPTION_CACHE_H
++#define VLC_SAMPLEBUFFER_FORMAT_DESCRIPTION_CACHE_H
++
++#import <CoreMedia/CoreMedia.h>
++
++typedef struct vlc_samplebuffer_format_description_cache
++{
++    CMVideoFormatDescriptionRef description;
++} vlc_samplebuffer_format_description_cache;
++
++static inline void
++vlc_samplebuffer_format_description_cache_Clear(
++    vlc_samplebuffer_format_description_cache *cache)
++{
++    if (cache->description != NULL)
++    {
++        CFRelease(cache->description);
++        cache->description = NULL;
++    }
++}
++
++/* The caller serializes access to cache. The returned description is owned by
++ * the caller, so it remains valid if another serialized operation clears the
++ * cache while that description is in use. */
++static inline OSStatus
++vlc_samplebuffer_format_description_cache_Copy(
++    vlc_samplebuffer_format_description_cache *cache,
++    CVImageBufferRef imageBuffer,
++    CMVideoFormatDescriptionRef *description,
++    bool *reused)
++{
++    if (cache == NULL || imageBuffer == NULL || description == NULL)
++        return -50; /* paramErr */
++
++    *description = NULL;
++    bool matches = cache->description != NULL &&
++        CMVideoFormatDescriptionMatchesImageBuffer(cache->description,
++                                                    imageBuffer);
++    if (!matches)
++    {
++        vlc_samplebuffer_format_description_cache_Clear(cache);
++        OSStatus status = CMVideoFormatDescriptionCreateForImageBuffer(
++            kCFAllocatorDefault, imageBuffer, &cache->description);
++        if (status != noErr)
++            return status;
++    }
++
++    if (reused != NULL)
++        *reused = matches;
++    *description = CFRetain(cache->description);
++    return noErr;
++}
++
++#endif /* VLC_SAMPLEBUFFER_FORMAT_DESCRIPTION_CACHE_H */

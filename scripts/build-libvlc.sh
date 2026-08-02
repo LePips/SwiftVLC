@@ -805,6 +805,14 @@ if [ -n "${PATCHES_DIR}" ] && [ -d "${PATCHES_DIR}" ]; then
     cd "${BUILD_DIR}"
 fi
 
+# Exercise the exact production helper whenever this patch is in the engine
+# source. CI links a released xcframework and cannot cover a newly added native
+# patch until its beta exists, so engine builds themselves own this regression.
+if [ -f "${VLC_SRC}/modules/video_output/apple/VLCSampleBufferFormatDescriptionCache.h" ]; then
+    info "Validating native format-description cache reuse and invalidation..."
+    "${SCRIPT_DIR}/validate-native-format-cache.sh" "${VLC_SRC}"
+fi
+
 # --- Step 1c: Patch VLC snapshot conversion owner ---
 # VLC's snapshot path can convert a hardware/opaque picture to RGBA in order
 # to blend a rendered subpicture into the saved PNG. At the pinned libVLC
