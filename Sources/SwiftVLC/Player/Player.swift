@@ -972,7 +972,13 @@ public final class Player {
 
   // MARK: - Track Refresh
 
-  func refreshTracks() {
+  /// Refreshes all observable track lists from the native player.
+  ///
+  /// The track arrays are asynchronously mirrored snapshots. Receiving the payload-free
+  /// ``PlayerEvent/tracksChanged`` or ``PlayerEvent/mediaChanged`` event does not guarantee
+  /// they are updated; consumers requiring an immediate native read should call this
+  /// method after either event. This also invalidates selected-track observations.
+  public func refreshTracks() {
     audioTracks = fetchTracks(type: .audio)
     videoTracks = fetchTracks(type: .video)
     subtitleTracks = fetchTracks(type: .subtitle)
