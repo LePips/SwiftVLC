@@ -136,6 +136,24 @@ extension Integration {
     }
 
     @Test(.enabled(if: TestCondition.canPlayMedia), .timeLimit(.minutes(1)))
+    func `authoritative jump settles from the post-seek native timer point`() async throws {
+      let player = Player(instance: TestInstance.makePlayback())
+      try player.play(url: TestMedia.twosecURL)
+      try #require(
+        await poll(until: { player.currentTime >= .milliseconds(800) }),
+        "Waiting for: currentTime >= 800ms"
+      )
+
+      let preJump = player.currentTime
+      let request = player.requestJump(by: .milliseconds(-500))
+
+      #expect(request.initialOutcome == .pending)
+      #expect(await request.outcome == .settled)
+      #expect(player.currentTime < preJump)
+      player.stop()
+    }
+
+    @Test(.enabled(if: TestCondition.canPlayMedia), .timeLimit(.minutes(1)))
     func `jump publishes currentTime immediately while paused`() async throws {
       let player = Player(instance: TestInstance.makePlayback())
       try player.play(url: TestMedia.twosecURL)

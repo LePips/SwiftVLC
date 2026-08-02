@@ -127,7 +127,7 @@ extension Integration {
           resume: { true },
           cancelPendingPause: { _, _, _ in },
           shouldResume: { false },
-          skip: { _ in .issued }
+          skip: { _ in .init(resolved: .settled) }
         )
       }
     }

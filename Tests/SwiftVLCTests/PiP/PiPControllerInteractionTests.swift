@@ -25,7 +25,7 @@ extension Integration {
       var shouldResume = false
       var resumeResult = true
       var skipIntervals: [CMTime] = []
-      var skipOutcome: PiPController.SkipOutcome = .issued
+      var skipOutcome: PiPController.SkipOutcome = .settled
 
       var driver: PiPController.PlaybackDriver {
         .init(
@@ -43,7 +43,7 @@ extension Integration {
           shouldResume: { self.shouldResume },
           skip: { interval in
             self.skipIntervals.append(interval)
-            return self.skipOutcome
+            return .init(resolved: self.skipOutcome)
           }
         )
       }
@@ -545,7 +545,7 @@ extension Integration {
     }
 
     @Test
-    func `playback delegate proxy forwards skip to owner`() {
+    func `playback delegate proxy forwards skip to owner`() async {
       let player = Player(instance: TestInstance.shared)
       player._setStateForTesting(currentTime: .seconds(5), duration: .seconds(20))
       let recorder = PlaybackRecorder()
@@ -555,17 +555,17 @@ extension Integration {
         pauseDebounce: .milliseconds(250)
       )
       guard let pip = makePictureInPictureController(for: controller) else { return }
-      let didComplete = Mutex(false)
+      // The generated async import calls the Objective-C completion-based
+      // delegate method without retaining `pip` past this await. AVKit's class
+      // has not adopted Sendable, so make that immutable crossing explicit.
+      nonisolated(unsafe) let unsafePiP = pip
 
-      controller._playbackDelegateForTesting.pictureInPictureController(
-        pip,
+      await controller._playbackDelegateForTesting.pictureInPictureController(
+        unsafePiP,
         skipByInterval: CMTime(seconds: 2, preferredTimescale: 1000)
-      ) {
-        didComplete.withLock { $0 = true }
-      }
+      )
 
       expectNoDifference(recorder.skipIntervals.map(\.seconds), [2])
-      #expect(didComplete.withLock { $0 })
     }
 
     @Test

@@ -301,6 +301,7 @@ extension Player {
     // Reattachment detaches the retiring generation, clears its pending
     // terminal cause, then installs the successor generation as one operation.
     eventBridge.reattach(to: newEventManager)
+    nativeSeekMonitor.reattach(to: newPointer)
     // The old handle's terminal events are unobservable from here on; a
     // pending stop/error cause would otherwise outlive its `Stopped` and
     // suppress the next genuine natural end. The same applies to its

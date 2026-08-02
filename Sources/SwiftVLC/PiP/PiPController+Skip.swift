@@ -8,15 +8,64 @@ extension PiPController {
   /// AVKit's contract is that the completion handler runs once the skip
   /// operation finishes or fails — never twice, and never not at all. Naming
   /// the outcomes makes "exactly once" checkable rather than assumed.
-  enum SkipOutcome: Equatable {
-    /// libVLC accepted the relative jump.
-    case issued
+  enum SkipOutcome: Equatable, Sendable {
+    /// libVLC accepted the relative jump and landing is still pending.
+    case pending
     /// There was no session to seek in, or libVLC refused the request. The
     /// published timeline is left exactly as it was.
     case rejected
+    /// The matching seek ended and its landed clock reached the observable timeline.
+    case settled
+    /// libVLC accepted the jump but emitted no landed timer point before the
+    /// bounded settlement window elapsed.
+    case timedOut
+    /// A newer jump or media lifecycle transition replaced this request.
+    case superseded
     /// AVKit handed over an interval that cannot be expressed in libVLC's
     /// millisecond unit — infinite, NaN, or out of range.
     case unrepresentableInterval
+  }
+
+  /// Initial dispatch classification plus one shared terminal result.
+  struct SkipRequest: Sendable {
+    private enum Resolution: Sendable {
+      case resolved(SkipOutcome)
+      case seek(SeekRequest)
+    }
+
+    let initialOutcome: SkipOutcome
+    private let resolution: Resolution
+
+    var outcome: SkipOutcome {
+      get async {
+        switch resolution {
+        case .resolved(let outcome): outcome
+        case .seek(let seekRequest):
+          switch await seekRequest.outcome {
+          case .pending: preconditionFailure("a terminal seek outcome cannot be pending")
+          case .rejected: .rejected
+          case .settled: .settled
+          case .timedOut: .timedOut
+          case .superseded: .superseded
+          }
+        }
+      }
+    }
+
+    init(resolved outcome: SkipOutcome) {
+      precondition(outcome != .pending)
+      initialOutcome = switch outcome {
+      case .rejected, .unrepresentableInterval: outcome
+      case .settled, .timedOut, .superseded: .pending
+      case .pending: preconditionFailure("pending is not terminal")
+      }
+      resolution = .resolved(outcome)
+    }
+
+    init(seekRequest: SeekRequest) {
+      initialOutcome = seekRequest.initialOutcome == .rejected ? .rejected : .pending
+      resolution = .seek(seekRequest)
+    }
   }
 
   /// Routes an AVKit skip through the player's relative jump.
@@ -37,14 +86,13 @@ extension PiPController {
   /// The interval is therefore preserved and handed to libVLC as a relative
   /// offset.
   @MainActor
-  static func performSkip(on player: Player, by interval: CMTime) -> SkipOutcome {
+  static func performSkip(on player: Player, by interval: CMTime) -> SkipRequest {
     guard let offsetMilliseconds = skipOffsetMilliseconds(interval) else {
-      return .unrepresentableInterval
+      return SkipRequest(resolved: .unrepresentableInterval)
     }
-    guard player.jump(by: .milliseconds(offsetMilliseconds)) else {
-      return .rejected
-    }
-    return .issued
+    return SkipRequest(
+      seekRequest: player.requestJump(by: .milliseconds(offsetMilliseconds))
+    )
   }
 
   /// Whether this outcome means the timeline actually moved.
@@ -53,7 +101,7 @@ extension PiPController {
   /// time as though it had landed puts the transport controls ahead of the
   /// media, and the next native clock sample then yanks them back.
   static func skipMovedTimeline(_ outcome: SkipOutcome) -> Bool {
-    outcome == .issued
+    outcome == .settled
   }
 }
 

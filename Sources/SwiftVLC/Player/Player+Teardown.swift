@@ -219,6 +219,7 @@ extension Player {
     // `nativePlaybackState` afterwards loses the race signal.
     let resumeBeforeRelease = shouldResumeNativePlayerBeforeStop
     publishPlaybackIntent(false)
+    supersedePendingSeekSettlement()
     pauseTransition = nil
     deferredPauseCommand = nil
     eventBridge.finishCurrentPlaybackGeneration(
@@ -239,6 +240,7 @@ extension Player {
     libvlc_media_player_set_nsobject(pointer, nil)
 
     let bridge = eventBridge
+    let seekMonitor = nativeSeekMonitor
     nonisolated(unsafe) let drawables =
       drawable.map { retainedDrawablesUntilNativePlayerRelease + [$0] }
         ?? retainedDrawablesUntilNativePlayerRelease
@@ -266,6 +268,7 @@ extension Player {
           p,
           lifetime: lifetime,
           bridge: bridge,
+          seekMonitor: seekMonitor,
           retainedDrawables: drawables,
           resumeBeforeStop: resumeBeforeRelease
         )
@@ -292,12 +295,14 @@ extension Player {
     _ pointer: OpaquePointer,
     lifetime: NativePlayerHandleLifetime,
     bridge: EventBridge,
+    seekMonitor: NativeSeekMonitor,
     retainedDrawables: [AnyObject],
     resumeBeforeStop: Bool
   ) {
     precondition(lifetime.pointer == pointer)
     lifetime.retainUntilReleased(retainedDrawables)
     bridge.invalidate()
+    seekMonitor.invalidate()
     stopNativePlayerBeforeRelease(pointer, resumeBeforeStop: resumeBeforeStop)
     libvlc_media_player_release(pointer)
     lifetime.initialOwnerDidRelease()

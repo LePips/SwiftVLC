@@ -129,6 +129,25 @@ player.seek(toPosition: 0.95, fast: true)  // raw fractional seek
 player.jump(by: .seconds(-10))             // native relative jump
 ```
 
+`jump(by:)` reports whether libVLC accepted the command. When a client must
+know when the asynchronous jump actually lands, use
+``Player/requestJump(by:)`` and await its terminal result:
+
+```swift
+let request = player.requestJump(by: .seconds(30))
+guard request.initialOutcome == .pending else { return }
+
+switch await request.outcome {
+case .settled: updateTransportUI()
+case .timedOut, .superseded, .rejected: recoverTransportUI()
+case .pending: break // `outcome` is always terminal
+}
+```
+
+The request is generation- and timeline-revision-bound. A matching native
+time sample settles it; a newer seek or media lifecycle change reports
+`.superseded`; and a missing sample reports `.timedOut` after a bounded wait.
+
 ## The raw event stream
 
 The observable properties cover typical playback UI. When you need
@@ -187,6 +206,9 @@ See <doc:ConcurrencyModel> for the full isolation story.
 - ``Player/seek(by:fast:)``
 - ``Player/seek(toPosition:fast:)``
 - ``Player/jump(by:)``
+- ``Player/requestJump(by:)``
+- ``SeekRequest``
+- ``SeekOutcome``
 - ``Player/nextFrame()``
 
 ### Observable properties

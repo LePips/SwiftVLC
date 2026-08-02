@@ -54,6 +54,11 @@ player.position = 0.95
 let accepted = player.seek(toPosition: PlaybackPosition(0.95))
 ```
 
+For delegate APIs that owe an asynchronous completion, dispatch acceptance is
+not enough. ``Player/requestJump(by:)`` returns a ``SeekRequest`` whose
+``SeekRequest/outcome`` distinguishes native rejection, authoritative landing,
+bounded timeout, and supersession by a newer timeline command.
+
 ## The .ended state
 
 VLCKit reported natural end-of-media as its own state,
@@ -344,6 +349,9 @@ Two ways to get "off unless the user asks":
 - ``Player/selectedSubtitleTrack``
 - ``Player/seek(toPosition:fast:)``
 - ``Player/jump(by:)``
+- ``Player/requestJump(by:)``
+- ``SeekRequest``
+- ``SeekOutcome``
 - ``PlayerEvent/endReached-enum.case``
 - ``Player/didReachEnd``
 - ``Player/recast(to:)``

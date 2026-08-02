@@ -40,6 +40,70 @@ extension Integration {
     }
 
     @Test
+    func `A stale clock callback cannot overwrite an authoritative terminal snapshot`() async throws {
+      let player = Player(instance: TestInstance.makeAudioOnly())
+      try player.load(Media(url: TestMedia.twosecURL))
+      let generation = player.sessionGeneration
+      let nativeGeneration = player.eventBridge.currentNativeHandleGeneration
+      let staleRevision = player.acceptedTimelineRevision
+      let authoritativeRevision = player.eventBridge.advanceTimelineRevision()
+      player.eventBridge.updateAuthoritativeTimeline(
+        time: .seconds(40),
+        position: 0.4,
+        playbackGeneration: generation,
+        timelineRevision: authoritativeRevision
+      )
+
+      player.eventBridge._broadcastForTesting(
+        .timeChanged(.seconds(11)),
+        nativeHandleGeneration: nativeGeneration,
+        playbackGeneration: generation,
+        emittedTimelineRevision: staleRevision
+      )
+      player.eventBridge._broadcastForTesting(
+        .positionChanged(0.11),
+        nativeHandleGeneration: nativeGeneration,
+        playbackGeneration: generation,
+        emittedTimelineRevision: staleRevision
+      )
+
+      let outcome = firstOutcome(from: player.terminalOutcomes)
+      try player.load(Media(url: TestMedia.silenceURL))
+      let value = try #require(await outcome.value)
+      #expect(value.finalTimeline.time == .seconds(40))
+      #expect(value.finalTimeline.position == 0.4)
+    }
+
+    @Test
+    func `A previous media clock cannot seed its successor terminal snapshot`() async throws {
+      let player = Player(instance: TestInstance.makeAudioOnly())
+      try player.load(Media(url: TestMedia.twosecURL))
+      let staleRevision = player.acceptedTimelineRevision
+      try player.load(Media(url: TestMedia.silenceURL))
+      let successorGeneration = player.sessionGeneration
+      let nativeGeneration = player.eventBridge.currentNativeHandleGeneration
+
+      player.eventBridge._broadcastForTesting(
+        .timeChanged(.seconds(11)),
+        nativeHandleGeneration: nativeGeneration,
+        playbackGeneration: successorGeneration,
+        emittedTimelineRevision: staleRevision
+      )
+      player.eventBridge._broadcastForTesting(
+        .positionChanged(0.11),
+        nativeHandleGeneration: nativeGeneration,
+        playbackGeneration: successorGeneration,
+        emittedTimelineRevision: staleRevision
+      )
+
+      let outcome = firstOutcome(from: player.terminalOutcomes)
+      try player.load(Media(url: TestMedia.sparseURL))
+      let value = try #require(await outcome.value)
+      #expect(value.finalTimeline.time == .zero)
+      #expect(value.finalTimeline.position == 0)
+    }
+
+    @Test
     func `An explicit stop intent outranks a following media replacement`() async throws {
       let player = Player(instance: TestInstance.makeAudioOnly())
       try player.load(Media(url: TestMedia.twosecURL))

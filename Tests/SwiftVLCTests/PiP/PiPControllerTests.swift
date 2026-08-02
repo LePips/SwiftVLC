@@ -18,7 +18,7 @@ extension Integration {
       var cancelPendingPauseCount = 0
       var shouldResume = false
       var skipIntervals: [CMTime] = []
-      var skipOutcome: PiPController.SkipOutcome = .issued
+      var skipOutcome: PiPController.SkipOutcome = .settled
       /// Models an input libVLC refuses to pause, so the deferred-pause retry
       /// bound can be exercised.
       var pauseSucceeds = true
@@ -43,7 +43,7 @@ extension Integration {
           shouldResume: { self.shouldResume },
           skip: { interval in
             self.skipIntervals.append(interval)
-            return self.skipOutcome
+            return .init(resolved: self.skipOutcome)
           }
         )
       }
@@ -739,7 +739,7 @@ extension Integration {
       )
 
       controller._setPlayingForTesting(false)
-      controller._skipByIntervalForTesting(CMTime(seconds: 1, preferredTimescale: 1000))
+      await controller._skipByIntervalForTesting(CMTime(seconds: 1, preferredTimescale: 1000))
       controller._setPlayingForTesting(true)
       try? await Task.sleep(for: .milliseconds(80))
 

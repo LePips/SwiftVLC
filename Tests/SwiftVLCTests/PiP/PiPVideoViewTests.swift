@@ -797,7 +797,7 @@ extension Integration {
       player.setPlaybackIntentFromExternalControl(false)
 
       #expect(didComplete.value)
-      #expect(player.currentTime == .zero)
+      #expect(player.currentTime == .seconds(5))
       #expect(mediaController.mediaLength() >= -1)
       #expect(mediaController.mediaTime() >= 0)
       _ = mediaController.isMediaSeekable()

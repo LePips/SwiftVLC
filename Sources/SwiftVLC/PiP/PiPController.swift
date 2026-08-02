@@ -82,7 +82,7 @@ public final class PiPController: NSObject {
     /// Relative rather than absolute: see ``PiPController/performSkip(on:by:)``
     /// for why the interval AVKit requested is preserved instead of being
     /// converted into a target.
-    let skip: @MainActor (CMTime) -> SkipOutcome
+    let skip: @MainActor (CMTime) -> SkipRequest
 
     static func live(player: Player) -> Self {
       Self(
@@ -386,6 +386,11 @@ public final class PiPController: NSObject {
   /// `currentTime` data that hasn't caught up to the seek yet.
   @ObservationIgnored
   var lastSkipTimestamp: CFAbsoluteTime = 0
+  /// Number of AVKit skips still waiting for a terminal native seek outcome.
+  /// Overlapping requests are counted so completion of a superseded request
+  /// cannot re-enable timebase retracking while its successor is still pending.
+  @ObservationIgnored
+  var pendingSkipCount = 0
 
   /// Whether PiP can be started right now.
   ///
@@ -1142,32 +1147,41 @@ public final class PiPController: NSObject {
       return
     }
 
-    let outcome = playbackDriver.skip(skipInterval)
+    let request = playbackDriver.skip(skipInterval)
+    let tracksPendingSkip = request.initialOutcome == .pending
+    if tracksPendingSkip {
+      pendingSkipCount += 1
+    }
+    Task { @MainActor [weak self] in
+      let outcome = await request.outcome
+      guard let self else {
+        completionHandler()
+        return
+      }
+      if tracksPendingSkip {
+        pendingSkipCount = Swift.max(0, pendingSkipCount - 1)
+      }
 
-    // A refused skip leaves the timeline untouched. Moving the timebase to a
-    // target the media never reached would put the transport controls ahead of
-    // playback until the next native clock sample yanked them back.
-    guard Self.skipMovedTimeline(outcome) else {
+      // A refused, timed-out, or superseded skip leaves the timebase alone.
+      // Publishing the requested estimate as authoritative before native
+      // landing evidence would put AVKit ahead of playback.
+      if Self.skipMovedTimeline(outcome) {
+        lastSkipTimestamp = CFAbsoluteTimeGetCurrent()
+
+        // Apple docs: "the control timebase should reflect the current
+        // playback time and rate when the closure is invoked". Read it back
+        // only after the matching native clock event has been applied.
+        if let tb = controlTimebase {
+          CMTimebaseSetTime(tb, time: CMTime(
+            seconds: Double(player.currentTime.milliseconds) / 1000.0,
+            preferredTimescale: 1000
+          ))
+          CMTimebaseSetRate(tb, rate: player.isActive ? Float64(player.rate) : 0.0)
+        }
+      }
+
       completionHandler()
-      return
     }
-
-    lastSkipTimestamp = CFAbsoluteTimeGetCurrent()
-
-    // Apple docs: "the control timebase should reflect the current
-    // playback time and rate when the closure is invoked". Read it back from
-    // the player rather than from a locally computed target: `jump(by:)` has
-    // already published its own clamped estimate, and recomputing one here
-    // could disagree with it.
-    if let tb = controlTimebase {
-      CMTimebaseSetTime(tb, time: CMTime(
-        seconds: Double(player.currentTime.milliseconds) / 1000.0,
-        preferredTimescale: 1000
-      ))
-      CMTimebaseSetRate(tb, rate: player.isActive ? Float64(player.rate) : 0.0)
-    }
-
-    completionHandler()
   }
 
   /// Sets the controlTimebase time to the player's current position.
