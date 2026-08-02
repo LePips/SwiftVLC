@@ -1,0 +1,22 @@
+# Use the portable stdin operand for contrib checksum verification.
+#
+# macOS 26 ships /sbin/sha512sum. Its check mode blocks indefinitely when the
+# checksum-list operand is /dev/stdin, even when stdin is a regular file. The
+# conventional "-" operand reads the same checksum list and works with both
+# the macOS implementation and GNU coreutils.
+#
+# This matters most on a clean build: contrib's parallel fetch launches one
+# checksum verifier per archive, and every verifier otherwise blocks before
+# any dependency can be unpacked or compiled.
+diff --git a/contrib/src/main.mak b/contrib/src/main.mak
+--- a/contrib/src/main.mak
++++ b/contrib/src/main.mak
+@@ -447,7 +447,7 @@ checksum = \
+ 	$(foreach f,$(filter $(TARBALLS)/%,$^), \
+ 		grep -- " $(f:$(TARBALLS)/%=%)$$" \
+ 			"$(SRC)/$(patsubst $(3)%,%,$@)/$(2)SUMS" &&) \
+-	(cd $(TARBALLS) && $(1) /dev/stdin) < \
++	(cd $(TARBALLS) && $(1) -) < \
+ 		"$(SRC)/$(patsubst $(3)%,%,$@)/$(2)SUMS"
+ CHECK_SHA512 = $(call checksum,$(SHA512SUM),SHA512,.sum-)
+ UNPACK = $(RM) -R $@ \

@@ -444,59 +444,42 @@ echo "Release rewrite validation passed."
 # so a binary produced months ago against a different pin or patch set would be
 # published as new and nothing would notice (#97, second criterion).
 #
-# The build records its inputs beside the artifact; this compares them with what
-# the repository says now. It is not a reproducibility proof — two builds of the
-# same inputs are not yet compared — but it does refuse a demonstrably stale one.
+# The build records its complete inputs and every slice checksum beside the
+# artifact. A separate proof records two byte-identical clean builds. Both have
+# to match the exact tree entering the release pipeline.
 verify_artifact_provenance() {
   # Derived from XCFW_PATH rather than hard-coded, so the provenance always
   # describes the artifact actually being packaged even if Vendor/ moves.
   local provenance="$(dirname "$XCFW_PATH")/libvlc-provenance.json"
+  local reproducibility="$(dirname "$XCFW_PATH")/libvlc-reproducibility.json"
 
-  if [[ ! -f "$provenance" ]]; then
-    echo "Error: $provenance not found." >&2
+  if [[ ! -f "$provenance" || ! -f "$reproducibility" ]]; then
+    echo "Error: complete provenance is missing beside $XCFW_PATH." >&2
+    echo "  Required: $provenance" >&2
+    echo "  Required: $reproducibility" >&2
     echo "  $XCFW_PATH was built before provenance was recorded, so its inputs" >&2
     echo "  cannot be established. Rebuild with:" >&2
     echo "    ./scripts/build-libvlc.sh --all" >&2
     return 1
   fi
 
-  # `python3` from PATH, not /usr/bin/python3: the rest of this script already
-  # relies on PATH, and a Homebrew-only Python would otherwise fail here while
-  # everything around it worked.
-  read_provenance() {
-    local key="$1"
-    local value
-    if ! value=$(python3 -c 'import json,sys
-try:
-    print(json.load(open(sys.argv[1]))[sys.argv[2]])
-except (OSError, ValueError) as error:
-    sys.exit(f"cannot read {sys.argv[1]}: {error}")
-except KeyError:
-    sys.exit(f"{sys.argv[1]} has no {sys.argv[2]!r} key")' "$provenance" "$key" 2>&1); then
-      echo "Error: $value" >&2
-      echo "  Rebuild to regenerate provenance: ./scripts/build-libvlc.sh --all" >&2
-      return 1
-    fi
-    printf '%s' "$value"
-  }
-
-  local recorded_pin recorded_manifest current_pin current_manifest
-  recorded_pin=$(read_provenance pinnedRevision) || return 1
-  recorded_manifest=$(read_provenance patchManifestDigest) || return 1
+  local current_pin current_manifest
   current_pin=$(sed -n 's/^VLC_HASH="\(.*\)"$/\1/p' "$SCRIPT_DIR/build-libvlc.sh" | head -1)
   current_manifest=$(shasum -a 256 "$SCRIPT_DIR/patches/manifest.sha256" | cut -d' ' -f1)
 
-  if [[ "$recorded_pin" != "$current_pin" ]]; then
-    echo "Error: the xcframework was built from a different engine pin." >&2
-    echo "  artifact: $recorded_pin" >&2
-    echo "  repo:     $current_pin" >&2
+  if ! python3 "$SCRIPT_DIR/libvlc-provenance.py" verify \
+    --provenance "$provenance" \
+    --xcframework "$XCFW_PATH" \
+    --pinned-revision "$current_pin" \
+    --patch-manifest "$SCRIPT_DIR/patches/manifest.sha256"; then
+    echo "  Rebuild so every shipped slice and input has current provenance:" >&2
+    echo "    ./scripts/build-libvlc.sh --all" >&2
     return 1
   fi
-  if [[ "$recorded_manifest" != "$current_manifest" ]]; then
-    echo "Error: the xcframework was built from a different patch series." >&2
-    echo "  artifact manifest: $recorded_manifest" >&2
-    echo "  repo manifest:     $current_manifest" >&2
-    echo "  Rebuild so the shipped binary contains the patches this release claims." >&2
+  if ! python3 "$SCRIPT_DIR/libvlc-provenance.py" verify-proof \
+    --proof "$reproducibility" \
+    --provenance "$provenance"; then
+    echo "  Run two clean builds and compare their provenance before release." >&2
     return 1
   fi
 
@@ -514,8 +497,10 @@ if [[ -n "$CANDIDATE_DIR" ]]; then
   ZIP_PATH="$CANDIDATE_DIR/$ZIP_NAME"
   WORK_XCFW="$XCFW_PATH"
 
+  RELEASE_PROVENANCE="$CANDIDATE_DIR/libvlc-provenance.json"
+  RELEASE_REPRODUCIBILITY="$CANDIDATE_DIR/libvlc-reproducibility.json"
   for candidate_file in "$CANDIDATE_MANIFEST" "$ZIP_PATH" \
-    "$CANDIDATE_DIR/libvlc-provenance.json"; do
+    "$RELEASE_PROVENANCE" "$RELEASE_REPRODUCIBILITY"; do
     if [[ ! -f "$candidate_file" ]]; then
       echo "Error: prepared candidate is missing $candidate_file." >&2
       exit 1
@@ -539,6 +524,7 @@ required = {
     "artifactDigest",
     "zipChecksum",
     "provenanceChecksum",
+    "reproducibilityChecksum",
 }
 missing = sorted(required - candidate.keys())
 if missing:
@@ -552,16 +538,20 @@ if candidate["artifactDigestAlgorithm"] != "swiftvlc-tree-v1":
 print(candidate["artifactDigest"])
 print(candidate["zipChecksum"])
 print(candidate["provenanceChecksum"])
+print(candidate["reproducibilityChecksum"])
 PY
 )
   CANDIDATE_TREE_DIGEST=$(printf '%s\n' "$CANDIDATE_VALUES" | sed -n '1p')
   EXPECTED_ZIP_CHECKSUM=$(printf '%s\n' "$CANDIDATE_VALUES" | sed -n '2p')
   EXPECTED_PROVENANCE_CHECKSUM=$(printf '%s\n' "$CANDIDATE_VALUES" | sed -n '3p')
+  EXPECTED_REPRODUCIBILITY_CHECKSUM=$(printf '%s\n' "$CANDIDATE_VALUES" | sed -n '4p')
 
   ACTUAL_TREE_DIGEST=$("$SCRIPT_DIR/artifact-tree-digest.py" "$WORK_XCFW")
   CHECKSUM=$(swift package compute-checksum "$ZIP_PATH")
   ACTUAL_PROVENANCE_CHECKSUM=$(shasum -a 256 \
-    "$CANDIDATE_DIR/libvlc-provenance.json" | cut -d' ' -f1)
+    "$RELEASE_PROVENANCE" | cut -d' ' -f1)
+  ACTUAL_REPRODUCIBILITY_CHECKSUM=$(shasum -a 256 \
+    "$RELEASE_REPRODUCIBILITY" | cut -d' ' -f1)
   if [[ "$ACTUAL_TREE_DIGEST" != "$CANDIDATE_TREE_DIGEST" ]]; then
     echo "Error: prepared XCFramework changed after candidate creation." >&2
     exit 1
@@ -572,6 +562,10 @@ PY
   fi
   if [[ "$ACTUAL_PROVENANCE_CHECKSUM" != "$EXPECTED_PROVENANCE_CHECKSUM" ]]; then
     echo "Error: prepared provenance changed after candidate creation." >&2
+    exit 1
+  fi
+  if [[ "$ACTUAL_REPRODUCIBILITY_CHECKSUM" != "$EXPECTED_REPRODUCIBILITY_CHECKSUM" ]]; then
+    echo "Error: prepared reproducibility proof changed after candidate creation." >&2
     exit 1
   fi
 
@@ -601,6 +595,16 @@ else
   echo "Verifying duplicate symbols in stripped libraries..."
   "$SCRIPT_DIR/fix-duplicate-symbols.sh" --verify "$WORK_XCFW"
 
+  RELEASE_PROVENANCE="$WORK_DIR/libvlc-provenance.json"
+  RELEASE_REPRODUCIBILITY="$(dirname "$XCFW_PATH")/libvlc-reproducibility.json"
+  python3 "$SCRIPT_DIR/libvlc-provenance.py" rebind \
+    --provenance "$(dirname "$XCFW_PATH")/libvlc-provenance.json" \
+    --xcframework "$WORK_XCFW" \
+    --output "$RELEASE_PROVENANCE"
+  python3 "$SCRIPT_DIR/libvlc-provenance.py" verify-proof \
+    --proof "$RELEASE_REPRODUCIBILITY" \
+    --provenance "$RELEASE_PROVENANCE"
+
   echo "Creating zip..."
   ZIP_PATH="$WORK_DIR/$ZIP_NAME"
   (cd "$WORK_DIR" && ditto -c -k --keepParent libvlc.xcframework "$ZIP_NAME")
@@ -629,16 +633,19 @@ if [[ -n "$PREPARE_DIR" ]]; then
   mkdir "$PREPARE_DIR"
   cp -R "$WORK_XCFW" "$PREPARE_DIR/libvlc.xcframework"
   cp "$ZIP_PATH" "$PREPARE_DIR/$ZIP_NAME"
-  cp "$(dirname "$XCFW_PATH")/libvlc-provenance.json" \
-    "$PREPARE_DIR/libvlc-provenance.json"
+  cp "$RELEASE_PROVENANCE" "$PREPARE_DIR/libvlc-provenance.json"
+  cp "$RELEASE_REPRODUCIBILITY" "$PREPARE_DIR/libvlc-reproducibility.json"
 
   CANDIDATE_TREE_DIGEST=$("$SCRIPT_DIR/artifact-tree-digest.py" "$WORK_XCFW")
   PROVENANCE_CHECKSUM=$(shasum -a 256 \
     "$PREPARE_DIR/libvlc-provenance.json" | cut -d' ' -f1)
+  REPRODUCIBILITY_CHECKSUM=$(shasum -a 256 \
+    "$PREPARE_DIR/libvlc-reproducibility.json" | cut -d' ' -f1)
   VERSION="$VERSION" \
     CANDIDATE_TREE_DIGEST="$CANDIDATE_TREE_DIGEST" \
     CHECKSUM="$CHECKSUM" \
     PROVENANCE_CHECKSUM="$PROVENANCE_CHECKSUM" \
+    REPRODUCIBILITY_CHECKSUM="$REPRODUCIBILITY_CHECKSUM" \
     python3 - "$PREPARE_DIR/release-candidate.json" <<'PY'
 import json
 import os
@@ -650,6 +657,7 @@ candidate = {
     "artifactDigest": os.environ["CANDIDATE_TREE_DIGEST"],
     "zipChecksum": os.environ["CHECKSUM"],
     "provenanceChecksum": os.environ["PROVENANCE_CHECKSUM"],
+    "reproducibilityChecksum": os.environ["REPRODUCIBILITY_CHECKSUM"],
 }
 with open(sys.argv[1], "w") as output:
     json.dump(candidate, output, indent=2, sort_keys=True)
@@ -755,7 +763,7 @@ git push origin "$TAG"
 
 echo "Creating draft GitHub Release..."
 RELEASE_FLAGS=(--draft)
-RELEASE_ASSETS=("$ZIP_PATH" "$(dirname "$XCFW_PATH")/libvlc-provenance.json")
+RELEASE_ASSETS=("$ZIP_PATH" "$RELEASE_PROVENANCE" "$RELEASE_REPRODUCIBILITY")
 if [[ -n "$CANDIDATE_DIR" ]]; then
   RELEASE_ASSETS+=("$CANDIDATE_DIR/release-candidate.json")
 fi

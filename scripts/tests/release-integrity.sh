@@ -57,6 +57,99 @@ printf 'changed header' > "$temp_dir/tree-b/Headers/libvlc.h"
 digest_b=$("$SCRIPT_DIR/artifact-tree-digest.py" "$temp_dir/tree-b")
 [[ "$digest_a" != "$digest_b" ]] || fail "header changes do not affect the digest"
 
+# Complete engine provenance records exact slices, SDK/toolchain inputs, patch
+# order, contrib checksums, and two-build reproducibility. Exercise it with a
+# minimal valid XCFramework so release integrity does not depend on a 368 MB
+# binary fixture.
+mkdir -p "$temp_dir/fake-vlc/contrib/src/example"
+printf 'example contrib checksum\n' > "$temp_dir/fake-vlc/contrib/src/example/SHA512SUMS"
+printf '%064d  0001-example.patch\n' 0 > "$temp_dir/patch-manifest.sha256"
+mkdir -p "$temp_dir/build-a/macos-arm64/Headers"
+printf 'header\n' > "$temp_dir/build-a/macos-arm64/Headers/libvlc.h"
+printf 'int swiftvlc_provenance_fixture(void) { return 1; }\n' > "$temp_dir/member.c"
+xcrun clang -c "$temp_dir/member.c" -o "$temp_dir/member.o"
+ar rcs "$temp_dir/build-a/macos-arm64/libvlc.a" "$temp_dir/member.o"
+python3 - "$temp_dir/build-a/Info.plist" <<'PY'
+import plistlib
+import sys
+
+value = {
+    "AvailableLibraries": [
+        {
+            "LibraryIdentifier": "macos-arm64",
+            "LibraryPath": "libvlc.a",
+            "HeadersPath": "Headers",
+            "SupportedArchitectures": ["arm64"],
+            "SupportedPlatform": "macos",
+        }
+    ],
+    "CFBundlePackageType": "XFWK",
+    "XCFrameworkFormatVersion": "1.0",
+}
+with open(sys.argv[1], "wb") as output:
+    plistlib.dump(value, output, sort_keys=True)
+PY
+cp -R "$temp_dir/build-a" "$temp_dir/build-b"
+
+for build_name in a b; do
+  "$SCRIPT_DIR/libvlc-provenance.py" create \
+    --xcframework "$temp_dir/build-$build_name" \
+    --output "$temp_dir/provenance-$build_name.json" \
+    --vlc-source "$temp_dir/fake-vlc" \
+    --source-revision 1111111111111111111111111111111111111111 \
+    --pinned-revision 111111111 \
+    --source-date-epoch 0 \
+    --patch-manifest "$temp_dir/patch-manifest.sha256" \
+    --make-flags=-j1 \
+    --deployment-target macos=15.0
+done
+python3 - "$temp_dir/provenance-a.json" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+value = json.load(open(path))
+value["build"]["builtAt"] = "2026-01-01T00:00:00Z"
+json.dump(value, open(path, "w"), indent=2, sort_keys=True)
+PY
+"$SCRIPT_DIR/libvlc-provenance.py" compare \
+  --first "$temp_dir/provenance-a.json" \
+  --second "$temp_dir/provenance-b.json" \
+  --output "$temp_dir/reproducibility.json" >/dev/null
+"$SCRIPT_DIR/libvlc-provenance.py" verify \
+  --provenance "$temp_dir/provenance-b.json" \
+  --xcframework "$temp_dir/build-b" \
+  --pinned-revision 111111111 \
+  --patch-manifest "$temp_dir/patch-manifest.sha256" >/dev/null
+"$SCRIPT_DIR/libvlc-provenance.py" verify-proof \
+  --proof "$temp_dir/reproducibility.json" \
+  --provenance "$temp_dir/provenance-b.json" >/dev/null
+
+cp -R "$temp_dir/build-b" "$temp_dir/rebound"
+printf 'int swiftvlc_provenance_fixture(void) { return 2; }\n' > "$temp_dir/member.c"
+xcrun clang -c "$temp_dir/member.c" -o "$temp_dir/member.o"
+ar rcs "$temp_dir/rebound/macos-arm64/libvlc.a" "$temp_dir/member.o"
+"$SCRIPT_DIR/libvlc-provenance.py" rebind \
+  --provenance "$temp_dir/provenance-b.json" \
+  --xcframework "$temp_dir/rebound" \
+  --output "$temp_dir/rebound-provenance.json"
+"$SCRIPT_DIR/libvlc-provenance.py" verify \
+  --provenance "$temp_dir/rebound-provenance.json" \
+  --xcframework "$temp_dir/rebound" \
+  --pinned-revision 111111111 \
+  --patch-manifest "$temp_dir/patch-manifest.sha256" >/dev/null
+"$SCRIPT_DIR/libvlc-provenance.py" verify-proof \
+  --proof "$temp_dir/reproducibility.json" \
+  --provenance "$temp_dir/rebound-provenance.json" >/dev/null
+printf 'mutated\n' > "$temp_dir/rebound/macos-arm64/Headers/libvlc.h"
+if "$SCRIPT_DIR/libvlc-provenance.py" verify \
+  --provenance "$temp_dir/rebound-provenance.json" \
+  --xcframework "$temp_dir/rebound" \
+  --pinned-revision 111111111 \
+  --patch-manifest "$temp_dir/patch-manifest.sha256" >/dev/null 2>&1; then
+  fail "provenance accepted a mutated release slice"
+fi
+
 python3 - "$temp_dir/matrix.json" "$temp_dir/record.json" "$digest_a" <<'PY'
 import json
 import sys

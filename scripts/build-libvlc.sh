@@ -668,6 +668,17 @@ if [ "${SOURCE_SHA}" != "${TARGET_SHA}" ]; then
 fi
 info "VLC source provenance: ${SOURCE_SHA}"
 
+# Make compiler date/time macros deterministic. VLC's help object embeds
+# __DATE__ and __TIME__; without SOURCE_DATE_EPOCH, two otherwise identical
+# clean builds differ by their wall-clock compilation time. Deriving the
+# epoch from the pinned commit makes it stable and auditable.
+SOURCE_DATE_EPOCH=$(git -C "${VLC_SRC}" show -s --format=%ct "${SOURCE_SHA}")
+if ! [[ "${SOURCE_DATE_EPOCH}" =~ ^[0-9]+$ ]]; then
+    error "Invalid SOURCE_DATE_EPOCH derived from ${SOURCE_SHA}"
+fi
+export SOURCE_DATE_EPOCH
+info "Reproducible build epoch: ${SOURCE_DATE_EPOCH} (pinned commit timestamp)"
+
 # --- Step 1b: Apply patches ---
 if [ -n "${PATCHES_DIR}" ] && [ -d "${PATCHES_DIR}" ]; then
     info "Applying patches from ${PATCHES_DIR}..."
@@ -1457,6 +1468,33 @@ xcodebuild -create-xcframework \
     "${XCFRAMEWORK_ARGS[@]}" \
     -output "${OUTPUT_DIR}/libvlc.xcframework"
 
+# xcodebuild writes AvailableLibraries in completion order rather than input
+# order, so two identical builds can serialize the same slice records in a
+# different sequence. Canonicalize the list and dictionary keys before hashing
+# or publishing the artifact.
+info "Normalizing XCFramework metadata..."
+python3 - "${OUTPUT_DIR}/libvlc.xcframework/Info.plist" <<'PYEOF'
+import plistlib
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+info = plistlib.loads(path.read_bytes())
+libraries = info.get("AvailableLibraries")
+if not isinstance(libraries, list) or not libraries:
+    raise SystemExit(f"Error: {path} has no AvailableLibraries")
+identifiers = [item.get("LibraryIdentifier") for item in libraries]
+if any(not isinstance(identifier, str) or not identifier for identifier in identifiers):
+    raise SystemExit(f"Error: {path} has an invalid library identifier")
+if len(set(identifiers)) != len(identifiers):
+    raise SystemExit(f"Error: {path} has duplicate library identifiers")
+info["AvailableLibraries"] = sorted(
+    libraries,
+    key=lambda item: item["LibraryIdentifier"],
+)
+path.write_bytes(plistlib.dumps(info, fmt=plistlib.FMT_XML, sort_keys=True))
+PYEOF
+
 # Fix duplicate symbols (json_parse_error/json_read) in the static library.
 # Two VLC plugins (ytdl, chromecast) each compile their own copy. The Apple
 # linker in Xcode 16+ treats these as errors on some platforms (Mac Catalyst).
@@ -1484,24 +1522,28 @@ info "Created: ${OUTPUT_DIR}/libvlc.xcframework"
 # provenance rather than provenance describing an artifact that was never
 # finished.
 PROVENANCE_FILE="${OUTPUT_DIR}/libvlc-provenance.json"
-manifest_digest="none"
+provenance_args=(
+    python3 "${SCRIPT_DIR}/libvlc-provenance.py" create
+    --xcframework "${OUTPUT_DIR}/libvlc.xcframework"
+    --output "${PROVENANCE_FILE}"
+    --vlc-source "${VLC_SRC}"
+    --source-revision "${SOURCE_SHA}"
+    --pinned-revision "${VLC_HASH}"
+    --source-date-epoch "${SOURCE_DATE_EPOCH}"
+    --make-flags="${MAKEFLAGS}"
+    --deployment-target "ios=${SWIFTVLC_MIN_IOS}"
+    --deployment-target "tvos=${SWIFTVLC_MIN_TVOS}"
+    --deployment-target "xros=${SWIFTVLC_MIN_VISIONOS}"
+    --deployment-target "macos=${SWIFTVLC_MIN_MACOS}"
+    --deployment-target "catalyst=${SWIFTVLC_MIN_CATALYST}"
+)
 if [ -n "${PATCHES_DIR}" ] && [ -f "${PATCHES_DIR}/manifest.sha256" ]; then
-    manifest_digest=$(shasum -a 256 "${PATCHES_DIR}/manifest.sha256" | cut -d' ' -f1)
+    provenance_args+=(--patch-manifest "${PATCHES_DIR}/manifest.sha256")
 fi
-slice_list=$(find "${OUTPUT_DIR}/libvlc.xcframework" -maxdepth 1 -mindepth 1 -type d \
-    -exec basename {} \; | sort | paste -sd, -)
-
-cat > "${PROVENANCE_FILE}" <<PROVENANCE
-{
-  "vlcSourceRevision": "${SOURCE_SHA}",
-  "pinnedRevision": "${VLC_HASH}",
-  "patchManifestDigest": "${manifest_digest}",
-  "assertionsEnabled": "${WITH_ASSERTS}",
-  "slices": "${slice_list}",
-  "xcodeBuildVersion": "$(xcodebuild -version 2>/dev/null | head -1)",
-  "builtAt": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-}
-PROVENANCE
+if [ "${WITH_ASSERTS}" = "yes" ]; then
+    provenance_args+=(--assertions-enabled)
+fi
+"${provenance_args[@]}"
 info "Recorded build provenance: ${PROVENANCE_FILE}"
 
 # --- Step 5: Verify ---
