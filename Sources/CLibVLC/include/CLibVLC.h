@@ -53,4 +53,7 @@ bool swiftvlc_media_player_get_playback_snapshot_if_available(
 /// Returns whether the linked libVLC exports the complete playback snapshot.
 bool swiftvlc_playback_snapshot_available(void);
 
+/// Returns whether native sample-buffer PiP composites VLC subpictures.
+bool swiftvlc_native_pip_overlay_composition_available(void);
+
 #endif /* CLibVLC_h */

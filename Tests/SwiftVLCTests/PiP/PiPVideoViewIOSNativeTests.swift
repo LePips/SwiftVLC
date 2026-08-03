@@ -15,11 +15,27 @@ extension Integration {
     }
 
     @Test
-    func `iOS native PiP reports its video-only overlay limitation`() {
+    func `iOS native PiP reports composited VLC overlays`() {
       let player = Player(instance: TestInstance.shared)
       let controller = PiPController(player: player, nativeBackend: IOSNativePiPBackend())
 
-      #expect(controller.overlaySupport == .unavailable)
+      #expect(controller.overlaySupport == .composited)
+    }
+
+    @Test
+    func `A stale native engine reports overlays unavailable without affecting direct PiP`() {
+      #expect(
+        PiPController.resolveOverlaySupport(
+          usesNativeBackend: true,
+          nativeCompositionAvailable: false
+        ) == .unavailable
+      )
+      #expect(
+        PiPController.resolveOverlaySupport(
+          usesNativeBackend: false,
+          nativeCompositionAvailable: false
+        ) == .composited
+      )
     }
 
     // Pinned libVLC copies `drawable-nsobject` into

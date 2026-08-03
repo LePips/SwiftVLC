@@ -827,6 +827,13 @@ if [ -f "${VLC_SRC}/modules/video_output/apple/VLCSampleBufferFormatDescriptionC
     "${SCRIPT_DIR}/validate-native-format-cache.sh" "${VLC_SRC}"
 fi
 
+if [ -f "${VLC_SRC}/modules/video_output/apple/VLCSampleBufferOverlayGeometry.h" ]; then
+    info "Validating native PiP overlay geometry..."
+    "${SCRIPT_DIR}/validate-native-pip-overlay-geometry.sh" "${VLC_SRC}"
+    info "Validating native PiP overlay pixel formats and metadata..."
+    "${SCRIPT_DIR}/validate-native-pip-overlay-pixels.sh"
+fi
+
 # --- Step 1c: Patch VLC snapshot conversion owner ---
 # VLC's snapshot path can convert a hardware/opaque picture to RGBA in order
 # to blend a rendered subpicture into the saved PNG. At the pinned libVLC

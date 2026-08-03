@@ -39,6 +39,10 @@ struct HarnessHome: View {
     streams?.subtitled != nil
   }
 
+  private var screenHAvailable: Bool {
+    streams?.subtitled != nil
+  }
+
   var body: some View {
     Form {
       configurationSection
@@ -167,6 +171,17 @@ struct HarnessHome: View {
       } else {
         unavailableRow(
           "(g) --freetype-fontsize survival",
+          detail: "Needs subtitled"
+        )
+      }
+
+      if let streams, screenHAvailable {
+        NavigationLink("(h) Native PiP subtitles + OSD") {
+          MatrixScreenH(streams: streams)
+        }
+      } else {
+        unavailableRow(
+          "(h) Native PiP subtitles + OSD",
           detail: "Needs subtitled"
         )
       }

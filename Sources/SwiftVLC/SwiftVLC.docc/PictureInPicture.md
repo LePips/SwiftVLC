@@ -78,22 +78,28 @@ events. Readiness arriving later from the expired controller is ignored; a
 fresh controller may still serve that same media generation on a subsequent
 PiP start.
 
-### Native PiP subtitle limitation
+### Native PiP subtitles and OSD
 
-The bundled native iOS PiP route does not currently include VLC-rendered
-subtitles, bitmap subpictures, or on-screen-display regions in the system PiP
-video. VLC draws those regions into a sibling overlay view for inline playback,
-while AVKit receives only the video sample-buffer layer. Core Animation
-sublayers and sibling views are not composited into that content source.
+The bundled native iOS PiP route includes VLC-rendered text, styled and bitmap
+subtitles, forced subpictures, and on-screen-display regions in the system PiP
+video. While system PiP is presenting and a subpicture exists, the native video
+output composites the immutable VLC region snapshot into a same-format pixel
+buffer before AVKit receives it. With no active region, playback stays on the
+zero-copy video path; inline playback continues to use VLC's sibling overlay
+view.
 
-Check ``PiPController/overlaySupport`` to distinguish this native limitation
-from direct PiP, whose vmem buffers include VLC's software-composited overlay.
+The compositor preserves the decoder's pixel format, dimensions, color and HDR
+attachments, clean aperture, pixel aspect ratio, and sample timing. PiP entry,
+failed entry, paused subtitle changes, and inline restoration enqueue at most
+one immediate refresh sample, so they do not wait for the next decoded frame.
 
-Supporting subtitles without degrading the zero-copy and HDR paths requires a
-separate, same-format burn-in stage before sample enqueue. That compositor is
-not part of SwiftVLC today. Do not rely on an inline subtitle appearing in the
-system PiP window; validate the exact subtitle behavior your app requires on a
-physical device.
+``PiPController/overlaySupport`` reports
+``PiPOverlaySupport/composited`` for every bundled backend when the matching
+engine artifact is linked. It reports ``PiPOverlaySupport/unavailable`` for the
+native iOS backend if a stale local engine predating this compositor is used.
+Physical-device qualification is still the authority for visual quality,
+subtitle timing, and CPU/GPU impact on the exact hardware and formats your app
+supports.
 
 ## Audio session (iOS only)
 
@@ -217,9 +223,9 @@ invalidation.
   not as an empty or fabricated finite range.
 - **Validate system PiP video on a physical iOS device.** Simulator PiP
   state can become active while its system window remains black.
-- **Native PiP does not currently carry VLC's subtitle overlay.** Inline
-  subtitle visibility is not evidence that the same region reaches AVKit's
-  system PiP video.
+- **Qualify overlays on the target device.** Native PiP composites active VLC
+  subpictures into AVKit's sample buffers, but visual timing, HDR output, and
+  performance still require physical-device evidence for your media matrix.
 - **Keep the macOS PiP-safe VLC defaults if you opt into SPI.** Passing
   a completely custom ``VLCInstance`` argument list on macOS can disable
   video output or force an unsupported vout. Start from
