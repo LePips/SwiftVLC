@@ -41,4 +41,23 @@ struct VendoredHeaderParityTests {
     event.u.media_player_media_stopping.reason = libvlc_stopping_reason_user
     #expect(event.u.media_player_media_stopping.reason == libvlc_stopping_reason_user)
   }
+
+  /// Patch 0020 extends the existing encountered-error event rather than
+  /// creating a wrapper-only guess. Referencing every value and the union
+  /// field here keeps the shipped header aligned with that engine ABI.
+  @Test
+  func `The encountered-error event carries a playback failure kind`() {
+    #expect(libvlc_playback_failure_unknown.rawValue == 0)
+    #expect(libvlc_playback_failure_source.rawValue == 1)
+    #expect(libvlc_playback_failure_demux.rawValue == 2)
+    #expect(libvlc_playback_failure_decoder.rawValue == 3)
+    #expect(libvlc_playback_failure_renderer.rawValue == 4)
+    #expect(libvlc_playback_failure_output.rawValue == 5)
+
+    var event = libvlc_event_t()
+    event.u.media_player_encountered_error.failure = libvlc_playback_failure_renderer
+    #expect(
+      event.u.media_player_encountered_error.failure == libvlc_playback_failure_renderer
+    )
+  }
 }

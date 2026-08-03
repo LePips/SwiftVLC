@@ -1,0 +1,401 @@
+# Attribute terminal playback errors to the engine subsystem that reported them.
+#
+# Patch 0015 preserved ERROR/EOS/USER at the libVLC boundary, but ERROR still
+# collapsed every pipeline failure to one value. SwiftVLC therefore had to
+# publish `.failure(.unknown)` even when the engine was at an authoritative
+# access, demux, decoder, renderer, or output failure site.
+#
+# This patch keeps the existing EncounteredError event and adds a failure-kind
+# payload. The first input failure wins, so secondary teardown errors cannot
+# relabel a generation. It is recorded even during input opening, but emitted
+# only when playback reaches ERROR_S or its final END_S transition; a
+# recoverable individual-stream failure therefore cannot end playback early,
+# while the eventual terminal result still records that degraded generation.
+# Input topology distinguishes combined access/demux
+# failures (network transports such as the HTTP access-demux) from failures in
+# a demux consuming a separate byte stream. Decoder critical errors and
+# unsupported codecs are decoder failures; video-output and audio-output
+# creation failures are reported before the decoder's subsequent critical
+# return can obscure their origin. Unknown remains the fallback for legacy or
+# otherwise unattributed ERROR_S transitions.
+#
+# This is a SwiftVLC-specific API extension, not a claimed upstream backport.
+# It has been compile-gated against the pinned engine with patches 0001-0020
+# applied. scripts/patches/validation/playback-failure-kind-probe.c provides
+# runtime validation of the public payload for source, demux, and decoder
+# failures; renderer and output failure injection remain part of the physical
+# device qualification matrix because those modules are platform-owned.
+--- a/include/vlc/libvlc_events.h
++++ b/include/vlc/libvlc_events.h
+@@ -62,6 +62,22 @@
+     /** media is stopping due to user request */
+     libvlc_stopping_reason_user,
+ } libvlc_stopping_reason_t;
++
++/** Playback subsystem that reported a terminal error. */
++typedef enum libvlc_playback_failure_kind_t {
++    /** The engine could not attribute the error to one subsystem. */
++    libvlc_playback_failure_unknown,
++    /** Media access or transport failed. */
++    libvlc_playback_failure_source,
++    /** Container or stream demultiplexing failed. */
++    libvlc_playback_failure_demux,
++    /** Audio, video, or subtitle decoding failed. */
++    libvlc_playback_failure_decoder,
++    /** Video rendering failed. */
++    libvlc_playback_failure_renderer,
++    /** Audio or stream output failed. */
++    libvlc_playback_failure_output,
++} libvlc_playback_failure_kind_t;
+
+ /**
+  * \ingroup libvlc_event
+@@ -320,6 +336,10 @@
+         } media_player_buffering;
+         struct
+         {
++            libvlc_playback_failure_kind_t failure;
++        } media_player_encountered_error;
++        struct
++        {
+             int new_chapter;
+         } media_player_chapter_changed;
+         struct
+--- a/include/vlc_player.h
++++ b/include/vlc_player.h
+@@ -256,6 +256,11 @@
+ {
+     VLC_PLAYER_ERROR_NONE,
+     VLC_PLAYER_ERROR_GENERIC,
++    VLC_PLAYER_ERROR_SOURCE,
++    VLC_PLAYER_ERROR_DEMUX,
++    VLC_PLAYER_ERROR_DECODER,
++    VLC_PLAYER_ERROR_RENDERER,
++    VLC_PLAYER_ERROR_OUTPUT,
+ };
+
+ /**
+--- a/lib/media_player.c
++++ b/lib/media_player.c
+@@ -166,17 +166,36 @@
+     libvlc_media_player_t *mp = data;
+
+     libvlc_event_t event;
++    libvlc_playback_failure_kind_t failure;
+     switch (error) {
+         case VLC_PLAYER_ERROR_NONE:
+             event.type = libvlc_MediaPlayerNothingSpecial;
+-            break;
++            libvlc_event_send(&mp->event_manager, &event);
++            return;
+         case VLC_PLAYER_ERROR_GENERIC:
+-            event.type = libvlc_MediaPlayerEncounteredError;
++            failure = libvlc_playback_failure_unknown;
+             break;
++        case VLC_PLAYER_ERROR_SOURCE:
++            failure = libvlc_playback_failure_source;
++            break;
++        case VLC_PLAYER_ERROR_DEMUX:
++            failure = libvlc_playback_failure_demux;
++            break;
++        case VLC_PLAYER_ERROR_DECODER:
++            failure = libvlc_playback_failure_decoder;
++            break;
++        case VLC_PLAYER_ERROR_RENDERER:
++            failure = libvlc_playback_failure_renderer;
++            break;
++        case VLC_PLAYER_ERROR_OUTPUT:
++            failure = libvlc_playback_failure_output;
++            break;
+         default:
+             vlc_assert_unreachable();
+     }
+
++    event.type = libvlc_MediaPlayerEncounteredError;
++    event.u.media_player_encountered_error.failure = failure;
+     libvlc_event_send(&mp->event_manager, &event);
+ }
+
+--- a/src/input/input_internal.h
++++ b/src/input/input_internal.h
+@@ -69,6 +69,17 @@
+     END_S,
+     ERROR_S,
+ } input_state_e;
++
++/** Subsystem that produced a terminal playback failure. */
++enum vlc_input_failure_kind
++{
++    VLC_INPUT_FAILURE_UNKNOWN,
++    VLC_INPUT_FAILURE_SOURCE,
++    VLC_INPUT_FAILURE_DEMUX,
++    VLC_INPUT_FAILURE_DECODER,
++    VLC_INPUT_FAILURE_RENDERER,
++    VLC_INPUT_FAILURE_OUTPUT,
++};
+
+ /**
+  * Input events
+@@ -86,6 +97,9 @@
+      * the input will be stopped normally at EOF */
+     INPUT_EVENT_EOF,
+
++    /* A playback subsystem reported a terminal failure */
++    INPUT_EVENT_FAILURE,
++
+     /* "rate" has changed */
+     INPUT_EVENT_RATE,
+
+@@ -310,6 +324,8 @@
+     union {
+         /* INPUT_EVENT_STATE */
+         struct vlc_input_event_state state;
++        /* INPUT_EVENT_FAILURE */
++        enum vlc_input_failure_kind failure;
+         /* INPUT_EVENT_RATE */
+         float rate;
+         /* INPUT_EVENT_CAPABILITIES */
+--- a/src/input/event.h
++++ b/src/input/event.h
+@@ -147,6 +147,15 @@
+     });
+ }
+
++static inline void input_SendEventFailure(input_thread_t *p_input,
++                                          enum vlc_input_failure_kind kind)
++{
++    input_SendEvent(p_input, &(struct vlc_input_event) {
++        .type = INPUT_EVENT_FAILURE,
++        .failure = kind,
++    });
++}
++
+ static inline void input_SendEventCache(input_thread_t *p_input, double f_level)
+ {
+     input_SendEvent(p_input, &(struct vlc_input_event) {
+--- a/src/input/decoder.h
++++ b/src/input/decoder.h
+@@ -35,6 +35,8 @@
+
+ struct vlc_input_decoder_callbacks {
+     /* notifications */
++    void (*on_failure)(vlc_input_decoder_t *decoder,
++                       enum vlc_input_failure_kind kind, void *userdata);
+     void (*on_vout_started)(vlc_input_decoder_t *decoder, vout_thread_t *vout,
+                             enum vlc_vout_order vout_order,
+                             void *userdata);
+--- a/src/input/decoder.c
++++ b/src/input/decoder.c
+@@ -709,6 +709,7 @@
+
+         if( p_aout == NULL )
+         {
++            decoder_Notify(p_owner, on_failure, VLC_INPUT_FAILURE_OUTPUT);
+             vlc_fifo_Unlock(p_owner->p_fifo);
+             return -1;
+         }
+@@ -833,6 +834,7 @@
+     }
+
+ error:
++    decoder_Notify(p_owner, on_failure, VLC_INPUT_FAILURE_RENDERER);
+     /* Clean fmt and vctx to trigger a new vout creation on the next update
+      * call */
+     vlc_fifo_Lock(p_owner->p_fifo);
+@@ -1801,6 +1803,7 @@
+         case VLCDEC_SUCCESS:
+             break;
+         case VLCDEC_ECRITICAL:
++            decoder_Notify(p_owner, on_failure, VLC_INPUT_FAILURE_DECODER);
+             p_owner->error = true;
+             break;
+         case VLCDEC_RELOAD:
+@@ -2440,6 +2443,7 @@
+     if( !p_dec->p_module )
+     {
+         DecoderUnsupportedCodec( p_dec, cfg->fmt, !cfg->sout );
++        decoder_Notify(p_owner, on_failure, VLC_INPUT_FAILURE_DECODER);
+
+         /* Don't use dec->fmt_in->i_cat since it may not be initialized here. */
+         DeleteDecoder( p_owner, cfg->fmt->i_cat );
+--- a/src/input/es_out.c
++++ b/src/input/es_out.c
+@@ -370,6 +370,20 @@
+ }
+
+ static void
++decoder_on_failure(vlc_input_decoder_t *decoder,
++                   enum vlc_input_failure_kind kind, void *userdata)
++{
++    (void) decoder;
++
++    es_out_id_t *id = userdata;
++    struct vlc_input_es_out *out = id->out;
++    es_out_sys_t *p_sys = PRIV(&out->out);
++
++    if (p_sys->p_input)
++        input_SendEventFailure(p_sys->p_input, kind);
++}
++
++static void
+ decoder_on_vout_started(vlc_input_decoder_t *decoder, vout_thread_t *vout,
+                       enum vlc_vout_order order, void *userdata)
+ {
+@@ -609,6 +623,7 @@
+ }
+
+ static const struct vlc_input_decoder_callbacks decoder_cbs = {
++    .on_failure = decoder_on_failure,
+     .on_vout_started = decoder_on_vout_started,
+     .on_vout_stopped = decoder_on_vout_stopped,
+     .on_output_paused = decoder_on_output_paused,
+--- a/src/input/input.c
++++ b/src/input/input.c
+@@ -550,6 +550,9 @@
+     }
+     else if( i_ret == VLC_DEMUXER_EGENERIC )
+     {
++        input_SendEventFailure(
++            p_input, p_demux->s == NULL ? VLC_INPUT_FAILURE_SOURCE
++                                        : VLC_INPUT_FAILURE_DEMUX);
+         input_ChangeState( p_input, ERROR_S, VLC_TICK_INVALID );
+     }
+     else if( p_priv->i_slave > 0 )
+@@ -794,6 +797,7 @@
+         priv->p_sout  = input_resource_RequestSout( priv->p_resource, psz );
+         if( priv->p_sout == NULL )
+         {
++            input_SendEventFailure(p_input, VLC_INPUT_FAILURE_OUTPUT);
+             input_ChangeState( p_input, ERROR_S, VLC_TICK_INVALID );
+             msg_Err( p_input, "cannot start stream output instance, " \
+                               "aborting" );
+@@ -1786,6 +1790,9 @@
+         if( demux_Control( p_demux, DEMUX_SET_PAUSE_STATE, false ) )
+         {
+             msg_Err( p_input, "cannot resume" );
++            input_SendEventFailure(
++                p_input, p_demux->s == NULL ? VLC_INPUT_FAILURE_SOURCE
++                                            : VLC_INPUT_FAILURE_DEMUX);
+             input_ChangeState( p_input, ERROR_S, i_control_date );
+             return;
+         }
+@@ -2745,7 +2752,10 @@
+     stream_t *p_stream = stream_AccessNew( obj, p_input, p_es_out,
+                                            preparsing, url );
+     if( p_stream == NULL )
++    {
++        input_SendEventFailure(p_input, VLC_INPUT_FAILURE_SOURCE);
+         return NULL;
++    }
+
+     p_stream = stream_FilterAutoNew( p_stream );
+
+@@ -2783,6 +2793,7 @@
+         return demux;
+
+ error:
++    input_SendEventFailure(p_input, VLC_INPUT_FAILURE_DEMUX);
+     vlc_stream_Delete( p_stream );
+     return NULL;
+ }
+@@ -2948,6 +2959,7 @@
+         if( in->p_demux == NULL )
+         {
+             msg_Err(p_input, "Failed to create demux filter");
++            input_SendEventFailure(p_input, VLC_INPUT_FAILURE_DEMUX);
+             if( in->p_slave_es_out )
+             {
+                 vlc_input_es_out_Delete(in->p_slave_es_out);
+--- a/src/player/input.c
++++ b/src/player/input.c
+@@ -350,18 +350,31 @@
+             break;
+         case END_S:
+             input->playing = false;
+-            input->stopping_reason = VLC_PLAYER_MEDIA_STOPPING_EOS;
++            if (input->error != VLC_PLAYER_ERROR_NONE)
++            {
++                input->stopping_reason = VLC_PLAYER_MEDIA_STOPPING_ERROR;
++                if (!input->error_reported)
++                {
++                    vlc_player_SendEvent(input->player, on_error_changed,
++                                         input->error);
++                    input->error_reported = true;
++                }
++            }
++            else
++                input->stopping_reason = VLC_PLAYER_MEDIA_STOPPING_EOS;
+             vlc_player_input_HandleState(input, VLC_PLAYER_STATE_STOPPING,
+                                          VLC_TICK_INVALID);
+             vlc_player_destructor_AddStoppingInput(input->player, input);
+             break;
+         case ERROR_S:
+             /* Don't send errors if the input is stopped by the user */
+-            if (input->started)
++            if (input->started && !input->error_reported)
+             {
+                 /* Contrary to the input_thead_t, an error is not a state */
+-                input->error = VLC_PLAYER_ERROR_GENERIC;
++                if (input->error == VLC_PLAYER_ERROR_NONE)
++                    input->error = VLC_PLAYER_ERROR_GENERIC;
+                 vlc_player_SendEvent(input->player, on_error_changed, input->error);
++                input->error_reported = true;
+             }
+             /* input->playing monitor the OPENING_S -> PLAYING_S transition.
+              * If input->playing is false, we have an error at the opening of
+@@ -993,6 +1006,37 @@
+         case INPUT_EVENT_STATE:
+             vlc_player_input_HandleStateEvent(input, event->state.value,
+                                               event->state.date);
++            break;
++        case INPUT_EVENT_FAILURE:
++            /* Preserve the first authoritative subsystem failure, including
++             * failures raised while the input is still opening. The terminal
++             * state transition owns the public notification so a recoverable
++             * stream failure cannot end playback early. */
++            if (input->error == VLC_PLAYER_ERROR_NONE)
++            {
++                switch (event->failure)
++                {
++                    case VLC_INPUT_FAILURE_SOURCE:
++                        input->error = VLC_PLAYER_ERROR_SOURCE;
++                        break;
++                    case VLC_INPUT_FAILURE_DEMUX:
++                        input->error = VLC_PLAYER_ERROR_DEMUX;
++                        break;
++                    case VLC_INPUT_FAILURE_DECODER:
++                        input->error = VLC_PLAYER_ERROR_DECODER;
++                        break;
++                    case VLC_INPUT_FAILURE_RENDERER:
++                        input->error = VLC_PLAYER_ERROR_RENDERER;
++                        break;
++                    case VLC_INPUT_FAILURE_OUTPUT:
++                        input->error = VLC_PLAYER_ERROR_OUTPUT;
++                        break;
++                    case VLC_INPUT_FAILURE_UNKNOWN:
++                    default:
++                        input->error = VLC_PLAYER_ERROR_GENERIC;
++                        break;
++                }
++            }
+             break;
+         case INPUT_EVENT_EOF:
+             handled = vlc_player_input_HandleAtoBLoop(input, true);
+@@ -1238,6 +1282,7 @@
+
+     input->state = VLC_PLAYER_STATE_STOPPED;
+     input->error = VLC_PLAYER_ERROR_NONE;
++    input->error_reported = false;
+     input->stopping_reason = VLC_PLAYER_MEDIA_STOPPING_ERROR;
+     input->rate = 1.f;
+     input->capabilities = 0;
+--- a/src/player/player.h
++++ b/src/player/player.h
+@@ -64,6 +64,7 @@
+
+     enum vlc_player_state state;
+     enum vlc_player_error error;
++    bool error_reported;
+     enum vlc_player_media_stopping_reason stopping_reason;
+     float rate;
+     int capabilities;

@@ -17,3 +17,4 @@ ea85b92b4239f4812542b3f4d4efe0600b42b23a331d524a811de9ddeb8fde29  0016-skip-vlc-
 e41b501f77342eb6f5cbc6b8c84b4b2d29e375958ffcdc76a07fe3c597b2ba16  0017-native-pip-format-description-cache.patch
 00aa6608db4f668a20b4138f504045ea2ce87ed7066a7adae01def71f4015d8b  0018-media-list-player-observer-lock-order.patch
 bee0f53d544430719a74c9fba5d032dcf33e0cf3e659187f82ac2cc0484998b5  0019-darwin-sha512-stdin.patch
+5279e772e203583b689a7bc5c51e94c4b22c0b1fdc4b6ea45f46cff556d18e47  0020-expose-playback-failure-kind.patch

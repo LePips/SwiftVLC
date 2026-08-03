@@ -63,6 +63,22 @@ typedef enum libvlc_stopping_reason_t {
     libvlc_stopping_reason_user,
 } libvlc_stopping_reason_t;
 
+/** Playback subsystem that reported a terminal error. */
+typedef enum libvlc_playback_failure_kind_t {
+    /** The engine could not attribute the error to one subsystem. */
+    libvlc_playback_failure_unknown,
+    /** Media access or transport failed. */
+    libvlc_playback_failure_source,
+    /** Container or stream demultiplexing failed. */
+    libvlc_playback_failure_demux,
+    /** Audio, video, or subtitle decoding failed. */
+    libvlc_playback_failure_decoder,
+    /** Video rendering failed. */
+    libvlc_playback_failure_renderer,
+    /** Audio or stream output failed. */
+    libvlc_playback_failure_output,
+} libvlc_playback_failure_kind_t;
+
 /**
  * \ingroup libvlc_event
  * @{
@@ -318,6 +334,10 @@ typedef struct libvlc_event_t
         {
             float new_cache;
         } media_player_buffering;
+        struct
+        {
+            libvlc_playback_failure_kind_t failure;
+        } media_player_encountered_error;
         struct
         {
             int new_chapter;

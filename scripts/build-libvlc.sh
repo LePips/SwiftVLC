@@ -1506,6 +1506,17 @@ PYEOF
 info "Fixing duplicate symbols in static libraries..."
 "${SCRIPT_DIR}/fix-duplicate-symbols.sh" "${OUTPUT_DIR}/libvlc.xcframework"
 
+# Patch 0020 extends EncounteredError with subsystem attribution. Compile and
+# execute its source/demux/decoder fixtures against the exact archive and
+# vendored headers about to ship, rather than merely proving the engine source
+# compiled. iOS-only builds have no host-runnable slice and skip this gate.
+if grep -q 'libvlc_playback_failure_kind_t' \
+    "${REPO_ROOT}/Sources/CLibVLC/include/vlc/libvlc_events.h"; then
+    info "Validating terminal playback failure attribution..."
+    "${SCRIPT_DIR}/validate-playback-failure-kind.sh" \
+        "${OUTPUT_DIR}/libvlc.xcframework"
+fi
+
 # Remove the CLibVLC module.modulemap from xcframework headers to avoid
 # "redefinition of module" errors when building with xcodebuild. The CLibVLC
 # SPM target provides its own module map; the xcframework only needs the raw
