@@ -84,11 +84,48 @@ extension Player {
     _ = issueResume()
   }
 
+  /// Issues a native pause owned by managed audio lifecycle while keeping the
+  /// user's active playback intent published. Deferred pauses count as owned:
+  /// foreground recovery must be able to cancel them before they settle.
+  @discardableResult
+  func issueManagedAudioPause(
+    playbackGeneration requestedGeneration: UInt64? = nil
+  ) -> Bool {
+    guard isPlaybackRequestedActive else { return false }
+    preservesPlaybackIntentForManagedAudioSuspension = true
+    let issued = issuePause(
+      playbackGeneration: requestedGeneration,
+      recordsPlaybackControlIntent: false
+    )
+    publishPlaybackIntent(true)
+    let ownsPause = issued
+      || pauseTransition == .pausing
+      || deferredPauseCommand == .pause
+      || state == .paused
+      || nativePlaybackState == .paused
+    if !ownsPause {
+      preservesPlaybackIntentForManagedAudioSuspension = false
+    }
+    return ownsPause
+  }
+
+  @discardableResult
+  func issueManagedAudioResume() -> Bool {
+    let accepted = issueResume(recordsPlaybackControlIntent: false)
+    if accepted {
+      preservesPlaybackIntentForManagedAudioSuspension = false
+    }
+    return accepted
+  }
+
   @discardableResult
   func issuePause(
     playbackGeneration requestedGeneration: UInt64? = nil,
     recordsPlaybackControlIntent: Bool = true
   ) -> Bool {
+    if recordsPlaybackControlIntent {
+      clearManagedAudioSuspensionForExplicitControl()
+    }
     let followsCurrentGeneration = requestedGeneration == nil
     let previousPlaybackControlIntent = playbackControlIntent
     if recordsPlaybackControlIntent {
@@ -189,7 +226,7 @@ extension Player {
           deferredPauseCommandPlaybackGeneration == playbackGeneration {
           deferredPauseCommand = nil
         }
-        publishPlaybackIntent(false)
+        publishPauseIntent()
         return false
       default:
         if recordsPlaybackControlIntent {
@@ -268,7 +305,7 @@ extension Player {
       if deferredPauseCommandPlaybackGeneration == playbackGeneration {
         deferredPauseCommand = nil
       }
-      publishPlaybackIntent(false)
+      publishPauseIntent()
       let issuedPlaybackControlRevision = playbackControlIntentRevision
       libvlc_media_player_set_pause(pointer, 1)
       #if DEBUG
@@ -298,7 +335,7 @@ extension Player {
         }
         if playbackControlIntent == .pause {
           setDeferredPauseCommand(.pause, playbackGeneration: generationAfterPause)
-          publishPlaybackIntent(false)
+          publishPauseIntent()
         } else {
           publishPlaybackIntent(
             playbackControlIntent == .resume || state.isActive
@@ -323,7 +360,7 @@ extension Player {
       ? eventBridge.currentPlaybackGeneration
       : playbackGeneration
     setDeferredPauseCommand(.pause, playbackGeneration: generation)
-    publishPlaybackIntent(false)
+    publishPauseIntent()
   }
 
   /// A fresh command can be generation-bound (PiP debounce) without following
@@ -345,7 +382,13 @@ extension Player {
   }
 
   @discardableResult
-  func issueResume(playbackGeneration requestedGeneration: UInt64? = nil) -> Bool {
+  func issueResume(
+    playbackGeneration requestedGeneration: UInt64? = nil,
+    recordsPlaybackControlIntent: Bool = true
+  ) -> Bool {
+    if recordsPlaybackControlIntent {
+      clearManagedAudioSuspensionForExplicitControl()
+    }
     let followsCurrentGeneration = requestedGeneration == nil
     let previousPlaybackControlIntent = playbackControlIntent
     if followsCurrentGeneration {
@@ -558,6 +601,19 @@ extension Player {
     pauseTransition = nil
     deferredPauseCommand = nil
     playbackControlIntent = nil
+    clearManagedAudioSuspensionForExplicitControl()
     publishPlaybackIntent(false)
+  }
+
+  private func publishPauseIntent() {
+    publishPlaybackIntent(preservesPlaybackIntentForManagedAudioSuspension)
+  }
+
+  func clearManagedAudioSuspensionForExplicitControl() {
+    preservesPlaybackIntentForManagedAudioSuspension = false
+    isManagedAudioLifecycleSuspended = false
+    isManagedAudioMediaServicesSuspended = false
+    isManagedAudioResumeDeniedByInterruption = false
+    isManagedAudioResumePendingActivation = false
   }
 }

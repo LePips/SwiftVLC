@@ -218,7 +218,7 @@ extension PiPController {
       deferredPause = .idle
     }
     guard shouldResume else { return (needed: false, accepted: false) }
-    return (needed: true, accepted: playbackDriver.resume())
+    return (needed: true, accepted: playbackDriver.resume(true))
   }
 }
 

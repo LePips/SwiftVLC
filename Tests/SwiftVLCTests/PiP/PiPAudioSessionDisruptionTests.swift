@@ -20,7 +20,8 @@ struct PiPAudioSessionDisruptionTests {
     playing: Bool = true,
     managed: Bool = true,
     lifecycleSuspended: Bool = false,
-    mediaServicesSuspended: Bool = false
+    mediaServicesSuspended: Bool = false,
+    resumeDenied: Bool = false
   )
     -> PiPController.AudioSessionReaction {
     PiPController.reaction(
@@ -28,7 +29,8 @@ struct PiPAudioSessionDisruptionTests {
       isPlaybackIntentActive: playing,
       managesAudioSession: managed,
       wasPlaybackSuspendedForLifecycle: lifecycleSuspended,
-      wasPlaybackSuspendedForMediaServices: mediaServicesSuspended
+      wasPlaybackSuspendedForMediaServices: mediaServicesSuspended,
+      wasManagedResumeDenied: resumeDenied
     )
   }
 
@@ -191,6 +193,21 @@ struct PiPAudioSessionDisruptionTests {
   }
 
   @Test
+  func `Interruption denial blocks delayed lifecycle recovery`() {
+    let denied = reaction(
+      .enteringForeground,
+      lifecycleSuspended: true,
+      resumeDenied: true
+    )
+    #expect(!denied.reactivates)
+    #expect(!denied.resumesManagedSuspendedPlayback)
+
+    let systemDenied = reaction(.interruptionEnded(shouldResume: false))
+    #expect(systemDenied.deniesManagedResume)
+    #expect(!systemDenied.reactivates)
+  }
+
+  @Test
   func `Overlapping background and media outage wait for both recoveries`() {
     let resetWhileBackgrounded = reaction(
       .mediaServicesReset,
@@ -223,7 +240,8 @@ struct PiPAudioSessionDisruptionTests {
     .mediaServicesReset,
     .enteredBackground(isPictureInPictureActive: false),
     .deviceLocked(isPictureInPictureActive: false),
-    .enteringForeground
+    .enteringForeground,
+    .pictureInPictureBecameActive
   ])
   func `An unmanaged session is never touched`(disruption: PiPController.AudioSessionDisruption) {
     #expect(
@@ -253,7 +271,7 @@ extension Integration {
             self.pauseRecordsPlaybackIntent.append(recordsPlaybackIntent)
             return .init(accepted: true, playbackControlRevision: nil)
           },
-          resume: {
+          resume: { _ in
             self.resumeCount += 1
             return self.acceptsResume
           },
@@ -396,6 +414,125 @@ extension Integration {
       #expect(controller.isPlaybackSuspendedForManagedAudioLifecycle)
       await player.shutdown()
     }
+
+    @Test
+    func `A deferred managed pause preserves intent and can be cancelled`() async {
+      let player = Player(instance: TestInstance.makeAudioOnly())
+      player._setStateForTesting(state: .opening, isPlaybackRequestedActive: true)
+      player._nativePlaybackStateOverrideForTesting = .opening
+
+      #expect(player.issueManagedAudioPause())
+      #expect(player.isPlaybackRequestedActive)
+      #expect(player.deferredPauseCommand == .pause)
+      #expect(player.preservesPlaybackIntentForManagedAudioSuspension)
+
+      player._handleEventForTesting(.stateChanged(.paused))
+      #expect(player.isPlaybackRequestedActive)
+      #expect(player.preservesPlaybackIntentForManagedAudioSuspension)
+
+      #expect(player.issueManagedAudioResume())
+      #expect(player.isPlaybackRequestedActive)
+      #expect(player.deferredPauseCommand != .pause)
+      #expect(!player.preservesPlaybackIntentForManagedAudioSuspension)
+      await player.shutdown()
+    }
+
+    @Test
+    func `Managed suspension ownership follows the player across controllers`() async {
+      let player = Player(instance: TestInstance.makeAudioOnly())
+      let firstRecorder = PauseRecorder()
+      let first = makeController(player: player, recorder: firstRecorder)
+      first.isPlaybackSuspendedForManagedAudioLifecycle = true
+      first.isPlaybackSuspendedForMediaServices = true
+
+      let successor = makeController(player: player, recorder: PauseRecorder())
+      #expect(successor.isPlaybackSuspendedForManagedAudioLifecycle)
+      #expect(successor.isPlaybackSuspendedForMediaServices)
+      withExtendedLifetime(first) {}
+      await player.shutdown()
+    }
+
+    @Test
+    func `Explicit playback control abandons managed suspension ownership`() async {
+      let player = Player(instance: TestInstance.makeAudioOnly())
+      player._setStateForTesting(state: .playing, isPlaybackRequestedActive: true)
+      player._nativePlaybackStateOverrideForTesting = .playing
+      player.preservesPlaybackIntentForManagedAudioSuspension = true
+      player.isManagedAudioLifecycleSuspended = true
+      player.isManagedAudioMediaServicesSuspended = true
+      player.isManagedAudioResumeDeniedByInterruption = true
+      player.isManagedAudioResumePendingActivation = true
+
+      _ = player.issuePause()
+
+      #expect(!player.preservesPlaybackIntentForManagedAudioSuspension)
+      #expect(!player.isManagedAudioLifecycleSuspended)
+      #expect(!player.isManagedAudioMediaServicesSuspended)
+      #expect(!player.isManagedAudioResumeDeniedByInterruption)
+      #expect(!player.isManagedAudioResumePendingActivation)
+      await player.shutdown()
+    }
+
+    @Test
+    func `Late automatic PiP activation recovers a lifecycle-only pause`() async {
+      let player = Player(instance: TestInstance.makeAudioOnly())
+      let recorder = PauseRecorder()
+      let controller = makeController(player: player, recorder: recorder)
+      player.setPlaybackIntentFromExternalControl(true)
+      controller.hasActivatedAudioSession = true
+      controller.isPlaybackSuspendedForManagedAudioLifecycle = true
+
+      controller.handlePiPActiveChangedForManagedAudioSession(true)
+
+      #expect(recorder.resumeCount == 1)
+      #expect(!controller.isPlaybackSuspendedForManagedAudioLifecycle)
+      await player.shutdown()
+    }
+
+    @Test
+    func `A later activation retry completes the pending managed resume`() async {
+      enum ActivationFailure: Error { case transient }
+
+      let player = Player(instance: TestInstance.makeAudioOnly())
+      let recorder = PauseRecorder()
+      let controller = makeController(player: player, recorder: recorder)
+      player.setPlaybackIntentFromExternalControl(true)
+      controller.isPlaybackSuspendedForManagedAudioLifecycle = true
+      controller.isManagedAudioResumePendingActivation = true
+      var attempts = 0
+
+      controller.activateAudioSessionIfNeeded(using: {
+        attempts += 1
+        throw ActivationFailure.transient
+      })
+      #expect(recorder.resumeCount == 0)
+      #expect(controller.isPlaybackSuspendedForManagedAudioLifecycle)
+
+      controller.activateAudioSessionIfNeeded(using: { attempts += 1 })
+      #expect(attempts == 2)
+      #expect(recorder.resumeCount == 1)
+      #expect(!controller.isPlaybackSuspendedForManagedAudioLifecycle)
+      #expect(!controller.isManagedAudioResumePendingActivation)
+      await player.shutdown()
+    }
+
+    #if os(iOS)
+    @Test
+    func `An inactive controller cannot deactivate another active PiP user`() async {
+      let firstPlayer = Player(instance: TestInstance.makeAudioOnly())
+      let secondPlayer = Player(instance: TestInstance.makeAudioOnly())
+      let first = makeController(player: firstPlayer, recorder: PauseRecorder())
+      let second = makeController(player: secondPlayer, recorder: PauseRecorder())
+      first.hasActivatedAudioSession = true
+      second.hasActivatedAudioSession = true
+      second.updatePiPActive(true)
+
+      #expect(first.hasAnotherManagedAudioSessionUser())
+
+      await firstPlayer.shutdown()
+      await secondPlayer.shutdown()
+    }
+    #endif
   }
 }
 #endif

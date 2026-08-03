@@ -473,6 +473,16 @@ public final class Player {
   /// a MediaListPlayer is opening its next item.
   var deferredPauseCommandPlaybackGeneration: UInt64?
 
+  /// Managed audio lifecycle can pause the native player without changing the
+  /// user's active playback intent. This ownership lives on `Player`, not on a
+  /// transient PiP controller, so a same-player SwiftUI reconstruction can
+  /// still recover the exact library-issued pause.
+  var preservesPlaybackIntentForManagedAudioSuspension = false
+  var isManagedAudioLifecycleSuspended = false
+  var isManagedAudioMediaServicesSuspended = false
+  var isManagedAudioResumeDeniedByInterruption = false
+  var isManagedAudioResumePendingActivation = false
+
   /// Shadow of the string last passed to `Marquee.setText`. libVLC's text
   /// renderer keys its glyph-bitmap cache on the text string, so a style-
   /// only write (color/opacity/fontSize) hits the cached entry and draws
@@ -755,6 +765,7 @@ public final class Player {
     guard !isShutdown else {
       throw .invalidState("play() called on a player that has been shut down")
     }
+    clearManagedAudioSuspensionForExplicitControl()
     try prepareDrawableForPlayback()
     didReachEnd = false
     if libvlc_media_player_play(pointer) == -1 {

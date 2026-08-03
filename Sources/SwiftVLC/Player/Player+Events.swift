@@ -382,10 +382,15 @@ extension Player {
 
     case .paused:
       guard pauseTransition != .resuming, deferredPauseCommand != .resume else { return }
+      guard !preservesPlaybackIntentForManagedAudioSuspension else {
+        publishPlaybackIntent(true)
+        return
+      }
       publishPlaybackIntent(false)
 
     case .idle, .stopped, .stopping, .error:
       guard !hasPauseControl(after: sessionGeneration) else { return }
+      clearManagedAudioSuspensionForExplicitControl()
       publishPlaybackIntent(false)
     }
   }
