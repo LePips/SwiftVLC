@@ -7,7 +7,9 @@ below or by backgrounding the app. While the OS PiP window is up, zap \
 between channels — every button issues a `load()` on the **same** \
 `Player`. For each transition class (VOD→live, live→live, live→VOD) \
 record whether the PiP window survives the zap and how long the picture \
-gap or freeze lasts.
+gap or freeze lasts. The event log records the controller generation, \
+outgoing and successor media generations, continuity outcome, and measured \
+rebuild duration reported by SwiftVLC.
 """
 
 struct MatrixScreenA: View {
@@ -15,6 +17,7 @@ struct MatrixScreenA: View {
 
   @State private var player = Player()
   @State private var pip: PiPController?
+  @State private var continuityStatus = "none"
   @State private var log: [LogLine] = []
 
   private struct LogLine: Identifiable {
@@ -42,6 +45,8 @@ struct MatrixScreenA: View {
         if let pip {
           LabeledContent("Possible", value: pip.isPossible ? "yes" : "no")
           LabeledContent("Active", value: pip.isActive ? "yes" : "no")
+          LabeledContent("Continuity", value: continuityStatus)
+            .accessibilityIdentifier("validation.matrixA.continuity")
           Button(
             pip.isActive ? "Stop PiP" : "Start PiP",
             systemImage: "pip",
@@ -70,6 +75,10 @@ struct MatrixScreenA: View {
     .showcaseFormStyle()
     .navigationTitle("(a) PiP survival")
     .task { await observeEvents() }
+    .task(id: pip.map(ObjectIdentifier.init)) {
+      guard let pip else { return }
+      await observeContinuityEvents(from: pip)
+    }
     .onChange(of: pip?.isActive) { _, isActive in
       if let isActive {
         append("pip.isActive → \(isActive)")
@@ -108,6 +117,16 @@ struct MatrixScreenA: View {
       default:
         append("\(event)")
       }
+    }
+  }
+
+  private func observeContinuityEvents(from pip: PiPController) async {
+    for await event in pip.pipContinuityEvents {
+      continuityStatus = "\(event.outcome)"
+      let detail = "continuity \(event.outcome): \(event.previousMediaGeneration) → "
+        + "\(event.mediaGeneration), controller \(event.controllerGeneration), "
+        + "elapsed \(event.elapsed)"
+      append(detail)
     }
   }
 
