@@ -210,7 +210,106 @@ if 'rm -f "${OUTPUT_DIR}/libvlc-provenance.json"' not in build:
     sys.exit("a failed rebuild can leave stale provenance beside its artifact")
 if "libvlc-provenance.py\" rebind" in release or "find \"$WORK_XCFW\" -name '*.a'" in release:
     sys.exit("release packaging still mutates or rebinds the proven artifact")
+for marker in (
+    '"releaseSourceDigestAlgorithm": "swiftvlc-git-tree-v1"',
+    '"releaseSourceDigest": os.environ["RELEASE_SOURCE_DIGEST"]',
+    '"qualificationMatrixChecksum": os.environ["QUALIFICATION_MATRIX_CHECKSUM"]',
+    'SWIFTVLC_CANDIDATE_SOURCE_DIGEST="$CANDIDATE_SOURCE_DIGEST"',
+    'elif [[ "$DRY_RUN" == true ]]; then',
+):
+    if marker not in release:
+        sys.exit(f"release candidate is not bound to qualification input: {marker}")
 PY
+
+source_repo="$temp_dir/release-source-repo"
+mkdir -p "$source_repo/Sources" \
+  "$source_repo/scripts/qualification/evidence/1.1.0" \
+  "$source_repo/Showcase/SwiftVLCShowcase.xcodeproj"
+git -C "$source_repo" init -q
+git -C "$source_repo" config user.name "SwiftVLC Test"
+git -C "$source_repo" config user.email "swiftvlc-test@example.invalid"
+printf 'public let value = 1\n' > "$source_repo/Sources/Value.swift"
+printf '{"scenarios":[],"hardware":[]}\n' > \
+  "$source_repo/scripts/qualification/matrix.json"
+cp "$ROOT_DIR/Package.swift" "$source_repo/Package.swift"
+cp "$ROOT_DIR/Showcase/SwiftVLCShowcase.xcodeproj/project.pbxproj" \
+  "$source_repo/Showcase/SwiftVLCShowcase.xcodeproj/project.pbxproj"
+git -C "$source_repo" add .
+git -C "$source_repo" commit -qm "source"
+source_digest_a=$("$SCRIPT_DIR/release-source-digest.py" 1.1.0 --root "$source_repo")
+
+cp "$source_repo/Package.swift" "$temp_dir/source-Package.swift"
+cp "$source_repo/Showcase/SwiftVLCShowcase.xcodeproj/project.pbxproj" \
+  "$temp_dir/source-project.pbxproj"
+python3 - "$source_repo/Package.swift" \
+  "$source_repo/Showcase/SwiftVLCShowcase.xcodeproj/project.pbxproj" <<'PY'
+import re
+import sys
+
+package_path, project_path = sys.argv[1:]
+package = open(package_path).read()
+package = re.sub(
+    r"v1\.1\.0-beta\.5/libvlc\.xcframework\.zip",
+    "v1.1.0/libvlc.xcframework.zip",
+    package,
+)
+package = re.sub(r'checksum: "[0-9a-f]{64}"', 'checksum: "' + "0" * 64 + '"', package)
+open(package_path, "w").write(package)
+project = open(project_path).read().replace(
+    "version = 1.1.0-beta.5;", "version = 1.1.0;"
+)
+open(project_path, "w").write(project)
+PY
+source_digest_rewritten=$(
+  "$SCRIPT_DIR/release-source-digest.py" 1.1.0 --root "$source_repo"
+)
+if [[ "$source_digest_a" != "$source_digest_rewritten" ]]; then
+  fail "deterministic release reference rewrites changed the source digest"
+fi
+cp "$temp_dir/source-Package.swift" "$source_repo/Package.swift"
+cp "$temp_dir/source-project.pbxproj" \
+  "$source_repo/Showcase/SwiftVLCShowcase.xcodeproj/project.pbxproj"
+
+printf 'public let untracked = true\n' > "$source_repo/Sources/Untracked.swift"
+if "$SCRIPT_DIR/release-source-digest.py" 1.1.0 \
+  --root "$source_repo" >/dev/null 2>&1; then
+  fail "untracked Swift source did not invalidate the release-source digest"
+fi
+rm "$source_repo/Sources/Untracked.swift"
+
+printf '{"version":"1.1.0"}\n' > \
+  "$source_repo/scripts/qualification/1.1.0.json"
+printf '{"result":"pass"}\n' > \
+  "$source_repo/scripts/qualification/evidence/1.1.0/result.json"
+git -C "$source_repo" add .
+git -C "$source_repo" commit -qm "evidence"
+source_digest_b=$("$SCRIPT_DIR/release-source-digest.py" 1.1.0 --root "$source_repo")
+if [[ "$source_digest_a" != "$source_digest_b" ]]; then
+  fail "qualification records changed the release-source digest"
+fi
+
+printf 'public let value = 2\n' > "$source_repo/Sources/Value.swift"
+source_digest_dirty=$(
+  "$SCRIPT_DIR/release-source-digest.py" 1.1.0 --root "$source_repo"
+)
+if [[ "$source_digest_b" == "$source_digest_dirty" ]]; then
+  fail "an uncommitted Swift source change did not change the source digest"
+fi
+git -C "$source_repo" add Sources/Value.swift
+git -C "$source_repo" commit -qm "source change"
+source_digest_c=$("$SCRIPT_DIR/release-source-digest.py" 1.1.0 --root "$source_repo")
+if [[ "$source_digest_dirty" != "$source_digest_c" ]]; then
+  fail "committing unchanged worktree source changed the release-source digest"
+fi
+
+printf '{"scenarios":[{"id":"new"}],"hardware":[]}\n' > \
+  "$source_repo/scripts/qualification/matrix.json"
+git -C "$source_repo" add scripts/qualification/matrix.json
+git -C "$source_repo" commit -qm "matrix change"
+source_digest_d=$("$SCRIPT_DIR/release-source-digest.py" 1.1.0 --root "$source_repo")
+if [[ "$source_digest_c" == "$source_digest_d" ]]; then
+  fail "a qualification matrix change did not change the release-source digest"
+fi
 
 python3 - "$temp_dir/matrix.json" "$temp_dir/record.json" "$digest_a" <<'PY'
 import json
@@ -278,12 +377,117 @@ json.dump(matrix, open(matrix_path, "w"))
 json.dump(record, open(record_path, "w"))
 PY
 
+qualification_source_digest=$("$SCRIPT_DIR/release-source-digest.py" 1.1.0)
+qualification_source_commit=$(git rev-parse HEAD)
+qualification_matrix_checksum=$(shasum -a 256 \
+  "$temp_dir/matrix.json" | cut -d' ' -f1)
+python3 - "$temp_dir/record.json" "$temp_dir/evidence.json" \
+  "$qualification_source_commit" "$qualification_source_digest" \
+  "$qualification_matrix_checksum" <<'PY'
+import json
+import sys
+
+record_path, evidence_path, commit, source_digest, matrix_checksum = sys.argv[1:]
+record = json.load(open(record_path))
+record.update(
+    {
+        "sourceCommit": commit,
+        "releaseSourceDigestAlgorithm": "swiftvlc-git-tree-v1",
+        "releaseSourceDigest": source_digest,
+        "qualificationMatrixChecksum": matrix_checksum,
+    }
+)
+json.dump(record, open(record_path, "w"))
+evidence = json.load(open(evidence_path))
+evidence["releaseSourceDigest"] = source_digest
+json.dump(evidence, open(evidence_path, "w"))
+PY
+
 SWIFTVLC_QUALIFICATION_MATRIX="$temp_dir/matrix.json" \
+  SWIFTVLC_QUALIFICATION_RECORD="$temp_dir/record.json" \
+  "$SCRIPT_DIR/check-qualification.sh" 1.1.0 "$temp_dir/tree-a" >/dev/null
+
+SWIFTVLC_CANDIDATE_SOURCE_COMMIT="$qualification_source_commit" \
+  SWIFTVLC_CANDIDATE_SOURCE_DIGEST="$qualification_source_digest" \
+  SWIFTVLC_CANDIDATE_MATRIX_CHECKSUM="$qualification_matrix_checksum" \
+  SWIFTVLC_QUALIFICATION_MATRIX="$temp_dir/matrix.json" \
   SWIFTVLC_QUALIFICATION_RECORD="$temp_dir/record.json" \
   "$SCRIPT_DIR/check-qualification.sh" 1.1.0 "$temp_dir/tree-a" >/dev/null
 
 # The scenario is scoped to iPhone, so the unrecorded iPad row must not be
 # invented by the checker. The successful call above is the regression test.
+
+python3 - "$temp_dir/record.json" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+record = json.load(open(path))
+record["releaseSourceDigest"] = "0" * 64
+json.dump(record, open(path, "w"))
+PY
+if SWIFTVLC_QUALIFICATION_MATRIX="$temp_dir/matrix.json" \
+  SWIFTVLC_QUALIFICATION_RECORD="$temp_dir/record.json" \
+  "$SCRIPT_DIR/check-qualification.sh" 1.1.0 "$temp_dir/tree-a" >/dev/null 2>&1; then
+  fail "qualification survived a Swift wrapper source change"
+fi
+
+python3 - "$temp_dir/record.json" "$qualification_source_digest" <<'PY'
+import json
+import sys
+
+path, source_digest = sys.argv[1:]
+record = json.load(open(path))
+record["releaseSourceDigest"] = source_digest
+json.dump(record, open(path, "w"))
+PY
+python3 - "$temp_dir/evidence.json" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+evidence = json.load(open(path))
+evidence["releaseSourceDigest"] = "0" * 64
+json.dump(evidence, open(path, "w"))
+PY
+if SWIFTVLC_QUALIFICATION_MATRIX="$temp_dir/matrix.json" \
+  SWIFTVLC_QUALIFICATION_RECORD="$temp_dir/record.json" \
+  "$SCRIPT_DIR/check-qualification.sh" 1.1.0 "$temp_dir/tree-a" >/dev/null 2>&1; then
+  fail "qualification accepted evidence from another Swift wrapper source"
+fi
+
+python3 - "$temp_dir/evidence.json" "$qualification_source_digest" <<'PY'
+import json
+import sys
+
+path, source_digest = sys.argv[1:]
+evidence = json.load(open(path))
+evidence["releaseSourceDigest"] = source_digest
+json.dump(evidence, open(path, "w"))
+PY
+cp "$temp_dir/matrix.json" "$temp_dir/matrix-original.json"
+python3 - "$temp_dir/matrix.json" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+matrix = json.load(open(path))
+matrix["changedAfterQualification"] = True
+json.dump(matrix, open(path, "w"))
+PY
+if SWIFTVLC_QUALIFICATION_MATRIX="$temp_dir/matrix.json" \
+  SWIFTVLC_QUALIFICATION_RECORD="$temp_dir/record.json" \
+  "$SCRIPT_DIR/check-qualification.sh" 1.1.0 "$temp_dir/tree-a" >/dev/null 2>&1; then
+  fail "qualification survived a matrix change"
+fi
+cp "$temp_dir/matrix-original.json" "$temp_dir/matrix.json"
+
+if SWIFTVLC_CANDIDATE_SOURCE_COMMIT=0000000000000000000000000000000000000000 \
+  SWIFTVLC_QUALIFICATION_MATRIX="$temp_dir/matrix.json" \
+  SWIFTVLC_QUALIFICATION_RECORD="$temp_dir/record.json" \
+  "$SCRIPT_DIR/check-qualification.sh" 1.1.0 "$temp_dir/tree-a" >/dev/null 2>&1; then
+  fail "qualification accepted a record from another candidate commit"
+fi
 
 python3 - "$temp_dir/record.json" <<'PY'
 import json

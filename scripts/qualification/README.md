@@ -31,6 +31,18 @@ The original cross-device PiP rows apply the same rule to each control,
 lifecycle order, recovery path, and stop reason; a top-level `result: "pass"`
 cannot mask a failed pause, missing restoration, or unsuccessful recovery.
 
+Qualification is bound to both halves of the shipped package. The
+XCFramework tree digest identifies the native engine and headers, while the
+release-source digest identifies every release-significant tracked file in the
+Swift wrapper worktree. The latter deliberately excludes only the record for
+the version being qualified and its `evidence/<version>/` attachments. It also
+normalizes the narrowly validated Package.swift binary reference and Showcase
+package reference, because candidate testing uses repo-local wiring and the
+release commit deterministically replaces those fields with the final URL and
+version. Any other tracked or untracked source, test, release-script, or matrix
+change produces a different identity and requires a new candidate and device
+run.
+
 Record the results as `scripts/qualification/<version>.json`:
 
 ```json
@@ -38,6 +50,10 @@ Record the results as `scripts/qualification/<version>.json`:
   "version": "1.1.0",
   "artifactDigestAlgorithm": "swiftvlc-tree-v1",
   "artifactDigest": "…",
+  "sourceCommit": "…",
+  "releaseSourceDigestAlgorithm": "swiftvlc-git-tree-v1",
+  "releaseSourceDigest": "…",
+  "qualificationMatrixChecksum": "…",
   "rows": [
     {
       "scenario": "vod-controls",
@@ -64,6 +80,7 @@ Every evidence file is a JSON object tied to the exact artifact and row:
 ```json
 {
   "artifactDigest": "…",
+  "releaseSourceDigest": "…",
   "scenario": "vod-controls",
   "hardware": "iphone-current",
   "events": {
@@ -101,6 +118,13 @@ Get it for the exact, already-stripped artifact you are about to qualify with:
 Do not strip, rewrite headers, or otherwise mutate the XCFramework after this
 digest is recorded. A header-only ABI mismatch can be just as unsafe as a
 library change.
+
+Candidate preparation records the source commit, release-source digest, and
+matrix checksum in `release-candidate.json`. Copy those values into the
+qualification record and each evidence file. `check-qualification.sh` computes
+the current identities itself and rejects stale source, a weakened or expanded
+matrix, a record from another candidate, or evidence captured against another
+wrapper revision.
 
 ## Checking before release
 

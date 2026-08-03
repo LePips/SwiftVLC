@@ -61,11 +61,18 @@ if [[ "$SLICE_COUNT" -eq 0 ]]; then
 fi
 
 DIGEST="$(artifact_digest)"
+SOURCE_DIGEST=$("$SCRIPT_DIR/release-source-digest.py" "$VERSION")
+MATRIX_CHECKSUM=$(shasum -a 256 "$MATRIX" | cut -d' ' -f1)
+CANDIDATE_SOURCE_COMMIT="${SWIFTVLC_CANDIDATE_SOURCE_COMMIT:-}"
+CANDIDATE_SOURCE_DIGEST="${SWIFTVLC_CANDIDATE_SOURCE_DIGEST:-}"
+CANDIDATE_MATRIX_CHECKSUM="${SWIFTVLC_CANDIDATE_MATRIX_CHECKSUM:-}"
 
 if [[ ! -f "$RECORD" ]]; then
   echo "Error: no device qualification record for $VERSION." >&2
   echo "  Expected: $RECORD" >&2
   echo "  Artifact digest: $DIGEST" >&2
+  echo "  Release source digest: $SOURCE_DIGEST" >&2
+  echo "  Qualification matrix checksum: $MATRIX_CHECKSUM" >&2
   echo "" >&2
   echo "  The device matrix is the acceptance gate for system PiP; CI cannot" >&2
   echo "  stand in for it. Run the matrix on hardware and record the results," >&2
@@ -73,13 +80,26 @@ if [[ ! -f "$RECORD" ]]; then
   exit 1
 fi
 
-python3 - "$MATRIX" "$RECORD" "$DIGEST" "$VERSION" <<'PY'
+python3 - "$MATRIX" "$RECORD" "$DIGEST" "$VERSION" \
+  "$SOURCE_DIGEST" "$MATRIX_CHECKSUM" "$CANDIDATE_SOURCE_COMMIT" \
+  "$CANDIDATE_SOURCE_DIGEST" "$CANDIDATE_MATRIX_CHECKSUM" <<'PY'
 import json
 import math
+import re
 import sys
 from pathlib import Path
 
-matrix_path, record_path, digest, version = sys.argv[1:5]
+(
+    matrix_path,
+    record_path,
+    digest,
+    version,
+    source_digest,
+    matrix_checksum,
+    candidate_source_commit,
+    candidate_source_digest,
+    candidate_matrix_checksum,
+) = sys.argv[1:10]
 
 try:
     matrix = json.load(open(matrix_path))
@@ -108,6 +128,54 @@ if record.get("artifactDigestAlgorithm") != "swiftvlc-tree-v1":
     problems.append(
         "the record does not declare artifactDigestAlgorithm "
         "'swiftvlc-tree-v1'"
+    )
+
+if record.get("releaseSourceDigestAlgorithm") != "swiftvlc-git-tree-v1":
+    problems.append(
+        "the record does not declare releaseSourceDigestAlgorithm "
+        "'swiftvlc-git-tree-v1'"
+    )
+
+recorded_source_digest = record.get("releaseSourceDigest")
+if recorded_source_digest != source_digest:
+    problems.append(
+        "the record describes different Swift wrapper source\n"
+        f"    recorded:   {recorded_source_digest}\n"
+        f"    on disk:    {source_digest}\n"
+        "    Device evidence cannot carry across release-significant source changes."
+    )
+
+recorded_source_commit = record.get("sourceCommit")
+if not isinstance(recorded_source_commit, str) or not re.fullmatch(
+    r"[0-9a-f]{40}", recorded_source_commit
+):
+    problems.append("the record has no valid 40-character sourceCommit")
+elif candidate_source_commit and recorded_source_commit != candidate_source_commit:
+    problems.append(
+        "the record names a different candidate source commit\n"
+        f"    recorded:   {recorded_source_commit}\n"
+        f"    candidate:  {candidate_source_commit}"
+    )
+
+if candidate_source_digest and recorded_source_digest != candidate_source_digest:
+    problems.append(
+        "the record names a different candidate source digest\n"
+        f"    recorded:   {recorded_source_digest}\n"
+        f"    candidate:  {candidate_source_digest}"
+    )
+
+recorded_matrix_checksum = record.get("qualificationMatrixChecksum")
+if recorded_matrix_checksum != matrix_checksum:
+    problems.append(
+        "the qualification matrix changed after the device run\n"
+        f"    recorded:   {recorded_matrix_checksum}\n"
+        f"    on disk:    {matrix_checksum}"
+    )
+if candidate_matrix_checksum and recorded_matrix_checksum != candidate_matrix_checksum:
+    problems.append(
+        "the record names a different candidate qualification matrix\n"
+        f"    recorded:   {recorded_matrix_checksum}\n"
+        f"    candidate:  {candidate_matrix_checksum}"
     )
 
 scenarios = matrix.get("scenarios")
@@ -310,6 +378,7 @@ for key in sorted(executed):
                 continue
             for field, expected in (
                 ("artifactDigest", digest),
+                ("releaseSourceDigest", source_digest),
                 ("scenario", key[0]),
                 ("hardware", key[1]),
             ):
@@ -419,6 +488,6 @@ if problems:
 
 print(
     f"Device qualification verified: {len(required)} rows executed and passing "
-    f"for artifact {digest[:12]}…"
+    f"for artifact {digest[:12]}… and source {source_digest[:12]}…"
 )
 PY
