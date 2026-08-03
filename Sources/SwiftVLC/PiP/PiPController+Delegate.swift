@@ -135,50 +135,41 @@ extension PiPController: AVPictureInPictureControllerDelegate {
         completionHandler(false)
         return
       }
-      // Record the reason before the host app's restore hook runs, so
-      // the stop delegate callbacks see it no matter how AVKit orders
-      // them relative to the hook's completion.
-      notePendingStopReason(.restoreRequested)
-      guard let onRestoreUserInterface else {
-        completionHandler(true)
-        return
-      }
+      handleRestoreUserInterface(completionHandler: completionHandler)
+    }
+  }
 
-      // AVKit's handler must run exactly once. The hook is host application
-      // code: it can answer twice, or never. Answering twice invokes a system
-      // completion handler more than once; never answering leaves PiP teardown
-      // waiting with no way out, which is the worse of the two because nothing
-      // surfaces it.
-      //
-      // The latch is read and written only on the main actor — both the hook's
-      // callback and the timeout below are `@MainActor` — so a plain box is
-      // enough.
-      let answered = RestoreAnswerLatch()
-      let answer: @MainActor @Sendable (Bool) -> Void = { restored in
-        guard !answered.value else { return }
-        answered.value = true
-        // Nothing left to bound. Without this the sleeping task, and the
-        // completion closure it retains, stay alive for the full timeout after
-        // even an immediate restore.
-        answered.timeout?.cancel()
-        answered.timeout = nil
-        completionHandler(restored)
-      }
+  /// Shared restore policy for both the directly-owned AVKit controller and
+  /// the native libVLC controller observed by `IOSNativePiPBackend`.
+  func handleRestoreUserInterface(
+    completionHandler: @escaping @Sendable (Bool) -> Void
+  ) {
+    // Record the reason before the host app's restore hook runs, so stop
+    // callbacks see it no matter how AVKit orders them relative to completion.
+    notePendingStopReason(.restoreRequested)
+    guard let onRestoreUserInterface else {
+      completionHandler(true)
+      return
+    }
 
-      onRestoreUserInterface(answer)
-
-      // A hook that answered synchronously needs no timeout at all; starting
-      // one here would create a task whose only job is to wake up and find the
-      // latch already closed.
+    // Host code can answer twice or never. Keep AVKit's completion exactly
+    // once and bound the latter case so PiP teardown cannot remain unresolved.
+    let answered = RestoreAnswerLatch()
+    let answer: @MainActor @Sendable (Bool) -> Void = { restored in
       guard !answered.value else { return }
+      answered.value = true
+      answered.timeout?.cancel()
+      answered.timeout = nil
+      completionHandler(restored)
+    }
 
-      answered.timeout = Task { @MainActor in
-        try? await Task.sleep(for: Self.restoreCompletionTimeout)
-        guard !Task.isCancelled else { return }
-        // `false`: the interface was not restored within the bound. Reporting
-        // success would tell AVKit a restore happened that did not.
-        answer(false)
-      }
+    onRestoreUserInterface(answer)
+    guard !answered.value else { return }
+
+    answered.timeout = Task { @MainActor in
+      try? await Task.sleep(for: Self.restoreCompletionTimeout)
+      guard !Task.isCancelled else { return }
+      answer(false)
     }
   }
 

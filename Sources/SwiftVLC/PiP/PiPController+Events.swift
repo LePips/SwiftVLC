@@ -8,10 +8,10 @@
 public enum PiPStopReason: Sendable, Equatable {
   /// The user dismissed the PiP window with its close (X) affordance.
   ///
-  /// Only reported on the sample-buffer path, where SwiftVLC owns the
-  /// `AVPictureInPictureController` delegate: a stop with no restore
-  /// request, no start failure, no programmatic ``PiPController/stop()``,
-  /// and no end-of-media is attributed to the close button.
+  /// Reported when SwiftVLC owns or successfully bridges the full
+  /// `AVPictureInPictureController` delegate: a stop with no restore request,
+  /// failure, programmatic ``PiPController/stop()``, controller replacement,
+  /// or end-of-media is attributed to the close button.
   case userClosed
 
   /// The user tapped the PiP window's restore ("return to app")
@@ -19,16 +19,23 @@ public enum PiPStopReason: Sendable, Equatable {
   case restoreRequested
 
   /// The stop follows a failed PiP start (see
-  /// ``PiPEvent/failedToStart(_:)``).
+  /// ``PiPEvent/failedToStart(_:)``) or a terminal playback/rendering error.
   case failure
 
   /// Playback reached the end of the media while PiP was up.
   case mediaEnded
 
-  /// No discriminating signal was available. Reported for programmatic
-  /// ``PiPController/stop()`` calls and for every stop on the native
-  /// drawable path (including PiP torn down by a native-handle
-  /// replacement such as a player swap or renderer recast).
+  /// The application explicitly called ``PiPController/stop()``.
+  case programmatic
+
+  /// libVLC replaced the native AVKit controller while PiP was active. This
+  /// includes native-handle replacement during a renderer recast or player
+  /// rebuild.
+  case controllerReplaced
+
+  /// No discriminating signal was available. This is retained as the explicit
+  /// fallback for unsupported native libVLC delegate revisions; supported
+  /// native and direct AVKit paths report an authoritative reason.
   case unknown
 }
 
@@ -93,14 +100,13 @@ extension PiPController {
   /// ``PiPEvent/willStart``, ``PiPEvent/willStop(reason:)`` and
   /// ``PiPEvent/failedToStart(_:)`` with the underlying AVKit error.
   ///
-  /// On the **native drawable path** (``PiPVideoView``), libVLC owns
-  /// the AVKit controller and its delegate; the only signal SwiftVLC
-  /// observes is the active flag flipping. There the stream degrades
-  /// to synthesized ``PiPEvent/didStart`` / ``PiPEvent/didStop(reason:)``
-  /// events whose reason is always ``PiPStopReason/unknown``;
-  /// will/failed events are unavailable. A native-handle replacement
-  /// while PiP is active (player swap, renderer recast) tears PiP down
-  /// the same way and is likewise reported as `didStop(reason: .unknown)`.
+  /// On the **native drawable path** (``PiPVideoView``), SwiftVLC installs a
+  /// forwarding bridge in front of libVLC's AVKit delegate. The original
+  /// delegate still receives every callback, while this stream receives the
+  /// complete ordered lifecycle, underlying start failure, restore request,
+  /// and authoritative stop reason. If a future libVLC revision exposes no
+  /// delegate to bridge, SwiftVLC logs the incompatibility and retains the
+  /// active-state fallback with ``PiPStopReason/unknown``.
   ///
   /// ## Stop-reason resolution
   ///
@@ -109,9 +115,10 @@ extension PiPController {
   ///
   /// 1. The **first discriminating signal** observed for the in-flight
   ///    stop wins and is never overwritten: the restore callback
-  ///    records ``PiPStopReason/restoreRequested``, a start failure
-  ///    records ``PiPStopReason/failure``, and a programmatic
-  ///    ``stop()`` records ``PiPStopReason/unknown``. In practice these
+  ///    records ``PiPStopReason/restoreRequested``, a start or playback failure
+  ///    records ``PiPStopReason/failure``, a programmatic ``stop()`` records
+  ///    ``PiPStopReason/programmatic``, and native replacement records
+  ///    ``PiPStopReason/controllerReplaced``. In practice these
   ///    signals are mutually exclusive, which yields the effective
   ///    precedence `restoreRequested` > `failure` over the fallbacks
   ///    below.
@@ -489,6 +496,9 @@ extension PiPController {
     if player.didReachEnd {
       return .mediaEnded
     }
+    if case .error = player.state {
+      return .failure
+    }
     return .userClosed
   }
 
@@ -505,6 +515,9 @@ extension PiPController {
     }
     if player.didReachEnd {
       return .mediaEnded
+    }
+    if case .error = player.state {
+      return .failure
     }
     return .userClosed
   }

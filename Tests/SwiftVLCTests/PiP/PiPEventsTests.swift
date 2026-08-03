@@ -259,7 +259,7 @@ extension Integration {
       let failure = NSError(domain: "swiftvlc.test.pip.idle-stop", code: 1)
 
       controller.stop()
-      #expect(controller.pendingStopReason == .unknown)
+      #expect(controller.pendingStopReason == .programmatic)
       #expect(controller.noteAcceptedPiPStartRequest(.accepted) == .accepted)
       controller.pictureInPictureController(
         avController,
@@ -360,7 +360,7 @@ extension Integration {
         Issue.record("Expected the failed attempt's trailing stop")
         return
       }
-      guard case .didStop(reason: .unknown) = envelopes[3].event else {
+      guard case .didStop(reason: .programmatic) = envelopes[3].event else {
         Issue.record("Expected the retry's programmatic stop reason")
         return
       }
@@ -624,7 +624,7 @@ extension Integration {
     }
 
     @Test
-    func `programmatic stop reports unknown`() async {
+    func `programmatic stop reports its authoritative reason`() async {
       let player = Player(instance: TestInstance.shared)
       let controller = PiPController(player: player)
       let avController = makeDummyAVController(for: controller)
@@ -636,12 +636,12 @@ extension Integration {
       controller.pictureInPictureControllerDidStopPictureInPicture(avController)
 
       let events = await collect(2, from: stream)
-      guard case .willStop(reason: .unknown) = events[0] else {
-        Issue.record("Expected .willStop(.unknown), got \(events[0])")
+      guard case .willStop(reason: .programmatic) = events[0] else {
+        Issue.record("Expected .willStop(.programmatic), got \(events[0])")
         return
       }
-      guard case .didStop(reason: .unknown) = events[1] else {
-        Issue.record("Expected .didStop(.unknown), got \(events[1])")
+      guard case .didStop(reason: .programmatic) = events[1] else {
+        Issue.record("Expected .didStop(.programmatic), got \(events[1])")
         return
       }
     }
