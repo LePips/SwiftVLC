@@ -373,6 +373,9 @@ private protocol IOSNativePiPDrawable: NSObjectProtocol {
 
   @objc(takePreservedPictureInPictureWindowController)
   func takePreservedPictureInPictureWindowController() -> AnyObject?
+
+  @objc(pictureInPictureWindowControllerHandoffDidTimeOut:)
+  func pictureInPictureWindowControllerHandoffDidTimeOut(_ controller: AnyObject)
 }
 
 @objc(VLCPictureInPictureMediaControlling)
@@ -508,7 +511,17 @@ final class IOSNativePiPDrawableAttachment: UIView, IOSNativePiPDrawable {
 
   @objc(takePreservedPictureInPictureWindowController)
   nonisolated func takePreservedPictureInPictureWindowController() -> AnyObject? {
-    continuityCoordinator.takePreservedController()
+    let mediaGeneration = nativeMediaController.callbackSnapshot.withLock {
+      $0.playbackGeneration
+    }
+    return continuityCoordinator.takePreservedController(for: mediaGeneration)
+  }
+
+  @objc(pictureInPictureWindowControllerHandoffDidTimeOut:)
+  nonisolated func pictureInPictureWindowControllerHandoffDidTimeOut(
+    _ controller: AnyObject
+  ) {
+    continuityCoordinator.didTimeOut(controller)
   }
 
   private var hasDrawableBounds: Bool {

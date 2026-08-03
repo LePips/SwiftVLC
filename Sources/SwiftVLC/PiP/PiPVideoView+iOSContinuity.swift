@@ -33,20 +33,16 @@ final class IOSNativePiPContinuityCoordinator: @unchecked Sendable {
     )
   }
 
-  static let defaultRebuildTimeout: Duration = .seconds(3)
-
   private struct Pending: @unchecked Sendable {
-    let token: UInt64
     let controllerIdentity: ObjectIdentifier
     let weakController: WeakController
     var controller: AnyObject?
     let previousMediaGeneration: PlaybackGeneration
-    let mediaGeneration: PlaybackGeneration
+    var mediaGeneration: PlaybackGeneration
     let startedAt: ContinuousClock.Instant
   }
 
   private struct State: @unchecked Sendable {
-    var nextToken: UInt64 = 0
     var readyMediaGeneration: PlaybackGeneration?
     /// Rejects late readiness from expired handoffs without preventing a
     /// freshly-created controller from serving the same media generation.
@@ -57,14 +53,9 @@ final class IOSNativePiPContinuityCoordinator: @unchecked Sendable {
 
   private let clock = ContinuousClock()
   private let state = Mutex(State())
-  private let rebuildTimeout: Duration
   private let emit: @Sendable (Transition) -> Void
 
-  init(
-    rebuildTimeout: Duration = IOSNativePiPContinuityCoordinator.defaultRebuildTimeout,
-    emit: @escaping @Sendable (Transition) -> Void
-  ) {
-    self.rebuildTimeout = rebuildTimeout
+  init(emit: @escaping @Sendable (Transition) -> Void) {
     self.emit = emit
   }
 
@@ -76,17 +67,34 @@ final class IOSNativePiPContinuityCoordinator: @unchecked Sendable {
   ) -> Bool {
     guard let mediaGeneration else { return false }
     let startedAt = clock.now
-    let transition = state.withLock { state -> Transition? in
+    let result = state.withLock { state -> (accepted: Bool, transition: Transition?) in
+      if var pending = state.pending {
+        guard
+          pending.controllerIdentity == ObjectIdentifier(controller),
+          mediaGeneration >= pending.mediaGeneration
+        else { return (false, nil) }
+
+        pending.controller = controller
+        let transition: Transition?
+        if mediaGeneration > pending.mediaGeneration {
+          pending.mediaGeneration = mediaGeneration
+          transition = .rebuilding(
+            previous: pending.previousMediaGeneration,
+            successor: mediaGeneration
+          )
+        } else {
+          transition = nil
+        }
+        state.pending = pending
+        return (true, transition)
+      }
+
       guard
-        state.pending == nil,
         let previous = state.readyMediaGeneration,
         previous != mediaGeneration
-      else { return nil }
+      else { return (false, nil) }
 
-      state.nextToken &+= 1
-      precondition(state.nextToken != 0, "PiP continuity token exhausted")
       state.pending = Pending(
-        token: state.nextToken,
         controllerIdentity: ObjectIdentifier(controller),
         weakController: WeakController(controller),
         controller: controller,
@@ -94,29 +102,49 @@ final class IOSNativePiPContinuityCoordinator: @unchecked Sendable {
         mediaGeneration: mediaGeneration,
         startedAt: startedAt
       )
-      return .rebuilding(previous: previous, successor: mediaGeneration)
+      return (
+        true,
+        .rebuilding(previous: previous, successor: mediaGeneration)
+      )
     }
 
-    guard let transition else { return false }
-    emit(transition)
-    let token = state.withLock { $0.pending?.token }
-    guard let token else { return false }
-    Task { [weak self] in
-      guard let self else { return }
-      try? await Task.sleep(for: rebuildTimeout)
-      timeOut(token: token)
+    if let transition = result.transition {
+      emit(transition)
     }
-    return true
+    return result.accepted
   }
 
   /// Transfers the held controller into the successor engine module while
   /// retaining the pending identity until its new display layer is ready.
-  func takePreservedController() -> AnyObject? {
-    state.withLock { state in
-      let controller = state.pending?.controller
-      state.pending?.controller = nil
-      return controller
+  func takePreservedController(
+    for mediaGeneration: PlaybackGeneration?
+  ) -> AnyObject? {
+    guard let mediaGeneration else { return nil }
+    let result = state.withLock { state -> (controller: AnyObject?, transition: Transition?) in
+      guard
+        var pending = state.pending,
+        let controller = pending.controller,
+        mediaGeneration >= pending.mediaGeneration
+      else { return (nil, nil) }
+
+      let transition: Transition?
+      if mediaGeneration > pending.mediaGeneration {
+        pending.mediaGeneration = mediaGeneration
+        transition = .rebuilding(
+          previous: pending.previousMediaGeneration,
+          successor: mediaGeneration
+        )
+      } else {
+        transition = nil
+      }
+      pending.controller = nil
+      state.pending = pending
+      return (controller, transition)
     }
+    if let transition = result.transition {
+      emit(transition)
+    }
+    return result.controller
   }
 
   /// Records an ordinary ready generation or completes a preserved handoff.
@@ -167,10 +195,16 @@ final class IOSNativePiPContinuityCoordinator: @unchecked Sendable {
     }
   }
 
-  private func timeOut(token: UInt64) {
+  /// Completes the handoff timeout selected by the native controller. The
+  /// Objective-C timer is authoritative so a successful `prepare` and timeout
+  /// cannot publish contradictory terminal outcomes.
+  func didTimeOut(_ controller: AnyObject) {
     let now = clock.now
     let transition = state.withLock { state -> Transition? in
-      guard let pending = state.pending, pending.token == token else { return nil }
+      guard
+        let pending = state.pending,
+        pending.controllerIdentity == ObjectIdentifier(controller)
+      else { return nil }
       state.pending = nil
       if
         state.timedOutThroughGeneration.map({ pending.mediaGeneration > $0 })

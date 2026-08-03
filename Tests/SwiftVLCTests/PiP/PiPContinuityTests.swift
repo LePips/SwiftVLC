@@ -39,8 +39,8 @@ extension Integration {
       coordinator.didBecomeReady(controller, mediaGeneration: original)
       #expect(coordinator.preserve(controller, for: original) == false)
       #expect(coordinator.preserve(controller, for: successor))
-      #expect(coordinator.takePreservedController() === controller)
-      #expect(coordinator.takePreservedController() == nil)
+      #expect(coordinator.takePreservedController(for: successor) === controller)
+      #expect(coordinator.takePreservedController(for: successor) == nil)
       coordinator.didBecomeReady(controller, mediaGeneration: successor)
 
       #expect(events.withLock { $0 } == [
@@ -50,11 +50,9 @@ extension Integration {
     }
 
     @Test
-    func `a missing successor publishes a bounded timeout`() async {
+    func `the native timeout publishes one terminal outcome`() {
       let events = Mutex<[Marker]>([])
-      let coordinator = IOSNativePiPContinuityCoordinator(
-        rebuildTimeout: .milliseconds(10)
-      ) { transition in
+      let coordinator = IOSNativePiPContinuityCoordinator { transition in
         events.withLock { $0.append(Self.marker(for: transition)) }
       }
       let controller = NSObject()
@@ -63,8 +61,10 @@ extension Integration {
 
       coordinator.didBecomeReady(controller, mediaGeneration: original)
       #expect(coordinator.preserve(controller, for: successor))
-      #expect(coordinator.takePreservedController() === controller)
-      try? await Task.sleep(for: .milliseconds(50))
+      #expect(coordinator.takePreservedController(for: successor) === controller)
+      coordinator.didTimeOut(controller)
+      coordinator.didBecomeReady(controller, mediaGeneration: successor)
+      coordinator.didTimeOut(controller)
 
       #expect(events.withLock { $0 } == [
         .rebuilding(original, successor),
@@ -73,11 +73,9 @@ extension Integration {
     }
 
     @Test
-    func `a stale controller or generation cannot complete a handoff`() async {
+    func `a stale controller or generation cannot complete a handoff`() {
       let events = Mutex<[Marker]>([])
-      let coordinator = IOSNativePiPContinuityCoordinator(
-        rebuildTimeout: .milliseconds(10)
-      ) { transition in
+      let coordinator = IOSNativePiPContinuityCoordinator { transition in
         events.withLock { $0.append(Self.marker(for: transition)) }
       }
       let controller = NSObject()
@@ -88,13 +86,13 @@ extension Integration {
 
       coordinator.didBecomeReady(controller, mediaGeneration: original)
       #expect(coordinator.preserve(controller, for: successor))
-      #expect(coordinator.takePreservedController() === controller)
+      #expect(coordinator.takePreservedController(for: successor) === controller)
       coordinator.didBecomeReady(staleController, mediaGeneration: successor)
       coordinator.didBecomeReady(controller, mediaGeneration: original)
-      try? await Task.sleep(for: .milliseconds(50))
+      coordinator.didTimeOut(controller)
       coordinator.didBecomeReady(controller, mediaGeneration: successor)
       #expect(coordinator.preserve(controller, for: laterSuccessor))
-      #expect(coordinator.takePreservedController() === controller)
+      #expect(coordinator.takePreservedController(for: laterSuccessor) === controller)
       coordinator.didBecomeReady(controller, mediaGeneration: laterSuccessor)
 
       #expect(events.withLock { $0 } == [
@@ -106,11 +104,9 @@ extension Integration {
     }
 
     @Test
-    func `a fresh controller can recover the generation that timed out`() async {
+    func `a fresh controller can recover the generation that timed out`() {
       let events = Mutex<[Marker]>([])
-      let coordinator = IOSNativePiPContinuityCoordinator(
-        rebuildTimeout: .milliseconds(10)
-      ) { transition in
+      let coordinator = IOSNativePiPContinuityCoordinator { transition in
         events.withLock { $0.append(Self.marker(for: transition)) }
       }
       let expiredController = NSObject()
@@ -121,12 +117,12 @@ extension Integration {
 
       coordinator.didBecomeReady(expiredController, mediaGeneration: original)
       #expect(coordinator.preserve(expiredController, for: timedOut))
-      #expect(coordinator.takePreservedController() === expiredController)
-      try? await Task.sleep(for: .milliseconds(50))
+      #expect(coordinator.takePreservedController(for: timedOut) === expiredController)
+      coordinator.didTimeOut(expiredController)
 
       coordinator.didBecomeReady(freshController, mediaGeneration: timedOut)
       #expect(coordinator.preserve(freshController, for: successor))
-      #expect(coordinator.takePreservedController() === freshController)
+      #expect(coordinator.takePreservedController(for: successor) === freshController)
       coordinator.didBecomeReady(freshController, mediaGeneration: successor)
 
       #expect(events.withLock { $0 } == [
@@ -134,6 +130,57 @@ extension Integration {
         .timedOut(original, timedOut),
         .rebuilding(timedOut, successor),
         .restored(timedOut, successor)
+      ])
+    }
+
+    @Test
+    func `a skipped output retargets the held controller to the newest generation`() {
+      let events = Mutex<[Marker]>([])
+      let coordinator = IOSNativePiPContinuityCoordinator { transition in
+        events.withLock { $0.append(Self.marker(for: transition)) }
+      }
+      let controller = NSObject()
+      let original = PlaybackGeneration(51)
+      let skipped = PlaybackGeneration(52)
+      let newest = PlaybackGeneration(53)
+
+      coordinator.didBecomeReady(controller, mediaGeneration: original)
+      #expect(coordinator.preserve(controller, for: skipped))
+      #expect(coordinator.takePreservedController(for: original) == nil)
+      #expect(coordinator.takePreservedController(for: newest) === controller)
+      coordinator.didBecomeReady(controller, mediaGeneration: skipped)
+      coordinator.didBecomeReady(controller, mediaGeneration: newest)
+
+      #expect(events.withLock { $0 } == [
+        .rebuilding(original, skipped),
+        .rebuilding(original, newest),
+        .restored(original, newest)
+      ])
+    }
+
+    @Test
+    func `an intermediate output can preserve the same controller for a later load`() {
+      let events = Mutex<[Marker]>([])
+      let coordinator = IOSNativePiPContinuityCoordinator { transition in
+        events.withLock { $0.append(Self.marker(for: transition)) }
+      }
+      let controller = NSObject()
+      let original = PlaybackGeneration(61)
+      let intermediate = PlaybackGeneration(62)
+      let newest = PlaybackGeneration(63)
+
+      coordinator.didBecomeReady(controller, mediaGeneration: original)
+      #expect(coordinator.preserve(controller, for: intermediate))
+      #expect(coordinator.takePreservedController(for: intermediate) === controller)
+      #expect(coordinator.preserve(controller, for: newest))
+      #expect(coordinator.takePreservedController(for: newest) === controller)
+      coordinator.didBecomeReady(controller, mediaGeneration: intermediate)
+      coordinator.didBecomeReady(controller, mediaGeneration: newest)
+
+      #expect(events.withLock { $0 } == [
+        .rebuilding(original, intermediate),
+        .rebuilding(original, newest),
+        .restored(original, newest)
       ])
     }
   }

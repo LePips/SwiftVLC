@@ -1,5 +1,5 @@
 diff --git a/modules/video_output/apple/VLCDrawable.h b/modules/video_output/apple/VLCDrawable.h
-index 42dacba037..83334aea87 100644
+index 42dacba037..b5fd8a3c2c 100644
 --- a/modules/video_output/apple/VLCDrawable.h
 +++ b/modules/video_output/apple/VLCDrawable.h
 @@ -55,6 +55,9 @@
@@ -12,7 +12,7 @@ index 42dacba037..83334aea87 100644
  @required
  
  /// Called by picture in picture to get the current media duration
-@@ -126,8 +129,20 @@
+@@ -126,8 +129,25 @@
  /// controller is passed
  - (void (^)(id<VLCPictureInPictureWindowControlling>)) pictureInPictureReady;
  
@@ -32,9 +32,14 @@ index 42dacba037..83334aea87 100644
 +/// nil when there is no pending handoff.
 +- (id<VLCPictureInPictureWindowControlling>)
 +    takePreservedPictureInPictureWindowController;
++
++/// Reports that the native handoff bound expired and the retained controller
++/// is about to close. Implementations must discard any matching handoff.
++- (void)pictureInPictureWindowControllerHandoffDidTimeOut:
++    (id<VLCPictureInPictureWindowControlling>)controller;
  @end
 diff --git a/modules/video_output/apple/VLCPictureInPictureController.m b/modules/video_output/apple/VLCPictureInPictureController.m
-index 68dd7cc369..df805e9a1e 100644
+index 68dd7cc369..ab23e0a149 100644
 --- a/modules/video_output/apple/VLCPictureInPictureController.m
 +++ b/modules/video_output/apple/VLCPictureInPictureController.m
 @@ -46,8 +46,13 @@ @interface VLCPictureInPictureController: NSObject
@@ -134,7 +139,7 @@ index 68dd7cc369..df805e9a1e 100644
      BOOL seekable = NO;
      if ([_mediaController respondsToSelector:
              @selector(mediaPlaybackSnapshotWithLength:time:seekable:)]) {
-@@ -120,27 +145,72 @@ - (void)prepare:(AVSampleBufferDisplayLayer *)layer {
+@@ -120,27 +145,80 @@ - (void)prepare:(AVSampleBufferDisplayLayer *)layer {
          seekable = [_mediaController isMediaSeekable];
      }
      avPipController.requiresLinearPlayback = !seekable;
@@ -193,8 +198,16 @@ index 68dd7cc369..df805e9a1e 100644
 +                uint_fast64_t currentToken =
 +                    atomic_load_explicit(&self->_handoffToken,
 +                                         memory_order_acquire);
-+                if (isPending && currentToken == token)
++                if (isPending && currentToken == token) {
++                    id<VLCPictureInPictureDrawable> currentDrawable =
++                        self->_drawable;
++                    if ([currentDrawable respondsToSelector:@selector(
++                            pictureInPictureWindowControllerHandoffDidTimeOut:)])
++                        [currentDrawable
++                            pictureInPictureWindowControllerHandoffDidTimeOut:
++                                self];
 +                    [self close];
++                }
 +            });
 +            return;
 +        }
@@ -213,7 +226,7 @@ index 68dd7cc369..df805e9a1e 100644
  
      dispatch_block_t cleanup = ^{
          AVPictureInPictureController *avPipController =
-@@ -289,11 +359,13 @@ - (void)pictureInPictureControllerWillStartPictureInPicture:(AVPictureInPictureC
+@@ -289,11 +367,13 @@ - (void)pictureInPictureControllerWillStartPictureInPicture:(AVPictureInPictureC
  }
  
  - (void)pictureInPictureControllerDidStartPictureInPicture:(AVPictureInPictureController *)pictureInPictureController {
@@ -227,7 +240,7 @@ index 68dd7cc369..df805e9a1e 100644
      if (!atomic_load_explicit(&_closed, memory_order_acquire) && _stateChangeEventHandler)
          _stateChangeEventHandler(NO);
  }
-@@ -357,7 +429,7 @@ static int CloseController( pip_controller_t *pipcontroller )
+@@ -357,7 +437,7 @@ static int CloseController( pip_controller_t *pipcontroller )
              (__bridge_transfer VLCPictureInPictureController*)pipcontroller->p_sys;
          pipcontroller->p_sys = NULL;
  
@@ -236,7 +249,7 @@ index 68dd7cc369..df805e9a1e 100644
      }
      
      return VLC_SUCCESS;
-@@ -375,9 +447,26 @@ static int OpenController( pip_controller_t *pipcontroller )
+@@ -375,9 +455,26 @@ static int OpenController( pip_controller_t *pipcontroller )
      pipcontroller->ops = &ops;
  
      if (@available(macOS 12.0, iOS 15.0, tvos 15.0, *)) {
