@@ -133,3 +133,17 @@ func mapEvent(_ event: libvlc_event_t) -> PlayerEvent? {
     return nil
   }
 }
+
+func mapPlaybackFailureKind(
+  _ failure: libvlc_playback_failure_kind_t
+) -> PlaybackFailureKind {
+  switch failure {
+  case libvlc_playback_failure_source: .source
+  case libvlc_playback_failure_demux: .demux
+  case libvlc_playback_failure_decoder: .decoder
+  case libvlc_playback_failure_renderer: .renderer
+  case libvlc_playback_failure_output: .output
+  case libvlc_playback_failure_unknown: .unknown
+  default: .unknown
+  }
+}

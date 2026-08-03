@@ -506,8 +506,12 @@ fi
 artifact_info=$(./scripts/resolve-release-artifact.sh)
 actual_tag=$(printf '%s' "$artifact_info" \
   | python3 -c 'import json,sys; print(json.load(sys.stdin)["tag"])')
-[[ "$actual_tag" == "v1.1.0-beta.1" ]] \
-  || fail "checkout resolved $actual_tag instead of v1.1.0-beta.1"
+showcase_version=$(sed -n \
+  's/^[[:space:]]*version = \([^;]*\);$/\1/p' \
+  Showcase/SwiftVLCShowcase.xcodeproj/project.pbxproj)
+[[ -n "$showcase_version" ]] || fail "Showcase release version was not found"
+[[ "$actual_tag" == "v$showcase_version" ]] \
+  || fail "checkout resolves $actual_tag but Showcase resolves v$showcase_version"
 
 stable_info=$(SWIFTVLC_RELEASE_TAG=v1.0.0 ./scripts/resolve-release-artifact.sh)
 stable_tag=$(printf '%s' "$stable_info" \

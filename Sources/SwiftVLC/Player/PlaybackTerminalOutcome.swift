@@ -16,10 +16,9 @@ public enum PlaybackTerminalCause: Hashable, Sendable {
 
 /// The playback subsystem that failed, when SwiftVLC can identify it.
 ///
-/// The bundled engine currently distinguishes a general playback error from
-/// clean EOF and user stop, but does not attribute every error to a subsystem.
-/// Such failures are reported as ``unknown`` instead of guessing from timing
-/// or log text.
+/// The bundled engine attributes failures at the access, demux, decoder,
+/// renderer, and output boundaries. Failures outside those authoritative
+/// paths are reported as ``unknown`` instead of guessing from timing or logs.
 public enum PlaybackFailureKind: Hashable, Sendable {
   /// Media source or transport failed.
   case source

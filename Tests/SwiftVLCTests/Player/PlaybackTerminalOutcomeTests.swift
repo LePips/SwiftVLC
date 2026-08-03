@@ -148,6 +148,27 @@ extension Integration {
     }
 
     @Test
+    func `Encountered error freezes the engine failure kind for its generation`() async throws {
+      let player = Player(instance: TestInstance.makeAudioOnly())
+      try player.load(Media(url: TestMedia.twosecURL))
+      let expectedGeneration = player.generation
+      let outcome = firstOutcome(from: player.terminalOutcomes)
+
+      var error = libvlc_event_t()
+      error.type = Int32(libvlc_MediaPlayerEncounteredError.rawValue)
+      error.u.media_player_encountered_error.failure = libvlc_playback_failure_decoder
+      player.eventBridge._emitNativeEventForTesting(error)
+
+      let value = try #require(await outcome.value)
+      #expect(value.generation == expectedGeneration)
+      #expect(value.cause == .failure(.decoder))
+
+      error.u.media_player_encountered_error.failure = libvlc_playback_failure_output
+      player.eventBridge._emitNativeEventForTesting(error)
+      #expect(player.terminalCause(for: expectedGeneration) == .failure(.decoder))
+    }
+
+    @Test
     func `Unattributed stop reports unknown and never claims natural end`() async throws {
       let player = Player(instance: TestInstance.makeAudioOnly())
       try player.load(Media(url: TestMedia.twosecURL))
