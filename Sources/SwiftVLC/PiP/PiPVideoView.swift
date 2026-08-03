@@ -44,7 +44,12 @@ public struct PiPVideoView: UIViewRepresentable {
   ///     then never touches the session. Constructing a view for an inactive
   ///     Player does not activate the session. Recreating the native view for
   ///     a Player whose playback intent is already active does activate it so
-  ///     automatic PiP cannot outrun the managed audio-session setup.
+  ///     automatic PiP cannot outrun the managed audio-session setup. Managed
+  ///     playback also observes interruptions, route loss, media-services
+  ///     restart, device lock, and app foreground/background transitions.
+  ///     Background playback without active PiP is paused after a one-second
+  ///     auto-PiP grace period and resumes on foreground only when SwiftVLC
+  ///     issued that pause and the user's playback intent remains active.
   public init(
     _ player: Player,
     controller: Binding<PiPController?>? = nil,

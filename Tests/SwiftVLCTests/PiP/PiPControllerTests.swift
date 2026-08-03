@@ -33,7 +33,7 @@ extension Integration {
               playbackControlRevision: nil
             )
           },
-          resume: {
+          resume: { _ in
             self.resumeCount += 1
             return true
           },

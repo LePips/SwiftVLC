@@ -33,7 +33,7 @@ extension Integration {
             self.pauseCount += 1
             return .init(accepted: self.pauseResult, playbackControlRevision: nil)
           },
-          resume: {
+          resume: { _ in
             self.resumeCount += 1
             return self.resumeResult
           },

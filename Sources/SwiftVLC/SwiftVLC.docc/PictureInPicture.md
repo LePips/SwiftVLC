@@ -88,6 +88,17 @@ without SwiftVLC receiving a will-start callback. The direct route retries at
 will-start, and the native route retries when it observes did-start. If
 activation fails transiently, SwiftVLC leaves it pending for either fallback.
 
+The managed path observes audio interruptions, output-route loss,
+media-services loss/reset, device lock, and app lifecycle. A route loss pauses
+and changes playback intent so audio cannot jump unexpectedly to the speaker.
+Device lock or backgrounding without an active PiP window instead pauses native
+playback while preserving the user's intent, releases audio focus, and resumes
+only that exact library-issued pause after a successful foreground activation.
+Background handling waits one second for automatic PiP to become active; if PiP
+stops while the app remains backgrounded, playback is suspended immediately.
+Overlapping lifecycle and media-services suspensions are tracked separately, so
+neither recovery signal can resume playback while the other disruption remains.
+
 Pass `managesAudioSession: false` to ``PiPVideoView`` when your app owns
 audio-session policy. In that mode SwiftVLC neither changes the category
 nor activates the shared session.
