@@ -1516,6 +1516,14 @@ find "${OUTPUT_DIR}/libvlc.xcframework" -name "CLibVLC.h" -delete
 info "Stripping release debug symbols before reproducibility hashing..."
 find "${OUTPUT_DIR}/libvlc.xcframework" -name '*.a' -exec strip -S {} \;
 
+# `strip` rebuilds each archive's __.SYMDEF member and stamps that member with
+# the current wall-clock time. The object payloads are unchanged, but those few
+# header bytes make otherwise identical clean builds hash differently. Reset
+# the archive indexes after the final mutating step so provenance covers the
+# exact deterministic artifact that will be released.
+info "Normalizing archive indexes after stripping..."
+find "${OUTPUT_DIR}/libvlc.xcframework" -name '*.a' -exec xcrun ranlib -D {} \;
+
 info "Created: ${OUTPUT_DIR}/libvlc.xcframework"
 
 # --- Step 5: Verify ---
