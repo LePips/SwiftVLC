@@ -217,8 +217,9 @@ public final class PiPController: NSObject {
   @ObservationIgnored
   let audioSessionActivation: @MainActor () throws -> Void
 
-  /// Whether the deferred `AVAudioSession.setActive(true)` has been
-  /// issued. One-shot per controller; see ``managesAudioSession``.
+  /// Whether the latest deferred `AVAudioSession.setActive(true)` succeeded.
+  /// The latch is cleared after interruptions, media-services loss, and
+  /// lifecycle suspension so recovery never trusts an invalid session.
   @ObservationIgnored
   var hasActivatedAudioSession = false
 
@@ -227,6 +228,31 @@ public final class PiPController: NSObject {
   /// because nothing may be changed. See `startAudioSessionObservers()`.
   @ObservationIgnored
   var audioSessionObservers: [any NSObjectProtocol] = []
+
+  /// Delays the background-without-PiP decision long enough for AVKit's
+  /// automatic PiP transition to settle. Cancelled when PiP becomes active or
+  /// the app returns to the foreground.
+  @ObservationIgnored
+  var audioSessionBackgroundPauseTask: Task<Void, Never>?
+
+  /// Tracks UIKit lifecycle independently of PiP activity. If PiP stops while
+  /// the app is still backgrounded, managed playback must not continue as
+  /// hidden audio indefinitely.
+  @ObservationIgnored
+  var isApplicationInBackground = false
+
+  /// True only when SwiftVLC paused native playback for device/app lifecycle
+  /// while deliberately preserving the user's active playback intent. This is
+  /// the gate that lets foreground/reset recovery resume that exact pause
+  /// without ever resuming a user-paused player.
+  @ObservationIgnored
+  var isPlaybackSuspendedForManagedAudioLifecycle = false
+
+  /// Independent from app/device lifecycle suspension: media services can be
+  /// lost while the app is also backgrounded. Each recovery signal clears only
+  /// its own cause, and playback resumes after the final cause is gone.
+  @ObservationIgnored
+  var isPlaybackSuspendedForMediaServices = false
 
   /// Broadcasts ``PiPEvent``s to every ``pipEvents`` subscriber.
   /// Terminated in deinit so subscribers' streams finish with the
@@ -616,6 +642,7 @@ public final class PiPController: NSObject {
     timingObserverTask?.cancel()
     playbackIntentObserverTask?.cancel()
     cadenceObserverTask?.cancel()
+    audioSessionBackgroundPauseTask?.cancel()
     possibleObservation = nil
     activeObservation = nil
     stopAudioSessionObserversIfManaged()
@@ -844,6 +871,7 @@ public final class PiPController: NSObject {
   func updatePiPActive(_ isActive: Bool) {
     guard self.isActive != isActive else { return }
     self.isActive = isActive
+    handlePiPActiveChangedForManagedAudioSession(isActive)
     publishPiPSnapshot()
   }
 

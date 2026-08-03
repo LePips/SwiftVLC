@@ -1,5 +1,8 @@
 #if os(iOS) || os(macOS)
 import AVFoundation
+#if os(iOS)
+import UIKit
+#endif
 
 // MARK: - Audio-session policy
 
@@ -81,6 +84,17 @@ extension PiPController {
     /// The media server restarted. Every session object is invalid and the
     /// category has to be set again from scratch.
     case mediaServicesReset
+    /// The media server became unavailable. Playback is suspended while
+    /// preserving intent until the subsequent reset notification.
+    case mediaServicesLost
+    /// UIKit completed backgrounding while no PiP window was active.
+    /// `isPictureInPictureActive` is captured after a bounded grace period so
+    /// an automatic PiP start is not mistaken for hidden background playback.
+    case enteredBackground(isPictureInPictureActive: Bool)
+    /// Protected data became unavailable, which is UIKit's device-lock signal.
+    case deviceLocked(isPictureInPictureActive: Bool)
+    /// UIKit is returning to the foreground.
+    case enteringForeground
   }
 
   /// What a disruption implies for the managed session.
@@ -95,6 +109,22 @@ extension PiPController {
     /// Pause playback, because continuing would be wrong rather than merely
     /// silent.
     var pausesPlayback = false
+    /// Issue a lifecycle pause without changing the user's active playback
+    /// intent, so only SwiftVLC's own pause can be recovered on foreground.
+    var preservesPlaybackIntentWhenPausing = false
+    /// Resume a pause previously issued by the managed lifecycle path.
+    var resumesManagedSuspendedPlayback = false
+    /// Record app/device lifecycle as one cause of the managed pause.
+    var marksLifecycleSuspension = false
+    /// Record lost media services as another independent pause cause.
+    var marksMediaServicesSuspension = false
+    /// Give up audio focus after hidden playback has been suspended.
+    var deactivatesSession = false
+    /// Forget a previous lifecycle suspension without resuming it, e.g. after
+    /// the user explicitly paused while the app was backgrounded.
+    var clearsLifecycleSuspension = false
+    /// Clear the media-services cause after a reset.
+    var clearsMediaServicesSuspension = false
   }
 
   /// Decides the response to a session disruption.
@@ -122,7 +152,9 @@ extension PiPController {
   nonisolated static func reaction(
     to disruption: AudioSessionDisruption,
     isPlaybackIntentActive: Bool,
-    managesAudioSession: Bool
+    managesAudioSession: Bool,
+    wasPlaybackSuspendedForLifecycle: Bool = false,
+    wasPlaybackSuspendedForMediaServices: Bool = false
   )
     -> AudioSessionReaction {
     guard managesAudioSession else { return AudioSessionReaction() }
@@ -132,18 +164,63 @@ extension PiPController {
       return AudioSessionReaction(clearsActivationLatch: true)
 
     case .interruptionEnded(let shouldResume):
-      let resumes = shouldResume && isPlaybackIntentActive
+      let resumes = shouldResume
+        && isPlaybackIntentActive
+        && !wasPlaybackSuspendedForLifecycle
+        && !wasPlaybackSuspendedForMediaServices
       return AudioSessionReaction(clearsActivationLatch: !resumes, reactivates: resumes)
 
     case .routeLost:
       // The session itself is still valid, so the latch stands.
-      return AudioSessionReaction(pausesPlayback: true)
+      return AudioSessionReaction(
+        pausesPlayback: true,
+        clearsLifecycleSuspension: wasPlaybackSuspendedForLifecycle,
+        clearsMediaServicesSuspension: wasPlaybackSuspendedForMediaServices
+      )
+
+    case .mediaServicesLost:
+      let isAlreadySuspended = wasPlaybackSuspendedForLifecycle
+        || wasPlaybackSuspendedForMediaServices
+      return AudioSessionReaction(
+        clearsActivationLatch: true,
+        pausesPlayback: isPlaybackIntentActive && !isAlreadySuspended,
+        preservesPlaybackIntentWhenPausing: true,
+        marksMediaServicesSuspension: isPlaybackIntentActive
+      )
 
     case .mediaServicesReset:
+      let resumes = isPlaybackIntentActive
+        && wasPlaybackSuspendedForMediaServices
+        && !wasPlaybackSuspendedForLifecycle
       return AudioSessionReaction(
         clearsActivationLatch: !isPlaybackIntentActive,
         reconfiguresCategory: true,
-        reactivates: isPlaybackIntentActive
+        reactivates: isPlaybackIntentActive && !wasPlaybackSuspendedForLifecycle,
+        resumesManagedSuspendedPlayback: resumes,
+        clearsMediaServicesSuspension: wasPlaybackSuspendedForMediaServices
+      )
+
+    case .enteredBackground(let isPictureInPictureActive),
+         .deviceLocked(let isPictureInPictureActive):
+      guard !isPictureInPictureActive else { return AudioSessionReaction() }
+      let isAlreadySuspended = wasPlaybackSuspendedForLifecycle
+        || wasPlaybackSuspendedForMediaServices
+      return AudioSessionReaction(
+        clearsActivationLatch: true,
+        pausesPlayback: isPlaybackIntentActive && !isAlreadySuspended,
+        preservesPlaybackIntentWhenPausing: true,
+        marksLifecycleSuspension: isPlaybackIntentActive,
+        deactivatesSession: true
+      )
+
+    case .enteringForeground:
+      let resumes = isPlaybackIntentActive
+        && wasPlaybackSuspendedForLifecycle
+        && !wasPlaybackSuspendedForMediaServices
+      return AudioSessionReaction(
+        reactivates: resumes,
+        resumesManagedSuspendedPlayback: resumes,
+        clearsLifecycleSuspension: wasPlaybackSuspendedForLifecycle
       )
     }
   }
@@ -151,6 +228,27 @@ extension PiPController {
   /// Applies a decided reaction. Split from ``reaction(to:isPlaybackIntentActive:managesAudioSession:)``
   /// so the rules stay testable and only the effects need a live session.
   func apply(_ reaction: AudioSessionReaction) {
+    var pauseAccepted = !reaction.pausesPlayback
+    if reaction.pausesPlayback {
+      let attempt = playbackDriver.pause(
+        nil,
+        !reaction.preservesPlaybackIntentWhenPausing
+      )
+      pauseAccepted = attempt.accepted
+    }
+    let wasAlreadySuspended = isPlaybackSuspendedForManagedAudioLifecycle
+      || isPlaybackSuspendedForMediaServices
+    if pauseAccepted || wasAlreadySuspended {
+      if reaction.marksLifecycleSuspension {
+        isPlaybackSuspendedForManagedAudioLifecycle = true
+      }
+      if reaction.marksMediaServicesSuspension {
+        isPlaybackSuspendedForMediaServices = true
+      }
+    }
+    if reaction.deactivatesSession {
+      deactivateAudioSessionIfNeeded()
+    }
     if reaction.clearsActivationLatch {
       hasActivatedAudioSession = false
     }
@@ -165,9 +263,40 @@ extension PiPController {
       hasActivatedAudioSession = false
       activateAudioSessionIfNeeded()
     }
-    if reaction.pausesPlayback {
-      _ = playbackDriver.pause(nil, true)
+    var resumedManagedSuspension = false
+    if
+      reaction.resumesManagedSuspendedPlayback,
+      hasActivatedAudioSession,
+      isPlaybackSuspendedForManagedAudioLifecycle
+      || isPlaybackSuspendedForMediaServices,
+      player.isPlaybackRequestedActive,
+      playbackDriver.resume() {
+      resumedManagedSuspension = true
     }
+    if
+      reaction.clearsLifecycleSuspension,
+      !reaction.resumesManagedSuspendedPlayback || resumedManagedSuspension {
+      isPlaybackSuspendedForManagedAudioLifecycle = false
+    }
+    if
+      reaction.clearsMediaServicesSuspension,
+      !reaction.resumesManagedSuspendedPlayback || resumedManagedSuspension {
+      isPlaybackSuspendedForMediaServices = false
+    }
+  }
+
+  /// Returns audio focus to other apps after SwiftVLC has suspended hidden
+  /// playback. Failures are intentionally non-terminal: the activation latch
+  /// is still cleared, and foreground recovery will perform a fresh category
+  /// setup and activation rather than trusting stale process state.
+  func deactivateAudioSessionIfNeeded() {
+    #if os(iOS)
+    guard managesAudioSession, hasActivatedAudioSession else { return }
+    try? AVAudioSession.sharedInstance().setActive(
+      false,
+      options: .notifyOthersOnDeactivation
+    )
+    #endif
   }
 
   #if os(iOS)
@@ -180,6 +309,14 @@ extension PiPController {
     guard managesAudioSession else { return }
     let center = NotificationCenter.default
     let session = AVAudioSession.sharedInstance()
+
+    // A controller can be constructed by a background task after UIKit has
+    // already posted didEnterBackground. Seed the current state so that path
+    // receives the same bounded hidden-playback policy as a live transition.
+    isApplicationInBackground = UIApplication.shared.applicationState == .background
+    if isApplicationInBackground {
+      scheduleBackgroundPauseIfNeeded(after: .seconds(1))
+    }
 
     audioSessionObservers = [
       center.addObserver(
@@ -204,12 +341,49 @@ extension PiPController {
         }
       },
       center.addObserver(
+        forName: AVAudioSession.mediaServicesWereLostNotification,
+        object: session,
+        queue: .main
+      ) { [weak self] _ in
+        MainActor.assumeIsolated {
+          self?.react(to: .mediaServicesLost)
+        }
+      },
+      center.addObserver(
         forName: AVAudioSession.mediaServicesWereResetNotification,
         object: session,
         queue: .main
       ) { [weak self] _ in
         MainActor.assumeIsolated {
           self?.react(to: .mediaServicesReset)
+        }
+      },
+      center.addObserver(
+        forName: UIApplication.didEnterBackgroundNotification,
+        object: nil,
+        queue: .main
+      ) { [weak self] _ in
+        MainActor.assumeIsolated {
+          self?.applicationDidEnterBackground()
+        }
+      },
+      center.addObserver(
+        forName: UIApplication.willEnterForegroundNotification,
+        object: nil,
+        queue: .main
+      ) { [weak self] _ in
+        MainActor.assumeIsolated {
+          self?.applicationWillEnterForeground()
+        }
+      },
+      center.addObserver(
+        forName: UIApplication.protectedDataWillBecomeUnavailableNotification,
+        object: nil,
+        queue: .main
+      ) { [weak self] _ in
+        MainActor.assumeIsolated {
+          guard let self else { return }
+          self.react(to: .deviceLocked(isPictureInPictureActive: self.isActive))
         }
       }
     ]
@@ -245,6 +419,53 @@ extension PiPController {
   }
   #endif
 
+  /// Gives automatic PiP a bounded interval to become active before treating
+  /// background playback as hidden audio. AVKit's start callbacks can arrive
+  /// after UIKit's background notification, so an immediate `isActive` check
+  /// races a valid automatic transition.
+  func applicationDidEnterBackground(
+    pauseGrace: Duration = .seconds(1)
+  ) {
+    isApplicationInBackground = true
+    scheduleBackgroundPauseIfNeeded(after: pauseGrace)
+  }
+
+  func applicationWillEnterForeground() {
+    isApplicationInBackground = false
+    audioSessionBackgroundPauseTask?.cancel()
+    audioSessionBackgroundPauseTask = nil
+    react(to: .enteringForeground)
+  }
+
+  func handlePiPActiveChangedForManagedAudioSession(_ isActive: Bool) {
+    guard managesAudioSession else { return }
+    if isActive {
+      audioSessionBackgroundPauseTask?.cancel()
+      audioSessionBackgroundPauseTask = nil
+    } else if isApplicationInBackground {
+      scheduleBackgroundPauseIfNeeded(after: .zero)
+    }
+  }
+
+  private func scheduleBackgroundPauseIfNeeded(after grace: Duration) {
+    guard managesAudioSession, isApplicationInBackground, !isActive else { return }
+    audioSessionBackgroundPauseTask?.cancel()
+    audioSessionBackgroundPauseTask = Task { @MainActor [weak self] in
+      do {
+        try await Task.sleep(for: grace)
+      } catch {
+        return
+      }
+      guard
+        let self,
+        isApplicationInBackground,
+        !self.isActive
+      else { return }
+      audioSessionBackgroundPauseTask = nil
+      react(to: .enteredBackground(isPictureInPictureActive: false))
+    }
+  }
+
   /// Platform-neutral entry points, so the shared initializers and `deinit`
   /// do not need their own `#if`. macOS has no `AVAudioSession` and nothing to
   /// observe.
@@ -266,7 +487,11 @@ extension PiPController {
       Self.reaction(
         to: disruption,
         isPlaybackIntentActive: player.isPlaybackRequestedActive,
-        managesAudioSession: managesAudioSession
+        managesAudioSession: managesAudioSession,
+        wasPlaybackSuspendedForLifecycle:
+        isPlaybackSuspendedForManagedAudioLifecycle,
+        wasPlaybackSuspendedForMediaServices:
+        isPlaybackSuspendedForMediaServices
       )
     )
   }

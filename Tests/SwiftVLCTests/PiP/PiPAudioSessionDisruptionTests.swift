@@ -18,13 +18,17 @@ struct PiPAudioSessionDisruptionTests {
   private func reaction(
     _ disruption: PiPController.AudioSessionDisruption,
     playing: Bool = true,
-    managed: Bool = true
+    managed: Bool = true,
+    lifecycleSuspended: Bool = false,
+    mediaServicesSuspended: Bool = false
   )
     -> PiPController.AudioSessionReaction {
     PiPController.reaction(
       to: disruption,
       isPlaybackIntentActive: playing,
-      managesAudioSession: managed
+      managesAudioSession: managed,
+      wasPlaybackSuspendedForLifecycle: lifecycleSuspended,
+      wasPlaybackSuspendedForMediaServices: mediaServicesSuspended
     )
   }
 
@@ -92,13 +96,134 @@ struct PiPAudioSessionDisruptionTests {
     #expect(result.clearsActivationLatch)
   }
 
+  @Test
+  func `Losing media services suspends playback without changing intent`() {
+    let result = reaction(.mediaServicesLost)
+    #expect(result.clearsActivationLatch)
+    #expect(result.pausesPlayback)
+    #expect(result.preservesPlaybackIntentWhenPausing)
+    #expect(!result.reactivates)
+  }
+
+  @Test
+  func `A media services reset resumes only its own suspension`() {
+    let result = reaction(.mediaServicesReset, lifecycleSuspended: true)
+    #expect(result.reconfiguresCategory)
+    #expect(!result.reactivates)
+    #expect(!result.resumesManagedSuspendedPlayback)
+
+    let mediaServicesPause = reaction(
+      .mediaServicesReset,
+      mediaServicesSuspended: true
+    )
+    #expect(mediaServicesPause.reactivates)
+    #expect(mediaServicesPause.resumesManagedSuspendedPlayback)
+
+    let userPaused = reaction(
+      .mediaServicesReset,
+      playing: false,
+      mediaServicesSuspended: true
+    )
+    #expect(!userPaused.reactivates)
+    #expect(!userPaused.resumesManagedSuspendedPlayback)
+    #expect(userPaused.clearsMediaServicesSuspension)
+  }
+
+  @Test
+  func `Background without PiP suspends hidden playback and releases focus`() {
+    let result = reaction(.enteredBackground(isPictureInPictureActive: false))
+    #expect(result.clearsActivationLatch)
+    #expect(result.pausesPlayback)
+    #expect(result.preservesPlaybackIntentWhenPausing)
+    #expect(result.deactivatesSession)
+  }
+
+  @Test
+  func `Background with active PiP preserves playback and audio focus`() {
+    #expect(
+      reaction(.enteredBackground(isPictureInPictureActive: true))
+        == PiPController.AudioSessionReaction()
+    )
+  }
+
+  @Test
+  func `Device lock has the same deterministic suspension policy`() {
+    let result = reaction(.deviceLocked(isPictureInPictureActive: false))
+    #expect(result.pausesPlayback)
+    #expect(result.preservesPlaybackIntentWhenPausing)
+    #expect(result.deactivatesSession)
+
+    #expect(
+      reaction(.deviceLocked(isPictureInPictureActive: true))
+        == PiPController.AudioSessionReaction()
+    )
+  }
+
+  @Test
+  func `Duplicate lifecycle signals do not issue duplicate pauses`() {
+    let result = reaction(
+      .deviceLocked(isPictureInPictureActive: false),
+      lifecycleSuspended: true
+    )
+    #expect(!result.pausesPlayback)
+    #expect(result.deactivatesSession)
+    #expect(result.clearsActivationLatch)
+  }
+
+  @Test
+  func `Foreground resumes only playback suspended by lifecycle`() {
+    let result = reaction(.enteringForeground, lifecycleSuspended: true)
+    #expect(result.reactivates)
+    #expect(result.resumesManagedSuspendedPlayback)
+
+    let ordinaryPlayback = reaction(.enteringForeground)
+    #expect(!ordinaryPlayback.reactivates)
+    #expect(!ordinaryPlayback.resumesManagedSuspendedPlayback)
+
+    let userPaused = reaction(
+      .enteringForeground,
+      playing: false,
+      lifecycleSuspended: true
+    )
+    #expect(!userPaused.reactivates)
+    #expect(!userPaused.resumesManagedSuspendedPlayback)
+    #expect(userPaused.clearsLifecycleSuspension)
+  }
+
+  @Test
+  func `Overlapping background and media outage wait for both recoveries`() {
+    let resetWhileBackgrounded = reaction(
+      .mediaServicesReset,
+      lifecycleSuspended: true,
+      mediaServicesSuspended: true
+    )
+    #expect(!resetWhileBackgrounded.reactivates)
+    #expect(!resetWhileBackgrounded.resumesManagedSuspendedPlayback)
+    #expect(resetWhileBackgrounded.clearsMediaServicesSuspension)
+    #expect(!resetWhileBackgrounded.clearsLifecycleSuspension)
+
+    let foregroundWhileServicesAreLost = reaction(
+      .enteringForeground,
+      lifecycleSuspended: true,
+      mediaServicesSuspended: true
+    )
+    #expect(!foregroundWhileServicesAreLost.reactivates)
+    #expect(!foregroundWhileServicesAreLost.resumesManagedSuspendedPlayback)
+    #expect(foregroundWhileServicesAreLost.clearsLifecycleSuspension)
+    #expect(!foregroundWhileServicesAreLost.clearsMediaServicesSuspension)
+  }
+
   /// A library told not to manage the session must not manage it on the way
   /// out either — including not pausing the host app's playback.
   @Test(arguments: [
     PiPController.AudioSessionDisruption.interruptionBegan,
     .interruptionEnded(shouldResume: true),
     .routeLost,
-    .mediaServicesReset
+    .mediaServicesLost,
+    .mediaServicesReset,
+    .enteredBackground(isPictureInPictureActive: false),
+    .deviceLocked(isPictureInPictureActive: false),
+    .enteringForeground
   ])
   func `An unmanaged session is never touched`(disruption: PiPController.AudioSessionDisruption) {
     #expect(
@@ -117,14 +242,21 @@ extension Integration {
     @MainActor
     final class PauseRecorder {
       var pauseCount = 0
+      var pauseRecordsPlaybackIntent: [Bool] = []
+      var resumeCount = 0
+      var acceptsResume = true
 
       var driver: PiPController.PlaybackDriver {
         .init(
-          pause: { _, _ in
+          pause: { _, recordsPlaybackIntent in
             self.pauseCount += 1
+            self.pauseRecordsPlaybackIntent.append(recordsPlaybackIntent)
             return .init(accepted: true, playbackControlRevision: nil)
           },
-          resume: { true },
+          resume: {
+            self.resumeCount += 1
+            return self.acceptsResume
+          },
           cancelPendingPause: { _, _, _ in },
           shouldResume: { false },
           skip: { _ in .init(resolved: .settled) }
@@ -191,6 +323,77 @@ extension Integration {
 
       #expect(recorder.pauseCount == 0, "an unmanaged controller paused the host app's playback")
       #expect(controller.hasActivatedAudioSession)
+      await player.shutdown()
+    }
+
+    @Test
+    func `Background grace is cancelled when automatic PiP becomes active`() async {
+      let player = Player(instance: TestInstance.makeAudioOnly())
+      let recorder = PauseRecorder()
+      let controller = makeController(player: player, recorder: recorder)
+      player.setPlaybackIntentFromExternalControl(true)
+
+      controller.applicationDidEnterBackground(pauseGrace: .milliseconds(50))
+      controller.handlePiPActiveChangedForManagedAudioSession(true)
+      try? await Task.sleep(for: .milliseconds(100))
+
+      #expect(recorder.pauseCount == 0)
+      #expect(!controller.isPlaybackSuspendedForManagedAudioLifecycle)
+      controller.applicationWillEnterForeground()
+      await player.shutdown()
+    }
+
+    @Test
+    func `Stopping PiP in background suspends playback immediately`() async {
+      let player = Player(instance: TestInstance.makeAudioOnly())
+      let recorder = PauseRecorder()
+      let controller = makeController(player: player, recorder: recorder)
+      player.setPlaybackIntentFromExternalControl(true)
+      controller.hasActivatedAudioSession = true
+      controller.isApplicationInBackground = true
+      controller.handlePiPActiveChangedForManagedAudioSession(false)
+      for _ in 0..<20 where recorder.pauseCount == 0 {
+        await Task.yield()
+      }
+
+      #expect(recorder.pauseCount == 1)
+      #expect(recorder.pauseRecordsPlaybackIntent == [false])
+      #expect(controller.isPlaybackSuspendedForManagedAudioLifecycle)
+      #expect(!controller.hasActivatedAudioSession)
+      controller.applicationWillEnterForeground()
+      await player.shutdown()
+    }
+
+    @Test
+    func `A lifecycle pause resumes only after activation and accepted resume`() async {
+      let player = Player(instance: TestInstance.makeAudioOnly())
+      let recorder = PauseRecorder()
+      let controller = makeController(player: player, recorder: recorder)
+      player.setPlaybackIntentFromExternalControl(true)
+      controller.isPlaybackSuspendedForManagedAudioLifecycle = true
+      controller.hasActivatedAudioSession = true
+
+      controller.apply(
+        .init(
+          resumesManagedSuspendedPlayback: true,
+          clearsLifecycleSuspension: true
+        )
+      )
+
+      #expect(recorder.resumeCount == 1)
+      #expect(!controller.isPlaybackSuspendedForManagedAudioLifecycle)
+
+      controller.isPlaybackSuspendedForManagedAudioLifecycle = true
+      recorder.acceptsResume = false
+      controller.apply(
+        .init(
+          resumesManagedSuspendedPlayback: true,
+          clearsLifecycleSuspension: true
+        )
+      )
+
+      #expect(recorder.resumeCount == 2)
+      #expect(controller.isPlaybackSuspendedForManagedAudioLifecycle)
       await player.shutdown()
     }
   }
