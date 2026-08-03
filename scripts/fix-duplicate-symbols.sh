@@ -1,12 +1,19 @@
 #!/usr/bin/env bash
 #
-# fix-duplicate-symbols.sh — Fix duplicate json symbols in libvlc static libraries
+# fix-duplicate-symbols.sh — Fix and normalize libvlc static libraries
 #
 # Two VLC plugins (ytdl and chromecast) each compile their own copy of
 # json_parse_error and json_read. The Apple linker in Xcode 16+ treats
 # duplicate global symbols as errors (especially on Mac Catalyst). This
 # script localizes one copy with nmedit so only a single global definition
 # remains.
+#
+# Apple's archive tools can also emit byte-different __.SYMDEF indexes for
+# identical object members (observed in both tvOS slices). `ranlib -D`
+# regenerates a sorted, zero-timestamp index deterministically. Every thin
+# architecture is normalized before universal archives are reassembled so two
+# clean builds have byte-identical static libraries, not merely identical
+# extracted objects.
 #
 # The localization targets the ytdl object, never the chromecast one.
 # nmedit rewrites the symbol table of whatever object it edits, which can
@@ -205,8 +212,14 @@ fix_static_lib() (
         -o "$REPACKED" "$THIN"
       mv "$REPACKED" "$THIN"
       verify_macho_archive_alignment "$THIN"
-      CHANGED=true
     fi
+
+    # Normalize the table of contents even when no duplicate JSON symbol was
+    # present. The object members can be identical while Apple's generated
+    # __.SYMDEF differs in size and ordering between clean builds.
+    xcrun ranlib -D "$THIN"
+    verify_macho_archive_alignment "$THIN"
+    CHANGED=true
 
     verify_thin_archive "$THIN" "$ARCH"
   done
@@ -221,7 +234,7 @@ fix_static_lib() (
     else
       cp "${WORK_DIR}/${ARCHS[0]}.a" "$LIB_PATH"
     fi
-    echo "  Fixed: $LIB_PATH"
+    echo "  Normalized: $LIB_PATH"
   fi
 
   verify_static_lib "$LIB_PATH"

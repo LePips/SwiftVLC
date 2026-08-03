@@ -55,6 +55,7 @@ BUILD_CATALYST=no
 # official VLC release builds ship. Developers debugging codec internals can
 # restore the asserts with --with-asserts.
 WITH_ASSERTS=no
+CLEAN_BUILD=no
 
 # Keep these deployment targets in sync with Package.swift.
 SWIFTVLC_MIN_IOS="18.0"
@@ -64,6 +65,7 @@ SWIFTVLC_MIN_MACOS="15.0"
 SWIFTVLC_MIN_CATALYST="18.0"
 
 BUILD_START_TIME=$(date +%s)
+BUILD_INVOCATION_ID=$(uuidgen | tr '[:upper:]' '[:lower:]')
 
 if [ -z "$MAKEFLAGS" ]; then
     MAKEFLAGS="-j$(sysctl -n machdep.cpu.core_count || nproc)"
@@ -262,6 +264,7 @@ for arg in "$@"; do
         --clean-build)
             echo "Removing build directory: ${BUILD_DIR}"
             rm -rf "${BUILD_DIR}"
+            CLEAN_BUILD=yes
             echo "Continuing with fresh build..."
             ;;
         --with-asserts)
@@ -667,6 +670,17 @@ if [ "${SOURCE_SHA}" != "${TARGET_SHA}" ]; then
     error "VLC source revision mismatch: expected ${TARGET_SHA}, found ${SOURCE_SHA}"
 fi
 info "VLC source provenance: ${SOURCE_SHA}"
+
+# Make compiler date/time macros deterministic. VLC's help object embeds
+# __DATE__ and __TIME__; without SOURCE_DATE_EPOCH, two otherwise identical
+# clean builds differ by their wall-clock compilation time. Deriving the
+# epoch from the pinned commit makes it stable and auditable.
+SOURCE_DATE_EPOCH=$(git -C "${VLC_SRC}" show -s --format=%ct "${SOURCE_SHA}")
+if ! [[ "${SOURCE_DATE_EPOCH}" =~ ^[0-9]+$ ]]; then
+    error "Invalid SOURCE_DATE_EPOCH derived from ${SOURCE_SHA}"
+fi
+export SOURCE_DATE_EPOCH
+info "Reproducible build epoch: ${SOURCE_DATE_EPOCH} (pinned commit timestamp)"
 
 # --- Step 1b: Apply patches ---
 if [ -n "${PATCHES_DIR}" ] && [ -d "${PATCHES_DIR}" ]; then
@@ -1452,10 +1466,39 @@ fi
 info "Creating libvlc.xcframework..."
 mkdir -p "${OUTPUT_DIR}"
 rm -rf "${OUTPUT_DIR}/libvlc.xcframework"
+rm -f "${OUTPUT_DIR}/libvlc-provenance.json" \
+    "${OUTPUT_DIR}/libvlc-reproducibility.json"
 
 xcodebuild -create-xcframework \
     "${XCFRAMEWORK_ARGS[@]}" \
     -output "${OUTPUT_DIR}/libvlc.xcframework"
+
+# xcodebuild writes AvailableLibraries in completion order rather than input
+# order, so two identical builds can serialize the same slice records in a
+# different sequence. Canonicalize the list and dictionary keys before hashing
+# or publishing the artifact.
+info "Normalizing XCFramework metadata..."
+python3 - "${OUTPUT_DIR}/libvlc.xcframework/Info.plist" <<'PYEOF'
+import plistlib
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+info = plistlib.loads(path.read_bytes())
+libraries = info.get("AvailableLibraries")
+if not isinstance(libraries, list) or not libraries:
+    raise SystemExit(f"Error: {path} has no AvailableLibraries")
+identifiers = [item.get("LibraryIdentifier") for item in libraries]
+if any(not isinstance(identifier, str) or not identifier for identifier in identifiers):
+    raise SystemExit(f"Error: {path} has an invalid library identifier")
+if len(set(identifiers)) != len(identifiers):
+    raise SystemExit(f"Error: {path} has duplicate library identifiers")
+info["AvailableLibraries"] = sorted(
+    libraries,
+    key=lambda item: item["LibraryIdentifier"],
+)
+path.write_bytes(plistlib.dumps(info, fmt=plistlib.FMT_XML, sort_keys=True))
+PYEOF
 
 # Fix duplicate symbols (json_parse_error/json_read) in the static library.
 # Two VLC plugins (ytdl, chromecast) each compile their own copy. The Apple
@@ -1470,39 +1513,18 @@ info "Fixing duplicate symbols in static libraries..."
 find "${OUTPUT_DIR}/libvlc.xcframework" -name "module.modulemap" -delete
 find "${OUTPUT_DIR}/libvlc.xcframework" -name "CLibVLC.h" -delete
 
+info "Stripping release debug symbols before reproducibility hashing..."
+find "${OUTPUT_DIR}/libvlc.xcframework" -name '*.a' -exec strip -S {} \;
+
+# `strip` rebuilds each archive's __.SYMDEF member and stamps that member with
+# the current wall-clock time. The object payloads are unchanged, but those few
+# header bytes make otherwise identical clean builds hash differently. Reset
+# the archive indexes after the final mutating step so provenance covers the
+# exact deterministic artifact that will be released.
+info "Normalizing archive indexes after stripping..."
+find "${OUTPUT_DIR}/libvlc.xcframework" -name '*.a' -exec xcrun ranlib -D {} \;
+
 info "Created: ${OUTPUT_DIR}/libvlc.xcframework"
-
-# --- Step 4b: Record what produced it ---
-#
-# `release.sh` packages whatever xcframework is sitting in Vendor/. Without a
-# record of the inputs it cannot tell a fresh build from one made months ago
-# against a different pin or patch set, so a stale binary could be published as
-# a new release and nothing would notice. That is issue #97's second acceptance
-# criterion.
-#
-# Written last, after every slice succeeded, so a partial build leaves no
-# provenance rather than provenance describing an artifact that was never
-# finished.
-PROVENANCE_FILE="${OUTPUT_DIR}/libvlc-provenance.json"
-manifest_digest="none"
-if [ -n "${PATCHES_DIR}" ] && [ -f "${PATCHES_DIR}/manifest.sha256" ]; then
-    manifest_digest=$(shasum -a 256 "${PATCHES_DIR}/manifest.sha256" | cut -d' ' -f1)
-fi
-slice_list=$(find "${OUTPUT_DIR}/libvlc.xcframework" -maxdepth 1 -mindepth 1 -type d \
-    -exec basename {} \; | sort | paste -sd, -)
-
-cat > "${PROVENANCE_FILE}" <<PROVENANCE
-{
-  "vlcSourceRevision": "${SOURCE_SHA}",
-  "pinnedRevision": "${VLC_HASH}",
-  "patchManifestDigest": "${manifest_digest}",
-  "assertionsEnabled": "${WITH_ASSERTS}",
-  "slices": "${slice_list}",
-  "xcodeBuildVersion": "$(xcodebuild -version 2>/dev/null | head -1)",
-  "builtAt": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-}
-PROVENANCE
-info "Recorded build provenance: ${PROVENANCE_FILE}"
 
 # --- Step 5: Verify ---
 #
@@ -1568,6 +1590,43 @@ verify_deployment_targets() {
 }
 
 verify_deployment_targets
+
+# --- Step 6: Record the verified, release-ready artifact ---
+#
+# Provenance is deliberately written only after every deployment-target check
+# passes. The artifact is also stripped above, before hashing, so the two-clean-
+# build proof covers the exact tree release.sh packages; no post-proof rebind is
+# permitted.
+PROVENANCE_FILE="${OUTPUT_DIR}/libvlc-provenance.json"
+provenance_args=(
+    python3 "${SCRIPT_DIR}/libvlc-provenance.py" create
+    --xcframework "${OUTPUT_DIR}/libvlc.xcframework"
+    --output "${PROVENANCE_FILE}"
+    --vlc-source "${VLC_SRC}"
+    --source-revision "${SOURCE_SHA}"
+    --pinned-revision "${VLC_HASH}"
+    --source-date-epoch "${SOURCE_DATE_EPOCH}"
+    --build-invocation-id "${BUILD_INVOCATION_ID}"
+    --build-configuration-file "build-libvlc.sh=${SCRIPT_DIR}/build-libvlc.sh"
+    --build-configuration-file "fix-duplicate-symbols.sh=${SCRIPT_DIR}/fix-duplicate-symbols.sh"
+    --make-flags="${MAKEFLAGS}"
+    --deployment-target "ios=${SWIFTVLC_MIN_IOS}"
+    --deployment-target "tvos=${SWIFTVLC_MIN_TVOS}"
+    --deployment-target "xros=${SWIFTVLC_MIN_VISIONOS}"
+    --deployment-target "macos=${SWIFTVLC_MIN_MACOS}"
+    --deployment-target "catalyst=${SWIFTVLC_MIN_CATALYST}"
+)
+if [ -n "${PATCHES_DIR}" ] && [ -f "${PATCHES_DIR}/manifest.sha256" ]; then
+    provenance_args+=(--patch-manifest "${PATCHES_DIR}/manifest.sha256")
+fi
+if [ "${WITH_ASSERTS}" = "yes" ]; then
+    provenance_args+=(--assertions-enabled)
+fi
+if [ "${CLEAN_BUILD}" = "yes" ]; then
+    provenance_args+=(--clean-build)
+fi
+"${provenance_args[@]}"
+info "Recorded verified build provenance: ${PROVENANCE_FILE}"
 
 echo ""
 info "Build complete!"
