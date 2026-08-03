@@ -66,6 +66,80 @@ extension Integration {
       }
     }
 
+    private final class CapturedFrame: @unchecked Sendable {
+      struct Snapshot: @unchecked Sendable {
+        var buffer: CVPixelBuffer?
+        var count: UInt64 = 0
+      }
+
+      let snapshot = Mutex(Snapshot())
+
+      func record(_ sample: CMSampleBuffer) {
+        guard let buffer = CMSampleBufferGetImageBuffer(sample) else { return }
+        snapshot.withLock {
+          $0.buffer = buffer
+          $0.count &+= 1
+        }
+      }
+    }
+
+    private final class CapturingHarness {
+      let layer: AVSampleBufferDisplayLayer
+      let renderer: PixelBufferRenderer
+      let registration: DirectPiPVideoCallbackRegistration
+      let capture: CapturedFrame
+
+      @MainActor
+      init(attachedTo player: Player) {
+        layer = AVSampleBufferDisplayLayer()
+        capture = CapturedFrame()
+        let capture = capture
+        renderer = PixelBufferRenderer(
+          displayLayer: layer,
+          displayLayerAPI: PixelBufferDisplayLayerAPI(
+            status: { _ in .rendering },
+            requiresFlush: { _ in false },
+            flush: { _ in },
+            isReadyForMoreMediaData: { _ in true },
+            enqueue: { _, sample in capture.record(sample) }
+          )
+        )
+        registration = DirectPiPVideoCallbackRegistration(renderer: renderer)
+        player.claimDirectPiPVideoCallbacks(registration)
+      }
+
+      var frameCount: UInt64 {
+        capture.snapshot.withLock { $0.count }
+      }
+
+      func rgbSum() -> UInt64? {
+        guard let buffer = capture.snapshot.withLock({ $0.buffer }) else { return nil }
+        guard CVPixelBufferGetPixelFormatType(buffer) == kCVPixelFormatType_32BGRA else {
+          return nil
+        }
+        CVPixelBufferLockBaseAddress(buffer, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
+        guard let baseAddress = CVPixelBufferGetBaseAddress(buffer) else { return nil }
+
+        let width = CVPixelBufferGetWidth(buffer)
+        let height = CVPixelBufferGetHeight(buffer)
+        let bytesPerRow = CVPixelBufferGetBytesPerRow(buffer)
+        var sum: UInt64 = 0
+        for row in 0..<height {
+          let pixels = baseAddress
+            .advanced(by: row * bytesPerRow)
+            .assumingMemoryBound(to: UInt8.self)
+          for column in 0..<width {
+            let offset = column * 4
+            sum &+= UInt64(pixels[offset])
+            sum &+= UInt64(pixels[offset + 1])
+            sum &+= UInt64(pixels[offset + 2])
+          }
+        }
+        return sum
+      }
+    }
+
     /// The foundation: a real decode reaches the renderer and is converted.
     ///
     /// If this fails, the vmem path is not carrying pictures and nothing else
@@ -81,6 +155,42 @@ extension Integration {
       try #require(
         await poll(timeout: .seconds(30), until: { harness.creations > 0 }),
         "no decoded frame reached the renderer, so the vmem path is not carrying pictures"
+      )
+    }
+
+    @Test(.timeLimit(.minutes(2)))
+    func `Direct PiP buffers include VLC subtitle blending`() async throws {
+      let baselinePlayer = Player(instance: TestInstance.makeVideoDecoding())
+      let baselineHarness = CapturingHarness(attachedTo: baselinePlayer)
+      try baselinePlayer.play(url: TestMedia.twosecURL)
+      defer { baselinePlayer.stop() }
+      try #require(
+        await poll(timeout: .seconds(30), until: { baselineHarness.frameCount > 2 }),
+        "no baseline video frames reached the direct PiP renderer"
+      )
+      let baseline = try #require(baselineHarness.rgbSum())
+      baselinePlayer.stop()
+
+      let subtitlePlayer = Player(instance: TestInstance.makeVideoDecoding())
+      let subtitleHarness = CapturingHarness(attachedTo: subtitlePlayer)
+      let media = try Media(url: TestMedia.twosecURL)
+      try media.addSlave(from: TestMedia.subtitleURL, type: .subtitle)
+      subtitlePlayer.load(media)
+      try subtitlePlayer.play()
+      defer { subtitlePlayer.stop() }
+      try #require(
+        await poll(timeout: .seconds(10), until: {
+          !subtitlePlayer.subtitleTracks.isEmpty
+        }),
+        "the sidecar subtitle track was not discovered"
+      )
+      subtitlePlayer.selectedSubtitleTrack = subtitlePlayer.subtitleTracks.first
+      try #require(
+        await poll(timeout: .seconds(30), until: {
+          subtitleHarness.frameCount > 2
+            && subtitleHarness.rgbSum().map { $0 > baseline + 10000 } == true
+        }),
+        "the selected VLC subtitle was not blended into direct PiP's video buffers"
       )
     }
 

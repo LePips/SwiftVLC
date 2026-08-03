@@ -443,6 +443,15 @@ extension Integration {
     }
 
     @Test
+    func `macOS native PiP reparents the composited VLC drawable`() {
+      let player = Player(instance: TestInstance.shared)
+      let host = MacNativePiPHostView()
+      let controller = PiPController(player: player, nativeBackend: host.nativePiPBackend)
+
+      #expect(controller.overlaySupport == .composited)
+    }
+
+    @Test
     func `macOS native PiP drawable does not expose VLC AVKit PiP callbacks`() {
       let view = MacNativePiPDrawableView()
 

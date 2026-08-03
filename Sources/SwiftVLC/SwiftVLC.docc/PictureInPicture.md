@@ -66,6 +66,9 @@ video. VLC draws those regions into a sibling overlay view for inline playback,
 while AVKit receives only the video sample-buffer layer. Core Animation
 sublayers and sibling views are not composited into that content source.
 
+Check ``PiPController/overlaySupport`` to distinguish this native limitation
+from direct PiP, whose vmem buffers include VLC's software-composited overlay.
+
 Supporting subtitles without degrading the zero-copy and HDR paths requires a
 separate, same-format burn-in stage before sample enqueue. That compositor is
 not part of SwiftVLC today. Do not rely on an inline subtitle appearing in the
