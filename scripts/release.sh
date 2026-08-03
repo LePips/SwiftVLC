@@ -437,6 +437,11 @@ echo "Validating release manifest rewrites..."
 validate_release_rewrites
 echo "Release rewrite validation passed."
 
+SOURCE_COMMIT=$(git rev-parse HEAD)
+RELEASE_SOURCE_DIGEST=$("$SCRIPT_DIR/release-source-digest.py" "$VERSION")
+QUALIFICATION_MATRIX_CHECKSUM=$(shasum -a 256 \
+  "$SCRIPT_DIR/qualification/matrix.json" | cut -d' ' -f1)
+
 # ── Artifact freshness ────────────────────────────────────────────────────────
 #
 # Everything below packages whatever xcframework is in Vendor/. Nothing so far
@@ -512,6 +517,7 @@ if [[ -n "$CANDIDATE_DIR" ]]; then
   echo "Verifying immutable release candidate..."
   CANDIDATE_VALUES=$(python3 - "$CANDIDATE_MANIFEST" "$VERSION" <<'PY'
 import json
+import re
 import sys
 
 path, version = sys.argv[1:3]
@@ -527,6 +533,10 @@ required = {
     "zipChecksum",
     "provenanceChecksum",
     "reproducibilityChecksum",
+    "sourceCommit",
+    "releaseSourceDigestAlgorithm",
+    "releaseSourceDigest",
+    "qualificationMatrixChecksum",
 }
 missing = sorted(required - candidate.keys())
 if missing:
@@ -537,16 +547,40 @@ if candidate["version"] != version:
     )
 if candidate["artifactDigestAlgorithm"] != "swiftvlc-tree-v1":
     sys.exit("Error: candidate uses an unsupported artifact digest algorithm")
+if candidate["releaseSourceDigestAlgorithm"] != "swiftvlc-git-tree-v1":
+    sys.exit("Error: candidate uses an unsupported release source digest algorithm")
+for field, length in (
+    ("sourceCommit", 40),
+    ("artifactDigest", 64),
+    ("zipChecksum", 64),
+    ("provenanceChecksum", 64),
+    ("reproducibilityChecksum", 64),
+    ("releaseSourceDigest", 64),
+    ("qualificationMatrixChecksum", 64),
+):
+    value = candidate[field]
+    if not isinstance(value, str) or not re.fullmatch(
+        rf"[0-9a-f]{{{length}}}", value
+    ):
+        sys.exit(f"Error: candidate has an invalid {field}")
 print(candidate["artifactDigest"])
 print(candidate["zipChecksum"])
 print(candidate["provenanceChecksum"])
 print(candidate["reproducibilityChecksum"])
+print(candidate["sourceCommit"])
+print(candidate["releaseSourceDigestAlgorithm"])
+print(candidate["releaseSourceDigest"])
+print(candidate["qualificationMatrixChecksum"])
 PY
 )
   CANDIDATE_TREE_DIGEST=$(printf '%s\n' "$CANDIDATE_VALUES" | sed -n '1p')
   EXPECTED_ZIP_CHECKSUM=$(printf '%s\n' "$CANDIDATE_VALUES" | sed -n '2p')
   EXPECTED_PROVENANCE_CHECKSUM=$(printf '%s\n' "$CANDIDATE_VALUES" | sed -n '3p')
   EXPECTED_REPRODUCIBILITY_CHECKSUM=$(printf '%s\n' "$CANDIDATE_VALUES" | sed -n '4p')
+  CANDIDATE_SOURCE_COMMIT=$(printf '%s\n' "$CANDIDATE_VALUES" | sed -n '5p')
+  CANDIDATE_SOURCE_DIGEST_ALGORITHM=$(printf '%s\n' "$CANDIDATE_VALUES" | sed -n '6p')
+  CANDIDATE_SOURCE_DIGEST=$(printf '%s\n' "$CANDIDATE_VALUES" | sed -n '7p')
+  CANDIDATE_MATRIX_CHECKSUM=$(printf '%s\n' "$CANDIDATE_VALUES" | sed -n '8p')
 
   ACTUAL_TREE_DIGEST=$("$SCRIPT_DIR/artifact-tree-digest.py" "$WORK_XCFW")
   CHECKSUM=$(swift package compute-checksum "$ZIP_PATH")
@@ -568,6 +602,21 @@ PY
   fi
   if [[ "$ACTUAL_REPRODUCIBILITY_CHECKSUM" != "$EXPECTED_REPRODUCIBILITY_CHECKSUM" ]]; then
     echo "Error: prepared reproducibility proof changed after candidate creation." >&2
+    exit 1
+  fi
+  if [[ "$RELEASE_SOURCE_DIGEST" != "$CANDIDATE_SOURCE_DIGEST" ]]; then
+    echo "Error: release-significant Swift source changed after candidate creation." >&2
+    echo "  candidate: $CANDIDATE_SOURCE_DIGEST" >&2
+    echo "  current:   $RELEASE_SOURCE_DIGEST" >&2
+    exit 1
+  fi
+  if [[ "$QUALIFICATION_MATRIX_CHECKSUM" != "$CANDIDATE_MATRIX_CHECKSUM" ]]; then
+    echo "Error: the qualification matrix changed after candidate creation." >&2
+    exit 1
+  fi
+  if ! git cat-file -e "${CANDIDATE_SOURCE_COMMIT}^{commit}" 2>/dev/null || \
+      ! git merge-base --is-ancestor "$CANDIDATE_SOURCE_COMMIT" HEAD; then
+    echo "Error: candidate source commit is not an ancestor of the release checkout." >&2
     exit 1
   fi
 
@@ -638,6 +687,9 @@ if [[ -n "$PREPARE_DIR" ]]; then
     CHECKSUM="$CHECKSUM" \
     PROVENANCE_CHECKSUM="$PROVENANCE_CHECKSUM" \
     REPRODUCIBILITY_CHECKSUM="$REPRODUCIBILITY_CHECKSUM" \
+    SOURCE_COMMIT="$SOURCE_COMMIT" \
+    RELEASE_SOURCE_DIGEST="$RELEASE_SOURCE_DIGEST" \
+    QUALIFICATION_MATRIX_CHECKSUM="$QUALIFICATION_MATRIX_CHECKSUM" \
     python3 - "$PREPARE_DIR/release-candidate.json" <<'PY'
 import json
 import os
@@ -650,6 +702,10 @@ candidate = {
     "zipChecksum": os.environ["CHECKSUM"],
     "provenanceChecksum": os.environ["PROVENANCE_CHECKSUM"],
     "reproducibilityChecksum": os.environ["REPRODUCIBILITY_CHECKSUM"],
+    "sourceCommit": os.environ["SOURCE_COMMIT"],
+    "releaseSourceDigestAlgorithm": "swiftvlc-git-tree-v1",
+    "releaseSourceDigest": os.environ["RELEASE_SOURCE_DIGEST"],
+    "qualificationMatrixChecksum": os.environ["QUALIFICATION_MATRIX_CHECKSUM"],
 }
 with open(sys.argv[1], "w") as output:
     json.dump(candidate, output, indent=2, sort_keys=True)
@@ -668,7 +724,10 @@ elif [[ "$UNQUALIFIED" == true ]]; then
   echo "  Publishing as a pre-release. It must not be described as qualified,"
   echo "  and the device matrix in scripts/qualification still owes a run."
 else
-  if ! "$SCRIPT_DIR/check-qualification.sh" "$VERSION" "$WORK_XCFW"; then
+  if ! SWIFTVLC_CANDIDATE_SOURCE_COMMIT="$CANDIDATE_SOURCE_COMMIT" \
+    SWIFTVLC_CANDIDATE_SOURCE_DIGEST="$CANDIDATE_SOURCE_DIGEST" \
+    SWIFTVLC_CANDIDATE_MATRIX_CHECKSUM="$CANDIDATE_MATRIX_CHECKSUM" \
+    "$SCRIPT_DIR/check-qualification.sh" "$VERSION" "$WORK_XCFW"; then
     echo "" >&2
     echo "  Qualify the prepared candidate before publishing stable." >&2
     exit 1
