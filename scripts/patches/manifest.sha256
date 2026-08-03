@@ -18,3 +18,4 @@ e41b501f77342eb6f5cbc6b8c84b4b2d29e375958ffcdc76a07fe3c597b2ba16  0017-native-pi
 00aa6608db4f668a20b4138f504045ea2ce87ed7066a7adae01def71f4015d8b  0018-media-list-player-observer-lock-order.patch
 bee0f53d544430719a74c9fba5d032dcf33e0cf3e659187f82ac2cc0484998b5  0019-darwin-sha512-stdin.patch
 5279e772e203583b689a7bc5c51e94c4b22c0b1fdc4b6ea45f46cff556d18e47  0020-expose-playback-failure-kind.patch
+3f06eb63bb6163a3dc075f54cee87ca68e75fc7e25c6d66eb1bd7eb43754111b  0021-avcodec-mpeg-motion-padding.patch
