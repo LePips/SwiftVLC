@@ -15,18 +15,33 @@
 # by disabling avcodec-dr globally; hardware-decoded paths are unchanged.
 --- a/modules/codec/avcodec/video.c
 +++ b/modules/codec/avcodec/video.c
-@@ -293,6 +293,14 @@ static int lavc_GetVideoFormat(decoder_t *dec, video_format_t *restrict fmt,
+@@ -275,6 +275,7 @@ static int lavc_GetVideoFormat(decoder_t *dec, video_format_t *restrict fmt,
+ {
+     int width = ctx->coded_width;
+     int height = ctx->coded_height;
++    bool needs_motion_padding = false;
+ 
+     video_format_Init(fmt, 0);
+ 
+@@ -293,6 +294,9 @@ static int lavc_GetVideoFormat(decoder_t *dec, video_format_t *restrict fmt,
              fmt->i_chroma = VLC_CODEC_XRGB;
 
          avcodec_align_dimensions2(ctx, &width, &height, aligns);
-+
-+        /* FFmpeg's SIMD MPEG motion compensation may read beyond the visible
-+         * edge. Direct rendering therefore needs horizontal padding in the
-+         * libVLC-owned picture, matching FFmpeg-owned frame allocation. */
-+        if (ctx->codec_id == AV_CODEC_ID_MPEG1VIDEO ||
-+            ctx->codec_id == AV_CODEC_ID_MPEG2VIDEO ||
-+            ctx->codec_id == AV_CODEC_ID_MPEG4)
-+            width += 32;
++        needs_motion_padding = ctx->codec_id == AV_CODEC_ID_MPEG1VIDEO ||
++                               ctx->codec_id == AV_CODEC_ID_MPEG2VIDEO ||
++                               ctx->codec_id == AV_CODEC_ID_MPEG4;
      }
-
+ 
      if( width == 0 || height == 0 || width > 8192 || height > 8192 ||
+@@ -306,4 +310,11 @@ static int lavc_GetVideoFormat(decoder_t *dec, video_format_t *restrict fmt,
+         return -1; /* invalid display size */
+     }
++
++    /* FFmpeg's SIMD MPEG motion compensation may read beyond the visible
++     * edge. Direct rendering therefore needs horizontal padding in the
++     * libVLC-owned picture, matching FFmpeg-owned frame allocation. Add it
++     * after validating the coded dimensions so 8192-pixel video stays valid. */
++    if (needs_motion_padding)
++        width += 32;
+ 
+     fmt->i_width = width;
