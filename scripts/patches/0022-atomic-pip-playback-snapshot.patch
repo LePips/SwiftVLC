@@ -1,0 +1,134 @@
+diff --git a/include/vlc/libvlc_media_player.h b/include/vlc/libvlc_media_player.h
+--- a/include/vlc/libvlc_media_player.h
++++ b/include/vlc/libvlc_media_player.h
+@@ -260,13 +260,13 @@ LIBVLC_API libvlc_media_t * libvlc_media_player_get_media( libvlc_media_player_t
+ /**
+- * Atomic retained-media and playback-length snapshot.
++ * Atomic retained-media and playback-state snapshot.
+  *
+- * Both fields are captured while holding the media player's internal player
++ * All fields are captured while holding the media player's internal player
+  * lock, so the media identity cannot change between the retained reference and
+- * its associated playback length. The caller owns one reference to @a media
++ * its associated playback state. The caller owns one reference to @a media
+  * on success and must release it with libvlc_media_release().
+  *
+  * \param p_mi the media player
+- * \param[out] snapshot destination for the retained media and length
+- * \retval true a media was captured; both output fields are initialized
+- * \retval false no media is associated; both output fields are initialized
++ * \param[out] snapshot destination for the retained media and playback state
++ * \retval true a media was captured; all output fields are initialized
++ * \retval false no media is associated; all output fields are initialized
+  */
+@@ -275,13 +275,16 @@ typedef struct swiftvlc_media_player_media_length_snapshot_t
+ {
+     libvlc_media_t *media;
+     libvlc_time_t length;
++    libvlc_time_t time;
++    bool seekable;
+ } swiftvlc_media_player_media_length_snapshot_t;
+ 
+ /**
+  * Version of SwiftVLC's additive pinned-libVLC extensions.
+  *
+  * Version 1 provides the geometry-aware vmem callback and atomic retained
+- * media/length snapshot.
++ * media/length snapshot. Version 2 adds playback time and seekability to that
++ * snapshot.
+  */
+ LIBVLC_API unsigned swiftvlc_libvlc_pip_extensions_version( void );
+ 
+diff --git a/lib/media_player.c b/lib/media_player.c
+--- a/lib/media_player.c
++++ b/lib/media_player.c
+@@ -996,7 +996,7 @@ libvlc_media_player_get_media( libvlc_media_player_t *p_mi )
+ 
+ unsigned swiftvlc_libvlc_pip_extensions_version( void )
+ {
+-    return 1;
++    return 2;
+ }
+ 
+ bool
+@@ -1025,6 +1025,10 @@ swiftvlc_libvlc_media_player_get_media_length_snapshot(
+     snapshot->length = media != NULL
+         ? libvlc_time_from_vlc_tick(vlc_player_GetLength(player))
+         : -1;
++    snapshot->time = media != NULL
++        ? libvlc_time_from_vlc_tick(vlc_player_GetTime(player))
++        : -1;
++    snapshot->seekable = media != NULL && vlc_player_CanSeek(player);
+ 
+     vlc_player_Unlock(player);
+     return media != NULL;
+diff --git a/modules/video_output/apple/VLCDrawable.h b/modules/video_output/apple/VLCDrawable.h
+--- a/modules/video_output/apple/VLCDrawable.h
++++ b/modules/video_output/apple/VLCDrawable.h
+@@ -48,6 +48,15 @@
+ /// - Parameter completion: block to call as soon as seek is finished
+ - (void)seekBy:(int64_t)offset completion:(dispatch_block_t)completion;
+ 
++@optional
++/// Atomically returns the duration, current time, and seekability for one
++/// media generation. Implementations should return NO when no media is loaded.
++- (BOOL)mediaPlaybackSnapshotWithLength:(int64_t *)length
++                                   time:(int64_t *)time
++                               seekable:(BOOL *)seekable;
++
++@required
++
+ /// Called by picture in picture to get the current media duration
+ /// - Returns Must return media duration in milliseconds
+ - (int64_t)mediaLength;
+diff --git a/modules/video_output/apple/VLCPictureInPictureController.m b/modules/video_output/apple/VLCPictureInPictureController.m
+--- a/modules/video_output/apple/VLCPictureInPictureController.m
++++ b/modules/video_output/apple/VLCPictureInPictureController.m
+@@ -103,8 +103,19 @@ API_AVAILABLE(ios(15.0), tvos(15.0), macosx(12.0))
+     AVPictureInPictureController *avPipController = [
+         [AVPictureInPictureController alloc]
+             initWithContentSource:avPipSource
+     ];
+-    avPipController.requiresLinearPlayback = ![_mediaController isMediaSeekable];
++    BOOL seekable = NO;
++    if ([_mediaController respondsToSelector:
++            @selector(mediaPlaybackSnapshotWithLength:time:seekable:)]) {
++        int64_t ignoredLength;
++        int64_t ignoredTime;
++        [_mediaController mediaPlaybackSnapshotWithLength:&ignoredLength
++                                                     time:&ignoredTime
++                                                 seekable:&seekable];
++    } else {
++        seekable = [_mediaController isMediaSeekable];
++    }
++    avPipController.requiresLinearPlayback = !seekable;
+     avPipController.delegate = self;
+ #if TARGET_OS_IOS
+     avPipController.canStartPictureInPictureAutomaticallyFromInline =
+@@ -229,11 +240,24 @@ API_AVAILABLE(ios(15.0), tvos(15.0), macosx(12.0))
+         return kCMTimeRangeInvalid;
+     const CMTimeRange live = CMTimeRangeMake(kCMTimeZero, kCMTimePositiveInfinity);
+ 
+-    int64_t length = mediaController.mediaLength;
++    int64_t length;
++    int64_t time;
++    BOOL seekable;
++    if ([mediaController respondsToSelector:
++            @selector(mediaPlaybackSnapshotWithLength:time:seekable:)]) {
++        if (![mediaController mediaPlaybackSnapshotWithLength:&length
++                                                         time:&time
++                                                     seekable:&seekable])
++            return live;
++    } else {
++        length = mediaController.mediaLength;
++        time = mediaController.mediaTime;
++        seekable = mediaController.isMediaSeekable;
++    }
++    (void)seekable;
+     if (length <= 0)
+         return live;
+ 
+-    int64_t time = mediaController.mediaTime;
+     if (time < 0)
+         time = 0;
+     else if (time >= length)

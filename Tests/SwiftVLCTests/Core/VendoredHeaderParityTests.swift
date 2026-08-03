@@ -60,4 +60,19 @@ struct VendoredHeaderParityTests {
       event.u.media_player_encountered_error.failure == libvlc_playback_failure_renderer
     )
   }
+
+  /// Extension version 2 expands the retained-media snapshot that native PiP
+  /// reads. Referencing the added fields keeps the engine and shipped headers
+  /// from silently diverging at this ABI boundary.
+  @Test
+  func `The playback snapshot carries time and seekability`() {
+    var snapshot = swiftvlc_media_player_media_length_snapshot_t()
+    snapshot.length = 2000
+    snapshot.time = 750
+    snapshot.seekable = true
+
+    #expect(snapshot.length == 2000)
+    #expect(snapshot.time == 750)
+    #expect(snapshot.seekable)
+  }
 }

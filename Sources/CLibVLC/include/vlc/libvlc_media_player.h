@@ -260,36 +260,39 @@ LIBVLC_API void libvlc_media_player_set_media( libvlc_media_player_t *p_mi,
 LIBVLC_API libvlc_media_t * libvlc_media_player_get_media( libvlc_media_player_t *p_mi );
 
 /**
- * Atomic retained-media and playback-length snapshot.
+ * Atomic retained-media and playback-state snapshot.
  *
- * Both fields are captured together while holding the media player's internal
+ * All fields are captured together while holding the media player's internal
  * player lock, so the media identity cannot change between the retained
- * reference and its associated playback length.
+ * reference and its associated playback state.
  */
 typedef struct swiftvlc_media_player_media_length_snapshot_t
 {
     libvlc_media_t *media;  /**< retained media, or NULL; release with libvlc_media_release() */
     libvlc_time_t length;   /**< playback length associated with @a media */
+    libvlc_time_t time;     /**< current playback time associated with @a media */
+    bool seekable;          /**< whether @a media is seekable */
 } swiftvlc_media_player_media_length_snapshot_t;
 
 /**
  * Version of SwiftVLC's additive pinned-libVLC extensions.
  *
  * Version 1 provides the geometry-aware vmem callback and atomic retained
- * media/length snapshot.
+ * media/length snapshot. Version 2 adds playback time and seekability to that
+ * snapshot.
  */
 LIBVLC_API unsigned swiftvlc_libvlc_pip_extensions_version( void );
 
 /**
- * Atomically capture the media player's current media and playback length.
+ * Atomically capture the media player's current media and playback state.
  *
  * On success the caller owns one reference to the returned media and must
  * release it with libvlc_media_release().
  *
  * \param p_mi the media player
- * \param[out] snapshot destination for the retained media and length
- * \retval true a media was captured; both output fields are initialized
- * \retval false no media is associated; both output fields are initialized
+ * \param[out] snapshot destination for the retained media and playback state
+ * \retval true a media was captured; all output fields are initialized
+ * \retval false no media is associated; all output fields are initialized
  */
 LIBVLC_API bool swiftvlc_libvlc_media_player_get_media_length_snapshot(
     libvlc_media_player_t *p_mi,
