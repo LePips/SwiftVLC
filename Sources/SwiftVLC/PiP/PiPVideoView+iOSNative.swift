@@ -1608,7 +1608,7 @@ final class IOSNativePiPMediaController: NSObject, IOSNativePiPMediaControlling,
     }
     defer { libvlc_media_player_release(pointer) }
 
-    var snapshot = swiftvlc_media_player_media_length_snapshot_t()
+    var snapshot = swiftvlc_media_player_playback_snapshot_t()
     if swiftvlc_media_player_get_playback_snapshot_if_available(pointer, &snapshot) {
       defer {
         if let media = snapshot.media {

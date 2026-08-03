@@ -1,5 +1,6 @@
 /* Runtime proof for patch 0022 (identity-coherent native PiP playback state). */
 #include <stdio.h>
+#include <stdint.h>
 #include <time.h>
 #include <vlc/vlc.h>
 
@@ -63,11 +64,28 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    swiftvlc_media_player_media_length_snapshot_t snapshot = {0};
+    const uint64_t guardValue = UINT64_C(0x53A7B10C53A7B10C);
+    struct {
+        uint64_t before;
+        swiftvlc_media_player_media_length_snapshot_t snapshot;
+        uint64_t after;
+    } legacy = { guardValue, {0}, guardValue };
+    swiftvlc_media_player_playback_snapshot_t snapshot = {0};
     int ready = 0;
     for (int attempt = 0; attempt < 100; ++attempt)
     {
-        if (swiftvlc_libvlc_media_player_get_media_length_snapshot(player, &snapshot))
+        if (swiftvlc_libvlc_media_player_get_media_length_snapshot(
+                player, &legacy.snapshot))
+        {
+            libvlc_media_release(legacy.snapshot.media);
+            legacy.snapshot.media = NULL;
+            if (legacy.before != guardValue || legacy.after != guardValue)
+            {
+                fprintf(stderr, "version-1 snapshot wrote beyond its ABI\n");
+                break;
+            }
+        }
+        if (swiftvlc_libvlc_media_player_get_playback_snapshot(player, &snapshot))
         {
             ready = snapshot.media == media && snapshot.length >= 1500
                 && snapshot.time >= 0 && snapshot.seekable;

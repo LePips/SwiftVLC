@@ -48,7 +48,7 @@ bool swiftvlc_media_length_snapshot_available(void);
 /// binaries or when no media is loaded.
 bool swiftvlc_media_player_get_playback_snapshot_if_available(
     libvlc_media_player_t *player,
-    swiftvlc_media_player_media_length_snapshot_t *snapshot);
+    swiftvlc_media_player_playback_snapshot_t *snapshot);
 
 /// Returns whether the linked libVLC exports the complete playback snapshot.
 bool swiftvlc_playback_snapshot_available(void);

@@ -61,16 +61,18 @@ struct VendoredHeaderParityTests {
     )
   }
 
-  /// Extension version 2 expands the retained-media snapshot that native PiP
-  /// reads. Referencing the added fields keeps the engine and shipped headers
-  /// from silently diverging at this ABI boundary.
+  /// Extension version 2 uses a separate retained-media snapshot so the
+  /// version-1 layout stays ABI-compatible. Referencing both types keeps the
+  /// engine and shipped headers from silently diverging at this boundary.
   @Test
-  func `The playback snapshot carries time and seekability`() {
-    var snapshot = swiftvlc_media_player_media_length_snapshot_t()
+  func `The playback snapshot is distinct from the version one layout`() {
+    let legacySize = MemoryLayout<swiftvlc_media_player_media_length_snapshot_t>.size
+    var snapshot = swiftvlc_media_player_playback_snapshot_t()
     snapshot.length = 2000
     snapshot.time = 750
     snapshot.seekable = true
 
+    #expect(legacySize < MemoryLayout.size(ofValue: snapshot))
     #expect(snapshot.length == 2000)
     #expect(snapshot.time == 750)
     #expect(snapshot.seekable)

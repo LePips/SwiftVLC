@@ -1,44 +1,56 @@
 diff --git a/include/vlc/libvlc_media_player.h b/include/vlc/libvlc_media_player.h
 --- a/include/vlc/libvlc_media_player.h
 +++ b/include/vlc/libvlc_media_player.h
-@@ -260,13 +260,13 @@ LIBVLC_API libvlc_media_t * libvlc_media_player_get_media( libvlc_media_player_t
- /**
-- * Atomic retained-media and playback-length snapshot.
-+ * Atomic retained-media and playback-state snapshot.
-  *
-- * Both fields are captured while holding the media player's internal player
-+ * All fields are captured while holding the media player's internal player
-  * lock, so the media identity cannot change between the retained reference and
-- * its associated playback length. The caller owns one reference to @a media
-+ * its associated playback state. The caller owns one reference to @a media
-  * on success and must release it with libvlc_media_release().
-  *
-  * \param p_mi the media player
-- * \param[out] snapshot destination for the retained media and length
-- * \retval true a media was captured; both output fields are initialized
-- * \retval false no media is associated; both output fields are initialized
-+ * \param[out] snapshot destination for the retained media and playback state
-+ * \retval true a media was captured; all output fields are initialized
-+ * \retval false no media is associated; all output fields are initialized
-  */
-@@ -275,13 +275,16 @@ typedef struct swiftvlc_media_player_media_length_snapshot_t
+@@ -275,12 +275,28 @@ typedef struct swiftvlc_media_player_media_length_snapshot_t
  {
      libvlc_media_t *media;
      libvlc_time_t length;
+ } swiftvlc_media_player_media_length_snapshot_t;
++
++/**
++ * Version-2 atomic retained-media and playback-state snapshot.
++ *
++ * This is a distinct type from the version-1 media/length snapshot so a newer
++ * archive never writes past storage allocated by a client built against the
++ * original ABI.
++ */
++typedef struct swiftvlc_media_player_playback_snapshot_t
++{
++    libvlc_media_t *media;
++    libvlc_time_t length;
 +    libvlc_time_t time;
 +    bool seekable;
- } swiftvlc_media_player_media_length_snapshot_t;
++} swiftvlc_media_player_playback_snapshot_t;
  
  /**
   * Version of SwiftVLC's additive pinned-libVLC extensions.
   *
   * Version 1 provides the geometry-aware vmem callback and atomic retained
 - * media/length snapshot.
-+ * media/length snapshot. Version 2 adds playback time and seekability to that
-+ * snapshot.
++ * media/length snapshot. Version 2 adds a separate playback snapshot carrying
++ * time and seekability without changing the version-1 layout.
   */
  LIBVLC_API unsigned swiftvlc_libvlc_pip_extensions_version( void );
+@@ -289,4 +305,8 @@ LIBVLC_API bool swiftvlc_libvlc_media_player_get_media_length_snapshot(
+ LIBVLC_API bool swiftvlc_libvlc_media_player_get_media_length_snapshot(
+     libvlc_media_player_t *p_mi,
+     swiftvlc_media_player_media_length_snapshot_t *snapshot );
++
++LIBVLC_API bool swiftvlc_libvlc_media_player_get_playback_snapshot(
++    libvlc_media_player_t *p_mi,
++    swiftvlc_media_player_playback_snapshot_t *snapshot );
  
+diff --git a/lib/libvlc.sym b/lib/libvlc.sym
+--- a/lib/libvlc.sym
++++ b/lib/libvlc.sym
+@@ -138,6 +138,7 @@ libvlc_media_player_get_hwnd
+ libvlc_media_player_get_length
+ libvlc_media_player_get_media
+ swiftvlc_libvlc_media_player_get_media_length_snapshot
++swiftvlc_libvlc_media_player_get_playback_snapshot
+ swiftvlc_libvlc_pip_extensions_version
+ libvlc_media_player_get_nsobject
+ libvlc_media_player_get_position
 diff --git a/lib/media_player.c b/lib/media_player.c
 --- a/lib/media_player.c
 +++ b/lib/media_player.c
@@ -51,17 +63,47 @@ diff --git a/lib/media_player.c b/lib/media_player.c
  }
  
  bool
-@@ -1025,6 +1025,10 @@ swiftvlc_libvlc_media_player_get_media_length_snapshot(
+@@ -1022,11 +1022,40 @@ swiftvlc_libvlc_media_player_get_media_length_snapshot(
+     snapshot->media = media;
      snapshot->length = media != NULL
          ? libvlc_time_from_vlc_tick(vlc_player_GetLength(player))
          : -1;
+ 
+     vlc_player_Unlock(player);
+     return media != NULL;
+ }
++
++bool
++swiftvlc_libvlc_media_player_get_playback_snapshot(
++    libvlc_media_player_t *p_mi,
++    swiftvlc_media_player_playback_snapshot_t *snapshot )
++{
++    if (snapshot == NULL)
++        return false;
++
++    vlc_player_t *player = p_mi->player;
++    vlc_player_Lock(player);
++
++    input_item_t *item = vlc_player_GetCurrentMedia(player);
++    libvlc_media_t *media = item != NULL ? item->libvlc_owner : NULL;
++    if (media != NULL)
++        input_item_Hold(item);
++
++    snapshot->media = media;
++    snapshot->length = media != NULL
++        ? libvlc_time_from_vlc_tick(vlc_player_GetLength(player))
++        : -1;
 +    snapshot->time = media != NULL
 +        ? libvlc_time_from_vlc_tick(vlc_player_GetTime(player))
 +        : -1;
 +    snapshot->seekable = media != NULL && vlc_player_CanSeek(player);
++
++    vlc_player_Unlock(player);
++    return media != NULL;
++}
  
-     vlc_player_Unlock(player);
-     return media != NULL;
+ /**************************************************************************
+  * Get the event Manager.
 diff --git a/modules/video_output/apple/VLCDrawable.h b/modules/video_output/apple/VLCDrawable.h
 --- a/modules/video_output/apple/VLCDrawable.h
 +++ b/modules/video_output/apple/VLCDrawable.h

@@ -38,6 +38,18 @@ bool swiftvlc_libvlc_media_player_get_media_length_snapshot(
     if (snapshot != NULL) {
         snapshot->media = NULL;
         snapshot->length = -1;
+    }
+    return false;
+}
+
+__attribute__((weak))
+bool swiftvlc_libvlc_media_player_get_playback_snapshot(
+    libvlc_media_player_t *player,
+    swiftvlc_media_player_playback_snapshot_t *snapshot) {
+    (void)player;
+    if (snapshot != NULL) {
+        snapshot->media = NULL;
+        snapshot->length = -1;
         snapshot->time = -1;
         snapshot->seekable = false;
     }
@@ -134,8 +146,6 @@ bool swiftvlc_media_player_get_media_length_snapshot_if_available(
     }
     snapshot->media = NULL;
     snapshot->length = -1;
-    snapshot->time = -1;
-    snapshot->seekable = false;
 #if defined(__APPLE__)
     if (swiftvlc_libvlc_pip_extensions_version() < 1) {
         return false;
@@ -158,7 +168,7 @@ bool swiftvlc_media_length_snapshot_available(void) {
 
 bool swiftvlc_media_player_get_playback_snapshot_if_available(
     libvlc_media_player_t *player,
-    swiftvlc_media_player_media_length_snapshot_t *snapshot) {
+    swiftvlc_media_player_playback_snapshot_t *snapshot) {
     if (snapshot == NULL) {
         return false;
     }
@@ -170,7 +180,7 @@ bool swiftvlc_media_player_get_playback_snapshot_if_available(
     if (swiftvlc_libvlc_pip_extensions_version() < 2) {
         return false;
     }
-    return swiftvlc_libvlc_media_player_get_media_length_snapshot(
+    return swiftvlc_libvlc_media_player_get_playback_snapshot(
         player, snapshot);
 #else
     (void)player;
