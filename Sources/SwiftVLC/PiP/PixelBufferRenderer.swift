@@ -107,14 +107,7 @@ final class PixelBufferRenderer: Sendable {
       return true
     }
     guard changed else { return }
-    enqueueState.withLock {
-      $0.pending = nil
-      $0.flushRecoveryRetryCount = 0
-      $0.flushRecoveryGeneration = nil
-      $0.latestPlaybackGeneration = generation
-      $0.latestVoutGeneration = nil
-      $0.status = .idle
-    }
+    enqueueState.withLock { $0.beginPlaybackGeneration(generation) }
     flushDisplayLayer()
   }
 

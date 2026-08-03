@@ -21,9 +21,12 @@ struct MatrixScreenI: View {
   @State private var corrections: [PiPTimebaseCorrection] = []
   @State private var samplingTask: Task<Void, Never>?
   @State private var correctionTask: Task<Void, Never>?
+  @State private var noteTasks: [Task<Void, Never>] = []
   @State private var captureWriter: TimebaseCaptureWriter?
   @State private var captureURL: URL?
   @State private var isRecording = false
+  @State private var isFinalizing = false
+  @State private var manualObservation = ""
   @State private var transitionNote = ""
   @State private var error: String?
 
@@ -56,14 +59,22 @@ struct MatrixScreenI: View {
         }
         Button("Seek −10 seconds") { recordTransition("seek -10s", accepted: player.jump(by: .seconds(-10))) }
         Button("Seek +10 seconds") { recordTransition("seek +10s", accepted: player.jump(by: .seconds(10))) }
-        TextField("Transition / audio observation", text: $transitionNote, axis: .vertical)
+        TextField("Transition / audio observation", text: $manualObservation, axis: .vertical)
+          .onSubmit { recordManualObservation() }
+        Button("Record observation") { recordManualObservation() }
+          .disabled(!isRecording || manualObservation.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        if !transitionNote.isEmpty {
+          Text(transitionNote)
+            .font(.caption.monospaced())
+            .foregroundStyle(.secondary)
+        }
       }
 
       Section("Picture in Picture") {
         LabeledContent("Possible", value: pip?.isPossible == true ? "yes" : "no")
         LabeledContent("Active", value: pip?.isActive == true ? "yes" : "no")
         Button(pip?.isActive == true ? "Stop PiP" : "Start PiP", systemImage: "pip") {
-          _ = pip?.toggle()
+          togglePiP()
         }
         .disabled(pip?.isPossible != true)
       }
@@ -73,18 +84,21 @@ struct MatrixScreenI: View {
         LabeledContent("Corrections", value: corrections.count.formatted())
         LabeledContent("Duration", value: formattedDuration)
         LabeledContent("Thermal state", value: String(describing: ProcessInfo.processInfo.thermalState))
-        Button(isRecording ? "Stop recording" : "Start recording") {
+        Button(isFinalizing ? "Finalizing…" : (isRecording ? "Stop recording" : "Start recording")) {
           isRecording ? stopRecording() : startRecording()
         }
+        .disabled(isFinalizing)
         .tint(isRecording ? .red : .accentColor)
         Button("Clear capture", role: .destructive) {
           snapshots.removeAll(keepingCapacity: true)
           corrections.removeAll(keepingCapacity: true)
+          manualObservation = ""
           transitionNote = ""
+          captureURL = nil
           error = nil
         }
-        .disabled(isRecording)
-        if let captureURL {
+        .disabled(isRecording || isFinalizing)
+        if let captureURL, !isRecording, !isFinalizing {
           ShareLink(item: captureURL) {
             Label("Share clock JSONL", systemImage: "square.and.arrow.up")
           }
@@ -134,20 +148,40 @@ struct MatrixScreenI: View {
     appendTransition("\(label) accepted=\(accepted)")
   }
 
+  private func recordManualObservation() {
+    let note = manualObservation.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard isRecording, !note.isEmpty else { return }
+    manualObservation = ""
+    appendTransition("observation: \(note)")
+  }
+
+  private func togglePiP() {
+    guard let pip else { return }
+    let wasActive = pip.isActive
+    let result = pip.toggle()
+    if wasActive {
+      appendTransition("PiP stop requested")
+    } else {
+      appendTransition("PiP start requested result=\(String(describing: result))")
+    }
+  }
+
   private func appendTransition(_ note: String) {
     let timestamped = "\(note) @ \(Date().formatted())"
     transitionNote += "\n\(timestamped)"
     guard let captureWriter else { return }
-    Task {
+    let task = Task {
       do {
         try await captureWriter.appendNote(timestamped)
       } catch {
         await MainActor.run { self.error = String(describing: error) }
       }
     }
+    noteTasks.append(task)
   }
 
   private func startRecording() {
+    guard !isFinalizing else { return }
     guard let pip else {
       error = "Direct PiP controller is not ready"
       return
@@ -159,8 +193,13 @@ struct MatrixScreenI: View {
       self.error = String(describing: error)
       return
     }
+    snapshots.removeAll(keepingCapacity: true)
+    corrections.removeAll(keepingCapacity: true)
+    manualObservation = ""
+    transitionNote = ""
+    captureURL = nil
+    noteTasks.removeAll(keepingCapacity: true)
     captureWriter = writer
-    captureURL = writer.url
     isRecording = true
     error = nil
     samplingTask = Task { @MainActor in
@@ -171,7 +210,7 @@ struct MatrixScreenI: View {
           try await writer.appendSnapshot(snapshot)
         } catch {
           self.error = String(describing: error)
-          stopRecording()
+          Task { @MainActor in stopRecording() }
           return
         }
         try? await Task.sleep(for: .seconds(1))
@@ -186,7 +225,7 @@ struct MatrixScreenI: View {
           try await writer.appendCorrection(correction)
         } catch {
           self.error = String(describing: error)
-          stopRecording()
+          Task { @MainActor in stopRecording() }
           return
         }
       }
@@ -194,18 +233,36 @@ struct MatrixScreenI: View {
   }
 
   private func stopRecording() {
+    let samplingTask = samplingTask
+    let correctionTask = correctionTask
+    let noteTasks = noteTasks
     samplingTask?.cancel()
     correctionTask?.cancel()
     let writer = captureWriter
-    samplingTask = nil
-    correctionTask = nil
+    self.samplingTask = nil
+    self.correctionTask = nil
+    self.noteTasks.removeAll(keepingCapacity: true)
     captureWriter = nil
     isRecording = false
+    guard let writer else { return }
+    isFinalizing = true
     Task {
       do {
-        try await writer?.close()
+        await samplingTask?.value
+        await correctionTask?.value
+        for task in noteTasks {
+          await task.value
+        }
+        try await writer.close()
+        await MainActor.run {
+          captureURL = writer.url
+          isFinalizing = false
+        }
       } catch {
-        await MainActor.run { self.error = String(describing: error) }
+        await MainActor.run {
+          self.error = String(describing: error)
+          isFinalizing = false
+        }
       }
     }
   }

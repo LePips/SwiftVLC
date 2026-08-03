@@ -42,10 +42,25 @@ struct PixelBufferEnqueueState: @unchecked Sendable {
   /// Seconds keep qualification telemetry `Sendable`; this is not scheduling
   /// state and is never fed back into the renderer.
   var lastPresentedSampleTimeSeconds: Double?
+  /// Playback generation that produced `lastPresentedSampleTimeSeconds`.
+  /// Cleared at every generation boundary so a new media session never
+  /// inherits the previous session's delivered PTS.
+  var lastPresentedSamplePlaybackGeneration: UInt64?
   var latestPlaybackGeneration: UInt64?
   var latestVoutGeneration: UInt64?
   var voutTransitionCount: UInt64 = 0
   var status: PixelBufferRendererTelemetryStatus = .idle
+
+  mutating func beginPlaybackGeneration(_ generation: UInt64) {
+    pending = nil
+    flushRecoveryRetryCount = 0
+    flushRecoveryGeneration = nil
+    latestPlaybackGeneration = generation
+    latestVoutGeneration = nil
+    lastPresentedSampleTimeSeconds = nil
+    lastPresentedSamplePlaybackGeneration = nil
+    status = .idle
+  }
 }
 
 enum PixelBufferRendererTelemetryStatus: Sendable, Equatable {
@@ -73,6 +88,7 @@ struct PixelBufferRendererTelemetrySnapshot: Sendable, Equatable {
   let lastEnqueuedAt: ContinuousClock.Instant?
   let lastPresentedAt: ContinuousClock.Instant?
   let lastPresentedSampleTimeSeconds: Double?
+  let lastPresentedSamplePlaybackGeneration: UInt64?
   let status: PixelBufferRendererTelemetryStatus
 }
 
@@ -246,6 +262,7 @@ extension PixelBufferRenderer {
         lastEnqueuedAt: $0.lastEnqueuedAt,
         lastPresentedAt: $0.lastPresentedAt,
         lastPresentedSampleTimeSeconds: $0.lastPresentedSampleTimeSeconds,
+        lastPresentedSamplePlaybackGeneration: $0.lastPresentedSamplePlaybackGeneration,
         status: $0.status
       )
     }
@@ -369,6 +386,10 @@ extension PixelBufferRenderer {
     if delivered {
       let presentationTime = CMSampleBufferGetPresentationTimeStamp(pending.sample)
       enqueueState.withLock {
+        guard
+          $0.latestPlaybackGeneration == pending.playbackGeneration,
+          $0.latestVoutGeneration == pending.voutGeneration
+        else { return }
         $0.flushRecoveryRetryCount = 0
         $0.flushRecoveryGeneration = nil
         $0.presentedFrameCount &+= 1
@@ -376,6 +397,7 @@ extension PixelBufferRenderer {
         $0.lastPresentedSampleTimeSeconds = presentationTime.isNumeric
           ? presentationTime.seconds
           : nil
+        $0.lastPresentedSamplePlaybackGeneration = pending.playbackGeneration
         $0.status = .rendering
       }
     }

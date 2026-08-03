@@ -107,6 +107,8 @@ extension PiPController {
 
     let timebase = controlTimebase
     let time = player.currentTime
+    let playerSeconds = Double(time.components.seconds)
+      + Double(time.components.attoseconds) / 1e18
     let retracking = Self.timebaseRetracking(
       isActive: active,
       rate: rate,
@@ -114,8 +116,7 @@ extension PiPController {
       hasTimebase: timebase != nil,
       isSkipPending: pendingSkipCount > 0,
       secondsSinceSkip: CFAbsoluteTimeGetCurrent() - lastSkipTimestamp,
-      playerSeconds: Double(time.components.seconds)
-        + Double(time.components.attoseconds) / 1e18,
+      playerSeconds: playerSeconds,
       timebaseSeconds: timebase.map { CMTimebaseGetTime($0).seconds } ?? 0
     )
 
@@ -124,7 +125,11 @@ extension PiPController {
     }
     if let timebase {
       if let rate = retracking.setsRate {
-        CMTimebaseSetRate(timebase, rate: Float64(rate))
+        setTimebaseRate(
+          Float64(rate),
+          reason: .playbackRateTransition,
+          mediaTimeSeconds: playerSeconds
+        )
       }
       if let seconds = retracking.setsTime {
         let previousSeconds = CMTimebaseGetTime(timebase).seconds

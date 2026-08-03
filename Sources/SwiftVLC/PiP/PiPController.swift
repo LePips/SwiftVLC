@@ -1283,11 +1283,15 @@ public final class PiPController: NSObject {
             seconds: correctedSeconds,
             preferredTimescale: 1000
           ))
-          CMTimebaseSetRate(tb, rate: player.isActive ? Float64(player.rate) : 0.0)
           recordTimebaseCorrection(
             reason: .skipLanding,
             previousTimebaseSeconds: previousSeconds,
             correctedTimebaseSeconds: correctedSeconds,
+            mediaTimeSeconds: correctedSeconds
+          )
+          setTimebaseRate(
+            player.isActive ? Float64(player.rate) : 0.0,
+            reason: .skipLanding,
             mediaTimeSeconds: correctedSeconds
           )
         }
