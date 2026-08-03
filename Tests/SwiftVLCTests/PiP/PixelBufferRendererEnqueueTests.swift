@@ -510,6 +510,14 @@ extension Integration {
       #expect(telemetry.voutGeneration == 2)
       #expect(telemetry.voutTransitionCount == 2)
       #expect(telemetry.enqueuedFrameCount == 3)
+      #expect(telemetry.lastPresentedSampleTimeSeconds == 4)
+      #expect(telemetry.lastPresentedSamplePlaybackGeneration == 3)
+
+      renderer.beginPlaybackGeneration(4)
+      let replacementTelemetry = renderer.telemetrySnapshot
+      #expect(replacementTelemetry.playbackGeneration == 4)
+      #expect(replacementTelemetry.lastPresentedSampleTimeSeconds == nil)
+      #expect(replacementTelemetry.lastPresentedSamplePlaybackGeneration == nil)
     }
 
     private func submitFrame(

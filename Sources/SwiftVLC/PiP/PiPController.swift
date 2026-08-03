@@ -289,6 +289,13 @@ public final class PiPController: NSObject {
   #endif
   @ObservationIgnored
   let pipSnapshotBroadcaster = Broadcaster<PiPSnapshot>()
+  /// Lossless qualification-only record of every control-timebase write.
+  /// Clock snapshots can be sampled; corrections cannot, because several can
+  /// occur between two polls during a transition.
+  @ObservationIgnored
+  nonisolated let timebaseCorrectionBroadcaster = Broadcaster<PiPTimebaseCorrection>()
+  @ObservationIgnored
+  var timebaseCorrectionSequence: UInt64 = 0
   @ObservationIgnored
   private var pipSnapshotRevision: UInt64 = 0
   /// Advances every time a new `AVPictureInPictureController` is installed, so
@@ -647,6 +654,7 @@ public final class PiPController: NSObject {
     pipContinuityEventBroadcaster.terminate()
     #endif
     pipSnapshotBroadcaster.terminate()
+    timebaseCorrectionBroadcaster.terminate()
     cancelDeferredPause()
     stateObserverTask?.cancel()
     timingObserverTask?.cancel()
@@ -1269,34 +1277,28 @@ public final class PiPController: NSObject {
         // playback time and rate when the closure is invoked". Read it back
         // only after the matching native clock event has been applied.
         if let tb = controlTimebase {
+          let previousSeconds = CMTimebaseGetTime(tb).seconds
+          let correctedSeconds = Double(player.currentTime.milliseconds) / 1000.0
           CMTimebaseSetTime(tb, time: CMTime(
-            seconds: Double(player.currentTime.milliseconds) / 1000.0,
+            seconds: correctedSeconds,
             preferredTimescale: 1000
           ))
-          CMTimebaseSetRate(tb, rate: player.isActive ? Float64(player.rate) : 0.0)
+          recordTimebaseCorrection(
+            reason: .skipLanding,
+            previousTimebaseSeconds: previousSeconds,
+            correctedTimebaseSeconds: correctedSeconds,
+            mediaTimeSeconds: correctedSeconds
+          )
+          setTimebaseRate(
+            player.isActive ? Float64(player.rate) : 0.0,
+            reason: .skipLanding,
+            mediaTimeSeconds: correctedSeconds
+          )
         }
       }
 
       completionHandler()
     }
-  }
-
-  /// Sets the controlTimebase time to the player's current position.
-  func syncTimebaseTime() {
-    guard let tb = controlTimebase else { return }
-    let t = player.currentTime
-    let seconds = Double(t.components.seconds) + Double(t.components.attoseconds) / 1e18
-    CMTimebaseSetTime(tb, time: CMTime(seconds: seconds, preferredTimescale: 1000))
-  }
-
-  /// Updates the controlTimebase time and rate to match playback state.
-  ///
-  /// When `playing` is true the timebase tracks the player's current
-  /// `rate` so PiP's scrubber animates at the real playback speed.
-  func syncTimebase(playing: Bool) {
-    guard let tb = controlTimebase else { return }
-    syncTimebaseTime()
-    CMTimebaseSetRate(tb, rate: playing ? Float64(player.rate) : 0.0)
   }
 }
 

@@ -131,7 +131,7 @@ private enum PiPValidationRenderingPath: String {
 
 /// Hosts the public direct sample-buffer PiP layer so the device suite can
 /// validate that route independently from libVLC's native drawable backend.
-private struct DirectPiPValidationSurface: UIViewRepresentable {
+struct DirectPiPValidationSurface: UIViewRepresentable {
   let player: Player
   @Binding var controller: PiPController?
 
@@ -212,7 +212,7 @@ private struct DirectPiPValidationSurface: UIViewRepresentable {
 }
 
 @MainActor
-private final class DirectPiPLayerHostView: UIView {
+final class DirectPiPLayerHostView: UIView {
   var displayLayer: CALayer? {
     didSet {
       oldValue?.removeFromSuperlayer()

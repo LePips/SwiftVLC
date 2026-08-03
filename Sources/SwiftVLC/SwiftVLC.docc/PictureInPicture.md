@@ -209,6 +209,23 @@ generation checks, covering events that arrived while no controller owned the
 backend. Playback-state transitions provide a conservative fallback
 invalidation.
 
+## Release qualification diagnostics
+
+SwiftVLC's `Qualification` SPI exposes a pollable direct-PiP clock sample
+and a lossless stream of control-timebase corrections. The device-validation
+harness's Matrix I writes both to JSON Lines as they occur, so a multi-hour
+run remains recoverable even if the app later terminates.
+
+The capture includes the libVLC media clock, control-timebase value and rate,
+delivered sample timestamp, frame counters, drop count, generation, and each
+timebase write. It deliberately does **not** label the media clock as an audio
+presentation timestamp. Release qualification must pair the JSONL with an
+audio/video measurement and an AVPlayer baseline recorded with the same
+fixture and physical device.
+
+`Qualification` is test infrastructure, not stable public API. It may change
+without a major-version release.
+
 ## Common pitfalls
 
 - **Never mix rendering paths.** A player attached to direct

@@ -55,7 +55,7 @@ extension PiPController {
     let initialActive = player.isPlaybackRequestedActive
     let initialNativeActive = player.isActive
     pipPlaybackActive = initialActive
-    syncTimebase(playing: initialNativeActive)
+    syncTimebase(playing: initialNativeActive, reason: .initialSynchronization)
 
     lastObservedNativeActive = initialNativeActive
     lastObservedRate = 1.0
@@ -107,6 +107,8 @@ extension PiPController {
 
     let timebase = controlTimebase
     let time = player.currentTime
+    let playerSeconds = Double(time.components.seconds)
+      + Double(time.components.attoseconds) / 1e18
     let retracking = Self.timebaseRetracking(
       isActive: active,
       rate: rate,
@@ -114,8 +116,7 @@ extension PiPController {
       hasTimebase: timebase != nil,
       isSkipPending: pendingSkipCount > 0,
       secondsSinceSkip: CFAbsoluteTimeGetCurrent() - lastSkipTimestamp,
-      playerSeconds: Double(time.components.seconds)
-        + Double(time.components.attoseconds) / 1e18,
+      playerSeconds: playerSeconds,
       timebaseSeconds: timebase.map { CMTimebaseGetTime($0).seconds } ?? 0
     )
 
@@ -124,10 +125,21 @@ extension PiPController {
     }
     if let timebase {
       if let rate = retracking.setsRate {
-        CMTimebaseSetRate(timebase, rate: Float64(rate))
+        setTimebaseRate(
+          Float64(rate),
+          reason: .playbackRateTransition,
+          mediaTimeSeconds: playerSeconds
+        )
       }
       if let seconds = retracking.setsTime {
+        let previousSeconds = CMTimebaseGetTime(timebase).seconds
         CMTimebaseSetTime(timebase, time: CMTime(seconds: seconds, preferredTimescale: 1000))
+        recordTimebaseCorrection(
+          reason: .steadyStateDrift,
+          previousTimebaseSeconds: previousSeconds,
+          correctedTimebaseSeconds: seconds,
+          mediaTimeSeconds: seconds
+        )
       }
     }
   }
