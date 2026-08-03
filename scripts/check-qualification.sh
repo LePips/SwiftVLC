@@ -75,6 +75,7 @@ fi
 
 python3 - "$MATRIX" "$RECORD" "$DIGEST" "$VERSION" <<'PY'
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -109,11 +110,70 @@ if record.get("artifactDigestAlgorithm") != "swiftvlc-tree-v1":
         "'swiftvlc-tree-v1'"
     )
 
-required = {
-    (s["id"], h["id"])
-    for s in matrix["scenarios"]
-    for h in matrix["hardware"]
-}
+scenarios = matrix.get("scenarios")
+hardware_rows = matrix.get("hardware")
+if not isinstance(scenarios, list) or not isinstance(hardware_rows, list):
+    sys.exit("Error: qualification matrix needs 'scenarios' and 'hardware' arrays.")
+
+if any(
+    not isinstance(scenario, dict) or not isinstance(scenario.get("id"), str)
+    for scenario in scenarios
+):
+    sys.exit("Error: every qualification scenario needs a string 'id'.")
+if any(
+    not isinstance(hardware, dict) or not isinstance(hardware.get("id"), str)
+    for hardware in hardware_rows
+):
+    sys.exit("Error: every qualification hardware row needs a string 'id'.")
+
+scenario_by_id = {scenario["id"]: scenario for scenario in scenarios}
+hardware_by_id = {hardware["id"]: hardware for hardware in hardware_rows}
+if len(scenario_by_id) != len(scenarios):
+    sys.exit("Error: qualification matrix contains duplicate scenario ids.")
+if len(hardware_by_id) != len(hardware_rows):
+    sys.exit("Error: qualification matrix contains duplicate hardware ids.")
+
+required = set()
+for scenario in scenarios:
+    required_evidence = scenario.get("requiredEvidenceFields", [])
+    if (
+        not isinstance(required_evidence, list)
+        or any(not isinstance(field, str) or not field for field in required_evidence)
+    ):
+        sys.exit(
+            f"Error: scenario {scenario['id']!r} has invalid required evidence fields."
+        )
+    expected_evidence = scenario.get("expectedEvidenceValues", {})
+    if not isinstance(expected_evidence, dict):
+        sys.exit(
+            f"Error: scenario {scenario['id']!r} has invalid expected evidence values."
+        )
+    allowed_evidence = scenario.get("allowedEvidenceValues", {})
+    if (
+        not isinstance(allowed_evidence, dict)
+        or any(
+            not isinstance(field, str)
+            or not field
+            or not isinstance(allowed, list)
+            or not allowed
+            for field, allowed in allowed_evidence.items()
+        )
+    ):
+        sys.exit(
+            f"Error: scenario {scenario['id']!r} has invalid allowed evidence values."
+        )
+    selected_hardware = scenario.get("hardware", list(hardware_by_id))
+    if not isinstance(selected_hardware, list) or not selected_hardware:
+        sys.exit(
+            f"Error: scenario {scenario['id']!r} has an empty or invalid hardware list."
+        )
+    unknown = sorted(set(selected_hardware) - set(hardware_by_id))
+    if unknown:
+        sys.exit(
+            f"Error: scenario {scenario['id']!r} names unknown hardware: "
+            + ", ".join(unknown)
+        )
+    required.update((scenario["id"], hardware_id) for hardware_id in selected_hardware)
 
 rows = record.get("rows")
 if not isinstance(rows, list):
@@ -156,7 +216,6 @@ if failed:
 
 # Fields the criteria call for on every row. A row missing them is not a record
 # of anything reproducible.
-hardware_by_id = {hardware["id"]: hardware for hardware in matrix["hardware"]}
 for key in sorted(executed):
     if key not in required:
         continue
@@ -170,6 +229,7 @@ for key in sorted(executed):
         "osReleaseType",
         "fixture",
         "duration",
+        "durationSeconds",
         "evidence",
         "result",
     ):
@@ -196,6 +256,31 @@ for key in sorted(executed):
             f"row {key[0]} on {key[1]} uses {row.get('osReleaseType')!r} OS "
             "software; release qualification requires a stable OS build"
         )
+
+    duration_seconds = row.get("durationSeconds")
+    if (
+        not isinstance(duration_seconds, (int, float))
+        or isinstance(duration_seconds, bool)
+    ):
+        problems.append(
+            f"row {key[0]} on {key[1]} durationSeconds must be a number"
+        )
+    elif not math.isfinite(duration_seconds):
+        problems.append(
+            f"row {key[0]} on {key[1]} durationSeconds must be finite"
+        )
+    elif duration_seconds <= 0:
+        problems.append(
+            f"row {key[0]} on {key[1]} durationSeconds must be positive"
+        )
+    else:
+        minimum = scenario_by_id[key[0]].get("minimumDurationSeconds", 0)
+        if duration_seconds < minimum:
+            problems.append(
+                f"row {key[0]} on {key[1]} ran for {duration_seconds:g}s, "
+                f"below the required {minimum:g}s"
+            )
+
     evidence = row.get("evidence")
     if evidence:
         evidence_path = Path(evidence)
@@ -209,6 +294,122 @@ for key in sorted(executed):
                 f"row {key[0]} on {key[1]} evidence file does not exist: "
                 f"{evidence}"
             )
+        else:
+            resolved_evidence = Path(record_path).parent / evidence_path
+            try:
+                evidence_document = json.load(open(resolved_evidence))
+            except (OSError, ValueError) as error:
+                problems.append(
+                    f"row {key[0]} on {key[1]} evidence is not valid JSON: {error}"
+                )
+                continue
+            if not isinstance(evidence_document, dict):
+                problems.append(
+                    f"row {key[0]} on {key[1]} evidence must be a JSON object"
+                )
+                continue
+            for field, expected in (
+                ("artifactDigest", digest),
+                ("scenario", key[0]),
+                ("hardware", key[1]),
+            ):
+                if evidence_document.get(field) != expected:
+                    problems.append(
+                        f"row {key[0]} on {key[1]} evidence {field!r} is "
+                        f"{evidence_document.get(field)!r}, expected {expected!r}"
+                    )
+
+            missing_marker = object()
+
+            def nested_value(document, dotted_path):
+                value = document
+                for component in dotted_path.split("."):
+                    if not isinstance(value, dict) or component not in value:
+                        return missing_marker
+                    value = value[component]
+                return value
+
+            def same_json_value(actual, expected):
+                # Python's bool subclasses int, but JSON booleans and numbers
+                # are different types. Compare recursively using JSON's type
+                # model so false cannot satisfy 0, including inside arrays or
+                # objects. Integers and floats remain one JSON number type.
+                if isinstance(expected, bool):
+                    return isinstance(actual, bool) and actual == expected
+                if isinstance(expected, (int, float)):
+                    return (
+                        isinstance(actual, (int, float))
+                        and not isinstance(actual, bool)
+                        and actual == expected
+                    )
+                if expected is None:
+                    return actual is None
+                if isinstance(expected, str):
+                    return isinstance(actual, str) and actual == expected
+                if isinstance(expected, list):
+                    return (
+                        isinstance(actual, list)
+                        and len(actual) == len(expected)
+                        and all(
+                            same_json_value(a, e)
+                            for a, e in zip(actual, expected)
+                        )
+                    )
+                if isinstance(expected, dict):
+                    return (
+                        isinstance(actual, dict)
+                        and actual.keys() == expected.keys()
+                        and all(
+                            same_json_value(actual[field], expected[field])
+                            for field in expected
+                        )
+                    )
+                return type(actual) is type(expected) and actual == expected
+
+            required_evidence = scenario_by_id[key[0]].get(
+                "requiredEvidenceFields", []
+            )
+            for field in required_evidence:
+                value = nested_value(evidence_document, field)
+                if (
+                    value is missing_marker
+                    or value is None
+                    or value == ""
+                    or value == []
+                    or value == {}
+                ):
+                    problems.append(
+                        f"row {key[0]} on {key[1]} evidence is missing "
+                        f"non-empty field {field!r}"
+                    )
+
+            expected_evidence = scenario_by_id[key[0]].get(
+                "expectedEvidenceValues", {}
+            )
+            for field, expected in expected_evidence.items():
+                value = nested_value(evidence_document, field)
+                if value is missing_marker or not same_json_value(value, expected):
+                    rendered = None if value is missing_marker else value
+                    problems.append(
+                        f"row {key[0]} on {key[1]} evidence field {field!r} "
+                        f"is {rendered!r}, "
+                        f"expected {expected!r}"
+                    )
+
+            allowed_evidence = scenario_by_id[key[0]].get(
+                "allowedEvidenceValues", {}
+            )
+            for field, allowed in allowed_evidence.items():
+                value = nested_value(evidence_document, field)
+                if value is missing_marker or not any(
+                    same_json_value(value, candidate) for candidate in allowed
+                ):
+                    rendered = None if value is missing_marker else value
+                    problems.append(
+                        f"row {key[0]} on {key[1]} evidence field {field!r} "
+                        f"is {rendered!r}, "
+                        f"expected one of {allowed!r}"
+                    )
 
 if problems:
     print(f"Error: {version} is not qualified for release.", file=sys.stderr)

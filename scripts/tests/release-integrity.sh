@@ -217,13 +217,41 @@ import json
 import sys
 
 matrix_path, record_path, digest = sys.argv[1:4]
-open(str(record_path).rsplit("/", 1)[0] + "/evidence.json", "w").write("{}\n")
 matrix = {
-    "scenarios": [{"id": "vod"}],
+    "scenarios": [
+        {
+            "id": "vod",
+            "hardware": ["iphone-current"],
+            "minimumDurationSeconds": 60,
+            "requiredEvidenceFields": ["metrics.cpu", "outcome", "retryCount"],
+            "expectedEvidenceValues": {
+                "metrics.errors": 0,
+                "rates": [1, 2],
+            },
+            "allowedEvidenceValues": {
+                "outcome": ["stable", "recovered"],
+                "retryCount": [0, 1],
+            },
+        }
+    ],
     "hardware": [
-        {"id": "iphone-current", "deviceFamily": "iPhone", "osMajor": 26}
+        {"id": "iphone-current", "deviceFamily": "iPhone", "osMajor": 26},
+        {"id": "ipad-current", "deviceFamily": "iPad", "osMajor": 26},
     ],
 }
+evidence = {
+    "artifactDigest": digest,
+    "scenario": "vod",
+    "hardware": "iphone-current",
+    "metrics": {"cpu": 0, "errors": 0},
+    "rates": [1.0, 2],
+    "outcome": "stable",
+    "retryCount": 0,
+}
+json.dump(
+    evidence,
+    open(str(record_path).rsplit("/", 1)[0] + "/evidence.json", "w"),
+)
 record = {
     "version": "1.1.0",
     "artifactDigestAlgorithm": "swiftvlc-tree-v1",
@@ -240,6 +268,7 @@ record = {
             "osReleaseType": "stable",
             "fixture": "fixture.mp4",
             "duration": "2m",
+            "durationSeconds": 120,
             "evidence": "evidence.json",
             "result": "pass",
         }
@@ -247,6 +276,167 @@ record = {
 }
 json.dump(matrix, open(matrix_path, "w"))
 json.dump(record, open(record_path, "w"))
+PY
+
+SWIFTVLC_QUALIFICATION_MATRIX="$temp_dir/matrix.json" \
+  SWIFTVLC_QUALIFICATION_RECORD="$temp_dir/record.json" \
+  "$SCRIPT_DIR/check-qualification.sh" 1.1.0 "$temp_dir/tree-a" >/dev/null
+
+# The scenario is scoped to iPhone, so the unrecorded iPad row must not be
+# invented by the checker. The successful call above is the regression test.
+
+python3 - "$temp_dir/record.json" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+record = json.load(open(path))
+record["rows"][0]["durationSeconds"] = 30
+json.dump(record, open(path, "w"))
+PY
+if SWIFTVLC_QUALIFICATION_MATRIX="$temp_dir/matrix.json" \
+  SWIFTVLC_QUALIFICATION_RECORD="$temp_dir/record.json" \
+  "$SCRIPT_DIR/check-qualification.sh" 1.1.0 "$temp_dir/tree-a" >/dev/null 2>&1; then
+  fail "qualification accepted a run shorter than the scenario minimum"
+fi
+
+for non_finite in nan infinity; do
+  python3 - "$temp_dir/record.json" "$non_finite" <<'PY'
+import json
+import sys
+
+path, kind = sys.argv[1:3]
+record = json.load(open(path))
+record["rows"][0]["durationSeconds"] = (
+    float("nan") if kind == "nan" else float("inf")
+)
+json.dump(record, open(path, "w"))
+PY
+  if SWIFTVLC_QUALIFICATION_MATRIX="$temp_dir/matrix.json" \
+    SWIFTVLC_QUALIFICATION_RECORD="$temp_dir/record.json" \
+    "$SCRIPT_DIR/check-qualification.sh" 1.1.0 "$temp_dir/tree-a" >/dev/null 2>&1; then
+    fail "qualification accepted a non-finite duration: $non_finite"
+  fi
+done
+
+python3 - "$temp_dir/record.json" "$temp_dir/evidence.json" <<'PY'
+import json
+import sys
+
+record_path, evidence_path = sys.argv[1:3]
+record = json.load(open(record_path))
+record["rows"][0]["durationSeconds"] = 120
+json.dump(record, open(record_path, "w"))
+evidence = json.load(open(evidence_path))
+evidence["metrics"].pop("cpu")
+json.dump(evidence, open(evidence_path, "w"))
+PY
+if SWIFTVLC_QUALIFICATION_MATRIX="$temp_dir/matrix.json" \
+  SWIFTVLC_QUALIFICATION_RECORD="$temp_dir/record.json" \
+  "$SCRIPT_DIR/check-qualification.sh" 1.1.0 "$temp_dir/tree-a" >/dev/null 2>&1; then
+  fail "qualification accepted evidence missing a required metric"
+fi
+
+python3 - "$temp_dir/evidence.json" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+evidence = json.load(open(path))
+evidence["metrics"]["cpu"] = 0
+json.dump(evidence, open(path, "w"))
+PY
+
+SWIFTVLC_QUALIFICATION_MATRIX="$temp_dir/matrix.json" \
+  SWIFTVLC_QUALIFICATION_RECORD="$temp_dir/record.json" \
+  "$SCRIPT_DIR/check-qualification.sh" 1.1.0 "$temp_dir/tree-a" >/dev/null
+
+python3 - "$temp_dir/evidence.json" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+evidence = json.load(open(path))
+evidence["metrics"]["errors"] = 1
+json.dump(evidence, open(path, "w"))
+PY
+if SWIFTVLC_QUALIFICATION_MATRIX="$temp_dir/matrix.json" \
+  SWIFTVLC_QUALIFICATION_RECORD="$temp_dir/record.json" \
+  "$SCRIPT_DIR/check-qualification.sh" 1.1.0 "$temp_dir/tree-a" >/dev/null 2>&1; then
+  fail "qualification accepted evidence with a wrong expected value"
+fi
+
+python3 - "$temp_dir/evidence.json" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+evidence = json.load(open(path))
+evidence["metrics"]["errors"] = False
+json.dump(evidence, open(path, "w"))
+PY
+if SWIFTVLC_QUALIFICATION_MATRIX="$temp_dir/matrix.json" \
+  SWIFTVLC_QUALIFICATION_RECORD="$temp_dir/record.json" \
+  "$SCRIPT_DIR/check-qualification.sh" 1.1.0 "$temp_dir/tree-a" >/dev/null 2>&1; then
+  fail "qualification treated a boolean as an expected number"
+fi
+
+python3 - "$temp_dir/evidence.json" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+evidence = json.load(open(path))
+evidence["metrics"]["errors"] = 0
+evidence["rates"] = [True, 2]
+json.dump(evidence, open(path, "w"))
+PY
+if SWIFTVLC_QUALIFICATION_MATRIX="$temp_dir/matrix.json" \
+  SWIFTVLC_QUALIFICATION_RECORD="$temp_dir/record.json" \
+  "$SCRIPT_DIR/check-qualification.sh" 1.1.0 "$temp_dir/tree-a" >/dev/null 2>&1; then
+  fail "qualification treated a boolean as a number inside an expected array"
+fi
+
+python3 - "$temp_dir/evidence.json" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+evidence = json.load(open(path))
+evidence["rates"] = [1.0, 2]
+evidence["retryCount"] = False
+json.dump(evidence, open(path, "w"))
+PY
+if SWIFTVLC_QUALIFICATION_MATRIX="$temp_dir/matrix.json" \
+  SWIFTVLC_QUALIFICATION_RECORD="$temp_dir/record.json" \
+  "$SCRIPT_DIR/check-qualification.sh" 1.1.0 "$temp_dir/tree-a" >/dev/null 2>&1; then
+  fail "qualification treated a boolean as an allowed number"
+fi
+
+python3 - "$temp_dir/evidence.json" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+evidence = json.load(open(path))
+evidence["retryCount"] = 0
+evidence["outcome"] = "failed"
+json.dump(evidence, open(path, "w"))
+PY
+if SWIFTVLC_QUALIFICATION_MATRIX="$temp_dir/matrix.json" \
+  SWIFTVLC_QUALIFICATION_RECORD="$temp_dir/record.json" \
+  "$SCRIPT_DIR/check-qualification.sh" 1.1.0 "$temp_dir/tree-a" >/dev/null 2>&1; then
+  fail "qualification accepted evidence outside the allowed values"
+fi
+
+python3 - "$temp_dir/evidence.json" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+evidence = json.load(open(path))
+evidence["outcome"] = "recovered"
+json.dump(evidence, open(path, "w"))
 PY
 
 SWIFTVLC_QUALIFICATION_MATRIX="$temp_dir/matrix.json" \
@@ -273,6 +463,30 @@ if SWIFTVLC_QUALIFICATION_MATRIX="$temp_dir/matrix.json" \
   "$SCRIPT_DIR/check-qualification.sh" 1.1.0 "$temp_dir/tree-a" >/dev/null 2>&1; then
   fail "qualification accepted a beta OS row"
 fi
+
+python3 - "$ROOT_DIR/scripts/qualification/matrix.json" <<'PY'
+import json
+import sys
+
+matrix = json.load(open(sys.argv[1]))
+for scenario in matrix["scenarios"]:
+    if 88 not in scenario.get("issues", []):
+        continue
+    expected = scenario.get("expectedEvidenceValues", {})
+    if not any(field.startswith("events.") for field in expected):
+        raise SystemExit(
+            f"issue 88 scenario {scenario['id']} does not enforce lifecycle outcomes"
+        )
+    if "controls" in scenario.get("requiredEvidenceFields", []):
+        allowed = scenario.get("allowedEvidenceValues", {})
+        if not any(
+            field == "controls" or field.startswith("controls.")
+            for field in expected.keys() | allowed.keys()
+        ):
+            raise SystemExit(
+                f"issue 88 scenario {scenario['id']} does not enforce control outcomes"
+            )
+PY
 
 cd "$ROOT_DIR"
 bash -n \
