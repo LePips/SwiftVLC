@@ -53,6 +53,23 @@ static CGImageRef CreateOverlay(void)
     return image;
 }
 
+static void ValidateRenderedOverlay(OSType format, CGImageRef rendered)
+{
+    uint8_t average[4] = {0};
+    CGColorSpaceRef space = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+    CGContextRef context = CGBitmapContextCreate(
+        average, 1, 1, 8, sizeof(average), space,
+        kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
+    CGColorSpaceRelease(space);
+    if (context == NULL)
+        Fail(format, "overlay readback context");
+    CGContextSetInterpolationQuality(context, kCGInterpolationHigh);
+    CGContextDrawImage(context, CGRectMake(0, 0, 1, 1), rendered);
+    CGContextRelease(context);
+    if (average[0] <= average[1] + 24 || average[0] <= average[2] + 24)
+        Fail(format, "composited overlay pixels were not present");
+}
+
 static void ValidateFormat(CIContext *context, CGImageRef overlay,
                            CGColorSpaceRef colorSpace, OSType format,
                            size_t width, size_t height)
@@ -133,6 +150,7 @@ static void ValidateFormat(CIContext *context, CGImageRef overlay,
                                                           192, 96)];
     if (rendered == NULL)
         Fail(format, "composited region could not be read back");
+    ValidateRenderedOverlay(format, rendered);
     printf("%c%c%c%c,%zux%zu,cold=%.3fms,warm=%.3fms\n",
            (int)(format >> 24), (int)(format >> 16),
            (int)(format >> 8), (int)format, width, height,
