@@ -709,14 +709,20 @@ private final class EventBridgeCallbackContext: Sendable {
     return result.0
   }
 
-  func noteEncounteredError(nativeHandleGeneration: UInt64) -> UInt64 {
+  func noteEncounteredError(
+    _ failure: PlaybackFailureKind,
+    nativeHandleGeneration: UInt64
+  ) -> UInt64 {
     let result = playbackLifecycle.withLock { state -> (UInt64, PlaybackTerminalOutcome?) in
       let generation = state.currentGeneration
-      state.terminalIntents[generation] = .failure(.unknown)
+      guard generation > state.lastEmittedGeneration else {
+        return (generation, nil)
+      }
+      state.terminalIntents[generation] = .failure(failure)
       let outcome = makeOutcome(
         in: &state,
         generation: generation,
-        cause: .failure(.unknown),
+        cause: .failure(failure),
         nativeHandleGeneration: nativeHandleGeneration
       )
       return (generation, outcome)
@@ -881,6 +887,9 @@ private func playerEventCallback(
 
   case .encounteredError:
     playbackGeneration = context.noteEncounteredError(
+      mapPlaybackFailureKind(
+        event.pointee.u.media_player_encountered_error.failure
+      ),
       nativeHandleGeneration: attachment.nativeHandleGeneration
     )
     shouldSynthesizeEnd = false

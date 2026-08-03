@@ -89,6 +89,19 @@ extension Logic {
     }
 
     @Test
+    func `Playback failure kinds preserve authoritative subsystem attribution`() {
+      #expect(mapPlaybackFailureKind(libvlc_playback_failure_source) == .source)
+      #expect(mapPlaybackFailureKind(libvlc_playback_failure_demux) == .demux)
+      #expect(mapPlaybackFailureKind(libvlc_playback_failure_decoder) == .decoder)
+      #expect(mapPlaybackFailureKind(libvlc_playback_failure_renderer) == .renderer)
+      #expect(mapPlaybackFailureKind(libvlc_playback_failure_output) == .output)
+      #expect(mapPlaybackFailureKind(libvlc_playback_failure_unknown) == .unknown)
+      #expect(
+        mapPlaybackFailureKind(libvlc_playback_failure_kind_t(rawValue: 999)) == .unknown
+      )
+    }
+
+    @Test
     func `MediaChanged maps to mediaChanged`() {
       let mapped = mapEvent(event(type: libvlc_MediaPlayerMediaChanged.rawValue))
       guard case .mediaChanged = mapped else {
