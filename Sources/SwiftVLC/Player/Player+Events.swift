@@ -177,7 +177,11 @@ extension Player {
       performDeferredPauseCommandIfNeeded()
 
     case .tracksChanged:
+      let previousVideoTracks = videoTracks
       refreshTracks()
+      if Self.playbackHealthVideoTracksDiffer(previousVideoTracks, videoTracks) {
+        markPlaybackHealthAdaptiveSwitch()
+      }
       // Adaptive streams can switch resolution mid-stream without any
       // dedicated size event; libVLC reports the change through the
       // track list (ES selection/update), so re-signal the decoded
@@ -318,6 +322,9 @@ extension Player {
   // MARK: - Playback state + intent publication
 
   func publishPlaybackState(_ newState: PlayerState) {
+    if newState == .playing, state != .playing {
+      rearmPlaybackHealthAfterEnteringPlaying()
+    }
     state = newState
     withMutation(keyPath: \.isActive) {}
     // The single funnel for `state`, and therefore the only place that can
@@ -328,6 +335,8 @@ extension Player {
     // produced a `.stateChanged` to forward.
     stateTransitionBridge.broadcast(newState)
     publishPlaybackStatus()
+    samplePlaybackHealth()
+    reconcilePlaybackHealthSamplingTask()
   }
 
   /// Republishes the current state paired with the session it belongs to.
@@ -510,6 +519,7 @@ extension Player {
     // generation carrying the outgoing media's capability — which would make
     // it distrust the poll for the rest of that media's lifetime.
     advanceCapabilityGeneration()
+    resetPlaybackHealth()
   }
 
   /// Re-applies the latest user intent to a media generation advanced by the
