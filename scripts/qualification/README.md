@@ -27,6 +27,9 @@ while `allowedEvidenceValues` accepts one of a documented set (for example a
 replacement session must be either preserved or boundedly re-engaged). This
 prevents a passing row from carrying evidence that actually records an
 unsupported feature, a regression, or a failed acceptance condition.
+The original cross-device PiP rows apply the same rule to each control,
+lifecycle order, recovery path, and stop reason; a top-level `result: "pass"`
+cannot mask a failed pause, missing restoration, or unsuccessful recovery.
 
 Record the results as `scripts/qualification/<version>.json`:
 
@@ -63,7 +66,11 @@ Every evidence file is a JSON object tied to the exact artifact and row:
   "artifactDigest": "…",
   "scenario": "vod-controls",
   "hardware": "iphone-current",
-  "events": ["willStart", "didStart", "willStop(userClosed)", "didStop(userClosed)"],
+  "events": {
+    "started": true,
+    "unexpectedStopCount": 0,
+    "order": "pass"
+  },
   "controls": {
     "pause": "pass",
     "scrub": "pass",
@@ -77,6 +84,9 @@ Scenario-specific required fields use dotted paths such as `metrics.cpu` or
 `backendResults.native`. Zero is a valid recorded value (for example zero
 crashes or frame drops); missing, null, empty strings, and empty collections
 are not. Exact and allowed-value constraints use the same dotted-path syntax.
+JSON types are strict: a boolean does not satisfy a numeric zero or one, even
+inside an array or object. Durations must also be finite positive numbers;
+`NaN` and infinity are rejected before minimum soak time is evaluated.
 Evidence may contain any additional raw samples, logs, Instruments exports,
 fixture hashes, or notes needed to make the result reproducible.
 

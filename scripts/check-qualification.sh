@@ -75,6 +75,7 @@ fi
 
 python3 - "$MATRIX" "$RECORD" "$DIGEST" "$VERSION" <<'PY'
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -264,6 +265,10 @@ for key in sorted(executed):
         problems.append(
             f"row {key[0]} on {key[1]} durationSeconds must be a number"
         )
+    elif not math.isfinite(duration_seconds):
+        problems.append(
+            f"row {key[0]} on {key[1]} durationSeconds must be finite"
+        )
     elif duration_seconds <= 0:
         problems.append(
             f"row {key[0]} on {key[1]} durationSeconds must be positive"
@@ -324,6 +329,43 @@ for key in sorted(executed):
                     value = value[component]
                 return value
 
+            def same_json_value(actual, expected):
+                # Python's bool subclasses int, but JSON booleans and numbers
+                # are different types. Compare recursively using JSON's type
+                # model so false cannot satisfy 0, including inside arrays or
+                # objects. Integers and floats remain one JSON number type.
+                if isinstance(expected, bool):
+                    return isinstance(actual, bool) and actual == expected
+                if isinstance(expected, (int, float)):
+                    return (
+                        isinstance(actual, (int, float))
+                        and not isinstance(actual, bool)
+                        and actual == expected
+                    )
+                if expected is None:
+                    return actual is None
+                if isinstance(expected, str):
+                    return isinstance(actual, str) and actual == expected
+                if isinstance(expected, list):
+                    return (
+                        isinstance(actual, list)
+                        and len(actual) == len(expected)
+                        and all(
+                            same_json_value(a, e)
+                            for a, e in zip(actual, expected)
+                        )
+                    )
+                if isinstance(expected, dict):
+                    return (
+                        isinstance(actual, dict)
+                        and actual.keys() == expected.keys()
+                        and all(
+                            same_json_value(actual[field], expected[field])
+                            for field in expected
+                        )
+                    )
+                return type(actual) is type(expected) and actual == expected
+
             required_evidence = scenario_by_id[key[0]].get(
                 "requiredEvidenceFields", []
             )
@@ -346,7 +388,7 @@ for key in sorted(executed):
             )
             for field, expected in expected_evidence.items():
                 value = nested_value(evidence_document, field)
-                if value is missing_marker or value != expected:
+                if value is missing_marker or not same_json_value(value, expected):
                     rendered = None if value is missing_marker else value
                     problems.append(
                         f"row {key[0]} on {key[1]} evidence field {field!r} "
@@ -359,7 +401,9 @@ for key in sorted(executed):
             )
             for field, allowed in allowed_evidence.items():
                 value = nested_value(evidence_document, field)
-                if value is missing_marker or value not in allowed:
+                if value is missing_marker or not any(
+                    same_json_value(value, candidate) for candidate in allowed
+                ):
                     rendered = None if value is missing_marker else value
                     problems.append(
                         f"row {key[0]} on {key[1]} evidence field {field!r} "
