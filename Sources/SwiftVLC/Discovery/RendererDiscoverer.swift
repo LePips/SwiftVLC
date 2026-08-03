@@ -1,5 +1,4 @@
 import CLibVLC
-import Dispatch
 
 /// Discovers renderer devices exposed by libVLC renderer-discovery plugins.
 ///
@@ -61,7 +60,10 @@ public final class RendererDiscoverer: Sendable {
   ///   - instance: The VLC instance.
   /// - Throws: `VLCError.instanceCreationFailed` if the discoverer cannot be created.
   public init(name: String, instance: VLCInstance = .shared) throws(VLCError) {
-    guard let p = libvlc_renderer_discoverer_new(instance.pointer, name) else {
+    let p = DiscoveryLifecycle.sync {
+      libvlc_renderer_discoverer_new(instance.pointer, name)
+    }
+    guard let p else {
       throw .instanceCreationFailed
     }
     pointer = p
@@ -89,7 +91,7 @@ public final class RendererDiscoverer: Sendable {
     nonisolated(unsafe) let box = opaque
     let instance = self.instance
     let broadcaster = self.broadcaster
-    DispatchQueue.global(qos: .utility).async {
+    DiscoveryLifecycle.async {
       let em = libvlc_renderer_discoverer_event_manager(discoverer)!
       libvlc_event_detach(em, Int32(libvlc_RendererDiscovererItemAdded.rawValue), rendererCallback, box)
       libvlc_event_detach(em, Int32(libvlc_RendererDiscovererItemDeleted.rawValue), rendererCallback, box)
@@ -103,14 +105,19 @@ public final class RendererDiscoverer: Sendable {
   /// Starts renderer discovery.
   /// - Throws: `VLCError.operationFailed` if discovery cannot start.
   public func start() throws(VLCError) {
-    if libvlc_renderer_discoverer_start(pointer) != 0 {
+    let result = DiscoveryLifecycle.sync {
+      libvlc_renderer_discoverer_start(pointer)
+    }
+    if result != 0 {
       throw .operationFailed("Start renderer discovery")
     }
   }
 
   /// Stops renderer discovery.
   public func stop() {
-    libvlc_renderer_discoverer_stop(pointer)
+    DiscoveryLifecycle.sync {
+      libvlc_renderer_discoverer_stop(pointer)
+    }
   }
 }
 
@@ -228,17 +235,19 @@ extension RendererDiscoverer {
   public static func availableServices(
     instance: VLCInstance = .shared
   ) -> [RendererService] {
-    var ppp: UnsafeMutablePointer<UnsafeMutablePointer<libvlc_rd_description_t>?>?
-    let count = libvlc_renderer_discoverer_list_get(instance.pointer, &ppp)
-    guard count > 0, let ppp else { return [] }
-    defer { libvlc_renderer_discoverer_list_release(ppp, count) }
+    DiscoveryLifecycle.sync {
+      var ppp: UnsafeMutablePointer<UnsafeMutablePointer<libvlc_rd_description_t>?>?
+      let count = libvlc_renderer_discoverer_list_get(instance.pointer, &ppp)
+      guard count > 0, let ppp else { return [] }
+      defer { libvlc_renderer_discoverer_list_release(ppp, count) }
 
-    return (0..<Int(count)).compactMap { i -> RendererService? in
-      guard let desc = ppp[i]?.pointee else { return nil }
-      return RendererService(
-        name: String(cString: desc.psz_name),
-        longName: String(cString: desc.psz_longname)
-      )
+      return (0..<Int(count)).compactMap { i -> RendererService? in
+        guard let desc = ppp[i]?.pointee else { return nil }
+        return RendererService(
+          name: String(cString: desc.psz_name),
+          longName: String(cString: desc.psz_longname)
+        )
+      }
     }
   }
 }

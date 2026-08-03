@@ -195,3 +195,11 @@ bool swiftvlc_playback_snapshot_available(void) {
     return false;
 #endif
 }
+
+bool swiftvlc_native_pip_overlay_composition_available(void) {
+#if defined(__APPLE__)
+    return swiftvlc_libvlc_pip_extensions_version() >= 3;
+#else
+    return false;
+#endif
+}

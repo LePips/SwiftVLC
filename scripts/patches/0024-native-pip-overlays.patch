@@ -1,0 +1,1029 @@
+diff --git a/lib/media_player.c b/lib/media_player.c
+index b77f6c837f..b9186f5c40 100644
+--- a/lib/media_player.c
++++ b/lib/media_player.c
+@@ -998,7 +998,7 @@ libvlc_media_player_get_media( libvlc_media_player_t *p_mi )
+ 
+ unsigned swiftvlc_libvlc_pip_extensions_version( void )
+ {
+-    return 2;
++    return 3;
+ }
+ 
+ bool
+diff --git a/modules/video_output/Makefile.am b/modules/video_output/Makefile.am
+index bca97ac800..5853c44265 100644
+--- a/modules/video_output/Makefile.am
++++ b/modules/video_output/Makefile.am
+@@ -84,6 +84,7 @@ if !HAVE_WATCHOS
+ libsamplebufferdisplay_plugin_la_SOURCES = \
+ 	video_output/apple/VLCSampleBufferDisplay.m \
+ 	video_output/apple/VLCSampleBufferGeometry.h \
++	video_output/apple/VLCSampleBufferOverlayGeometry.h \
+ 	codec/vt_utils.c codec/vt_utils.h
+ libsamplebufferdisplay_plugin_la_OBJCFLAGS = $(AM_OBJCFLAGS) -fobjc-arc
+ if HAVE_OSX
+diff --git a/modules/video_output/apple/VLCPictureInPictureController.m b/modules/video_output/apple/VLCPictureInPictureController.m
+index ab23e0a149..87c9f80034 100644
+--- a/modules/video_output/apple/VLCPictureInPictureController.m
++++ b/modules/video_output/apple/VLCPictureInPictureController.m
+@@ -48,8 +48,10 @@ @interface VLCPictureInPictureController: NSObject
+     atomic_bool _closed;
+     atomic_bool _awaitingSuccessor;
+     atomic_bool _pictureInPictureActive;
++    atomic_bool _pictureInPicturePresenting;
+     atomic_uint_fast64_t _handoffToken;
+     BOOL _observingPictureInPicturePossible;
++    __weak id<VLCPictureInPictureOverlayStateObserving> _overlayStateObserver;
+     __weak id<VLCPictureInPictureDrawable> _drawable;
+     id<VLCPictureInPictureMediaControlling> _mediaController;
+     uint64_t _mediaPlaybackGeneration;
+@@ -64,6 +66,8 @@ @interface VLCPictureInPictureController: NSObject
+ - (instancetype)initWithPipController:(pip_controller_t *)pipcontroller;
+ - (void)rebindToPipController:(pip_controller_t *)pipcontroller;
+ - (void)invalidatePlaybackState;
++- (BOOL)shouldCompositeSubpictures;
++- (void)setOverlayCompositionEnabled:(BOOL)enabled;
+ - (void)close;
+ - (void)closeForVideoOutput;
+ 
+@@ -78,6 +82,7 @@ - (instancetype)initWithPipController:(pip_controller_t *)pipcontroller {
+     atomic_init(&_closed, false);
+     atomic_init(&_awaitingSuccessor, false);
+     atomic_init(&_pictureInPictureActive, false);
++    atomic_init(&_pictureInPicturePresenting, false);
+     atomic_init(&_handoffToken, 0);
+ 
+     [self rebindToPipController:pipcontroller];
+@@ -98,6 +103,16 @@ - (void)rebindToPipController:(pip_controller_t *)pipcontroller {
+         return;
+     
+     _drawable = drawable;
++    id<VLCPictureInPictureOverlayStateObserving> overlayStateObserver =
++        (__bridge id<VLCPictureInPictureOverlayStateObserving>)
++            pipcontroller->overlay_state_observer;
++    _overlayStateObserver = overlayStateObserver;
++    /* A preserved controller can be rebound while PiP is already presenting.
++     * Publish the current mode to the successor vout even though the
++     * controller-wide boolean did not transition. */
++    if (atomic_load_explicit(&_pictureInPicturePresenting,
++                             memory_order_acquire))
++        [overlayStateObserver pictureInPictureOverlayCompositionDidChange:YES];
+     _mediaController = drawable.mediaController;
+     if ([_mediaController respondsToSelector:@selector(mediaPlaybackGeneration)])
+         _mediaPlaybackGeneration = [_mediaController mediaPlaybackGeneration];
+@@ -218,6 +233,7 @@ - (void)close {
+     if (atomic_exchange_explicit(&_closed, true, memory_order_acq_rel))
+         return;
+     atomic_store_explicit(&_awaitingSuccessor, false, memory_order_release);
++    [self setOverlayCompositionEnabled:NO];
+     atomic_fetch_add_explicit(&_handoffToken, 1, memory_order_acq_rel);
+ 
+     dispatch_block_t cleanup = ^{
+@@ -362,8 +378,17 @@ - (void)pictureInPictureControllerWillStartPictureInPicture:(AVPictureInPictureC
+      * pictureInPictureControllerTimeRangeForPlayback: isn't automatically
+      * called each time PiP is activated
+      */
+-    if (!atomic_load_explicit(&_closed, memory_order_acquire))
++    if (!atomic_load_explicit(&_closed, memory_order_acquire)) {
++        [self setOverlayCompositionEnabled:YES];
+         [self invalidatePlaybackState];
++    }
++}
++
++- (void)pictureInPictureController:(AVPictureInPictureController *)pictureInPictureController
++        failedToStartPictureInPictureWithError:(NSError *)error {
++    VLC_UNUSED(pictureInPictureController);
++    VLC_UNUSED(error);
++    [self setOverlayCompositionEnabled:NO];
+ }
+ 
+ - (void)pictureInPictureControllerDidStartPictureInPicture:(AVPictureInPictureController *)pictureInPictureController {
+@@ -374,6 +399,7 @@ - (void)pictureInPictureControllerDidStartPictureInPicture:(AVPictureInPictureCo
+ 
+ - (void)pictureInPictureControllerDidStopPictureInPicture:(AVPictureInPictureController *)pictureInPictureController {
+     atomic_store_explicit(&_pictureInPictureActive, false, memory_order_release);
++    [self setOverlayCompositionEnabled:NO];
+     if (!atomic_load_explicit(&_closed, memory_order_acquire) && _stateChangeEventHandler)
+         _stateChangeEventHandler(NO);
+ }
+@@ -404,6 +430,21 @@ - (void)invalidatePlaybackState {
+     [avPipController invalidatePlaybackState];
+ }
+ 
++- (BOOL)shouldCompositeSubpictures {
++    return atomic_load_explicit(&_pictureInPicturePresenting,
++                                memory_order_acquire);
++}
++
++- (void)setOverlayCompositionEnabled:(BOOL)enabled {
++    BOOL previous = atomic_exchange_explicit(&_pictureInPicturePresenting,
++                                             enabled, memory_order_acq_rel);
++    if (previous == enabled)
++        return;
++    id<VLCPictureInPictureOverlayStateObserving> observer =
++        _overlayStateObserver;
++    [observer pictureInPictureOverlayCompositionDidChange:enabled];
++}
++
+ @end
+ 
+ static void *HoldPresentationContext(pip_controller_t *pipcontroller) {
+@@ -430,6 +471,14 @@ static void ReleasePresentationContext(void *opaque) {
+     }
+ }
+ 
++static bool ShouldCompositeSubpictures(pip_controller_t *pipcontroller) {
++    if (pipcontroller->p_sys == NULL)
++        return false;
++    VLCPictureInPictureController *sys =
++        (__bridge VLCPictureInPictureController *)pipcontroller->p_sys;
++    return [sys shouldCompositeSubpictures];
++}
++
+ static int CloseController( pip_controller_t *pipcontroller )
+ {
+     if (@available(macOS 12.0, iOS 15.0, tvos 15.0, *)) {
+@@ -449,6 +498,7 @@ static int OpenController( pip_controller_t *pipcontroller )
+         .hold_presentation_context = HoldPresentationContext,
+         .set_display_layer_on_context = SetDisplayLayerOnContext,
+         .release_presentation_context = ReleasePresentationContext,
++        .should_composite_subpictures = ShouldCompositeSubpictures,
+         .close = CloseController,
+     };
+ 
+diff --git a/modules/video_output/apple/VLCSampleBufferDisplay.m b/modules/video_output/apple/VLCSampleBufferDisplay.m
+index 94ce31d04c..a12270badf 100644
+--- a/modules/video_output/apple/VLCSampleBufferDisplay.m
++++ b/modules/video_output/apple/VLCSampleBufferDisplay.m
+@@ -39,11 +39,13 @@
+ 
+ #import <AVFoundation/AVFoundation.h>
+ #import <AVKit/AVKit.h>
++#import <CoreImage/CoreImage.h>
+ 
+ #include "../../codec/vt_utils.h"
+ #include "vlc_pip_controller.h"
+ #include "VLCSampleBufferFormatDescriptionCache.h"
+ #include "VLCSampleBufferGeometry.h"
++#include "VLCSampleBufferOverlayGeometry.h"
+ 
+ #import <VideoToolbox/VideoToolbox.h>
+ 
+@@ -565,6 +567,133 @@ - (instancetype)initWithOrder:(int64_t)order
+ 
+ #pragma mark -
+ 
++@interface VLCSampleBufferOverlayCompositor : NSObject
++- (CVPixelBufferRef)copyPixelBufferByCompositing:
++                         (VLCSampleBufferSubpicture *)subpicture
++                                      overBuffer:(CVPixelBufferRef)pixelBuffer
++                                      videoFrame:(CGRect)videoFrame
++                                   displayHeight:(CGFloat)displayHeight
++    CF_RETURNS_RETAINED;
++@end
++
++@implementation VLCSampleBufferOverlayCompositor
++{
++    CIContext *_context;
++    VLCRotatedPixelBufferProvider *_bufferProvider;
++}
++
++- (instancetype)init
++{
++    self = [super init];
++    if (!self)
++        return nil;
++
++    _context = [CIContext contextWithOptions:@{
++        kCIContextCacheIntermediates: @NO,
++    }];
++    _bufferProvider = [VLCRotatedPixelBufferProvider new];
++    return self;
++}
++
++static CIImage *ApplyRegionAlpha(CIImage *image, CGFloat alpha)
++{
++    if (alpha >= 1.0)
++        return image;
++    CGFloat boundedAlpha = fmax(0.0, fmin(1.0, alpha));
++    CIVector *red = [CIVector vectorWithX:boundedAlpha Y:0 Z:0 W:0];
++    CIVector *green = [CIVector vectorWithX:0 Y:boundedAlpha Z:0 W:0];
++    CIVector *blue = [CIVector vectorWithX:0 Y:0 Z:boundedAlpha W:0];
++    CIVector *transparency =
++        [CIVector vectorWithX:0 Y:0 Z:0 W:boundedAlpha];
++    return [image imageByApplyingFilter:@"CIColorMatrix"
++                    withInputParameters:@{
++        @"inputRVector": red,
++        @"inputGVector": green,
++        @"inputBVector": blue,
++        @"inputAVector": transparency,
++    }];
++}
++
++- (CVPixelBufferRef)copyPixelBufferByCompositing:
++                         (VLCSampleBufferSubpicture *)subpicture
++                                      overBuffer:(CVPixelBufferRef)pixelBuffer
++                                      videoFrame:(CGRect)videoFrame
++                                   displayHeight:(CGFloat)displayHeight
++{
++    if (subpicture == nil || subpicture.regions.count == 0 ||
++        CGRectIsEmpty(videoFrame) || displayHeight <= 0.0)
++        return NULL;
++
++    @synchronized(self) {
++        size_t width = CVPixelBufferGetWidth(pixelBuffer);
++        size_t height = CVPixelBufferGetHeight(pixelBuffer);
++        if (width == 0 || height == 0)
++            return NULL;
++
++        CVPixelBufferRef composited =
++            [_bufferProvider provideFromBuffer:pixelBuffer
++                                   outputWidth:width
++                                  outputHeight:height];
++        if (composited == NULL)
++            return NULL;
++
++        CFDictionaryRef attachments = CVBufferCopyAttachments(
++            pixelBuffer, kCVAttachmentMode_ShouldPropagate);
++
++        CIImage *result = [CIImage imageWithCVPixelBuffer:pixelBuffer];
++        CGRect outputBounds = CGRectMake(0, 0, width, height);
++
++        for (VLCSampleBufferSubpictureRegion *region in subpicture.regions) {
++            CGRect frame;
++            if (!vlc_samplebuffer_map_overlay_region(
++                    region.backingFrame, videoFrame, displayHeight,
++                    width, height, &frame))
++                continue;
++
++            size_t imageWidth = CGImageGetWidth(region.image);
++            size_t imageHeight = CGImageGetHeight(region.image);
++            if (imageWidth == 0 || imageHeight == 0)
++                continue;
++
++            CIImage *overlay = [CIImage imageWithCGImage:region.image];
++            CGAffineTransform transform = CGAffineTransformMakeScale(
++                frame.size.width / imageWidth, frame.size.height / imageHeight);
++            transform.tx = frame.origin.x;
++            transform.ty = frame.origin.y;
++            overlay = [overlay imageByApplyingTransform:transform];
++            overlay = ApplyRegionAlpha(overlay, region.alpha);
++            result = [overlay imageByCompositingOverImage:result];
++        }
++
++        CGColorSpaceRef colorSpace = CVImageBufferGetColorSpace(pixelBuffer);
++        @try {
++            [_context render:result
++             toCVPixelBuffer:composited
++                      bounds:outputBounds
++                  colorSpace:colorSpace];
++        } @catch (NSException *exception) {
++            if (attachments != NULL)
++                CFRelease(attachments);
++            CVPixelBufferRelease(composited);
++            return NULL;
++        }
++        if (attachments != NULL) {
++            /* Core Image may derive output colour attachments from its render
++             * colour space. The sample must retain the decoder's authoritative
++             * mastering, transfer, matrix, aperture, and aspect metadata. */
++            CVBufferRemoveAllAttachments(composited);
++            CVBufferSetAttachments(composited, attachments,
++                                   kCVAttachmentMode_ShouldPropagate);
++            CFRelease(attachments);
++        }
++        return composited;
++    }
++}
++
++@end
++
++#pragma mark -
++
+ @interface VLCSampleBufferSubpictureView: VLCView
+ - (void)drawSubpicture:(VLCSampleBufferSubpicture *)subpicture;
+ @end
+@@ -708,11 +837,22 @@ - (BOOL)acceptsFirstResponder
+ #pragma mark -
+ 
+ @interface VLCSampleBufferDisplay: NSObject
++    <VLCPictureInPictureOverlayStateObserving>
+ {
+     @public
+     filter_t *converter;
+     atomic_uint geometryFailureCount;
++    atomic_uint overlayFailureCount;
++    atomic_bool overlayCompositionEnabled;
++    atomic_uint_fast64_t overlayRefreshGeneration;
++    atomic_uint_fast64_t lastOverlayWarmupSignature;
+     CMSampleBufferRef pendingSampleBuffer;
++    CVPixelBufferRef latestUncompositedPixelBuffer;
++    CMSampleTimingInfo latestSampleTiming;
++    uint64_t latestFrameSequence;
++    uint64_t overlayWarmupSignatures[16];
++    uint8_t overlayWarmupSignatureCount;
++    uint8_t overlayWarmupSignatureCursor;
+     vlc_samplebuffer_format_description_cache formatDescriptionCache;
+ }
+     @property (nonatomic, readonly, weak) VLCView *window;
+@@ -721,6 +861,8 @@ @interface VLCSampleBufferDisplay: NSObject
+     @property (nonatomic) VLCSampleBufferDisplayView *displayView;
+     @property (nonatomic) AVSampleBufferDisplayLayer *displayLayer;
+     @property (nonatomic, readonly) NSObject *displayLayerLock;
++    @property (nonatomic, readonly) NSObject *subpictureLock;
++    @property (nonatomic, readonly) dispatch_queue_t overlayRefreshQueue;
+     @property (nonatomic) BOOL displayClosed;
+     @property (nonatomic) BOOL displayPreparationScheduled;
+     @property (nonatomic) VLCSampleBufferSubpictureView *spuView;
+@@ -728,6 +870,7 @@ @interface VLCSampleBufferDisplay: NSObject
+      * Main-queue drawing receives the exact triggering snapshot through its
+      * block capture and never reads this mutable publication slot. */
+     @property (nonatomic, strong) VLCSampleBufferSubpicture *subpicture;
++    @property (nonatomic) VLCSampleBufferOverlayCompositor *overlayCompositor;
+     @property (nonatomic) id<VLCPixelBufferRotationContext> rotationContext;
+     @property (nonatomic) VLCPixelBufferCropContext *cropContext;
+ 
+@@ -737,6 +880,14 @@ - (instancetype)init NS_UNAVAILABLE;
+     + (instancetype)new NS_UNAVAILABLE;
+     - (instancetype)initWithVoutDisplay:(vout_display_t *)vd;
+     - (void)placeVideo:(vout_display_place_t)newPlace;
++    - (void)refreshOverlayCompositionEnabled:(bool)enabled
++                                    snapshot:
++                                        (VLCSampleBufferSubpicture *)snapshot;
++    - (void)prewarmOverlayForPixelBuffer:(CVPixelBufferRef)pixelBuffer
++                                snapshot:
++                                    (VLCSampleBufferSubpicture *)snapshot
++                              videoFrame:(CGRect)videoFrame
++                           displayHeight:(CGFloat)displayHeight;
+ @end
+ 
+ /* VLC core already computes the final video rectangle in `vd->place`,
+@@ -783,11 +934,19 @@ - (instancetype)initWithVoutDisplay:(vout_display_t *)vd
+ 
+     _window = window;
+     _displayLayerLock = [NSObject new];
+-
+-    _pipcontroller = CreatePipController(vd, (__bridge void *)self);
++    _subpictureLock = [NSObject new];
++    _overlayRefreshQueue = dispatch_queue_create(
++        "org.videolan.vlc.sample-buffer-overlay-refresh",
++        DISPATCH_QUEUE_SERIAL);
+ 
+     _vd = vd;
+     atomic_init(&geometryFailureCount, 0);
++    atomic_init(&overlayFailureCount, 0);
++    atomic_init(&overlayCompositionEnabled, false);
++    atomic_init(&overlayRefreshGeneration, 0);
++    atomic_init(&lastOverlayWarmupSignature, 0);
++
++    _pipcontroller = CreatePipController(vd, (__bridge void *)self);
+ 
+     return self;
+ }
+@@ -911,9 +1070,241 @@ - (void)placeVideo:(vout_display_place_t)newPlace
+     self.displayView.frame = [self frameForPlace:&newPlace];
+ }
+ 
++- (void)pictureInPictureOverlayCompositionDidChange:(bool)enabled
++{
++    atomic_store_explicit(&overlayCompositionEnabled, enabled,
++                          memory_order_release);
++    VLCSampleBufferSubpicture *snapshot;
++    @synchronized(_subpictureLock) {
++        snapshot = _subpicture;
++    }
++    [self refreshOverlayCompositionEnabled:enabled snapshot:snapshot];
++}
++
++- (void)refreshOverlayCompositionEnabled:(bool)enabled
++                                    snapshot:
++                                        (VLCSampleBufferSubpicture *)snapshot
++{
++    VLCSampleBufferDisplay *sys = self;
++    uint64_t refreshGeneration = atomic_fetch_add_explicit(
++        &overlayRefreshGeneration, 1, memory_order_acq_rel) + 1;
++
++    dispatch_block_t updateInlineOverlay = ^{
++        if (atomic_load_explicit(&sys->overlayRefreshGeneration,
++                                 memory_order_acquire) != refreshGeneration)
++            return;
++        @synchronized(sys.displayLayerLock) {
++            if (sys.displayClosed)
++                return;
++        }
++        VLCSampleBufferSubpicture *inlineSnapshot = nil;
++        if (!enabled) {
++            @synchronized(sys.subpictureLock) {
++                inlineSnapshot = sys.subpicture;
++            }
++        }
++        [sys.spuView drawSubpicture:inlineSnapshot];
++    };
++    dispatch_block_t scheduleInlineOverlayUpdate = ^{
++        if ([NSThread isMainThread])
++            updateInlineOverlay();
++        else
++            dispatch_async(dispatch_get_main_queue(), updateInlineOverlay);
++    };
++    /* Hide the sibling before the first burned-in frame can arrive. During
++     * restoration, keep it hidden until an uncomposited frame is enqueued so
++     * the inline surface never displays the same subtitle twice. */
++    if (enabled)
++        scheduleInlineOverlayUpdate();
++
++    CVPixelBufferRef basePixelBuffer = NULL;
++    CMSampleTimingInfo sampleTiming;
++    uint64_t frameSequence = 0;
++    CGRect videoFrame = CGRectZero;
++    CGFloat displayHeight = 0.0;
++    @synchronized(_displayLayerLock) {
++        if (!_displayClosed && latestUncompositedPixelBuffer != NULL) {
++            basePixelBuffer =
++                CVPixelBufferRetain(latestUncompositedPixelBuffer);
++            sampleTiming = latestSampleTiming;
++            frameSequence = latestFrameSequence;
++            videoFrame = CGRectMake(_vd->place->x, _vd->place->y,
++                                    _vd->place->width, _vd->place->height);
++            displayHeight = _vd->cfg->display.height;
++        }
++    }
++    if (basePixelBuffer == NULL) {
++        if (!enabled)
++            scheduleInlineOverlayUpdate();
++        return;
++    }
++
++    dispatch_async(_overlayRefreshQueue, ^{
++        if (atomic_load_explicit(&sys->overlayRefreshGeneration,
++                                 memory_order_acquire) != refreshGeneration) {
++            CVPixelBufferRelease(basePixelBuffer);
++            return;
++        }
++
++        CVPixelBufferRef refreshPixelBuffer = basePixelBuffer;
++        if (enabled && snapshot.regions.count != 0) {
++            VLCSampleBufferOverlayCompositor *compositor;
++            @synchronized(sys) {
++                if (sys.overlayCompositor == nil)
++                    sys.overlayCompositor =
++                        [VLCSampleBufferOverlayCompositor new];
++                compositor = sys.overlayCompositor;
++            }
++            CVPixelBufferRef composited;
++            @autoreleasepool {
++                composited =
++                    [compositor copyPixelBufferByCompositing:snapshot
++                                                  overBuffer:basePixelBuffer
++                                                  videoFrame:videoFrame
++                                               displayHeight:displayHeight];
++            }
++            if (composited == NULL) {
++                CVPixelBufferRelease(basePixelBuffer);
++                return;
++            }
++            refreshPixelBuffer = composited;
++        } else {
++            CVPixelBufferRetain(refreshPixelBuffer);
++        }
++
++        CMVideoFormatDescriptionRef formatDescription = NULL;
++        OSStatus status = CMVideoFormatDescriptionCreateForImageBuffer(
++            kCFAllocatorDefault, refreshPixelBuffer, &formatDescription);
++        CMSampleBufferRef sampleBuffer = NULL;
++        if (status == noErr) {
++            status = CMSampleBufferCreateReadyWithImageBuffer(
++                kCFAllocatorDefault, refreshPixelBuffer, formatDescription,
++                &sampleTiming, &sampleBuffer);
++            CFRelease(formatDescription);
++        }
++        CVPixelBufferRelease(refreshPixelBuffer);
++        CVPixelBufferRelease(basePixelBuffer);
++        if (status != noErr || sampleBuffer == NULL) {
++            if (!enabled)
++                scheduleInlineOverlayUpdate();
++            return;
++        }
++
++        CFArrayRef attachments =
++            CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, true);
++        if (attachments != NULL && CFArrayGetCount(attachments) != 0) {
++            CFMutableDictionaryRef attachment =
++                (CFMutableDictionaryRef)CFArrayGetValueAtIndex(attachments, 0);
++            CFDictionarySetValue(attachment,
++                                 kCMSampleAttachmentKey_DisplayImmediately,
++                                 kCFBooleanTrue);
++        }
++
++        dispatch_async(dispatch_get_main_queue(), ^{
++            if (atomic_load_explicit(&sys->overlayRefreshGeneration,
++                                     memory_order_acquire) ==
++                refreshGeneration) {
++                @synchronized(sys.displayLayerLock) {
++                    if (!sys.displayClosed &&
++                        sys->latestFrameSequence == frameSequence &&
++                        sys.displayLayer != nil) {
++                        AVSampleBufferVideoRenderer *renderer =
++                            sys.displayLayer.sampleBufferRenderer;
++                        if (renderer.requiresFlushToResumeDecoding ||
++                            renderer.status ==
++                                AVQueuedSampleBufferRenderingStatusFailed)
++                            [renderer flush];
++                        /* This one bounded transition sample makes paused PiP
++                         * entry and inline restoration reflect the new
++                         * composition mode without waiting for another frame. */
++                        [renderer enqueueSampleBuffer:sampleBuffer];
++                    }
++                }
++                if (!enabled)
++                    updateInlineOverlay();
++            }
++            CFRelease(sampleBuffer);
++        });
++    });
++}
++
++- (void)prewarmOverlayForPixelBuffer:(CVPixelBufferRef)pixelBuffer
++                            snapshot:
++                                (VLCSampleBufferSubpicture *)snapshot
++                          videoFrame:(CGRect)videoFrame
++                       displayHeight:(CGFloat)displayHeight
++{
++    if (snapshot.regions.count == 0)
++        return;
++
++    OSType format = CVPixelBufferGetPixelFormatType(pixelBuffer);
++    size_t width = CVPixelBufferGetWidth(pixelBuffer);
++    size_t height = CVPixelBufferGetHeight(pixelBuffer);
++    CGColorSpaceRef colorSpace = CVImageBufferGetColorSpace(pixelBuffer);
++    uint64_t signature = 1469598103934665603ULL;
++#define MIX_OVERLAY_SIGNATURE(value) \
++    signature = (signature ^ (uint64_t)(value)) * 1099511628211ULL
++    MIX_OVERLAY_SIGNATURE(format);
++    MIX_OVERLAY_SIGNATURE(width);
++    MIX_OVERLAY_SIGNATURE(height);
++    MIX_OVERLAY_SIGNATURE(colorSpace != NULL ? CFHash(colorSpace) : 0);
++#undef MIX_OVERLAY_SIGNATURE
++
++    if (atomic_load_explicit(&lastOverlayWarmupSignature,
++                             memory_order_acquire) == signature)
++        return;
++
++    @synchronized(self) {
++        for (uint8_t index = 0; index < overlayWarmupSignatureCount; ++index) {
++            if (overlayWarmupSignatures[index] == signature) {
++                atomic_store_explicit(&lastOverlayWarmupSignature, signature,
++                                      memory_order_release);
++                return;
++            }
++        }
++        _Static_assert(ARRAY_SIZE(overlayWarmupSignatures) <= UINT8_MAX,
++                       "Warmup signature count exceeds its index type");
++        if (overlayWarmupSignatureCount <
++            (uint8_t)ARRAY_SIZE(overlayWarmupSignatures))
++            overlayWarmupSignatures[overlayWarmupSignatureCount++] = signature;
++        else {
++            overlayWarmupSignatures[overlayWarmupSignatureCursor] = signature;
++            overlayWarmupSignatureCursor =
++                (uint8_t)((overlayWarmupSignatureCursor + 1) %
++                          ARRAY_SIZE(overlayWarmupSignatures));
++        }
++        atomic_store_explicit(&lastOverlayWarmupSignature, signature,
++                              memory_order_release);
++    }
++
++    VLCSampleBufferDisplay *sys = self;
++    CVPixelBufferRef retainedPixelBuffer = CVPixelBufferRetain(pixelBuffer);
++    dispatch_async(_overlayRefreshQueue, ^{
++        @autoreleasepool {
++            VLCSampleBufferOverlayCompositor *compositor;
++            @synchronized(sys) {
++                if (sys.overlayCompositor == nil)
++                    sys.overlayCompositor =
++                        [VLCSampleBufferOverlayCompositor new];
++                compositor = sys.overlayCompositor;
++            }
++            CVPixelBufferRef warmed =
++                [compositor copyPixelBufferByCompositing:snapshot
++                                              overBuffer:retainedPixelBuffer
++                                              videoFrame:videoFrame
++                                           displayHeight:displayHeight];
++            if (warmed != NULL)
++                CVPixelBufferRelease(warmed);
++            CVPixelBufferRelease(retainedPixelBuffer);
++        }
++    });
++}
++
+ - (void)close {
+     VLCSampleBufferDisplay *sys = self;
+     @synchronized(_displayLayerLock) {
++        atomic_fetch_add_explicit(&overlayRefreshGeneration, 1,
++                                  memory_order_acq_rel);
+         _displayClosed = YES;
+         _displayLayer = nil;
+         if (pendingSampleBuffer != NULL)
+@@ -921,6 +1312,11 @@ - (void)close {
+             CFRelease(pendingSampleBuffer);
+             pendingSampleBuffer = NULL;
+         }
++        if (latestUncompositedPixelBuffer != NULL)
++        {
++            CVPixelBufferRelease(latestUncompositedPixelBuffer);
++            latestUncompositedPixelBuffer = NULL;
++        }
+         vlc_samplebuffer_format_description_cache_Clear(
+             &formatDescriptionCache);
+     }
+@@ -973,6 +1369,22 @@ static void ReportGeometryFailure(vout_display_t *vd,
+                  reason, occurrence);
+ }
+ 
++static void ReportOverlayFailure(vout_display_t *vd,
++                                 VLCSampleBufferDisplay *sys)
++{
++    unsigned occurrence = atomic_fetch_add_explicit(
++        &sys->overlayFailureCount, 1, memory_order_relaxed) + 1;
++    if (occurrence <= 4 || (occurrence & (occurrence - 1)) == 0)
++        msg_Warn(vd, "Could not composite PiP overlay; presenting the video "
++                 "plane without it (occurrence %u)", occurrence);
++}
++
++static bool ShouldCompositeSubpictures(VLCSampleBufferDisplay *sys)
++{
++    return atomic_load_explicit(&sys->overlayCompositionEnabled,
++                                memory_order_acquire);
++}
++
+ /* Returns an owned description that matches every property CoreMedia derives
+  * from the image buffer. The display instance is scoped to one vout
+  * generation, so replacement naturally drops the cache; format, dimensions,
+@@ -999,7 +1411,9 @@ static void ReportGeometryFailure(vout_display_t *vd,
+     return result;
+ }
+ 
+-static void RenderPicture(vout_display_t *vd, picture_t *pic, vlc_tick_t date) {
++static void RenderPicture(vout_display_t *vd, picture_t *pic, vlc_tick_t date,
++                          VLCSampleBufferSubpicture *subpicture,
++                          bool compositeSubpicture) {
+     VLCSampleBufferDisplay *sys;
+     sys = (__bridge VLCSampleBufferDisplay*)vd->sys;
+ 
+@@ -1188,14 +1602,6 @@ static void RenderPicture(vout_display_t *vd, picture_t *pic, vlc_tick_t date) {
+                           (__bridge CFDictionaryRef)cleanAperture,
+                           kCVAttachmentMode_ShouldPropagate);
+ 
+-    CMSampleBufferRef sampleBuffer = NULL;
+-    CMVideoFormatDescriptionRef formatDesc =
+-        CopyCompatibleFormatDescription(vd, sys, pixelBuffer);
+-    if (formatDesc == NULL) {
+-        CVPixelBufferRelease(pixelBuffer);
+-        return;
+-    }
+-
+     vlc_tick_t now = vlc_tick_now();
+     CFTimeInterval ca_now = CACurrentMediaTime();
+     vlc_tick_t ca_now_ts = vlc_tick_from_sec(ca_now);
+@@ -1207,6 +1613,57 @@ static void RenderPicture(vout_display_t *vd, picture_t *pic, vlc_tick_t date) {
+         .presentationTimeStamp = CMTimeMakeWithSeconds(ca_date, 1000000)
+     };
+ 
++    @synchronized(sys.displayLayerLock) {
++        if (!sys.displayClosed) {
++            if (sys->latestUncompositedPixelBuffer != NULL)
++                CVPixelBufferRelease(sys->latestUncompositedPixelBuffer);
++            sys->latestUncompositedPixelBuffer = CVPixelBufferRetain(pixelBuffer);
++            sys->latestSampleTiming = sampleTimingInfo;
++            sys->latestFrameSequence++;
++        }
++    }
++
++    CGRect videoFrame = CGRectMake(vd->place->x, vd->place->y,
++                                   vd->place->width, vd->place->height);
++    CGFloat displayHeight = vd->cfg->display.height;
++    if (!compositeSubpicture && subpicture.regions.count != 0)
++        [sys prewarmOverlayForPixelBuffer:pixelBuffer
++                                 snapshot:subpicture
++                               videoFrame:videoFrame
++                            displayHeight:displayHeight];
++
++    if (compositeSubpicture && subpicture.regions.count != 0) {
++        VLCSampleBufferOverlayCompositor *compositor;
++        @synchronized(sys) {
++            if (sys.overlayCompositor == nil)
++                sys.overlayCompositor =
++                    [VLCSampleBufferOverlayCompositor new];
++            compositor = sys.overlayCompositor;
++        }
++        CVPixelBufferRef composited;
++        @autoreleasepool {
++            composited =
++                [compositor copyPixelBufferByCompositing:subpicture
++                                              overBuffer:pixelBuffer
++                                              videoFrame:videoFrame
++                                           displayHeight:displayHeight];
++        }
++        if (composited != NULL) {
++            CVPixelBufferRelease(pixelBuffer);
++            pixelBuffer = composited;
++        } else {
++            ReportOverlayFailure(vd, sys);
++        }
++    }
++
++    CMSampleBufferRef sampleBuffer = NULL;
++    CMVideoFormatDescriptionRef formatDesc =
++        CopyCompatibleFormatDescription(vd, sys, pixelBuffer);
++    if (formatDesc == NULL) {
++        CVPixelBufferRelease(pixelBuffer);
++        return;
++    }
++
+     OSStatus err = CMSampleBufferCreateReadyWithImageBuffer(kCFAllocatorDefault, pixelBuffer, formatDesc, &sampleTimingInfo, &sampleBuffer);
+     CFRelease(formatDesc);
+     CVPixelBufferRelease(pixelBuffer);
+@@ -1383,79 +1840,85 @@ static bool UpdateSubpictureSnapshot(
+     sys = (__bridge VLCSampleBufferDisplay*)vd->sys;
+     *triggeringSnapshot = nil;
+ 
+-    VLCSampleBufferSubpicture *current = sys.subpicture;
++    @synchronized(sys.subpictureLock) {
++        VLCSampleBufferSubpicture *current = sys.subpicture;
+ 
+-    if (subpicture == NULL)
+-    {
+-        if (current == nil)
+-            return false;
+-        sys.subpicture = nil;
+-        /* Need to draw one last time in order to clear the current subpicture */
+-        return true;
+-    }
+-
+-    size_t count = subpicture->regions.size;
+-    const struct subpicture_region_rendered *r;
++        if (subpicture == NULL)
++        {
++            if (current == nil)
++                return false;
++            sys.subpicture = nil;
++            /* Draw once more to clear the current subpicture. */
++            return true;
++        }
+ 
+-    bool draw = current == nil || subpicture->i_order != current.order;
++        size_t count = subpicture->regions.size;
++        const struct subpicture_region_rendered *r;
++        bool draw = current == nil || subpicture->i_order != current.order;
+ 
+-    if (!draw && count == current.regions.count)
+-    {
+-        size_t i = 0;
+-        vlc_vector_foreach(r, &subpicture->regions)
++        if (!draw && count == current.regions.count)
+         {
+-            VLCSampleBufferSubpictureRegion *region =
+-                current.regions[i++];
++            size_t i = 0;
++            vlc_vector_foreach(r, &subpicture->regions)
++            {
++                VLCSampleBufferSubpictureRegion *region =
++                    current.regions[i++];
+ 
+-            CGRect newRegion = RegionBackingFrame(vd->cfg->display.height, r);
++                CGRect newRegion =
++                    RegionBackingFrame(vd->cfg->display.height, r);
+ 
+-            if ( !CGRectEqualToRect(region.backingFrame, newRegion) )
+-            {
+-                /* Subpicture regions are different */
+-                draw = true;
+-                break;
++                if (!CGRectEqualToRect(region.backingFrame, newRegion))
++                {
++                    /* Subpicture regions are different. */
++                    draw = true;
++                    break;
++                }
+             }
+         }
+-    }
+-    else if (!draw)
+-    {
+-        /* Subpicture region count is different */
+-        draw = true;
+-    }
+-
+-    if (!draw)
+-        return false;
++        else if (!draw)
++        {
++            /* Subpicture region count is different. */
++            draw = true;
++        }
+ 
+-    /* Build a complete replacement before publishing it. No object reachable
+-     * from a published snapshot is mutated afterward. */
+-    VLCSampleBufferSubpicture *snapshot =
+-        CreateSubpictureSnapshot(vd, subpicture);
+-    if (snapshot == nil)
+-    {
+-        msg_Err(vd, "Failed to create immutable subpicture snapshot");
+-        if (current == nil)
++        if (!draw)
+             return false;
+-        /* Do not leave stale subtitles visible after a failed replacement. */
+-        sys.subpicture = nil;
++
++        /* Build a complete replacement before publishing it. No object
++         * reachable from a published snapshot is mutated afterward. */
++        VLCSampleBufferSubpicture *snapshot =
++            CreateSubpictureSnapshot(vd, subpicture);
++        if (snapshot == nil)
++        {
++            msg_Err(vd, "Failed to create immutable subpicture snapshot");
++            if (current == nil)
++                return false;
++            /* Do not leave stale subtitles after a failed replacement. */
++            sys.subpicture = nil;
++            return true;
++        }
++
++        sys.subpicture = snapshot;
++        *triggeringSnapshot = snapshot;
+         return true;
+     }
+-
+-    sys.subpicture = snapshot;
+-    *triggeringSnapshot = snapshot;
+-    return true;
+ }
+ 
+-static void RenderSubpicture(vout_display_t *vd, const vlc_render_subpicture *spu)
++static void DrawSubpicture(VLCSampleBufferDisplay *sys,
++                           VLCSampleBufferSubpicture *snapshot,
++                           bool compositeSubpicture)
+ {
+-    VLCSampleBufferSubpicture *snapshot = nil;
+-    if (!UpdateSubpictureSnapshot(vd, spu, &snapshot))
+-        return;
+-
+-    VLCSampleBufferDisplay *sys;
+-    sys = (__bridge VLCSampleBufferDisplay*)vd->sys;
+     VLCSampleBufferSubpicture *const triggeringSnapshot = snapshot;
++    uint64_t overlayModeGeneration = atomic_load_explicit(
++        &sys->overlayRefreshGeneration, memory_order_acquire);
+ 
+     dispatch_async(dispatch_get_main_queue(), ^{
++        if (atomic_load_explicit(&sys->overlayRefreshGeneration,
++                                 memory_order_acquire) !=
++                overlayModeGeneration ||
++            atomic_load_explicit(&sys->overlayCompositionEnabled,
++                                 memory_order_acquire) != compositeSubpicture)
++            return;
+         /* The block retains the exact snapshot that triggered this draw. It
+          * never re-reads the producer's replaceable publication slot. */
+         [sys.spuView drawSubpicture:triggeringSnapshot];
+@@ -1473,11 +1936,27 @@ static void Prepare (vout_display_t *vd, picture_t *pic,
+                      const vlc_render_subpicture *subpicture, vlc_tick_t date)
+ {
+     PrepareDisplay(vd);
+-    if (pic) {
+-        RenderPicture(vd, pic, date);
++    VLCSampleBufferDisplay *sys =
++        (__bridge VLCSampleBufferDisplay *)vd->sys;
++    VLCSampleBufferSubpicture *triggeringSnapshot = nil;
++    bool subpictureChanged =
++        UpdateSubpictureSnapshot(vd, subpicture, &triggeringSnapshot);
++    bool compositeSubpicture = ShouldCompositeSubpictures(sys);
++
++    VLCSampleBufferSubpicture *currentSubpicture;
++    @synchronized(sys.subpictureLock) {
++        currentSubpicture = sys.subpicture;
+     }
+-
+-    RenderSubpicture(vd, subpicture);
++    if (pic)
++        RenderPicture(vd, pic, date, currentSubpicture,
++                      compositeSubpicture);
++
++    if (subpictureChanged && compositeSubpicture && pic == NULL)
++        [sys refreshOverlayCompositionEnabled:true
++                                     snapshot:currentSubpicture];
++    else if (subpictureChanged)
++        DrawSubpicture(sys, compositeSubpicture ? nil : currentSubpicture,
++                       compositeSubpicture);
+ }
+ 
+ static void Display(vout_display_t *vd, picture_t *pic)
+@@ -1514,10 +1993,10 @@ static int Control (vout_display_t *vd, int query)
+ 
+ static pip_controller_t * CreatePipController( vout_display_t *vd, void *cbs_opaque )
+ {
+-    VLC_UNUSED(cbs_opaque);
+     pip_controller_t *pip_controller = vlc_object_create(vd, sizeof(pip_controller_t));
+     if (pip_controller == NULL)
+         return NULL;
++    pip_controller->overlay_state_observer = cbs_opaque;
+ 
+     module_t **mods;
+     ssize_t total = vlc_module_match("pictureinpicture", NULL, false, &mods, NULL);
+diff --git a/modules/video_output/apple/VLCSampleBufferOverlayGeometry.h b/modules/video_output/apple/VLCSampleBufferOverlayGeometry.h
+new file mode 100644
+index 0000000000..666a93bf8a
+--- /dev/null
++++ b/modules/video_output/apple/VLCSampleBufferOverlayGeometry.h
+@@ -0,0 +1,58 @@
++/*****************************************************************************
++ * VLCSampleBufferOverlayGeometry.h: native PiP overlay coordinate mapping
++ *****************************************************************************
++ * Copyright (C) 2026 VLC authors and VideoLAN
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU Lesser General Public License as published by
++ * the Free Software Foundation; either version 2.1 of the License, or
++ * (at your option) any later version.
++ ******************************************************************************/
++
++#ifndef VLC_SAMPLEBUFFER_OVERLAY_GEOMETRY_H
++#define VLC_SAMPLEBUFFER_OVERLAY_GEOMETRY_H 1
++
++#include <CoreGraphics/CoreGraphics.h>
++#include <math.h>
++#include <stdbool.h>
++#include <stddef.h>
++
++static inline bool vlc_samplebuffer_overlay_rect_is_finite(CGRect rect)
++{
++    return isfinite(rect.origin.x) && isfinite(rect.origin.y) &&
++        isfinite(rect.size.width) && isfinite(rect.size.height);
++}
++
++/* VLC region frames and vout placement use bottom-left backing coordinates,
++ * while vout place itself is stored from the display's top edge. Map a region
++ * to the decoded buffer without reinterpreting source aspect or orientation. */
++static inline bool vlc_samplebuffer_map_overlay_region(
++    CGRect region, CGRect video_frame, CGFloat display_height,
++    size_t pixel_width, size_t pixel_height, CGRect *mapped_region)
++{
++    if (mapped_region == NULL || pixel_width == 0 || pixel_height == 0 ||
++        !isfinite(display_height) || display_height <= 0.0 ||
++        !vlc_samplebuffer_overlay_rect_is_finite(region) ||
++        !vlc_samplebuffer_overlay_rect_is_finite(video_frame) ||
++        CGRectIsEmpty(region) || CGRectIsEmpty(video_frame))
++        return false;
++
++    CGFloat video_bottom = display_height - CGRectGetMaxY(video_frame);
++    CGRect backing_video_frame =
++        CGRectMake(video_frame.origin.x, video_bottom,
++                   video_frame.size.width, video_frame.size.height);
++    CGFloat scale_x = (CGFloat)pixel_width / backing_video_frame.size.width;
++    CGFloat scale_y = (CGFloat)pixel_height / backing_video_frame.size.height;
++    CGRect mapped = CGRectMake(
++        (CGRectGetMinX(region) - CGRectGetMinX(backing_video_frame)) * scale_x,
++        (CGRectGetMinY(region) - CGRectGetMinY(backing_video_frame)) * scale_y,
++        region.size.width * scale_x, region.size.height * scale_y);
++    CGRect output_bounds = CGRectMake(0, 0, pixel_width, pixel_height);
++    if (CGRectIsEmpty(CGRectIntersection(mapped, output_bounds)))
++        return false;
++
++    *mapped_region = mapped;
++    return true;
++}
++
++#endif
+diff --git a/modules/video_output/apple/vlc_pip_controller.h b/modules/video_output/apple/vlc_pip_controller.h
+index 96c6ad0b3a..745dedf965 100644
+--- a/modules/video_output/apple/vlc_pip_controller.h
++++ b/modules/video_output/apple/vlc_pip_controller.h
+@@ -31,12 +31,19 @@
+ 
+ typedef struct pip_controller_t pip_controller_t;
+ 
++#ifdef __OBJC__
++@protocol VLCPictureInPictureOverlayStateObserving
++- (void)pictureInPictureOverlayCompositionDidChange:(bool)enabled;
++@end
++#endif
++
+ struct pip_controller_operations {
+     /* Hold an implementation-owned presentation context across asynchronous
+      * UI work. The context, unlike pip_controller_t, may outlive vout close. */
+     void *(*hold_presentation_context)(pip_controller_t *);
+     void (*set_display_layer_on_context)(void *, void *);
+     void (*release_presentation_context)(void *);
++    bool (*should_composite_subpictures)(pip_controller_t *);
+     int (*close)(pip_controller_t *);
+ };
+ 
+@@ -46,6 +53,11 @@ struct pip_controller_t
+ 
+     void               *p_sys;
+ 
++    /* Unretained Objective-C observer owned by the video output. The native
++     * controller stores it weakly before this short-lived module object can
++     * be deleted. */
++    void               *overlay_state_observer;
++
+     const struct pip_controller_operations *ops;
+ };
+ 

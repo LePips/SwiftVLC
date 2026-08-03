@@ -1,0 +1,31 @@
+# Do not hold the process-global UPnP wrapper lock during libupnp shutdown.
+#
+# UpnpFinish() waits for libupnp's receive workers to exit. An in-flight SSDP
+# worker can be inside UpnpInstanceWrapper::Callback(), which needs s_lock to
+# finish. release() previously retained s_lock while deleting the last wrapper,
+# so shutdown waited for the callback while the callback waited for shutdown's
+# lock. Select the object under the mutex, then destroy it after unlocking.
+diff --git a/modules/services_discovery/upnp-wrapper.cpp b/modules/services_discovery/upnp-wrapper.cpp
+index 2a85d681a6..716fa35aac 100644
+--- a/modules/services_discovery/upnp-wrapper.cpp
++++ b/modules/services_discovery/upnp-wrapper.cpp
+@@ -110,12 +110,15 @@ UpnpInstanceWrapper *UpnpInstanceWrapper::get(vlc_object_t *p_obj)
+ void UpnpInstanceWrapper::release()
+ {
+     UpnpInstanceWrapper *p_delete = NULL;
+-    vlc::threads::mutex_locker lock( s_lock );
+-    if (--s_instance->m_refcount == 0)
+     {
+-        p_delete = s_instance;
+-        s_instance = NULL;
++        vlc::threads::mutex_locker lock( s_lock );
++        if (--s_instance->m_refcount == 0)
++        {
++            p_delete = s_instance;
++            s_instance = NULL;
++        }
+     }
++
+     delete p_delete;
+ }
+ 

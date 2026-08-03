@@ -1,5 +1,4 @@
 import CLibVLC
-import Dispatch
 
 /// Discovers media sources on the local network, devices, or local directories.
 ///
@@ -35,7 +34,10 @@ public final class MediaDiscoverer: Sendable {
   ///   - instance: The VLC instance.
   /// - Throws: `VLCError.instanceCreationFailed` if the discoverer cannot be created.
   public init(name: String, instance: VLCInstance = .shared) throws(VLCError) {
-    guard let p = libvlc_media_discoverer_new(instance.pointer, name) else {
+    let p = DiscoveryLifecycle.sync {
+      libvlc_media_discoverer_new(instance.pointer, name)
+    }
+    guard let p else {
       throw .instanceCreationFailed
     }
     pointer = p
@@ -52,34 +54,45 @@ public final class MediaDiscoverer: Sendable {
     // drop doesn't stall main when the discoverer is owned by a
     // SwiftUI view.
     nonisolated(unsafe) let discoverer = pointer
-    DispatchQueue.global(qos: .utility).async {
+    let instance = self.instance
+    DiscoveryLifecycle.async {
       libvlc_media_discoverer_release(discoverer)
+      _ = instance
     }
   }
 
   /// Starts discovery.
   /// - Throws: `VLCError.operationFailed` if discovery cannot start.
   public func start() throws(VLCError) {
-    if libvlc_media_discoverer_start(pointer) != 0 {
+    let result = DiscoveryLifecycle.sync {
+      libvlc_media_discoverer_start(pointer)
+    }
+    if result != 0 {
       throw .operationFailed("Start media discovery")
     }
   }
 
   /// Stops discovery.
   public func stop() {
-    libvlc_media_discoverer_stop(pointer)
+    DiscoveryLifecycle.sync {
+      libvlc_media_discoverer_stop(pointer)
+    }
   }
 
   /// Whether discovery is currently running.
   public var isRunning: Bool {
-    libvlc_media_discoverer_is_running(pointer)
+    DiscoveryLifecycle.sync {
+      libvlc_media_discoverer_is_running(pointer)
+    }
   }
 
   /// The media list containing discovered media items.
   ///
   /// Discovered items are added/removed from this list dynamically.
   public var mediaList: MediaList? {
-    Self.adoptMediaList(libvlc_media_discoverer_media_list(pointer))
+    DiscoveryLifecycle.sync {
+      Self.adoptMediaList(libvlc_media_discoverer_media_list(pointer))
+    }
   }
 
   static func adoptMediaList(_ pointer: OpaquePointer?) -> MediaList? {
@@ -145,18 +158,20 @@ extension MediaDiscoverer {
     category: DiscoveryCategory,
     instance: VLCInstance = .shared
   ) -> [DiscoveryService] {
-    var ppp: UnsafeMutablePointer<UnsafeMutablePointer<libvlc_media_discoverer_description_t>?>?
-    let count = libvlc_media_discoverer_list_get(instance.pointer, category.cValue, &ppp)
-    guard count > 0, let ppp else { return [] }
-    defer { libvlc_media_discoverer_list_release(ppp, count) }
+    DiscoveryLifecycle.sync {
+      var ppp: UnsafeMutablePointer<UnsafeMutablePointer<libvlc_media_discoverer_description_t>?>?
+      let count = libvlc_media_discoverer_list_get(instance.pointer, category.cValue, &ppp)
+      guard count > 0, let ppp else { return [] }
+      defer { libvlc_media_discoverer_list_release(ppp, count) }
 
-    return (0..<Int(count)).compactMap { i -> DiscoveryService? in
-      guard let desc = ppp[i]?.pointee else { return nil }
-      return DiscoveryService(
-        name: String(cString: desc.psz_name),
-        longName: String(cString: desc.psz_longname),
-        category: DiscoveryCategory(from: desc.i_cat)
-      )
+      return (0..<Int(count)).compactMap { i -> DiscoveryService? in
+        guard let desc = ppp[i]?.pointee else { return nil }
+        return DiscoveryService(
+          name: String(cString: desc.psz_name),
+          longName: String(cString: desc.psz_longname),
+          category: DiscoveryCategory(from: desc.i_cat)
+        )
+      }
     }
   }
 }
