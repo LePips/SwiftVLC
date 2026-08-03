@@ -729,17 +729,15 @@ public final class PiPController: NSObject {
 
   /// Stops Picture-in-Picture.
   ///
-  /// A stop initiated through this method is reported on
-  /// ``pipEvents`` with ``PiPStopReason/unknown``: AVKit gives a
-  /// programmatic stop no discriminating delegate signal, so SwiftVLC
-  /// does not guess a richer reason for it.
+  /// A stop initiated through this method is reported on ``pipEvents`` with
+  /// ``PiPStopReason/programmatic``.
   public func stop() {
     // Recorded unconditionally: between AVKit beginning the start
     // animation and the didStart callback, `isActive` is still false,
     // and a stop issued in that window would otherwise be reported as
     // the user's close tap. If no lifecycle was actually in flight, the next
     // accepted start (or an automatic willStart/didStart) clears it.
-    notePendingStopReason(.unknown)
+    notePendingStopReason(.programmatic)
     #if os(iOS)
     if let nativeBackend {
       nativeBackend.stop()
@@ -1119,15 +1117,71 @@ public final class PiPController: NSObject {
     updatePiPPossible(nativeBackend?.isPossible == true)
   }
 
-  /// Mirrors the native backend's active flag and synthesizes the
-  /// ``PiPEvent``s the backend can observe. libVLC owns the
-  /// `AVPictureInPictureController` (and its delegate) on the native
-  /// drawable path, so the only signal SwiftVLC sees is this active
-  /// flip: `.didStart`/`.didStop` are synthesized from it, will/failed
-  /// events never fire, and the stop reason degrades to
-  /// ``PiPStopReason/unknown`` — including for stops caused by a
-  /// native-handle replacement (player swap, renderer recast) tearing
-  /// PiP down. See ``pipEvents``.
+  #if os(iOS)
+  func handleNativePictureInPictureWillStart(
+    mediaGeneration: PlaybackGeneration?
+  ) {
+    clearUnownedStopReasonBeforeStart()
+    activateAudioSessionIfNeeded()
+    syncPlaybackStateForPictureInPicture()
+    invalidatePictureInPicturePlaybackState()
+    publishPiPEvent(.willStart, mediaGeneration: mediaGeneration)
+  }
+
+  func handleNativePictureInPictureDidStart(
+    mediaGeneration: PlaybackGeneration?
+  ) {
+    clearUnownedStopReasonBeforeStart()
+    syncPlaybackStateForPictureInPicture()
+    invalidatePictureInPicturePlaybackState()
+    updatePiPActive(true)
+    publishPiPEvent(.didStart, mediaGeneration: mediaGeneration)
+  }
+
+  func handleNativePictureInPictureWillStop(
+    mediaGeneration: PlaybackGeneration?
+  ) {
+    publishPiPEvent(
+      .willStop(reason: resolveWillStopReason(mediaGeneration: mediaGeneration)),
+      mediaGeneration: mediaGeneration
+    )
+  }
+
+  func handleNativePictureInPictureDidStop(
+    mediaGeneration: PlaybackGeneration?
+  ) {
+    let reason = resolveStopReason(mediaGeneration: mediaGeneration)
+    updatePiPActive(false)
+    publishPiPEvent(.didStop(reason: reason), mediaGeneration: mediaGeneration)
+  }
+
+  func handleNativePictureInPictureFailedToStart(
+    _ error: any Error,
+    mediaGeneration: PlaybackGeneration?
+  ) {
+    updatePiPActive(false)
+    publishPiPEvent(.failedToStart(error), mediaGeneration: mediaGeneration)
+  }
+
+  func handleNativePictureInPictureControllerReplacement(
+    wasActive: Bool,
+    mediaGeneration: PlaybackGeneration?
+  ) {
+    if wasActive {
+      notePendingStopReason(.controllerReplaced)
+      handleNativePictureInPictureWillStop(mediaGeneration: mediaGeneration)
+      handleNativePictureInPictureDidStop(mediaGeneration: mediaGeneration)
+    }
+    pipControllerGeneration &+= 1
+    clearPiPLifecycleAttribution()
+    publishPiPSnapshot()
+  }
+  #endif
+
+  /// Mirrors the native backend's active flag. On supported libVLC revisions,
+  /// lifecycle events come from the forwarding AVKit delegate bridge and this
+  /// path updates state only. It still synthesizes `.didStart` / `.didStop`
+  /// with ``PiPStopReason/unknown`` when no delegate was available to bridge.
   func handleNativePictureInPictureActiveChanged(
     _ isActive: Bool,
     mediaGeneration: PlaybackGeneration? = nil,

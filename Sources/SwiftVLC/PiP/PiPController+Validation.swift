@@ -20,8 +20,12 @@ public struct NativePiPProbe: Sendable {
   public let hasAVController: Bool
 
   /// Runtime class name of the `AVPictureInPictureController`'s
-  /// delegate, if any.
+  /// original libVLC delegate, if any.
   public let avDelegateClassName: String?
+
+  /// Whether SwiftVLC successfully installed its lifecycle-forwarding bridge
+  /// in front of libVLC's delegate.
+  public let hasLifecycleDelegateBridge: Bool
 
   /// `respondsToSelector` results for the
   /// `AVPictureInPictureControllerDelegate` callbacks, keyed by

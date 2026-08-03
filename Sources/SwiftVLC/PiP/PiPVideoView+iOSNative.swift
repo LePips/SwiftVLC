@@ -192,6 +192,171 @@ final class IOSNativePiPCallbackGenerations: Sendable {
   }
 }
 
+/// Observes the AVKit lifecycle owned by libVLC without replacing its
+/// behaviour. Every callback is forwarded to libVLC's original delegate and
+/// independently reported to the generation-guarded SwiftVLC backend.
+final class IOSNativePiPDelegateBridge: NSObject,
+  AVPictureInPictureControllerDelegate,
+  @unchecked Sendable {
+  nonisolated(unsafe) weak var backend: IOSNativePiPBackend?
+  /// Retained for the bridge lifetime because AVKit's delegate reference is
+  /// weak. Replacing that weak slot must not accidentally deallocate libVLC's
+  /// delegate before forwarding the next lifecycle callback.
+  nonisolated(unsafe) let downstream: (any AVPictureInPictureControllerDelegate)?
+  nonisolated let generation: IOSNativePiPCallbackGenerations.ReadyCallback
+
+  init(
+    backend: IOSNativePiPBackend,
+    downstream: (any AVPictureInPictureControllerDelegate)?,
+    generation: IOSNativePiPCallbackGenerations.ReadyCallback
+  ) {
+    self.backend = backend
+    self.downstream = downstream
+    self.generation = generation
+  }
+
+  nonisolated func pictureInPictureControllerWillStartPictureInPicture(
+    _ pictureInPictureController: AVPictureInPictureController
+  ) {
+    downstream?.pictureInPictureControllerWillStartPictureInPicture?(
+      pictureInPictureController
+    )
+    pipMainActorAsync { [weak backend, generation] in
+      backend?.nativeDelegateWillStart(generation: generation)
+    }
+  }
+
+  nonisolated func pictureInPictureControllerDidStartPictureInPicture(
+    _ pictureInPictureController: AVPictureInPictureController
+  ) {
+    downstream?.pictureInPictureControllerDidStartPictureInPicture?(
+      pictureInPictureController
+    )
+    pipMainActorAsync { [weak backend, generation] in
+      backend?.nativeDelegateDidStart(generation: generation)
+    }
+  }
+
+  nonisolated func pictureInPictureControllerWillStopPictureInPicture(
+    _ pictureInPictureController: AVPictureInPictureController
+  ) {
+    downstream?.pictureInPictureControllerWillStopPictureInPicture?(
+      pictureInPictureController
+    )
+    pipMainActorAsync { [weak backend, generation] in
+      backend?.nativeDelegateWillStop(generation: generation)
+    }
+  }
+
+  nonisolated func pictureInPictureControllerDidStopPictureInPicture(
+    _ pictureInPictureController: AVPictureInPictureController
+  ) {
+    downstream?.pictureInPictureControllerDidStopPictureInPicture?(
+      pictureInPictureController
+    )
+    pipMainActorAsync { [weak backend, generation] in
+      backend?.nativeDelegateDidStop(generation: generation)
+    }
+  }
+
+  nonisolated func pictureInPictureController(
+    _ pictureInPictureController: AVPictureInPictureController,
+    failedToStartPictureInPictureWithError error: any Error
+  ) {
+    downstream?.pictureInPictureController?(
+      pictureInPictureController,
+      failedToStartPictureInPictureWithError: error
+    )
+    pipMainActorAsync { [weak backend, generation] in
+      backend?.nativeDelegateFailedToStart(error, generation: generation)
+    }
+  }
+
+  nonisolated func pictureInPictureController(
+    _ pictureInPictureController: AVPictureInPictureController,
+    restoreUserInterfaceForPictureInPictureStopWithCompletionHandler completionHandler: @escaping @Sendable (Bool) -> Void
+  ) {
+    nonisolated(unsafe) let pictureInPictureController = pictureInPictureController
+    nonisolated(unsafe) let downstream = downstream
+    pipMainActorAsync { [weak backend, generation] in
+      guard let backend else {
+        completionHandler(false)
+        return
+      }
+      backend.nativeDelegateRestore(
+        pictureInPictureController,
+        downstream: downstream,
+        generation: generation,
+        completionHandler: completionHandler
+      )
+    }
+  }
+}
+
+@MainActor
+private final class IOSNativePiPRestoreCoordinator {
+  private var hostResult: Bool?
+  private var downstreamResult: Bool?
+  private var timeout: Task<Void, Never>?
+  private var didComplete = false
+  private let completionHandler: @Sendable (Bool) -> Void
+  private let onFinish: @MainActor () -> Void
+
+  init(
+    expectsDownstreamAnswer: Bool,
+    completionHandler: @escaping @Sendable (Bool) -> Void,
+    onFinish: @escaping @MainActor () -> Void
+  ) {
+    downstreamResult = expectsDownstreamAnswer ? nil : true
+    self.completionHandler = completionHandler
+    self.onFinish = onFinish
+  }
+
+  func startTimeout(_ duration: Duration) {
+    timeout = Task { @MainActor [weak self] in
+      try? await Task.sleep(for: duration)
+      guard !Task.isCancelled else { return }
+      self?.finish(false)
+    }
+  }
+
+  func answerFromHost(_ restored: Bool) {
+    hostResult = restored
+    if !restored {
+      finish(false)
+      return
+    }
+    finishIfReady()
+  }
+
+  func answerFromDownstream(_ restored: Bool) {
+    downstreamResult = restored
+    if !restored {
+      finish(false)
+      return
+    }
+    finishIfReady()
+  }
+
+  func cancel() {
+    finish(false)
+  }
+
+  private func finishIfReady() {
+    guard let hostResult, let downstreamResult else { return }
+    finish(hostResult && downstreamResult)
+  }
+
+  private func finish(_ restored: Bool) {
+    guard !didComplete else { return }
+    didComplete = true
+    timeout?.cancel()
+    timeout = nil
+    completionHandler(restored)
+    onFinish()
+  }
+}
+
 @objc(VLCPictureInPictureDrawable)
 private protocol IOSNativePiPDrawable: NSObjectProtocol {
   @objc(mediaController)
@@ -653,6 +818,8 @@ final class IOSNativePiPBackend: NSObject, @unchecked Sendable {
 
   private weak var windowController: NSObject?
   private var avPictureInPictureController: AVPictureInPictureController?
+  private var delegateBridge: IOSNativePiPDelegateBridge?
+  private var restoreCoordinator: IOSNativePiPRestoreCoordinator?
   private var possibleObservation: NSKeyValueObservation?
   private var activeObservation: NSKeyValueObservation?
   private var stateChangeEventHandler: IOSNativePiPStateChangeEventHandler?
@@ -717,8 +884,29 @@ final class IOSNativePiPBackend: NSObject, @unchecked Sendable {
     mediaGeneration: PlaybackGeneration?
   ) {
     guard let controller = controller as? NSObject else { return }
+    let incomingAVController = avPictureInPictureController(from: controller)
+    let replacesExistingController = avPictureInPictureController.map { existing in
+      incomingAVController == nil || incomingAVController !== existing
+    } ?? false
+    // KVO can report inactive before AVKit delivers the terminal delegate
+    // callback. The retained media identity means that lifecycle still owns a
+    // stop even though the instantaneous backend flag is already false.
+    let replacedControllerNeedsTerminal = isActive || activeMediaGeneration != nil
+    let replacedMediaGeneration = activeMediaGeneration
 
     callbackGenerations.performIfCurrent(generation) {
+      if replacesExistingController {
+        owner?.handleNativePictureInPictureControllerReplacement(
+          wasActive: replacedControllerNeedsTerminal,
+          mediaGeneration: replacedMediaGeneration
+        )
+        // The owner has now published the old lifecycle's terminal events.
+        // Reset the backend too, so an incoming controller that is already
+        // active is adopted as a fresh lifecycle rather than suppressed by a
+        // stale `isActive == true` comparison.
+        isActive = false
+        activeMediaGeneration = nil
+      }
       clearWindowController()
       guard Self.supportsNativePictureInPictureRendering else {
         setPossible(false)
@@ -846,6 +1034,15 @@ final class IOSNativePiPBackend: NSObject, @unchecked Sendable {
       windowController.responds(to: IOSNativePiPSelector.setStateChangeEventHandler) {
       windowController.setValue(nil, forKey: "stateChangeEventHandler")
     }
+    restoreCoordinator?.cancel()
+    restoreCoordinator = nil
+    if
+      let avPictureInPictureController,
+      let delegateBridge,
+      avPictureInPictureController.delegate === delegateBridge {
+      avPictureInPictureController.delegate = delegateBridge.downstream
+    }
+    delegateBridge = nil
     possibleObservation = nil
     activeObservation = nil
     avPictureInPictureController = nil
@@ -889,19 +1086,33 @@ final class IOSNativePiPBackend: NSObject, @unchecked Sendable {
     generation: IOSNativePiPCallbackGenerations.ReadyCallback,
     initialActiveMediaGeneration: PlaybackGeneration?
   ) {
-    guard controller.responds(to: IOSNativePiPSelector.avPictureInPictureController) else { return }
-    guard let avController = controller.value(forKey: "avPipController") as? AVPictureInPictureController else { return }
+    guard let avController = avPictureInPictureController(from: controller) else { return }
 
     avPictureInPictureController = avController
     avController.requiresLinearPlayback = requiresLinearPlayback
     avController.canStartPictureInPictureAutomaticallyFromInline =
       startsAutomaticallyFromInline
     setPossible(avController.isPictureInPicturePossible)
-    setActiveFromNativeSignal(
-      avController.isPictureInPictureActive,
-      mediaGeneration: initialActiveMediaGeneration,
-      acceptedStart: nil
+    let installedLifecycleBridge = installLifecycleDelegateBridge(
+      on: avController,
+      generation: generation
     )
+    if installedLifecycleBridge, avController.isPictureInPictureActive, !isActive {
+      let mediaGeneration = owner?.attributedNativePiPStartMediaGeneration(
+        signaledMediaGeneration: initialActiveMediaGeneration,
+        acceptedRequestMediaGeneration: nil
+      ) ?? initialActiveMediaGeneration
+      activeMediaGeneration = mediaGeneration
+      isActive = true
+      owner?.handleNativePictureInPictureWillStart(mediaGeneration: mediaGeneration)
+      owner?.handleNativePictureInPictureDidStart(mediaGeneration: mediaGeneration)
+    } else {
+      setActiveFromNativeSignal(
+        avController.isPictureInPictureActive,
+        mediaGeneration: initialActiveMediaGeneration,
+        acceptedStart: nil
+      )
+    }
 
     let callbackGenerations = callbackGenerations
     possibleObservation = avController.observe(
@@ -942,6 +1153,16 @@ final class IOSNativePiPBackend: NSObject, @unchecked Sendable {
     }
   }
 
+  private func avPictureInPictureController(
+    from windowController: NSObject
+  ) -> AVPictureInPictureController? {
+    guard
+      windowController.responds(to: IOSNativePiPSelector.avPictureInPictureController)
+    else { return nil }
+    return windowController.value(forKey: "avPipController")
+      as? AVPictureInPictureController
+  }
+
   @discardableResult
   private func performWindowControllerAction(_ selector: Selector) -> PiPStartResult {
     // The window controller is created lazily alongside the PiP-ready
@@ -963,7 +1184,8 @@ final class IOSNativePiPBackend: NSObject, @unchecked Sendable {
       "pictureInPictureController:restoreUserInterfaceForPictureInPictureStopWithCompletionHandler:"
     ]
 
-    let delegate = avPictureInPictureController?.delegate
+    let delegate = delegateBridge?.downstream
+      ?? avPictureInPictureController?.delegate
     var delegateResponds: [String: Bool] = [:]
     if let delegate {
       for name in delegateSelectorNames {
@@ -975,10 +1197,164 @@ final class IOSNativePiPBackend: NSObject, @unchecked Sendable {
       windowControllerClassName: windowController.map { NSStringFromClass(type(of: $0)) },
       hasAVController: avPictureInPictureController != nil,
       avDelegateClassName: delegate.flatMap { object_getClass($0) }.map { NSStringFromClass($0) },
+      hasLifecycleDelegateBridge: delegateBridge != nil,
       delegateResponds: delegateResponds,
       isPossible: isPossible,
       isActive: isActive
     )
+  }
+
+  @discardableResult
+  private func installLifecycleDelegateBridge(
+    on controller: AVPictureInPictureController,
+    generation: IOSNativePiPCallbackGenerations.ReadyCallback
+  ) -> Bool {
+    guard let downstream = controller.delegate else {
+      Self.logger.error(
+        "Native PiP lifecycle bridge unavailable: AVKit controller has no libVLC delegate"
+      )
+      return false
+    }
+    let bridge = IOSNativePiPDelegateBridge(
+      backend: self,
+      downstream: downstream,
+      generation: generation
+    )
+    delegateBridge = bridge
+    controller.delegate = bridge
+    return true
+  }
+
+  private func lifecycleMediaGeneration(
+    for generation: IOSNativePiPCallbackGenerations.ReadyCallback
+  ) -> PlaybackGeneration? {
+    if let activeMediaGeneration {
+      return activeMediaGeneration
+    }
+    let signaled = mediaController.callbackSnapshot.withLock {
+      $0.playbackGeneration
+    }
+    let accepted = callbackGenerations.acceptedStart(at: generation)
+    let resolved = owner?.attributedNativePiPStartMediaGeneration(
+      signaledMediaGeneration: signaled,
+      acceptedRequestMediaGeneration: accepted?.mediaGeneration
+    ) ?? accepted?.mediaGeneration ?? signaled
+    activeMediaGeneration = resolved
+    return resolved
+  }
+
+  func nativeDelegateWillStart(
+    generation: IOSNativePiPCallbackGenerations.ReadyCallback
+  ) {
+    callbackGenerations.performIfCurrent(generation) {
+      owner?.handleNativePictureInPictureWillStart(
+        mediaGeneration: lifecycleMediaGeneration(for: generation)
+      )
+    }
+  }
+
+  func nativeDelegateDidStart(
+    generation: IOSNativePiPCallbackGenerations.ReadyCallback
+  ) {
+    callbackGenerations.performIfCurrent(generation) {
+      let mediaGeneration = lifecycleMediaGeneration(for: generation)
+      callbackGenerations.clearAcceptedStart()
+      isActive = true
+      owner?.handleNativePictureInPictureDidStart(
+        mediaGeneration: mediaGeneration
+      )
+    }
+  }
+
+  func nativeDelegateWillStop(
+    generation: IOSNativePiPCallbackGenerations.ReadyCallback
+  ) {
+    callbackGenerations.performIfCurrent(generation) {
+      owner?.handleNativePictureInPictureWillStop(
+        mediaGeneration: activeMediaGeneration
+      )
+    }
+  }
+
+  func nativeDelegateDidStop(
+    generation: IOSNativePiPCallbackGenerations.ReadyCallback
+  ) {
+    callbackGenerations.performIfCurrent(generation) {
+      let mediaGeneration = activeMediaGeneration
+      // A start can be accepted and then stopped before either `didStart` or
+      // active KVO arrives. That terminal stop retires the request just as a
+      // successful or failed start does; retaining it would relabel a later
+      // automatic start with the aborted request's media generation.
+      callbackGenerations.clearAcceptedStart()
+      isActive = false
+      owner?.handleNativePictureInPictureDidStop(
+        mediaGeneration: mediaGeneration
+      )
+      activeMediaGeneration = nil
+    }
+  }
+
+  func nativeDelegateFailedToStart(
+    _ error: any Error,
+    generation: IOSNativePiPCallbackGenerations.ReadyCallback
+  ) {
+    callbackGenerations.performIfCurrent(generation) {
+      let mediaGeneration = lifecycleMediaGeneration(for: generation)
+      callbackGenerations.clearAcceptedStart()
+      isActive = false
+      owner?.handleNativePictureInPictureFailedToStart(
+        error,
+        mediaGeneration: mediaGeneration
+      )
+      activeMediaGeneration = nil
+    }
+  }
+
+  func nativeDelegateRestore(
+    _ controller: AVPictureInPictureController,
+    downstream: (any AVPictureInPictureControllerDelegate)?,
+    generation: IOSNativePiPCallbackGenerations.ReadyCallback,
+    completionHandler: @escaping @Sendable (Bool) -> Void
+  ) {
+    guard callbackGenerations.isCurrent(generation) else {
+      completionHandler(false)
+      return
+    }
+
+    restoreCoordinator?.cancel()
+    let selector = Selector((
+      "pictureInPictureController:" +
+        "restoreUserInterfaceForPictureInPictureStopWithCompletionHandler:"
+    ))
+    let expectsDownstreamAnswer = downstream?.responds(to: selector) == true
+    let coordinator = IOSNativePiPRestoreCoordinator(
+      expectsDownstreamAnswer: expectsDownstreamAnswer,
+      completionHandler: completionHandler,
+      onFinish: { [weak self] in self?.restoreCoordinator = nil }
+    )
+    restoreCoordinator = coordinator
+    coordinator.startTimeout(PiPController.restoreCompletionTimeout)
+
+    if let owner {
+      owner.handleRestoreUserInterface { restored in
+        Task { @MainActor [weak coordinator] in
+          coordinator?.answerFromHost(restored)
+        }
+      }
+    } else {
+      coordinator.answerFromHost(false)
+    }
+
+    if expectsDownstreamAnswer {
+      downstream?.pictureInPictureController?(
+        controller,
+        restoreUserInterfaceForPictureInPictureStopWithCompletionHandler: { restored in
+          Task { @MainActor [weak coordinator] in
+            coordinator?.answerFromDownstream(restored)
+          }
+        }
+      )
+    }
   }
 
   private func setPossible(_ isPossible: Bool) {
@@ -1004,6 +1380,21 @@ final class IOSNativePiPBackend: NSObject, @unchecked Sendable {
     acceptedStart: IOSNativePiPCallbackGenerations.AcceptedStart?
   ) {
     guard self.isActive != isActive else { return }
+    if delegateBridge != nil {
+      if isActive {
+        let signaledMediaGeneration = mediaGeneration
+          ?? owner?.player.generation
+          ?? mediaController.player?.generation
+        activeMediaGeneration = owner?.attributedNativePiPStartMediaGeneration(
+          signaledMediaGeneration: signaledMediaGeneration,
+          acceptedRequestMediaGeneration: acceptedStart?.mediaGeneration
+        ) ?? acceptedStart?.mediaGeneration ?? signaledMediaGeneration
+        callbackGenerations.clearAcceptedStart()
+      }
+      self.isActive = isActive
+      owner?.updatePiPActive(isActive)
+      return
+    }
     if isActive {
       let signaledMediaGeneration = mediaGeneration
         ?? owner?.player.generation

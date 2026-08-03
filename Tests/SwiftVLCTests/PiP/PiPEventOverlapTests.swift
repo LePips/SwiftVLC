@@ -91,7 +91,7 @@ extension Integration {
         avController,
         failedToStartPictureInPictureWithError: failure
       )
-      #expect(controller.resolveStopReason() == .unknown)
+      #expect(controller.resolveStopReason() == .programmatic)
 
       // AVKit may omit didStop after a start failure. A new successful start
       // must therefore replace the retired attempt instead of queuing forever
@@ -177,7 +177,7 @@ extension Integration {
       #expect(envelopes[4].mediaGeneration == retryMediaGeneration)
       #expect(envelopes[5].mediaGeneration == failedMediaGeneration)
       #expect(envelopes[6].mediaGeneration == retryMediaGeneration)
-      guard case .willStop(reason: .unknown) = envelopes[4].event else {
+      guard case .willStop(reason: .programmatic) = envelopes[4].event else {
         Issue.record("Expected the active retry's programmatic willStop")
         return
       }
@@ -185,7 +185,7 @@ extension Integration {
         Issue.record("Expected the delayed failed stop first")
         return
       }
-      guard case .didStop(reason: .unknown) = envelopes[6].event else {
+      guard case .didStop(reason: .programmatic) = envelopes[6].event else {
         Issue.record("Expected the active retry's stop second")
         return
       }
@@ -250,7 +250,7 @@ extension Integration {
         failedToStartPictureInPictureWithError: failure
       )
       controller.stop()
-      #expect(controller.pendingStopReason == .unknown)
+      #expect(controller.pendingStopReason == .programmatic)
 
       try player.load(Media(url: TestMedia.silenceURL))
       let retryMediaGeneration = player.generation

@@ -109,6 +109,7 @@ struct MatrixScreenC: View {
     append("windowController = \(snapshot.windowControllerClassName ?? "nil")")
     append("avController present = \(snapshot.hasAVController)")
     append("delegate = \(snapshot.avDelegateClassName ?? "nil")")
+    append("lifecycle bridge = \(snapshot.hasLifecycleDelegateBridge)")
     for (selector, responds) in snapshot.delegateResponds.sorted(by: { $0.key < $1.key }) {
       append("\(responds ? "responds" : "missing")  \(selector)")
     }
