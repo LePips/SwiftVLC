@@ -12,11 +12,12 @@ import plistlib
 import stat
 import subprocess
 import tempfile
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 SDK_BY_PLATFORM = {
     ("ios", None): "iphoneos",
     ("ios", "simulator"): "iphonesimulator",
@@ -110,6 +111,30 @@ def manifest_entries(path: Path) -> list[dict[str, str]]:
     if not entries:
         fail(f"patch manifest has no entries: {path}")
     return entries
+
+
+def named_file_records(values: list[str]) -> list[dict[str, str]]:
+    records: list[dict[str, str]] = []
+    names: set[str] = set()
+    for value in values:
+        if "=" not in value:
+            fail(f"build configuration file must be NAME=PATH: {value}")
+        name, raw_path = value.split("=", 1)
+        path = Path(raw_path).resolve()
+        if not name or name in names or not path.is_file():
+            fail(f"invalid or duplicate build configuration file: {value}")
+        names.add(name)
+        records.append({"name": name, "sha256": sha256_file(path)})
+    if not records:
+        fail("at least one build configuration file is required")
+    return sorted(records, key=lambda record: record["name"])
+
+
+def invocation_id(value: str) -> str:
+    try:
+        return str(uuid.UUID(value))
+    except (ValueError, AttributeError):
+        fail(f"build invocation ID is not a UUID: {value}")
 
 
 def contrib_manifest(vlc_source: Path) -> dict[str, Any]:
@@ -275,11 +300,14 @@ def create(arguments: argparse.Namespace) -> None:
         "vlcSourceRevision": arguments.source_revision,
         "pinnedRevision": arguments.pinned_revision,
         "patchManifest": patch_record,
+        "buildConfiguration": named_file_records(arguments.build_configuration_file),
         "contribChecksums": contrib_manifest(arguments.vlc_source.resolve()),
         "build": {
             "assertionsEnabled": arguments.assertions_enabled,
             "makeFlags": arguments.make_flags,
             "sourceDateEpoch": arguments.source_date_epoch,
+            "cleanBuild": arguments.clean_build,
+            "invocationId": invocation_id(arguments.build_invocation_id),
             "hostArchitecture": platform.machine(),
             "xcode": xcode_details(),
             "clangVersion": first_line("xcrun", "clang", "--version"),
@@ -318,6 +346,10 @@ def verify(arguments: argparse.Namespace) -> None:
         fail("provenance patch manifest does not match the repository")
     if manifest.get("entries") != manifest_entries(arguments.patch_manifest):
         fail("provenance patch order does not match the repository")
+    if record.get("buildConfiguration") != named_file_records(
+        arguments.build_configuration_file
+    ):
+        fail("provenance build configuration does not match the repository")
     if record.get("xcframeworkTreeDigest") != tree_digest(xcframework):
         fail("XCFramework tree digest does not match provenance")
     recorded_slices = {item["identifier"]: item for item in record.get("slices", [])}
@@ -346,38 +378,11 @@ def verify(arguments: argparse.Namespace) -> None:
     )
 
 
-def rebind(arguments: argparse.Namespace) -> None:
-    record = load_record(arguments.provenance)
-    xcframework = arguments.xcframework.resolve()
-    recorded_slices = {item["identifier"]: item for item in record.get("slices", [])}
-    rebound_slices = []
-    for library in load_xcframework_libraries(xcframework):
-        identifier = library["LibraryIdentifier"]
-        if identifier not in recorded_slices:
-            fail(f"rebound XCFramework contains an unrecorded slice: {identifier}")
-        rebound = dict(recorded_slices[identifier])
-        root = xcframework / identifier
-        archive = root / library["LibraryPath"]
-        headers = root / library["HeadersPath"]
-        rebound.update(
-            librarySha256=sha256_file(archive),
-            headersTreeDigest=tree_digest(headers),
-            **archive_member_digest(archive),
-        )
-        rebound_slices.append(rebound)
-    if len(rebound_slices) != len(recorded_slices):
-        fail("rebound XCFramework is missing a recorded slice")
-    record["sourceBuildTreeDigest"] = record.get(
-        "sourceBuildTreeDigest", record["xcframeworkTreeDigest"]
-    )
-    record["xcframeworkTreeDigest"] = tree_digest(xcframework)
-    record["slices"] = sorted(rebound_slices, key=lambda item: item["identifier"])
-    arguments.output.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n")
-
-
 def normalized_build_inputs(record: dict[str, Any]) -> dict[str, Any]:
     return {
-        key: value for key, value in record.get("build", {}).items() if key != "builtAt"
+        key: value
+        for key, value in record.get("build", {}).items()
+        if key not in {"builtAt", "invocationId"}
     }
 
 
@@ -403,6 +408,7 @@ def compare(arguments: argparse.Namespace) -> None:
         "vlcSourceRevision",
         "pinnedRevision",
         "patchManifest",
+        "buildConfiguration",
         "contribChecksums",
     )
     for key in input_keys:
@@ -412,6 +418,14 @@ def compare(arguments: argparse.Namespace) -> None:
         fail("build toolchain, host, flags, or assertion inputs differ")
     if slice_inputs(first) != slice_inputs(second):
         fail("build slice SDK, target, platform, or architecture inputs differ")
+    first_build = first.get("build", {})
+    second_build = second.get("build", {})
+    if not first_build.get("cleanBuild") or not second_build.get("cleanBuild"):
+        fail("reproducibility proof requires two clean builds")
+    first_invocation = first_build.get("invocationId")
+    second_invocation = second_build.get("invocationId")
+    if not first_invocation or first_invocation == second_invocation:
+        fail("reproducibility proof requires independent build invocations")
     first_slices = {item["identifier"]: item for item in first.get("slices", [])}
     second_slices = {item["identifier"]: item for item in second.get("slices", [])}
     if set(first_slices) != set(second_slices):
@@ -434,15 +448,18 @@ def compare(arguments: argparse.Namespace) -> None:
         fail("clean builds are not byte-reproducible: " + ", ".join(differences))
     if arguments.output is not None:
         proof = {
-            "schemaVersion": 1,
+            "schemaVersion": 2,
             "vlcSourceRevision": first["vlcSourceRevision"],
             "pinnedRevision": first["pinnedRevision"],
             "patchManifestSha256": first["patchManifest"]["sha256"],
+            "buildConfiguration": first["buildConfiguration"],
             "contribChecksums": first["contribChecksums"],
             "buildInputs": normalized_build_inputs(first),
             "sliceInputs": slice_inputs(first),
             "firstBuiltAt": first["build"]["builtAt"],
             "secondBuiltAt": second["build"]["builtAt"],
+            "firstInvocationId": first_invocation,
+            "secondInvocationId": second_invocation,
             "xcframeworkTreeDigest": first["xcframeworkTreeDigest"],
             "slices": {
                 identifier: {
@@ -470,25 +487,31 @@ def verify_proof(arguments: argparse.Namespace) -> None:
         proof = json.loads(arguments.proof.read_text())
     except (OSError, ValueError) as error:
         fail(f"cannot read reproducibility proof {arguments.proof}: {error}")
-    if proof.get("schemaVersion") != 1:
+    if proof.get("schemaVersion") != 2:
         fail("reproducibility proof has an unsupported schema")
-    expected_digest = provenance.get(
-        "sourceBuildTreeDigest", provenance["xcframeworkTreeDigest"]
-    )
     expected = {
         "vlcSourceRevision": provenance["vlcSourceRevision"],
         "pinnedRevision": provenance["pinnedRevision"],
         "patchManifestSha256": provenance["patchManifest"]["sha256"],
+        "buildConfiguration": provenance["buildConfiguration"],
         "contribChecksums": provenance["contribChecksums"],
         "buildInputs": normalized_build_inputs(provenance),
         "sliceInputs": slice_inputs(provenance),
-        "xcframeworkTreeDigest": expected_digest,
+        "xcframeworkTreeDigest": provenance["xcframeworkTreeDigest"],
     }
     for key, value in expected.items():
         if proof.get(key) != value:
             fail(f"reproducibility proof does not match provenance at {key}")
-    if proof.get("firstBuiltAt") == proof.get("secondBuiltAt"):
-        fail("reproducibility proof does not describe two distinct builds")
+    if not provenance.get("build", {}).get("cleanBuild"):
+        fail("provenance does not describe a clean build")
+    invocation_ids = {
+        proof.get("firstInvocationId"),
+        proof.get("secondInvocationId"),
+    }
+    if None in invocation_ids or len(invocation_ids) != 2:
+        fail("reproducibility proof does not describe independent builds")
+    if provenance["build"].get("invocationId") not in invocation_ids:
+        fail("provenance build invocation is absent from reproducibility proof")
     print(
         f"libVLC reproducibility proof verified: "
         f"{proof['xcframeworkTreeDigest'][:12]}…"
@@ -507,7 +530,15 @@ def main() -> None:
     create_parser.add_argument("--pinned-revision", required=True)
     create_parser.add_argument("--source-date-epoch", type=int, required=True)
     create_parser.add_argument("--patch-manifest", type=Path)
+    create_parser.add_argument(
+        "--build-configuration-file",
+        action="append",
+        default=[],
+        required=True,
+    )
     create_parser.add_argument("--assertions-enabled", action="store_true")
+    create_parser.add_argument("--clean-build", action="store_true")
+    create_parser.add_argument("--build-invocation-id", required=True)
     create_parser.add_argument("--make-flags", required=True)
     create_parser.add_argument(
         "--deployment-target",
@@ -522,13 +553,13 @@ def main() -> None:
     verify_parser.add_argument("--xcframework", type=Path, required=True)
     verify_parser.add_argument("--pinned-revision", required=True)
     verify_parser.add_argument("--patch-manifest", type=Path, required=True)
+    verify_parser.add_argument(
+        "--build-configuration-file",
+        action="append",
+        default=[],
+        required=True,
+    )
     verify_parser.set_defaults(function=verify)
-
-    rebind_parser = commands.add_parser("rebind")
-    rebind_parser.add_argument("--provenance", type=Path, required=True)
-    rebind_parser.add_argument("--xcframework", type=Path, required=True)
-    rebind_parser.add_argument("--output", type=Path, required=True)
-    rebind_parser.set_defaults(function=rebind)
 
     compare_parser = commands.add_parser("compare")
     compare_parser.add_argument("--first", type=Path, required=True)

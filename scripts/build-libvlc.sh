@@ -55,6 +55,7 @@ BUILD_CATALYST=no
 # official VLC release builds ship. Developers debugging codec internals can
 # restore the asserts with --with-asserts.
 WITH_ASSERTS=no
+CLEAN_BUILD=no
 
 # Keep these deployment targets in sync with Package.swift.
 SWIFTVLC_MIN_IOS="18.0"
@@ -64,6 +65,7 @@ SWIFTVLC_MIN_MACOS="15.0"
 SWIFTVLC_MIN_CATALYST="18.0"
 
 BUILD_START_TIME=$(date +%s)
+BUILD_INVOCATION_ID=$(uuidgen | tr '[:upper:]' '[:lower:]')
 
 if [ -z "$MAKEFLAGS" ]; then
     MAKEFLAGS="-j$(sysctl -n machdep.cpu.core_count || nproc)"
@@ -262,6 +264,7 @@ for arg in "$@"; do
         --clean-build)
             echo "Removing build directory: ${BUILD_DIR}"
             rm -rf "${BUILD_DIR}"
+            CLEAN_BUILD=yes
             echo "Continuing with fresh build..."
             ;;
         --with-asserts)
@@ -1463,6 +1466,8 @@ fi
 info "Creating libvlc.xcframework..."
 mkdir -p "${OUTPUT_DIR}"
 rm -rf "${OUTPUT_DIR}/libvlc.xcframework"
+rm -f "${OUTPUT_DIR}/libvlc-provenance.json" \
+    "${OUTPUT_DIR}/libvlc-reproducibility.json"
 
 xcodebuild -create-xcframework \
     "${XCFRAMEWORK_ARGS[@]}" \
@@ -1508,43 +1513,10 @@ info "Fixing duplicate symbols in static libraries..."
 find "${OUTPUT_DIR}/libvlc.xcframework" -name "module.modulemap" -delete
 find "${OUTPUT_DIR}/libvlc.xcframework" -name "CLibVLC.h" -delete
 
-info "Created: ${OUTPUT_DIR}/libvlc.xcframework"
+info "Stripping release debug symbols before reproducibility hashing..."
+find "${OUTPUT_DIR}/libvlc.xcframework" -name '*.a' -exec strip -S {} \;
 
-# --- Step 4b: Record what produced it ---
-#
-# `release.sh` packages whatever xcframework is sitting in Vendor/. Without a
-# record of the inputs it cannot tell a fresh build from one made months ago
-# against a different pin or patch set, so a stale binary could be published as
-# a new release and nothing would notice. That is issue #97's second acceptance
-# criterion.
-#
-# Written last, after every slice succeeded, so a partial build leaves no
-# provenance rather than provenance describing an artifact that was never
-# finished.
-PROVENANCE_FILE="${OUTPUT_DIR}/libvlc-provenance.json"
-provenance_args=(
-    python3 "${SCRIPT_DIR}/libvlc-provenance.py" create
-    --xcframework "${OUTPUT_DIR}/libvlc.xcframework"
-    --output "${PROVENANCE_FILE}"
-    --vlc-source "${VLC_SRC}"
-    --source-revision "${SOURCE_SHA}"
-    --pinned-revision "${VLC_HASH}"
-    --source-date-epoch "${SOURCE_DATE_EPOCH}"
-    --make-flags="${MAKEFLAGS}"
-    --deployment-target "ios=${SWIFTVLC_MIN_IOS}"
-    --deployment-target "tvos=${SWIFTVLC_MIN_TVOS}"
-    --deployment-target "xros=${SWIFTVLC_MIN_VISIONOS}"
-    --deployment-target "macos=${SWIFTVLC_MIN_MACOS}"
-    --deployment-target "catalyst=${SWIFTVLC_MIN_CATALYST}"
-)
-if [ -n "${PATCHES_DIR}" ] && [ -f "${PATCHES_DIR}/manifest.sha256" ]; then
-    provenance_args+=(--patch-manifest "${PATCHES_DIR}/manifest.sha256")
-fi
-if [ "${WITH_ASSERTS}" = "yes" ]; then
-    provenance_args+=(--assertions-enabled)
-fi
-"${provenance_args[@]}"
-info "Recorded build provenance: ${PROVENANCE_FILE}"
+info "Created: ${OUTPUT_DIR}/libvlc.xcframework"
 
 # --- Step 5: Verify ---
 #
@@ -1610,6 +1582,43 @@ verify_deployment_targets() {
 }
 
 verify_deployment_targets
+
+# --- Step 6: Record the verified, release-ready artifact ---
+#
+# Provenance is deliberately written only after every deployment-target check
+# passes. The artifact is also stripped above, before hashing, so the two-clean-
+# build proof covers the exact tree release.sh packages; no post-proof rebind is
+# permitted.
+PROVENANCE_FILE="${OUTPUT_DIR}/libvlc-provenance.json"
+provenance_args=(
+    python3 "${SCRIPT_DIR}/libvlc-provenance.py" create
+    --xcframework "${OUTPUT_DIR}/libvlc.xcframework"
+    --output "${PROVENANCE_FILE}"
+    --vlc-source "${VLC_SRC}"
+    --source-revision "${SOURCE_SHA}"
+    --pinned-revision "${VLC_HASH}"
+    --source-date-epoch "${SOURCE_DATE_EPOCH}"
+    --build-invocation-id "${BUILD_INVOCATION_ID}"
+    --build-configuration-file "build-libvlc.sh=${SCRIPT_DIR}/build-libvlc.sh"
+    --build-configuration-file "fix-duplicate-symbols.sh=${SCRIPT_DIR}/fix-duplicate-symbols.sh"
+    --make-flags="${MAKEFLAGS}"
+    --deployment-target "ios=${SWIFTVLC_MIN_IOS}"
+    --deployment-target "tvos=${SWIFTVLC_MIN_TVOS}"
+    --deployment-target "xros=${SWIFTVLC_MIN_VISIONOS}"
+    --deployment-target "macos=${SWIFTVLC_MIN_MACOS}"
+    --deployment-target "catalyst=${SWIFTVLC_MIN_CATALYST}"
+)
+if [ -n "${PATCHES_DIR}" ] && [ -f "${PATCHES_DIR}/manifest.sha256" ]; then
+    provenance_args+=(--patch-manifest "${PATCHES_DIR}/manifest.sha256")
+fi
+if [ "${WITH_ASSERTS}" = "yes" ]; then
+    provenance_args+=(--assertions-enabled)
+fi
+if [ "${CLEAN_BUILD}" = "yes" ]; then
+    provenance_args+=(--clean-build)
+fi
+"${provenance_args[@]}"
+info "Recorded verified build provenance: ${PROVENANCE_FILE}"
 
 echo ""
 info "Build complete!"

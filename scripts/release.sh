@@ -459,7 +459,7 @@ verify_artifact_provenance() {
     echo "  Required: $reproducibility" >&2
     echo "  $XCFW_PATH was built before provenance was recorded, so its inputs" >&2
     echo "  cannot be established. Rebuild with:" >&2
-    echo "    ./scripts/build-libvlc.sh --all" >&2
+    echo "    ./scripts/build-libvlc.sh --clean-build --all" >&2
     return 1
   fi
 
@@ -471,9 +471,11 @@ verify_artifact_provenance() {
     --provenance "$provenance" \
     --xcframework "$XCFW_PATH" \
     --pinned-revision "$current_pin" \
-    --patch-manifest "$SCRIPT_DIR/patches/manifest.sha256"; then
+    --patch-manifest "$SCRIPT_DIR/patches/manifest.sha256" \
+    --build-configuration-file "build-libvlc.sh=$SCRIPT_DIR/build-libvlc.sh" \
+    --build-configuration-file "fix-duplicate-symbols.sh=$SCRIPT_DIR/fix-duplicate-symbols.sh"; then
     echo "  Rebuild so every shipped slice and input has current provenance:" >&2
-    echo "    ./scripts/build-libvlc.sh --all" >&2
+    echo "    ./scripts/build-libvlc.sh --clean-build --all" >&2
     return 1
   fi
   if ! python3 "$SCRIPT_DIR/libvlc-provenance.py" verify-proof \
@@ -586,21 +588,11 @@ else
   echo "Copying xcframework to temp dir..."
   cp -R "$XCFW_PATH" "$WORK_XCFW"
 
-  echo "Stripping debug symbols from .a files..."
-  BEFORE_SIZE=$(du -sh "$WORK_XCFW" | cut -f1)
-  find "$WORK_XCFW" -name '*.a' -exec strip -S {} \;
-  AFTER_SIZE=$(du -sh "$WORK_XCFW" | cut -f1)
-  echo "  Before: $BEFORE_SIZE → After: $AFTER_SIZE"
-
-  echo "Verifying duplicate symbols in stripped libraries..."
+  echo "Verifying duplicate symbols in release-ready libraries..."
   "$SCRIPT_DIR/fix-duplicate-symbols.sh" --verify "$WORK_XCFW"
 
-  RELEASE_PROVENANCE="$WORK_DIR/libvlc-provenance.json"
+  RELEASE_PROVENANCE="$(dirname "$XCFW_PATH")/libvlc-provenance.json"
   RELEASE_REPRODUCIBILITY="$(dirname "$XCFW_PATH")/libvlc-reproducibility.json"
-  python3 "$SCRIPT_DIR/libvlc-provenance.py" rebind \
-    --provenance "$(dirname "$XCFW_PATH")/libvlc-provenance.json" \
-    --xcframework "$WORK_XCFW" \
-    --output "$RELEASE_PROVENANCE"
   python3 "$SCRIPT_DIR/libvlc-provenance.py" verify-proof \
     --proof "$RELEASE_REPRODUCIBILITY" \
     --provenance "$RELEASE_PROVENANCE"
@@ -666,9 +658,9 @@ PY
   echo "Prepared immutable candidate at $PREPARE_DIR"
 fi
 
-# Device qualification must describe the exact post-strip tree that the zip
-# contains. Preparation intentionally precedes qualification; stable publishing
-# later requires --candidate and refuses to rebuild or mutate those bytes.
+# Device qualification must describe the exact provenance-covered tree that the
+# zip contains. Preparation intentionally precedes qualification; stable
+# publishing later requires --candidate and refuses to rebuild or mutate bytes.
 if [[ -n "$PREPARE_DIR" ]]; then
   echo "Candidate prepared but not yet device-qualified."
 elif [[ "$UNQUALIFIED" == true ]]; then
