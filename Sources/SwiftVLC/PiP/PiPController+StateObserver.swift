@@ -55,7 +55,7 @@ extension PiPController {
     let initialActive = player.isPlaybackRequestedActive
     let initialNativeActive = player.isActive
     pipPlaybackActive = initialActive
-    syncTimebase(playing: initialNativeActive)
+    syncTimebase(playing: initialNativeActive, reason: .initialSynchronization)
 
     lastObservedNativeActive = initialNativeActive
     lastObservedRate = 1.0
@@ -127,7 +127,14 @@ extension PiPController {
         CMTimebaseSetRate(timebase, rate: Float64(rate))
       }
       if let seconds = retracking.setsTime {
+        let previousSeconds = CMTimebaseGetTime(timebase).seconds
         CMTimebaseSetTime(timebase, time: CMTime(seconds: seconds, preferredTimescale: 1000))
+        recordTimebaseCorrection(
+          reason: .steadyStateDrift,
+          previousTimebaseSeconds: previousSeconds,
+          correctedTimebaseSeconds: seconds,
+          mediaTimeSeconds: seconds
+        )
       }
     }
   }

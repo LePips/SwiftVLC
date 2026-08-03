@@ -43,6 +43,11 @@ struct HarnessHome: View {
     streams?.subtitled != nil
   }
 
+  private var screenIAvailable: Bool {
+    guard let streams else { return false }
+    return streams.vod != nil || streams.hlsLive != nil || streams.liveTS != nil
+  }
+
   var body: some View {
     Form {
       configurationSection
@@ -183,6 +188,17 @@ struct HarnessHome: View {
         unavailableRow(
           "(h) Native PiP subtitles + OSD",
           detail: "Needs subtitled"
+        )
+      }
+
+      if let streams, screenIAvailable {
+        NavigationLink("(i) Direct PiP clock + A/V soak") {
+          MatrixScreenI(streams: streams)
+        }
+      } else {
+        unavailableRow(
+          "(i) Direct PiP clock + A/V soak",
+          detail: "Needs vod, hlsLive, or liveTS"
         )
       }
     }

@@ -38,6 +38,10 @@ struct PixelBufferEnqueueState: @unchecked Sendable {
   var backpressureDropCount: UInt64 = 0
   var lastEnqueuedAt: ContinuousClock.Instant?
   var lastPresentedAt: ContinuousClock.Instant?
+  /// PTS handed to the display layer by the most recently delivered sample.
+  /// Seconds keep qualification telemetry `Sendable`; this is not scheduling
+  /// state and is never fed back into the renderer.
+  var lastPresentedSampleTimeSeconds: Double?
   var latestPlaybackGeneration: UInt64?
   var latestVoutGeneration: UInt64?
   var voutTransitionCount: UInt64 = 0
@@ -68,6 +72,7 @@ struct PixelBufferRendererTelemetrySnapshot: Sendable, Equatable {
   let lastDecodedAt: ContinuousClock.Instant?
   let lastEnqueuedAt: ContinuousClock.Instant?
   let lastPresentedAt: ContinuousClock.Instant?
+  let lastPresentedSampleTimeSeconds: Double?
   let status: PixelBufferRendererTelemetryStatus
 }
 
@@ -240,6 +245,7 @@ extension PixelBufferRenderer {
         lastDecodedAt: decoded.1,
         lastEnqueuedAt: $0.lastEnqueuedAt,
         lastPresentedAt: $0.lastPresentedAt,
+        lastPresentedSampleTimeSeconds: $0.lastPresentedSampleTimeSeconds,
         status: $0.status
       )
     }
@@ -361,11 +367,15 @@ extension PixelBufferRenderer {
       return true
     }
     if delivered {
+      let presentationTime = CMSampleBufferGetPresentationTimeStamp(pending.sample)
       enqueueState.withLock {
         $0.flushRecoveryRetryCount = 0
         $0.flushRecoveryGeneration = nil
         $0.presentedFrameCount &+= 1
         $0.lastPresentedAt = .now
+        $0.lastPresentedSampleTimeSeconds = presentationTime.isNumeric
+          ? presentationTime.seconds
+          : nil
         $0.status = .rendering
       }
     }

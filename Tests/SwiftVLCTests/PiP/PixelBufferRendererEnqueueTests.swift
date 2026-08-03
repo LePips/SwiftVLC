@@ -510,6 +510,7 @@ extension Integration {
       #expect(telemetry.voutGeneration == 2)
       #expect(telemetry.voutTransitionCount == 2)
       #expect(telemetry.enqueuedFrameCount == 3)
+      #expect(telemetry.lastPresentedSampleTimeSeconds == 4)
     }
 
     private func submitFrame(
