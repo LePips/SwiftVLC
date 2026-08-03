@@ -221,7 +221,7 @@ final class IOSNativePiPDelegateBridge: NSObject,
     downstream?.pictureInPictureControllerWillStartPictureInPicture?(
       pictureInPictureController
     )
-    Task { @MainActor [weak backend] in
+    pipMainActorAsync { [weak backend, generation] in
       backend?.nativeDelegateWillStart(generation: generation)
     }
   }
@@ -232,7 +232,7 @@ final class IOSNativePiPDelegateBridge: NSObject,
     downstream?.pictureInPictureControllerDidStartPictureInPicture?(
       pictureInPictureController
     )
-    Task { @MainActor [weak backend] in
+    pipMainActorAsync { [weak backend, generation] in
       backend?.nativeDelegateDidStart(generation: generation)
     }
   }
@@ -243,7 +243,7 @@ final class IOSNativePiPDelegateBridge: NSObject,
     downstream?.pictureInPictureControllerWillStopPictureInPicture?(
       pictureInPictureController
     )
-    Task { @MainActor [weak backend] in
+    pipMainActorAsync { [weak backend, generation] in
       backend?.nativeDelegateWillStop(generation: generation)
     }
   }
@@ -254,7 +254,7 @@ final class IOSNativePiPDelegateBridge: NSObject,
     downstream?.pictureInPictureControllerDidStopPictureInPicture?(
       pictureInPictureController
     )
-    Task { @MainActor [weak backend] in
+    pipMainActorAsync { [weak backend, generation] in
       backend?.nativeDelegateDidStop(generation: generation)
     }
   }
@@ -267,7 +267,7 @@ final class IOSNativePiPDelegateBridge: NSObject,
       pictureInPictureController,
       failedToStartPictureInPictureWithError: error
     )
-    Task { @MainActor [weak backend] in
+    pipMainActorAsync { [weak backend, generation] in
       backend?.nativeDelegateFailedToStart(error, generation: generation)
     }
   }
@@ -278,7 +278,7 @@ final class IOSNativePiPDelegateBridge: NSObject,
   ) {
     nonisolated(unsafe) let pictureInPictureController = pictureInPictureController
     nonisolated(unsafe) let downstream = downstream
-    Task { @MainActor [weak backend] in
+    pipMainActorAsync { [weak backend, generation] in
       guard let backend else {
         completionHandler(false)
         return
@@ -322,11 +322,19 @@ private final class IOSNativePiPRestoreCoordinator {
 
   func answerFromHost(_ restored: Bool) {
     hostResult = restored
+    if !restored {
+      finish(false)
+      return
+    }
     finishIfReady()
   }
 
   func answerFromDownstream(_ restored: Bool) {
     downstreamResult = restored
+    if !restored {
+      finish(false)
+      return
+    }
     finishIfReady()
   }
 
@@ -880,15 +888,24 @@ final class IOSNativePiPBackend: NSObject, @unchecked Sendable {
     let replacesExistingController = avPictureInPictureController.map { existing in
       incomingAVController == nil || incomingAVController !== existing
     } ?? false
-    let replacedControllerWasActive = isActive
+    // KVO can report inactive before AVKit delivers the terminal delegate
+    // callback. The retained media identity means that lifecycle still owns a
+    // stop even though the instantaneous backend flag is already false.
+    let replacedControllerNeedsTerminal = isActive || activeMediaGeneration != nil
     let replacedMediaGeneration = activeMediaGeneration
 
     callbackGenerations.performIfCurrent(generation) {
       if replacesExistingController {
         owner?.handleNativePictureInPictureControllerReplacement(
-          wasActive: replacedControllerWasActive,
+          wasActive: replacedControllerNeedsTerminal,
           mediaGeneration: replacedMediaGeneration
         )
+        // The owner has now published the old lifecycle's terminal events.
+        // Reset the backend too, so an incoming controller that is already
+        // active is adopted as a fresh lifecycle rather than suppressed by a
+        // stale `isActive == true` comparison.
+        isActive = false
+        activeMediaGeneration = nil
       }
       clearWindowController()
       guard Self.supportsNativePictureInPictureRendering else {
@@ -1264,6 +1281,11 @@ final class IOSNativePiPBackend: NSObject, @unchecked Sendable {
   ) {
     callbackGenerations.performIfCurrent(generation) {
       let mediaGeneration = activeMediaGeneration
+      // A start can be accepted and then stopped before either `didStart` or
+      // active KVO arrives. That terminal stop retires the request just as a
+      // successful or failed start does; retaining it would relabel a later
+      // automatic start with the aborted request's media generation.
+      callbackGenerations.clearAcceptedStart()
       isActive = false
       owner?.handleNativePictureInPictureDidStop(
         mediaGeneration: mediaGeneration

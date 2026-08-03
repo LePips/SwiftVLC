@@ -70,7 +70,7 @@ extension PiPController: AVPictureInPictureControllerDelegate {
       // lifecycle describes a session that is over.
       guard let self, isCurrentAVController(identity) else { return }
       publishPiPEvent(
-        .willStop(reason: resolveWillStopReason()),
+        .willStop(reason: resolveWillStopReason(mediaGeneration: mediaGeneration)),
         mediaGeneration: mediaGeneration
       )
     }
@@ -90,7 +90,7 @@ extension PiPController: AVPictureInPictureControllerDelegate {
       // a controller replaced in the meantime can still deliver, and its
       // lifecycle describes a session that is over.
       guard let self, isCurrentAVController(identity) else { return }
-      let reason = resolveStopReason()
+      let reason = resolveStopReason(mediaGeneration: mediaGeneration)
       updatePiPActive(false)
       publishPiPEvent(.didStop(reason: reason), mediaGeneration: mediaGeneration)
     }

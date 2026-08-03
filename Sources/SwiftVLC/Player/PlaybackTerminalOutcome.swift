@@ -73,4 +73,14 @@ extension Player {
   public nonisolated var terminalOutcomes: AsyncStream<PlaybackTerminalOutcome> {
     eventBridge.makeTerminalOutcomeStream()
   }
+
+  /// Frozen terminal classification for one exact media generation. Internal
+  /// lifecycle consumers use this instead of the mutable `state`, which can
+  /// temporarily retain an outgoing error after `load(_:)` has adopted a new
+  /// generation.
+  nonisolated func terminalCause(
+    for generation: PlaybackGeneration
+  ) -> PlaybackTerminalCause? {
+    eventBridge.terminalCause(for: generation.value)
+  }
 }

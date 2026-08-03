@@ -2,6 +2,7 @@
 @testable import SwiftVLC
 import AVFoundation
 import AVKit
+import CLibVLC
 import Synchronization
 import Testing
 
@@ -35,20 +36,46 @@ private final class NativePiPDownstreamRecorder: NSObject,
   }
 }
 
+private final class NativePiPNonAnsweringRestoreDelegate: NSObject,
+  AVPictureInPictureControllerDelegate,
+  @unchecked Sendable {
+  nonisolated func pictureInPictureController(
+    _: AVPictureInPictureController,
+    restoreUserInterfaceForPictureInPictureStopWithCompletionHandler _: @escaping @Sendable (Bool) -> Void
+  ) {
+    // Intentionally never answers. A definitive host failure must still
+    // complete immediately instead of waiting for the global timeout.
+  }
+}
+
 extension Integration {
   @Suite(.tags(.mainActor))
   @MainActor struct PiPNativeLifecycleBridgeTests {
-    @Test
-    func `playback failure reports its authoritative stop reason`() async {
-      let player = Player(instance: TestInstance.shared)
-      let controller = PiPController(player: player)
+    private func installedAVController(
+      for controller: PiPController
+    ) -> AVPictureInPictureController {
+      if let installed = controller.pipController {
+        return installed
+      }
       let contentSource = AVPictureInPictureController.ContentSource(
-        sampleBufferDisplayLayer: AVSampleBufferDisplayLayer(),
+        sampleBufferDisplayLayer: controller.layer,
         playbackDelegate: controller._playbackDelegateForTesting
       )
-      let avController = AVPictureInPictureController(contentSource: contentSource)
+      let installed = AVPictureInPictureController(contentSource: contentSource)
+      controller.pipController = installed
+      return installed
+    }
+
+    @Test
+    func `playback failure reports its authoritative stop reason`() async throws {
+      let player = Player(instance: TestInstance.makeAudioOnly())
+      try player.load(Media(url: TestMedia.twosecURL))
+      let controller = PiPController(player: player)
+      let avController = installedAVController(for: controller)
       var events = controller.pipEvents.makeAsyncIterator()
-      player._setStateForTesting(state: .error)
+      var encounteredError = libvlc_event_t()
+      encounteredError.type = Int32(libvlc_MediaPlayerEncounteredError.rawValue)
+      player.eventBridge._emitNativeEventForTesting(encounteredError)
 
       controller.pictureInPictureControllerWillStopPictureInPicture(avController)
       controller.pictureInPictureControllerDidStopPictureInPicture(avController)
@@ -58,6 +85,34 @@ extension Integration {
         case .didStop(reason: .failure) = await events.next()
       else {
         Issue.record("playback failure stop was not classified as failure")
+        return
+      }
+    }
+
+    @Test
+    func `outgoing playback failure does not classify a successor stop`() async throws {
+      let player = Player(instance: TestInstance.makeAudioOnly())
+      try player.load(Media(url: TestMedia.twosecURL))
+      var encounteredError = libvlc_event_t()
+      encounteredError.type = Int32(libvlc_MediaPlayerEncounteredError.rawValue)
+      player.eventBridge._emitNativeEventForTesting(encounteredError)
+
+      try player.load(Media(url: TestMedia.silenceURL))
+      // Model the interval before libVLC publishes the successor's first
+      // state transition: Player intentionally still exposes the old error.
+      player._setStateForTesting(state: .error)
+      let controller = PiPController(player: player)
+      let avController = installedAVController(for: controller)
+      var events = controller.pipEvents.makeAsyncIterator()
+
+      controller.pictureInPictureControllerWillStopPictureInPicture(avController)
+      controller.pictureInPictureControllerDidStopPictureInPicture(avController)
+
+      guard
+        case .willStop(reason: .userClosed) = await events.next(),
+        case .didStop(reason: .userClosed) = await events.next()
+      else {
+        Issue.record("outgoing failure leaked into the successor PiP lifecycle")
         return
       }
     }
@@ -233,6 +288,63 @@ extension Integration {
         "native restore never answered AVKit"
       )
       #expect(answers.withLock { $0 } == [true])
+    }
+
+    @Test
+    func `native restore finishes immediately when one participant rejects`() async throws {
+      let player = Player(instance: TestInstance.shared)
+      let backend = IOSNativePiPBackend()
+      let attachment = backend.attach(to: player)
+      let ready = try #require(
+        backend.callbackGenerations.reserveReadyCallback(for: attachment)
+      )
+      let controller = PiPController(player: player, nativeBackend: backend)
+      controller.onRestoreUserInterface = { answer in answer(false) }
+      let avController = AVPictureInPictureController(
+        contentSource: .init(
+          sampleBufferDisplayLayer: AVSampleBufferDisplayLayer(),
+          playbackDelegate: controller._playbackDelegateForTesting
+        )
+      )
+      let downstream = NativePiPNonAnsweringRestoreDelegate()
+      let answers = Mutex<[Bool]>([])
+
+      backend.nativeDelegateRestore(
+        avController,
+        downstream: downstream,
+        generation: ready
+      ) { restored in
+        answers.withLock { $0.append(restored) }
+      }
+
+      try #require(
+        await poll(timeout: .milliseconds(500), until: {
+          !answers.withLock { $0 }.isEmpty
+        }),
+        "a definitive restore rejection waited for the global timeout"
+      )
+      #expect(answers.withLock { $0 } == [false])
+    }
+
+    @Test
+    func `terminal stop clears an accepted start that never became active`() throws {
+      let player = Player(instance: TestInstance.makeAudioOnly())
+      try player.load(Media(url: TestMedia.twosecURL))
+      let backend = IOSNativePiPBackend()
+      let attachment = backend.attach(to: player)
+      let ready = try #require(
+        backend.callbackGenerations.reserveReadyCallback(for: attachment)
+      )
+      _ = PiPController(player: player, nativeBackend: backend)
+      #expect(
+        backend.callbackGenerations.recordAcceptedStart(
+          mediaGeneration: player.generation
+        )
+      )
+
+      backend.nativeDelegateDidStop(generation: ready)
+
+      #expect(backend.callbackGenerations.currentAcceptedStart() == nil)
     }
   }
 }

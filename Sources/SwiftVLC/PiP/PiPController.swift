@@ -1142,7 +1142,7 @@ public final class PiPController: NSObject {
     mediaGeneration: PlaybackGeneration?
   ) {
     publishPiPEvent(
-      .willStop(reason: resolveWillStopReason()),
+      .willStop(reason: resolveWillStopReason(mediaGeneration: mediaGeneration)),
       mediaGeneration: mediaGeneration
     )
   }
@@ -1150,7 +1150,7 @@ public final class PiPController: NSObject {
   func handleNativePictureInPictureDidStop(
     mediaGeneration: PlaybackGeneration?
   ) {
-    let reason = resolveStopReason()
+    let reason = resolveStopReason(mediaGeneration: mediaGeneration)
     updatePiPActive(false)
     publishPiPEvent(.didStop(reason: reason), mediaGeneration: mediaGeneration)
   }

@@ -157,6 +157,13 @@ final class EventBridge: Sendable {
     context.makeTerminalOutcomeStream()
   }
 
+  /// Returns the frozen terminal cause for one exact media generation.
+  /// Unlike `Player.state`, this cannot carry an outgoing error across a
+  /// synchronous media replacement.
+  func terminalCause(for playbackGeneration: UInt64) -> PlaybackTerminalCause? {
+    context.terminalCause(for: playbackGeneration)
+  }
+
   /// Aligns the event bridge with a wrapper-initiated media generation.
   /// The outgoing generation is frozen as a replacement before the new
   /// timeline becomes current.
@@ -392,6 +399,10 @@ private final class EventBridgeCallbackContext: Sendable {
     var retiredMediaGenerations: [UInt: [UInt64]] = [:]
     var snapshots: [UInt64: TimelineSnapshot] = [:]
     var terminalIntents: [UInt64: PlaybackTerminalCause] = [:]
+    /// Recent frozen outcomes retained for synchronous generation-scoped
+    /// attribution (for example a late PiP stop). Bounded in `makeOutcome` so
+    /// long-running playlist players do not accumulate one entry per item.
+    var terminalCauses: [UInt64: PlaybackTerminalCause] = [:]
     var lastEmittedGeneration: UInt64 = 0
     var pendingStoppedGeneration: UInt64?
   }
@@ -423,6 +434,10 @@ private final class EventBridgeCallbackContext: Sendable {
 
   func makeTerminalOutcomeStream() -> AsyncStream<PlaybackTerminalOutcome> {
     terminalOutcomes.subscribe(policy: .unbounded)
+  }
+
+  func terminalCause(for playbackGeneration: UInt64) -> PlaybackTerminalCause? {
+    playbackLifecycle.withLock { $0.terminalCauses[playbackGeneration] }
   }
 
   func synchronizePlaybackGeneration(
@@ -795,6 +810,11 @@ private final class EventBridgeCallbackContext: Sendable {
     guard generation > state.lastEmittedGeneration else { return nil }
     state.lastEmittedGeneration = generation
     let snapshot = state.snapshots[generation] ?? TimelineSnapshot()
+    state.terminalCauses[generation] = cause
+    let oldestRetainedGeneration = generation > 32 ? generation - 32 : 0
+    state.terminalCauses = state.terminalCauses.filter {
+      $0.key >= oldestRetainedGeneration
+    }
     state.terminalIntents[generation] = nil
     state.snapshots = state.snapshots.filter { $0.key >= generation }
     state.mediaGenerations = state.mediaGenerations.filter { $0.value >= generation }

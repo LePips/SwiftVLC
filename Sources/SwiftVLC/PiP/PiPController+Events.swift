@@ -486,18 +486,17 @@ extension PiPController {
   /// failed attempt awaiting its optional trailing stop wins before the
   /// independently current lifecycle's reason; otherwise use that current
   /// reason, natural end of media, or the user's close affordance.
-  func resolveStopReason() -> PiPStopReason {
+  func resolveStopReason(
+    mediaGeneration: PlaybackGeneration? = nil
+  ) -> PiPStopReason {
     if failedLifecycleOwnsNextStop, let failedPiPLifecycle = failedPiPLifecycles.first {
       return failedPiPLifecycle.stopReason
     }
     if let pendingStopReason {
       return pendingStopReason
     }
-    if player.didReachEnd {
-      return .mediaEnded
-    }
-    if case .error = player.state {
-      return .failure
+    if let terminalReason = terminalStopReason(for: mediaGeneration) {
+      return terminalReason
     }
     return .userClosed
   }
@@ -506,20 +505,45 @@ extension PiPController {
   /// observed that callback. A failed lifecycle remains first for `didStop`
   /// after its own `willStop`, but must not steal a distinct `willStop` from
   /// an active retry during that delay.
-  func resolveWillStopReason() -> PiPStopReason {
+  func resolveWillStopReason(
+    mediaGeneration: PlaybackGeneration? = nil
+  ) -> PiPStopReason {
     if let failedIndex = failedLifecycleIndexOwningNextWillStop {
       return failedPiPLifecycles[failedIndex].stopReason
     }
     if let pendingStopReason {
       return pendingStopReason
     }
-    if player.didReachEnd {
-      return .mediaEnded
-    }
-    if case .error = player.state {
-      return .failure
+    if let terminalReason = terminalStopReason(for: mediaGeneration) {
+      return terminalReason
     }
     return .userClosed
+  }
+
+  /// Maps only a terminal fact frozen against the lifecycle's own media
+  /// generation. `Player.state` is intentionally not a fallback: `load(_:)`
+  /// adopts a successor generation synchronously while the observable state
+  /// can remain `.error` until libVLC publishes its next transition.
+  private func terminalStopReason(
+    for mediaGeneration: PlaybackGeneration?
+  ) -> PiPStopReason? {
+    let generation = mediaGeneration
+      ?? pipLifecycleAttribution?.mediaGeneration
+      ?? player.generation
+    return switch player.terminalCause(for: generation) {
+    case .naturalEnd: .mediaEnded
+    case .failure: .failure
+    case .requestedStop, .replacement, .cancellation,
+         .unknownNativeStop: nil
+    case nil:
+      // `_handleEventForTesting(.endReached)` deliberately bypasses the
+      // native terminal-outcome bridge. The observable is still safe as a
+      // natural-end fallback because `load(_:)` clears it synchronously,
+      // unlike the deliberately retained playback state.
+      generation == player.generation && player.didReachEnd
+        ? .mediaEnded
+        : nil
+    }
   }
 
   /// The failed lifecycle that owns the next `willStop`, if any. Unlike
