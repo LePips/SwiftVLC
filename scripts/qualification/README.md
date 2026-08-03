@@ -34,11 +34,14 @@ cannot mask a failed pause, missing restoration, or unsuccessful recovery.
 Qualification is bound to both halves of the shipped package. The
 XCFramework tree digest identifies the native engine and headers, while the
 release-source digest identifies every release-significant tracked file in the
-Swift wrapper checkout. The latter deliberately excludes only the record for
-the version being qualified and its `evidence/<version>/` attachments, so those
-results can be committed after candidate preparation without changing the
-candidate identity. Any source, test, release-script, or matrix change requires
-a new candidate and a new device run.
+Swift wrapper worktree. The latter deliberately excludes only the record for
+the version being qualified and its `evidence/<version>/` attachments. It also
+normalizes the narrowly validated Package.swift binary reference and Showcase
+package reference, because candidate testing uses repo-local wiring and the
+release commit deterministically replaces those fields with the final URL and
+version. Any other tracked or untracked source, test, release-script, or matrix
+change produces a different identity and requires a new candidate and device
+run.
 
 Record the results as `scripts/qualification/<version>.json`:
 

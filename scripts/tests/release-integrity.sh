@@ -215,22 +215,67 @@ for marker in (
     '"releaseSourceDigest": os.environ["RELEASE_SOURCE_DIGEST"]',
     '"qualificationMatrixChecksum": os.environ["QUALIFICATION_MATRIX_CHECKSUM"]',
     'SWIFTVLC_CANDIDATE_SOURCE_DIGEST="$CANDIDATE_SOURCE_DIGEST"',
+    'elif [[ "$DRY_RUN" == true ]]; then',
 ):
     if marker not in release:
         sys.exit(f"release candidate is not bound to qualification input: {marker}")
 PY
 
 source_repo="$temp_dir/release-source-repo"
-mkdir -p "$source_repo/Sources" "$source_repo/scripts/qualification/evidence/1.1.0"
+mkdir -p "$source_repo/Sources" \
+  "$source_repo/scripts/qualification/evidence/1.1.0" \
+  "$source_repo/Showcase/SwiftVLCShowcase.xcodeproj"
 git -C "$source_repo" init -q
 git -C "$source_repo" config user.name "SwiftVLC Test"
 git -C "$source_repo" config user.email "swiftvlc-test@example.invalid"
 printf 'public let value = 1\n' > "$source_repo/Sources/Value.swift"
 printf '{"scenarios":[],"hardware":[]}\n' > \
   "$source_repo/scripts/qualification/matrix.json"
+cp "$ROOT_DIR/Package.swift" "$source_repo/Package.swift"
+cp "$ROOT_DIR/Showcase/SwiftVLCShowcase.xcodeproj/project.pbxproj" \
+  "$source_repo/Showcase/SwiftVLCShowcase.xcodeproj/project.pbxproj"
 git -C "$source_repo" add .
 git -C "$source_repo" commit -qm "source"
 source_digest_a=$("$SCRIPT_DIR/release-source-digest.py" 1.1.0 --root "$source_repo")
+
+cp "$source_repo/Package.swift" "$temp_dir/source-Package.swift"
+cp "$source_repo/Showcase/SwiftVLCShowcase.xcodeproj/project.pbxproj" \
+  "$temp_dir/source-project.pbxproj"
+python3 - "$source_repo/Package.swift" \
+  "$source_repo/Showcase/SwiftVLCShowcase.xcodeproj/project.pbxproj" <<'PY'
+import re
+import sys
+
+package_path, project_path = sys.argv[1:]
+package = open(package_path).read()
+package = re.sub(
+    r"v1\.1\.0-beta\.5/libvlc\.xcframework\.zip",
+    "v1.1.0/libvlc.xcframework.zip",
+    package,
+)
+package = re.sub(r'checksum: "[0-9a-f]{64}"', 'checksum: "' + "0" * 64 + '"', package)
+open(package_path, "w").write(package)
+project = open(project_path).read().replace(
+    "version = 1.1.0-beta.5;", "version = 1.1.0;"
+)
+open(project_path, "w").write(project)
+PY
+source_digest_rewritten=$(
+  "$SCRIPT_DIR/release-source-digest.py" 1.1.0 --root "$source_repo"
+)
+if [[ "$source_digest_a" != "$source_digest_rewritten" ]]; then
+  fail "deterministic release reference rewrites changed the source digest"
+fi
+cp "$temp_dir/source-Package.swift" "$source_repo/Package.swift"
+cp "$temp_dir/source-project.pbxproj" \
+  "$source_repo/Showcase/SwiftVLCShowcase.xcodeproj/project.pbxproj"
+
+printf 'public let untracked = true\n' > "$source_repo/Sources/Untracked.swift"
+if "$SCRIPT_DIR/release-source-digest.py" 1.1.0 \
+  --root "$source_repo" >/dev/null 2>&1; then
+  fail "untracked Swift source did not invalidate the release-source digest"
+fi
+rm "$source_repo/Sources/Untracked.swift"
 
 printf '{"version":"1.1.0"}\n' > \
   "$source_repo/scripts/qualification/1.1.0.json"
@@ -244,11 +289,17 @@ if [[ "$source_digest_a" != "$source_digest_b" ]]; then
 fi
 
 printf 'public let value = 2\n' > "$source_repo/Sources/Value.swift"
+source_digest_dirty=$(
+  "$SCRIPT_DIR/release-source-digest.py" 1.1.0 --root "$source_repo"
+)
+if [[ "$source_digest_b" == "$source_digest_dirty" ]]; then
+  fail "an uncommitted Swift source change did not change the source digest"
+fi
 git -C "$source_repo" add Sources/Value.swift
 git -C "$source_repo" commit -qm "source change"
 source_digest_c=$("$SCRIPT_DIR/release-source-digest.py" 1.1.0 --root "$source_repo")
-if [[ "$source_digest_b" == "$source_digest_c" ]]; then
-  fail "a Swift source change did not change the release-source digest"
+if [[ "$source_digest_dirty" != "$source_digest_c" ]]; then
+  fail "committing unchanged worktree source changed the release-source digest"
 fi
 
 printf '{"scenarios":[{"id":"new"}],"hardware":[]}\n' > \

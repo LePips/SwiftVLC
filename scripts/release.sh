@@ -41,6 +41,9 @@ DRY_RUN=false
 UNQUALIFIED=false
 PREPARE_DIR=""
 CANDIDATE_DIR=""
+CANDIDATE_SOURCE_COMMIT=""
+CANDIDATE_SOURCE_DIGEST=""
+CANDIDATE_MATRIX_CHECKSUM=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -438,6 +441,10 @@ validate_release_rewrites
 echo "Release rewrite validation passed."
 
 SOURCE_COMMIT=$(git rev-parse HEAD)
+# These two files contain narrowly validated release-managed references. The
+# digest normalizes only those fields, so local Showcase wiring and the final
+# URL/version rewrite describe the same runtime source while every other
+# tracked byte remains qualification-significant.
 RELEASE_SOURCE_DIGEST=$("$SCRIPT_DIR/release-source-digest.py" "$VERSION")
 QUALIFICATION_MATRIX_CHECKSUM=$(shasum -a 256 \
   "$SCRIPT_DIR/qualification/matrix.json" | cut -d' ' -f1)
@@ -723,6 +730,8 @@ elif [[ "$UNQUALIFIED" == true ]]; then
   echo "WARNING: releasing WITHOUT device qualification."
   echo "  Publishing as a pre-release. It must not be described as qualified,"
   echo "  and the device matrix in scripts/qualification still owes a run."
+elif [[ "$DRY_RUN" == true ]]; then
+  echo "Dry run only; no device qualification is claimed."
 else
   if ! SWIFTVLC_CANDIDATE_SOURCE_COMMIT="$CANDIDATE_SOURCE_COMMIT" \
     SWIFTVLC_CANDIDATE_SOURCE_DIGEST="$CANDIDATE_SOURCE_DIGEST" \
