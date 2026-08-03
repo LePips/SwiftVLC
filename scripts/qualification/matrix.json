@@ -1,20 +1,353 @@
 {
-  "description": "Physical-device rows that must be executed and passing before an xcframework can be released. Derived from the acceptance criteria of issue 88. Simulator runs never satisfy a row.",
+  "description": "Physical-device rows required before the v1.1.0 xcframework can be released. Simulator runs never satisfy a row.",
   "scenarios": [
-    { "id": "vod-controls",        "summary": "Finite VOD: play, pause, scrub, skip forward and back from the PiP controls" },
-    { "id": "live-media",          "summary": "Live stream with indefinite duration: PiP controls reflect an unbounded range" },
-    { "id": "restore",             "summary": "Restore from the PiP window back into the app" },
-    { "id": "close",               "summary": "Close the PiP window with the X control" },
-    { "id": "failed-start",        "summary": "PiP start refused or failing, surfaced rather than silent" },
-    { "id": "replacement",         "summary": "Same-player media replacement while PiP is active" },
-    { "id": "interruptions",       "summary": "Phone call or Siri interruption, and a route change such as Bluetooth disconnect" },
-    { "id": "background-audio",    "summary": "Audio continues with the app backgrounded" },
-    { "id": "long-stall",          "summary": "Sustained network stall and recovery while in PiP" }
+    {
+      "id": "vod-controls",
+      "issues": [88],
+      "summary": "Finite VOD: play, pause, scrub, skip forward and back from the PiP controls",
+      "requiredEvidenceFields": ["events", "controls"]
+    },
+    {
+      "id": "live-media",
+      "issues": [88],
+      "summary": "Live stream with indefinite duration: PiP controls reflect an unbounded range",
+      "requiredEvidenceFields": ["events", "playbackRange"]
+    },
+    {
+      "id": "restore",
+      "issues": [84, 88],
+      "summary": "Restore from the PiP window back into the app",
+      "requiredEvidenceFields": ["events"]
+    },
+    {
+      "id": "close",
+      "issues": [84, 88],
+      "summary": "Close the PiP window with the X control",
+      "requiredEvidenceFields": ["events"]
+    },
+    {
+      "id": "failed-start",
+      "issues": [84, 88, 104],
+      "summary": "PiP start refused or failing, surfaced rather than silent",
+      "requiredEvidenceFields": ["events"]
+    },
+    {
+      "id": "replacement",
+      "issues": [82, 84, 88],
+      "summary": "Same-player media replacement while PiP is active",
+      "requiredEvidenceFields": ["events", "recoveryOutcome"]
+    },
+    {
+      "id": "interruptions",
+      "issues": [87, 88],
+      "summary": "Phone call or Siri interruption, and a route change such as Bluetooth disconnect",
+      "requiredEvidenceFields": ["events"]
+    },
+    {
+      "id": "background-audio",
+      "issues": [87, 88],
+      "summary": "Audio continues with the app backgrounded",
+      "requiredEvidenceFields": ["events"]
+    },
+    {
+      "id": "long-stall",
+      "issues": [88],
+      "summary": "Sustained network stall and recovery while in PiP",
+      "requiredEvidenceFields": ["events", "recoveryOutcome"]
+    },
+    {
+      "id": "capability-convergence",
+      "issues": [75],
+      "hardware": ["iphone-current"],
+      "summary": "Suppressed seekable/length events and VOD/live/VOD transitions converge on direct and native PiP",
+      "requiredEvidenceFields": [
+        "backendResults.direct",
+        "backendResults.native",
+        "transitions",
+        "skipControls"
+      ],
+      "expectedEvidenceValues": {
+        "backendResults.direct": "pass",
+        "backendResults.native": "pass",
+        "transitions": "pass",
+        "skipControls": "pass"
+      }
+    },
+    {
+      "id": "replacement-continuity",
+      "issues": [82],
+      "hardware": ["iphone-current"],
+      "summary": "VOD/live and seekable/unseekable replacement combinations have coherent snapshots and deterministic recovery",
+      "requiredEvidenceFields": [
+        "combinations",
+        "snapshotCoherence",
+        "measurements.audioGapMilliseconds",
+        "measurements.videoGapMilliseconds",
+        "controls",
+        "recoveryOutcome",
+        "staleSuccessorMutations"
+      ],
+      "expectedEvidenceValues": {
+        "snapshotCoherence": "pass",
+        "staleSuccessorMutations": 0
+      },
+      "allowedEvidenceValues": {
+        "recoveryOutcome": ["preserved", "reengaged"]
+      }
+    },
+    {
+      "id": "native-lifecycle",
+      "issues": [84],
+      "hardware": ["iphone-current"],
+      "summary": "Native close, restore, start failure, programmatic stop, media end, failure, recast, and replacement publish ordered authoritative events",
+      "requiredEvidenceFields": ["bridgeProbe", "cases", "orderedEvents"],
+      "expectedEvidenceValues": {
+        "bridgeProbe": true,
+        "authoritativeStopReasons": true,
+        "restoreExactlyOnce": true,
+        "unsupportedBridgeVisible": true
+      }
+    },
+    {
+      "id": "terminal-outcomes",
+      "issues": [85],
+      "hardware": ["iphone-current"],
+      "summary": "EOF, stop, replacement, server close, malformed input, decode, renderer, and network failures produce one generation-scoped terminal outcome",
+      "requiredEvidenceFields": [
+        "cases",
+        "finalTimelines",
+        "generationIsolation",
+        "failureClassifications.source",
+        "failureClassifications.demux",
+        "failureClassifications.decoder",
+        "failureClassifications.renderer",
+        "failureClassifications.output",
+        "maximumTerminalOutcomesPerGeneration",
+        "unattributedStopNaturalEndCount"
+      ],
+      "expectedEvidenceValues": {
+        "generationIsolation": true,
+        "failureClassifications.source": "source",
+        "failureClassifications.demux": "demux",
+        "failureClassifications.decoder": "decoder",
+        "failureClassifications.renderer": "renderer",
+        "failureClassifications.output": "output",
+        "maximumTerminalOutcomesPerGeneration": 1,
+        "unattributedStopNaturalEndCount": 0
+      }
+    },
+    {
+      "id": "adaptive-hls-soak",
+      "issues": [91],
+      "hardware": ["iphone-current"],
+      "minimumDurationSeconds": 7200,
+      "summary": "Multi-hour live/VOD/event HLS soak across TS/fMP4, ABR, discontinuities, expired windows, retries, and cancellation",
+      "requiredEvidenceFields": [
+        "playlistCoverage",
+        "allocationProvenance",
+        "memorySeries",
+        "sanitizerFindings",
+        "crashes",
+        "unboundedRecoveries",
+        "monotonicGrowth",
+        "upstreamCrossLink"
+      ],
+      "expectedEvidenceValues": {
+        "sanitizerFindings": 0,
+        "crashes": 0,
+        "unboundedRecoveries": 0,
+        "monotonicGrowth": false
+      }
+    },
+    {
+      "id": "pip-render-performance-1080p60",
+      "issues": [93],
+      "hardware": ["iphone-current"],
+      "minimumDurationSeconds": 900,
+      "summary": "1080p60 direct PiP resize and replacement performance",
+      "requiredEvidenceFields": [
+        "metrics.cpu",
+        "metrics.gpu",
+        "metrics.rss",
+        "metrics.energy",
+        "metrics.thermal",
+        "metrics.conversionCost",
+        "metrics.frameDrops",
+        "metrics.presentationRate",
+        "resizeCycles",
+        "inlineQuality",
+        "effectiveWorkOutcome",
+        "boundedMemory",
+        "boundedWork"
+      ],
+      "expectedEvidenceValues": {
+        "inlineQuality": "preserved",
+        "effectiveWorkOutcome": "reduced",
+        "boundedMemory": true,
+        "boundedWork": true
+      }
+    },
+    {
+      "id": "pip-render-performance-4k60",
+      "issues": [93],
+      "hardware": ["iphone-current"],
+      "minimumDurationSeconds": 900,
+      "summary": "4K60 direct PiP resize and replacement performance",
+      "requiredEvidenceFields": [
+        "metrics.cpu",
+        "metrics.gpu",
+        "metrics.rss",
+        "metrics.energy",
+        "metrics.thermal",
+        "metrics.conversionCost",
+        "metrics.frameDrops",
+        "metrics.presentationRate",
+        "resizeCycles",
+        "inlineQuality",
+        "effectiveWorkOutcome",
+        "boundedMemory",
+        "boundedWork"
+      ],
+      "expectedEvidenceValues": {
+        "inlineQuality": "preserved",
+        "effectiveWorkOutcome": "reduced",
+        "boundedMemory": true,
+        "boundedWork": true
+      }
+    },
+    {
+      "id": "native-subtitle-matrix",
+      "issues": [95],
+      "hardware": ["iphone-current"],
+      "summary": "Text, styled, bitmap, forced, and live subtitles plus OSD remain correct through PiP transitions",
+      "requiredEvidenceFields": [
+        "supportMatrix",
+        "timingTransitions",
+        "metrics.cpu",
+        "metrics.gpu",
+        "metrics.colorHDRImpact"
+      ],
+      "expectedEvidenceValues": {
+        "supportMatrix.text": "supported",
+        "supportMatrix.styled": "supported",
+        "supportMatrix.bitmap": "supported",
+        "supportMatrix.forced": "supported",
+        "supportMatrix.live": "supported",
+        "supportMatrix.osd": "supported"
+      }
+    },
+    {
+      "id": "timebase-vod-soak",
+      "issues": [99],
+      "hardware": ["iphone-current"],
+      "minimumDurationSeconds": 7200,
+      "summary": "Multi-hour VOD direct PiP timebase and A/V drift at 0.5x, 1x, and 2x",
+      "requiredEvidenceFields": [
+        "rates",
+        "clockSeries",
+        "corrections",
+        "transitions",
+        "avPlayerBaseline",
+        "visibleSnapCount",
+        "monotonicityViolations"
+      ],
+      "expectedEvidenceValues": {
+        "rates": [0.5, 1, 2],
+        "visibleSnapCount": 0,
+        "monotonicityViolations": 0
+      }
+    },
+    {
+      "id": "timebase-live-soak",
+      "issues": [99],
+      "hardware": ["iphone-current"],
+      "minimumDurationSeconds": 7200,
+      "summary": "Multi-hour live direct PiP timebase and A/V drift at supported rates",
+      "requiredEvidenceFields": [
+        "rates",
+        "clockSeries",
+        "corrections",
+        "transitions",
+        "avPlayerBaseline",
+        "visibleSnapCount",
+        "monotonicityViolations"
+      ],
+      "expectedEvidenceValues": {
+        "rates": [0.5, 1, 2],
+        "visibleSnapCount": 0,
+        "monotonicityViolations": 0
+      }
+    },
+    {
+      "id": "cadence-matrix",
+      "issues": [102],
+      "hardware": ["iphone-current"],
+      "minimumDurationSeconds": 600,
+      "summary": "23.976/24/25/29.97/30/50/59.94/60 fps and VFR cadence through rate, pause, replacement, and resize transitions",
+      "requiredEvidenceFields": [
+        "rates",
+        "vfr",
+        "presentationMetrics",
+        "transitionResults",
+        "fabricatedDurationCount"
+      ],
+      "expectedEvidenceValues": {
+        "rates": [23.976, 24, 25, 29.97, 30, 50, 59.94, 60],
+        "vfr": true,
+        "fabricatedDurationCount": 0
+      }
+    },
+    {
+      "id": "deferred-pause-rejection",
+      "issues": [103],
+      "hardware": ["iphone-current"],
+      "summary": "Permanent and transient unpausable inputs settle with typed outcomes and truthful controls",
+      "requiredEvidenceFields": ["permanentCase", "transientCase", "cancellationCases"],
+      "expectedEvidenceValues": {
+        "permanentCase.outcome": "rejected",
+        "transientCase.outcome": "issued",
+        "cancellationCases": "pass",
+        "endlessTaskCount": 0,
+        "duplicatePauseCount": 0,
+        "truthfulControls": true
+      }
+    },
+    {
+      "id": "accepted-start-delayed-failure",
+      "issues": [104],
+      "hardware": ["iphone-current"],
+      "summary": "An accepted native start followed by delayed AVKit failure retains ordered controller/media attribution",
+      "requiredEvidenceFields": ["startResult", "orderedEvents", "controllerGeneration", "mediaGeneration"],
+      "expectedEvidenceValues": {
+        "startResult": "accepted",
+        "orderedAttribution": true
+      }
+    }
   ],
   "hardware": [
-    { "id": "iphone-minimum", "deviceFamily": "iPhone", "osMajor": 18, "summary": "iPhone on the minimum supported OS" },
-    { "id": "iphone-current", "deviceFamily": "iPhone", "osMajor": 26, "summary": "iPhone on the current stable OS" },
-    { "id": "ipad-minimum",   "deviceFamily": "iPad",   "osMajor": 18, "summary": "iPad on the minimum supported OS" },
-    { "id": "ipad-current",   "deviceFamily": "iPad",   "osMajor": 26, "summary": "iPad on the current stable OS" }
+    {
+      "id": "iphone-minimum",
+      "deviceFamily": "iPhone",
+      "osMajor": 18,
+      "summary": "iPhone on the minimum supported OS"
+    },
+    {
+      "id": "iphone-current",
+      "deviceFamily": "iPhone",
+      "osMajor": 26,
+      "summary": "iPhone on the current stable OS"
+    },
+    {
+      "id": "ipad-minimum",
+      "deviceFamily": "iPad",
+      "osMajor": 18,
+      "summary": "iPad on the minimum supported OS"
+    },
+    {
+      "id": "ipad-current",
+      "deviceFamily": "iPad",
+      "osMajor": 26,
+      "summary": "iPad on the current stable OS"
+    }
   ]
 }
