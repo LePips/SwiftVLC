@@ -563,6 +563,13 @@ extension Integration {
     }
 
     @Test
+    func `Direct PiP reports composited VLC overlays`() {
+      let player = Player(instance: TestInstance.shared)
+      let controller = PiPController(player: player)
+      #expect(controller.overlaySupport == .composited)
+    }
+
+    @Test
     func `layer returns a valid AVSampleBufferDisplayLayer`() {
       let player = Player(instance: TestInstance.shared)
       let controller = PiPController(player: player)

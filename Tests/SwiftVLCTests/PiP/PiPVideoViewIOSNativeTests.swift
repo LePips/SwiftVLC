@@ -14,6 +14,14 @@ extension Integration {
       libvlc_media_player_get_nsobject(player.pointer)
     }
 
+    @Test
+    func `iOS native PiP reports its video-only overlay limitation`() {
+      let player = Player(instance: TestInstance.shared)
+      let controller = PiPController(player: player, nativeBackend: IOSNativePiPBackend())
+
+      #expect(controller.overlaySupport == .unavailable)
+    }
+
     // Pinned libVLC copies `drawable-nsobject` into
     // `VLCVideoUIView._viewContainer` once, when the vout opens. Replacing
     // the player's variable cannot move that already-open vout. This probe
