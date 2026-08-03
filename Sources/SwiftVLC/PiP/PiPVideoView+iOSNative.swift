@@ -367,6 +367,12 @@ private protocol IOSNativePiPDrawable: NSObjectProtocol {
 
   @objc(canStartPictureInPictureAutomaticallyFromInline)
   optional func canStartPictureInPictureAutomaticallyFromInline() -> Bool
+
+  @objc(preservePictureInPictureWindowController:)
+  func preservePictureInPictureWindowController(_ controller: AnyObject) -> Bool
+
+  @objc(takePreservedPictureInPictureWindowController)
+  func takePreservedPictureInPictureWindowController() -> AnyObject?
 }
 
 @objc(VLCPictureInPictureMediaControlling)
@@ -384,6 +390,8 @@ private protocol IOSNativePiPMediaControlling: NSObjectProtocol {
     seekable: UnsafeMutablePointer<ObjCBool>
   ) -> Bool
 
+  @objc func mediaPlaybackGeneration() -> UInt64
+
   @objc func mediaLength() -> Int64
   @objc func mediaTime() -> Int64
   @objc func isMediaSeekable() -> Bool
@@ -399,16 +407,19 @@ final class IOSNativePiPDrawableAttachment: UIView, IOSNativePiPDrawable {
   nonisolated let nativeMediaController: IOSNativePiPMediaController
   nonisolated let startsAutomaticallyFromInline: Bool
   nonisolated let nativePiPBackend: IOSNativePiPBackend
+  nonisolated let continuityCoordinator: IOSNativePiPContinuityCoordinator
 
   init(
     nativePiPBackend: IOSNativePiPBackend,
     attachment: IOSNativePiPCallbackGenerations.Attachment,
     mediaController: IOSNativePiPMediaController,
+    continuityCoordinator: IOSNativePiPContinuityCoordinator,
     startsAutomaticallyFromInline: Bool
   ) {
     self.nativePiPBackend = nativePiPBackend
     self.attachment = attachment
     nativeMediaController = mediaController
+    self.continuityCoordinator = continuityCoordinator
     self.startsAutomaticallyFromInline = startsAutomaticallyFromInline
     super.init(frame: .zero)
     backgroundColor = .black
@@ -451,10 +462,15 @@ final class IOSNativePiPDrawableAttachment: UIView, IOSNativePiPDrawable {
   nonisolated func pictureInPictureReady() -> IOSNativePictureInPictureReadyBlock {
     let attachment = attachment
     let nativeMediaController = nativeMediaController
+    let continuityCoordinator = continuityCoordinator
     return { [weak nativePiPBackend] windowController in
       let mediaGeneration = nativeMediaController.callbackSnapshot.withLock {
         $0.playbackGeneration
       }
+      continuityCoordinator.didBecomeReady(
+        windowController,
+        mediaGeneration: mediaGeneration
+      )
       nonisolated(unsafe) let windowController = windowController
       Task { @MainActor in
         guard
@@ -475,6 +491,24 @@ final class IOSNativePiPDrawableAttachment: UIView, IOSNativePiPDrawable {
   @objc(canStartPictureInPictureAutomaticallyFromInline)
   nonisolated func canStartPictureInPictureAutomaticallyFromInline() -> Bool {
     startsAutomaticallyFromInline
+  }
+
+  @objc(preservePictureInPictureWindowController:)
+  nonisolated func preservePictureInPictureWindowController(
+    _ controller: AnyObject
+  ) -> Bool {
+    let mediaGeneration = nativeMediaController.callbackSnapshot.withLock {
+      $0.playbackGeneration
+    }
+    return continuityCoordinator.preserve(
+      controller,
+      for: mediaGeneration
+    )
+  }
+
+  @objc(takePreservedPictureInPictureWindowController)
+  nonisolated func takePreservedPictureInPictureWindowController() -> AnyObject? {
+    continuityCoordinator.takePreservedController()
   }
 
   private var hasDrawableBounds: Bool {
@@ -658,6 +692,7 @@ final class IOSNativePiPDrawableView: UIView {
       nativePiPBackend: nativePiPBackend,
       attachment: attachment,
       mediaController: nativePiPBackend.mediaController,
+      continuityCoordinator: nativePiPBackend.continuityCoordinator,
       startsAutomaticallyFromInline: startsAutomaticallyFromInline
     )
     self.drawableAttachment = drawableAttachment
@@ -790,6 +825,12 @@ final class IOSNativePiPDrawableView: UIView {
 
 @MainActor
 final class IOSNativePiPBackend: NSObject, @unchecked Sendable {
+  lazy var continuityCoordinator = IOSNativePiPContinuityCoordinator { [weak self] transition in
+    Task { @MainActor [weak self] in
+      self?.handleContinuityTransition(transition)
+    }
+  }
+
   private(set) var mediaController = IOSNativePiPMediaController()
   nonisolated let callbackGenerations = IOSNativePiPCallbackGenerations()
   weak var owner: PiPController? {
@@ -842,6 +883,39 @@ final class IOSNativePiPBackend: NSObject, @unchecked Sendable {
     subsystem: Signposts.subsystem,
     category: "PictureInPicture"
   )
+
+  private func handleContinuityTransition(
+    _ transition: IOSNativePiPContinuityCoordinator.Transition
+  ) {
+    guard let owner else { return }
+    let event = switch transition {
+    case .rebuilding(let previous, let successor):
+      PiPContinuityEvent(
+        previousMediaGeneration: previous,
+        mediaGeneration: successor,
+        controllerGeneration: owner.pipControllerGeneration,
+        outcome: .rebuilding,
+        elapsed: .zero
+      )
+    case .restored(let previous, let successor, let elapsed):
+      PiPContinuityEvent(
+        previousMediaGeneration: previous,
+        mediaGeneration: successor,
+        controllerGeneration: owner.pipControllerGeneration,
+        outcome: .restored,
+        elapsed: elapsed
+      )
+    case .timedOut(let previous, let successor, let elapsed):
+      PiPContinuityEvent(
+        previousMediaGeneration: previous,
+        mediaGeneration: successor,
+        controllerGeneration: owner.pipControllerGeneration,
+        outcome: .timedOut,
+        elapsed: elapsed
+      )
+    }
+    owner.publishPiPContinuityEvent(event)
+  }
 
   @discardableResult
   func attach(to player: Player) -> IOSNativePiPCallbackGenerations.Attachment {
@@ -1628,6 +1702,13 @@ final class IOSNativePiPMediaController: NSObject, IOSNativePiPMediaControlling,
     time.pointee = max(libvlc_media_player_get_time(pointer), 0)
     seekable.pointee = ObjCBool(libvlc_media_player_is_seekable(pointer))
     return true
+  }
+
+  /// Synchronous media identity used by libVLC to distinguish a same-player
+  /// replacement from ordinary video-output teardown. Zero means that no
+  /// media generation is currently published.
+  @objc func mediaPlaybackGeneration() -> UInt64 {
+    callbackSnapshot.withLock { $0.playbackGeneration?.value ?? 0 }
   }
 
   @objc func mediaLength() -> Int64 {

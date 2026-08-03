@@ -283,6 +283,10 @@ public final class PiPController: NSObject {
   let pipEventBroadcaster = Broadcaster<PiPEvent>()
   @ObservationIgnored
   let pipEventEnvelopeBroadcaster = Broadcaster<PiPEventEnvelope>()
+  #if os(iOS)
+  @ObservationIgnored
+  let pipContinuityEventBroadcaster = Broadcaster<PiPContinuityEvent>()
+  #endif
   @ObservationIgnored
   let pipSnapshotBroadcaster = Broadcaster<PiPSnapshot>()
   @ObservationIgnored
@@ -318,25 +322,6 @@ public final class PiPController: NSObject {
   /// allowing a fresh request after a terminal start failure.
   @ObservationIgnored
   var pipLifecycleAttributionPhase: PiPLifecycleAttributionPhase = .idle
-
-  struct PiPLifecycleAttribution {
-    let mediaGeneration: PlaybackGeneration
-    let controllerGeneration: UInt64
-    let sequence: UInt64
-  }
-
-  struct FailedPiPLifecycle {
-    let attribution: PiPLifecycleAttribution
-    let stopReason: PiPStopReason
-    var willStopObserved = false
-  }
-
-  enum PiPLifecycleAttributionPhase: Equatable {
-    case idle
-    case awaitingStart
-    case started
-    case stopping
-  }
 
   /// The best-known reason for an in-flight PiP stop, recorded by the
   /// first discriminating signal (restore callback, start failure,
@@ -658,6 +643,9 @@ public final class PiPController: NSObject {
   isolated deinit {
     pipEventBroadcaster.terminate()
     pipEventEnvelopeBroadcaster.terminate()
+    #if os(iOS)
+    pipContinuityEventBroadcaster.terminate()
+    #endif
     pipSnapshotBroadcaster.terminate()
     cancelDeferredPause()
     stateObserverTask?.cancel()
