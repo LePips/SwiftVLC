@@ -43,4 +43,14 @@ bool swiftvlc_media_player_get_media_length_snapshot_if_available(
 /// Returns whether the linked libVLC exports SwiftVLC's atomic snapshot ABI.
 bool swiftvlc_media_length_snapshot_available(void);
 
+/// Captures one retained-media/playback-state snapshot when the linked pinned
+/// libVLC exports version 2 of the atomic extension. Returns false on older
+/// binaries or when no media is loaded.
+bool swiftvlc_media_player_get_playback_snapshot_if_available(
+    libvlc_media_player_t *player,
+    swiftvlc_media_player_playback_snapshot_t *snapshot);
+
+/// Returns whether the linked libVLC exports the complete playback snapshot.
+bool swiftvlc_playback_snapshot_available(void);
+
 #endif /* CLibVLC_h */

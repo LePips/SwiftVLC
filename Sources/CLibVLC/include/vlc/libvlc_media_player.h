@@ -262,9 +262,9 @@ LIBVLC_API libvlc_media_t * libvlc_media_player_get_media( libvlc_media_player_t
 /**
  * Atomic retained-media and playback-length snapshot.
  *
- * Both fields are captured together while holding the media player's internal
- * player lock, so the media identity cannot change between the retained
- * reference and its associated playback length.
+ * Both fields are captured while holding the media player's internal player
+ * lock, so the media identity cannot change between the retained reference and
+ * its associated playback length.
  */
 typedef struct swiftvlc_media_player_media_length_snapshot_t
 {
@@ -273,10 +273,26 @@ typedef struct swiftvlc_media_player_media_length_snapshot_t
 } swiftvlc_media_player_media_length_snapshot_t;
 
 /**
+ * Version-2 atomic retained-media and playback-state snapshot.
+ *
+ * This is a distinct type from the version-1 media/length snapshot so a newer
+ * archive never writes past storage allocated by a client built against the
+ * original ABI.
+ */
+typedef struct swiftvlc_media_player_playback_snapshot_t
+{
+    libvlc_media_t *media;  /**< retained media, or NULL; release with libvlc_media_release() */
+    libvlc_time_t length;   /**< playback length associated with @a media */
+    libvlc_time_t time;     /**< current playback time associated with @a media */
+    bool seekable;          /**< whether @a media is seekable */
+} swiftvlc_media_player_playback_snapshot_t;
+
+/**
  * Version of SwiftVLC's additive pinned-libVLC extensions.
  *
  * Version 1 provides the geometry-aware vmem callback and atomic retained
- * media/length snapshot.
+ * media/length snapshot. Version 2 adds a separate playback snapshot carrying
+ * time and seekability without changing the version-1 layout.
  */
 LIBVLC_API unsigned swiftvlc_libvlc_pip_extensions_version( void );
 
@@ -294,6 +310,16 @@ LIBVLC_API unsigned swiftvlc_libvlc_pip_extensions_version( void );
 LIBVLC_API bool swiftvlc_libvlc_media_player_get_media_length_snapshot(
     libvlc_media_player_t *p_mi,
     swiftvlc_media_player_media_length_snapshot_t *snapshot );
+
+/**
+ * Atomically capture the media player's current media and playback state.
+ *
+ * On success the caller owns one reference to the returned media and must
+ * release it with libvlc_media_release().
+ */
+LIBVLC_API bool swiftvlc_libvlc_media_player_get_playback_snapshot(
+    libvlc_media_player_t *p_mi,
+    swiftvlc_media_player_playback_snapshot_t *snapshot );
 
 /**
  * Get the Event Manager from which the media player send event.

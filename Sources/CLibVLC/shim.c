@@ -41,6 +41,20 @@ bool swiftvlc_libvlc_media_player_get_media_length_snapshot(
     }
     return false;
 }
+
+__attribute__((weak))
+bool swiftvlc_libvlc_media_player_get_playback_snapshot(
+    libvlc_media_player_t *player,
+    swiftvlc_media_player_playback_snapshot_t *snapshot) {
+    (void)player;
+    if (snapshot != NULL) {
+        snapshot->media = NULL;
+        snapshot->length = -1;
+        snapshot->time = -1;
+        snapshot->seekable = false;
+    }
+    return false;
+}
 #endif
 
 /// Wrapper for libvlc_log_set that formats the va_list message in C
@@ -147,6 +161,36 @@ bool swiftvlc_media_player_get_media_length_snapshot_if_available(
 bool swiftvlc_media_length_snapshot_available(void) {
 #if defined(__APPLE__)
     return swiftvlc_libvlc_pip_extensions_version() >= 1;
+#else
+    return false;
+#endif
+}
+
+bool swiftvlc_media_player_get_playback_snapshot_if_available(
+    libvlc_media_player_t *player,
+    swiftvlc_media_player_playback_snapshot_t *snapshot) {
+    if (snapshot == NULL) {
+        return false;
+    }
+    snapshot->media = NULL;
+    snapshot->length = -1;
+    snapshot->time = -1;
+    snapshot->seekable = false;
+#if defined(__APPLE__)
+    if (swiftvlc_libvlc_pip_extensions_version() < 2) {
+        return false;
+    }
+    return swiftvlc_libvlc_media_player_get_playback_snapshot(
+        player, snapshot);
+#else
+    (void)player;
+    return false;
+#endif
+}
+
+bool swiftvlc_playback_snapshot_available(void) {
+#if defined(__APPLE__)
+    return swiftvlc_libvlc_pip_extensions_version() >= 2;
 #else
     return false;
 #endif

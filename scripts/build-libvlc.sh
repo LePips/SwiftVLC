@@ -1517,6 +1517,13 @@ if grep -q 'libvlc_playback_failure_kind_t' \
         "${OUTPUT_DIR}/libvlc.xcframework"
 fi
 
+if grep -q 'bool seekable;' \
+    "${REPO_ROOT}/Sources/CLibVLC/include/vlc/libvlc_media_player.h"; then
+    info "Validating atomic PiP playback snapshots..."
+    "${SCRIPT_DIR}/validate-pip-playback-snapshot.sh" \
+        "${OUTPUT_DIR}/libvlc.xcframework"
+fi
+
 # Remove the CLibVLC module.modulemap from xcframework headers to avoid
 # "redefinition of module" errors when building with xcodebuild. The CLibVLC
 # SPM target provides its own module map; the xcframework only needs the raw

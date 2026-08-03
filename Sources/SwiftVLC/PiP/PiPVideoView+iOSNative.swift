@@ -377,6 +377,13 @@ private protocol IOSNativePiPMediaControlling: NSObjectProtocol {
   @objc(seekBy:completion:)
   func seek(by offset: Int64, completion: (() -> Void)?)
 
+  @objc(mediaPlaybackSnapshotWithLength:time:seekable:)
+  func mediaPlaybackSnapshot(
+    length: UnsafeMutablePointer<Int64>,
+    time: UnsafeMutablePointer<Int64>,
+    seekable: UnsafeMutablePointer<ObjCBool>
+  ) -> Bool
+
   @objc func mediaLength() -> Int64
   @objc func mediaTime() -> Int64
   @objc func isMediaSeekable() -> Bool
@@ -1575,11 +1582,57 @@ final class IOSNativePiPMediaController: NSObject, IOSNativePiPMediaControlling,
   }
 
   // Synchronous queries VLC's native PiP module makes from its own threads.
-  // They read the snapshot and then call libVLC after releasing the lock,
-  // never blocking on the main actor.
+  // They retain the snapshotted player while holding the same lock replacement
+  // uses to publish its successor. That closes the interval between copying a
+  // raw pointer and entering libVLC without ever blocking on the main actor.
+
+  private func retainedCallbackPlayer() -> OpaquePointer? {
+    callbackSnapshot.withLock { snapshot in
+      guard let pointer = snapshot.playerPointer else { return nil }
+      _ = libvlc_media_player_retain(pointer)
+      return pointer
+    }
+  }
+
+  @objc(mediaPlaybackSnapshotWithLength:time:seekable:)
+  func mediaPlaybackSnapshot(
+    length: UnsafeMutablePointer<Int64>,
+    time: UnsafeMutablePointer<Int64>,
+    seekable: UnsafeMutablePointer<ObjCBool>
+  ) -> Bool {
+    guard let pointer = retainedCallbackPlayer() else {
+      length.pointee = 0
+      time.pointee = 0
+      seekable.pointee = false
+      return false
+    }
+    defer { libvlc_media_player_release(pointer) }
+
+    var snapshot = swiftvlc_media_player_playback_snapshot_t()
+    if swiftvlc_media_player_get_playback_snapshot_if_available(pointer, &snapshot) {
+      defer {
+        if let media = snapshot.media {
+          libvlc_media_release(media)
+        }
+      }
+      length.pointee = max(snapshot.length, 0)
+      time.pointee = max(snapshot.time, 0)
+      seekable.pointee = ObjCBool(snapshot.seekable)
+      return true
+    }
+
+    // Compatibility with beta.1 and older artifacts. The v1.1.0 release
+    // binary exports extension version 2, so its native PiP module never uses
+    // this non-atomic fallback.
+    length.pointee = max(libvlc_media_player_get_length(pointer), 0)
+    time.pointee = max(libvlc_media_player_get_time(pointer), 0)
+    seekable.pointee = ObjCBool(libvlc_media_player_is_seekable(pointer))
+    return true
+  }
 
   @objc func mediaLength() -> Int64 {
-    guard let pointer = callbackSnapshot.withLock({ $0.playerPointer }) else { return 0 }
+    guard let pointer = retainedCallbackPlayer() else { return 0 }
+    defer { libvlc_media_player_release(pointer) }
     let length = libvlc_media_player_get_length(pointer)
     // VLC's native PiP module checks for VLC_TICK_INVALID (0), not
     // libvlc's public unknown-length sentinel (-1).
@@ -1587,12 +1640,14 @@ final class IOSNativePiPMediaController: NSObject, IOSNativePiPMediaControlling,
   }
 
   @objc func mediaTime() -> Int64 {
-    guard let pointer = callbackSnapshot.withLock({ $0.playerPointer }) else { return 0 }
+    guard let pointer = retainedCallbackPlayer() else { return 0 }
+    defer { libvlc_media_player_release(pointer) }
     return max(libvlc_media_player_get_time(pointer), 0)
   }
 
   @objc func isMediaSeekable() -> Bool {
-    guard let pointer = callbackSnapshot.withLock({ $0.playerPointer }) else { return false }
+    guard let pointer = retainedCallbackPlayer() else { return false }
+    defer { libvlc_media_player_release(pointer) }
     return libvlc_media_player_is_seekable(pointer)
   }
 

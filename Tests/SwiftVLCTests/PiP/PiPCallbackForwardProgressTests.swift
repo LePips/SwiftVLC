@@ -74,10 +74,10 @@ struct PiPCallbackForwardProgressTests {
     #expect(progressed, "the time-range query blocked on a stalled main actor")
   }
 
-  /// A query reads the pointer and timebase in one lock acquisition, so it can
-  /// never assemble a range from two different generations.
+  /// A query reads the pointer and generation in one lock acquisition, so an
+  /// in-flight callback cannot silently move onto a successor handle.
   @Test
-  func `A query never mixes generations`() throws {
+  func `A handle query never changes generations in flight`() throws {
     let snapshot = Mutex(PiPCallbackSnapshot())
     let first = try #require(OpaquePointer(bitPattern: 0x1))
     let second = try #require(OpaquePointer(bitPattern: 0x2))
@@ -100,6 +100,29 @@ struct PiPCallbackForwardProgressTests {
     #expect(observed.generation == 7)
     #expect(snapshot.withLock { $0.generation } == 8)
   }
+
+  #if os(iOS)
+  /// The native module's new optional selector always receives initialized
+  /// outputs, including when teardown has already detached the controller.
+  @Test
+  func `An unattached playback snapshot returns stable defaults`() {
+    let controller = IOSNativePiPMediaController()
+    var length: Int64 = 123
+    var time: Int64 = 456
+    var seekable = ObjCBool(true)
+
+    let captured = controller.mediaPlaybackSnapshot(
+      length: &length,
+      time: &time,
+      seekable: &seekable
+    )
+
+    #expect(!captured)
+    #expect(length == 0)
+    #expect(time == 0)
+    #expect(!seekable.boolValue)
+  }
+  #endif
 
   /// An unattached snapshot reports "not attached" so queries fall back to
   /// stable defaults instead of dereferencing a released handle.
