@@ -86,6 +86,25 @@ public struct PiPEventEnvelope: Sendable {
 // MARK: - Lifecycle event stream
 
 extension PiPController {
+  struct PiPLifecycleAttribution {
+    let mediaGeneration: PlaybackGeneration
+    let controllerGeneration: UInt64
+    let sequence: UInt64
+  }
+
+  struct FailedPiPLifecycle {
+    let attribution: PiPLifecycleAttribution
+    let stopReason: PiPStopReason
+    var willStopObserved = false
+  }
+
+  enum PiPLifecycleAttributionPhase: Equatable {
+    case idle
+    case awaitingStart
+    case started
+    case stopping
+  }
+
   /// A stream of Picture-in-Picture lifecycle events.
   ///
   /// Each access returns an independent, unbounded stream — lifecycle

@@ -1,0 +1,281 @@
+diff --git a/modules/video_output/apple/VLCDrawable.h b/modules/video_output/apple/VLCDrawable.h
+index 42dacba037..b5fd8a3c2c 100644
+--- a/modules/video_output/apple/VLCDrawable.h
++++ b/modules/video_output/apple/VLCDrawable.h
+@@ -55,6 +55,9 @@
+                                    time:(int64_t *)time
+                                seekable:(BOOL *)seekable;
+ 
++/// Returns the current client media generation. Zero means no media.
++- (uint64_t)mediaPlaybackGeneration;
++
+ @required
+ 
+ /// Called by picture in picture to get the current media duration
+@@ -126,8 +129,25 @@
+ /// controller is passed
+ - (void (^)(id<VLCPictureInPictureWindowControlling>)) pictureInPictureReady;
+ 
++@optional
++
+ /// Controls whether PiP can start automatically when video enters inline mode
+ /// - Returns YES to allow automatic PiP activation, NO to disable it
+ /// The default implementation will return YES if not implemented
+ - (BOOL)canStartPictureInPictureAutomaticallyFromInline;
++
++/// Retains an active native PiP controller while a successor video output is
++/// being constructed. Returns YES when the handoff was accepted.
++- (BOOL)preservePictureInPictureWindowController:
++    (id<VLCPictureInPictureWindowControlling>)controller;
++
++/// Returns a controller retained for one same-player media replacement, or
++/// nil when there is no pending handoff.
++- (id<VLCPictureInPictureWindowControlling>)
++    takePreservedPictureInPictureWindowController;
++
++/// Reports that the native handoff bound expired and the retained controller
++/// is about to close. Implementations must discard any matching handoff.
++- (void)pictureInPictureWindowControllerHandoffDidTimeOut:
++    (id<VLCPictureInPictureWindowControlling>)controller;
+ @end
+diff --git a/modules/video_output/apple/VLCPictureInPictureController.m b/modules/video_output/apple/VLCPictureInPictureController.m
+index 68dd7cc369..ab23e0a149 100644
+--- a/modules/video_output/apple/VLCPictureInPictureController.m
++++ b/modules/video_output/apple/VLCPictureInPictureController.m
+@@ -46,8 +46,13 @@ @interface VLCPictureInPictureController: NSObject
+      AVPictureInPictureControllerDelegate,
+      VLCPictureInPictureWindowControlling> {
+     atomic_bool _closed;
++    atomic_bool _awaitingSuccessor;
++    atomic_bool _pictureInPictureActive;
++    atomic_uint_fast64_t _handoffToken;
+     BOOL _observingPictureInPicturePossible;
++    __weak id<VLCPictureInPictureDrawable> _drawable;
+     id<VLCPictureInPictureMediaControlling> _mediaController;
++    uint64_t _mediaPlaybackGeneration;
+     void (^_pictureInPictureReady)(id<VLCPictureInPictureWindowControlling>);
+     BOOL _canStartAutomaticallyFromInline;
+     AVSampleBufferDisplayLayer *_displayLayer;
+@@ -57,8 +62,10 @@ @interface VLCPictureInPictureController: NSObject
+ @property (nonatomic) void(^stateChangeEventHandler)(BOOL isStarted);
+ 
+ - (instancetype)initWithPipController:(pip_controller_t *)pipcontroller;
++- (void)rebindToPipController:(pip_controller_t *)pipcontroller;
+ - (void)invalidatePlaybackState;
+ - (void)close;
++- (void)closeForVideoOutput;
+ 
+ @end
+ 
+@@ -69,22 +76,39 @@ - (instancetype)initWithPipController:(pip_controller_t *)pipcontroller {
+     if (!self)
+         return nil;
+     atomic_init(&_closed, false);
++    atomic_init(&_awaitingSuccessor, false);
++    atomic_init(&_pictureInPictureActive, false);
++    atomic_init(&_handoffToken, 0);
++
++    [self rebindToPipController:pipcontroller];
++    if (_drawable == nil)
++        return nil;
++
++    return self;
++}
++
++- (void)rebindToPipController:(pip_controller_t *)pipcontroller {
++    NSAssert(!atomic_load_explicit(&_closed, memory_order_acquire),
++             @"A closed PiP controller cannot be rebound");
+ 
+     id<VLCPictureInPictureDrawable> drawable =
+         (__bridge id)var_InheritAddress (pipcontroller, "drawable-nsobject");
+     
+     if (![drawable conformsToProtocol:@protocol(VLCPictureInPictureDrawable)])
+-        return nil;
++        return;
+     
++    _drawable = drawable;
+     _mediaController = drawable.mediaController;
++    if ([_mediaController respondsToSelector:@selector(mediaPlaybackGeneration)])
++        _mediaPlaybackGeneration = [_mediaController mediaPlaybackGeneration];
++    else
++        _mediaPlaybackGeneration = 0;
+     _pictureInPictureReady = [drawable.pictureInPictureReady copy];
+     if ([drawable respondsToSelector:@selector(canStartPictureInPictureAutomaticallyFromInline)])
+         _canStartAutomaticallyFromInline =
+             [drawable canStartPictureInPictureAutomaticallyFromInline];
+     else
+         _canStartAutomaticallyFromInline = YES;
+-
+-    return self;
+ }
+ 
+ - (void)prepare:(AVSampleBufferDisplayLayer *)layer {
+@@ -93,9 +117,6 @@ - (void)prepare:(AVSampleBufferDisplayLayer *)layer {
+         return;
+     if (![AVPictureInPictureController isPictureInPictureSupported])
+         return;
+-    if (_avPipController != nil)
+-        return;
+-        
+     assert(layer);
+     _displayLayer = layer;
+     AVPictureInPictureControllerContentSource *avPipSource;
+@@ -104,10 +125,14 @@ - (void)prepare:(AVSampleBufferDisplayLayer *)layer {
+             initWithSampleBufferDisplayLayer:layer
+                             playbackDelegate:self
+     ];
+-    AVPictureInPictureController *avPipController = [
+-        [AVPictureInPictureController alloc]
+-            initWithContentSource:avPipSource
+-    ];
++    AVPictureInPictureController *avPipController =
++        (AVPictureInPictureController *)_avPipController;
++    BOOL isHandoff = avPipController != nil;
++    if (isHandoff)
++        avPipController.contentSource = avPipSource;
++    else
++        avPipController = [[AVPictureInPictureController alloc]
++            initWithContentSource:avPipSource];
+     BOOL seekable = NO;
+     if ([_mediaController respondsToSelector:
+             @selector(mediaPlaybackSnapshotWithLength:time:seekable:)]) {
+@@ -120,27 +145,80 @@ - (void)prepare:(AVSampleBufferDisplayLayer *)layer {
+         seekable = [_mediaController isMediaSeekable];
+     }
+     avPipController.requiresLinearPlayback = !seekable;
+-    avPipController.delegate = self;
++    if (!isHandoff)
++        avPipController.delegate = self;
+ #if TARGET_OS_IOS
+     avPipController.canStartPictureInPictureAutomaticallyFromInline =
+         _canStartAutomaticallyFromInline;
+ #endif
+     _avPipController = avPipController;
+ 
++    if (!isHandoff) {
++        [_avPipController addObserver:self
++                           forKeyPath:@"isPictureInPicturePossible"
++                              options:NSKeyValueObservingOptionInitial|NSKeyValueObservingOptionNew
++                              context:NULL];
++        _observingPictureInPicturePossible = YES;
++    }
+ 
+-    [_avPipController addObserver:self
+-                       forKeyPath:@"isPictureInPicturePossible"
+-                          options:NSKeyValueObservingOptionInitial|NSKeyValueObservingOptionNew
+-                          context:NULL];
+-    _observingPictureInPicturePossible = YES;
++    atomic_store_explicit(&_awaitingSuccessor, false, memory_order_release);
+ 
+     if (!atomic_load_explicit(&_closed, memory_order_acquire) && _pictureInPictureReady)
+         _pictureInPictureReady(self);
+ }
+ 
++- (void)closeForVideoOutput {
++    id<VLCPictureInPictureDrawable> drawable = _drawable;
++    uint64_t currentGeneration = 0;
++    if ([_mediaController respondsToSelector:@selector(mediaPlaybackGeneration)])
++        currentGeneration = [_mediaController mediaPlaybackGeneration];
++
++    BOOL isReplacement = currentGeneration != 0 &&
++        _mediaPlaybackGeneration != 0 &&
++        currentGeneration != _mediaPlaybackGeneration;
++    BOOL isActive = atomic_load_explicit(&_pictureInPictureActive,
++                                         memory_order_acquire);
++    if (isReplacement && isActive &&
++        [drawable respondsToSelector:
++            @selector(preservePictureInPictureWindowController:)]) {
++        uint_fast64_t token = atomic_fetch_add_explicit(&_handoffToken, 1,
++                                                        memory_order_acq_rel) + 1;
++        atomic_store_explicit(&_awaitingSuccessor, true, memory_order_release);
++        if ([drawable preservePictureInPictureWindowController:self]) {
++            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
++                                         (int64_t)(3 * NSEC_PER_SEC)),
++                           dispatch_get_main_queue(), ^{
++                BOOL isPending =
++                    atomic_load_explicit(&self->_awaitingSuccessor,
++                                         memory_order_acquire);
++                uint_fast64_t currentToken =
++                    atomic_load_explicit(&self->_handoffToken,
++                                         memory_order_acquire);
++                if (isPending && currentToken == token) {
++                    id<VLCPictureInPictureDrawable> currentDrawable =
++                        self->_drawable;
++                    if ([currentDrawable respondsToSelector:@selector(
++                            pictureInPictureWindowControllerHandoffDidTimeOut:)])
++                        [currentDrawable
++                            pictureInPictureWindowControllerHandoffDidTimeOut:
++                                self];
++                    [self close];
++                }
++            });
++            return;
++        }
++        atomic_store_explicit(&_awaitingSuccessor, false,
++                              memory_order_release);
++    }
++
++    [self close];
++}
++
+ - (void)close {
+     if (atomic_exchange_explicit(&_closed, true, memory_order_acq_rel))
+         return;
++    atomic_store_explicit(&_awaitingSuccessor, false, memory_order_release);
++    atomic_fetch_add_explicit(&_handoffToken, 1, memory_order_acq_rel);
+ 
+     dispatch_block_t cleanup = ^{
+         AVPictureInPictureController *avPipController =
+@@ -289,11 +367,13 @@ - (void)pictureInPictureControllerWillStartPictureInPicture:(AVPictureInPictureC
+ }
+ 
+ - (void)pictureInPictureControllerDidStartPictureInPicture:(AVPictureInPictureController *)pictureInPictureController {
++    atomic_store_explicit(&_pictureInPictureActive, true, memory_order_release);
+     if (!atomic_load_explicit(&_closed, memory_order_acquire) && _stateChangeEventHandler)
+         _stateChangeEventHandler(YES);
+ }
+ 
+ - (void)pictureInPictureControllerDidStopPictureInPicture:(AVPictureInPictureController *)pictureInPictureController {
++    atomic_store_explicit(&_pictureInPictureActive, false, memory_order_release);
+     if (!atomic_load_explicit(&_closed, memory_order_acquire) && _stateChangeEventHandler)
+         _stateChangeEventHandler(NO);
+ }
+@@ -357,7 +437,7 @@ static int CloseController( pip_controller_t *pipcontroller )
+             (__bridge_transfer VLCPictureInPictureController*)pipcontroller->p_sys;
+         pipcontroller->p_sys = NULL;
+ 
+-        [sys close];
++        [sys closeForVideoOutput];
+     }
+     
+     return VLC_SUCCESS;
+@@ -375,9 +455,26 @@ static int OpenController( pip_controller_t *pipcontroller )
+     pipcontroller->ops = &ops;
+ 
+     if (@available(macOS 12.0, iOS 15.0, tvos 15.0, *)) {
+-        VLCPictureInPictureController *sys = 
+-        [[VLCPictureInPictureController alloc] 
+-            initWithPipController:pipcontroller];
++        id<VLCPictureInPictureDrawable> drawable =
++            (__bridge id)var_InheritAddress(pipcontroller,
++                                             "drawable-nsobject");
++        VLCPictureInPictureController *sys = nil;
++        if ([drawable conformsToProtocol:
++                @protocol(VLCPictureInPictureDrawable)] &&
++            [drawable respondsToSelector:
++                @selector(takePreservedPictureInPictureWindowController)]) {
++            id preserved =
++                [drawable takePreservedPictureInPictureWindowController];
++            if ([preserved isKindOfClass:
++                    [VLCPictureInPictureController class]]) {
++                sys = preserved;
++                [sys rebindToPipController:pipcontroller];
++            }
++        }
++
++        if (sys == nil)
++            sys = [[VLCPictureInPictureController alloc]
++                initWithPipController:pipcontroller];
+         
+         if (sys == nil) {
+             return VLC_EGENERIC;

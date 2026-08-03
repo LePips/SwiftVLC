@@ -58,6 +58,26 @@ rendering a black system PiP window, so validate iOS PiP rendering on
 a physical device. Simulator success is not evidence that frames reach
 the system PiP window.
 
+### Same-player media replacement
+
+When ``Player/load(_:)`` replaces media while native iOS PiP is active,
+SwiftVLC keeps the existing `AVPictureInPictureController` and rebinds its
+content source to the successor video output. This preserves the system PiP
+window and its controller identity instead of reporting a stop followed by a
+new start. The handoff is generation-scoped: ordinary stop or view teardown is
+not preserved, and stale callbacks from the predecessor cannot control the
+successor.
+
+The successor has three seconds to publish a usable display layer. Observe
+``PiPController/pipContinuityEvents`` for
+``PiPContinuityOutcome/rebuilding``, ``PiPContinuityOutcome/restored``, or
+``PiPContinuityOutcome/timedOut``. A timeout stops the retained AVKit
+controller cleanly rather than leaving a frozen PiP window. Direct PiP does
+not rebuild a libVLC-owned controller and therefore emits no continuity
+events. Readiness arriving later from the expired controller is ignored; a
+fresh controller may still serve that same media generation on a subsequent
+PiP start.
+
 ### Native PiP subtitle limitation
 
 The bundled native iOS PiP route does not currently include VLC-rendered
@@ -238,6 +258,10 @@ compile the PiP wrapper on visionOS. ``PiPController`` and
 ### Views and controllers
 - ``PiPVideoView``
 - ``PiPController``
+
+### Replacement continuity
+- ``PiPContinuityEvent``
+- ``PiPContinuityOutcome``
 
 ### State
 - ``PiPController/isPossible``
