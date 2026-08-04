@@ -61,13 +61,16 @@ final class PiPUITests: ShowcaseIOSTestCase {
   /// Critical UX invariant: when PiP isn't possible, the toggle button
   /// must be disabled (not simply hidden). In simulator, isPossible is
   /// typically `false`, so this is the common-case UX path.
-  func test_deep_toggleButtonDisabledWhenNotPossible() {
+  func test_deep_toggleButtonDisabledWhenNotPossible() throws {
     launch(route: .pip)
 
     waitForLabel(playPauseButton, equals: "Pause", timeout: 10)
     scrollToPiPSection()
 
-    waitForLabel(possibleLabel, equals: "no", timeout: 10)
+    XCTAssertTrue(possibleLabel.waitForExistence(timeout: 10))
+    guard possibleLabel.label == "no" else {
+      throw XCTSkip("This device supports PiP; the unavailable-state contract is not reachable")
+    }
 
     // SwiftUI Form may strip disabled Buttons from the accessibility
     // tree entirely — treat either "button doesn't exist" or "button

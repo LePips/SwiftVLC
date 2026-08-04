@@ -1,14 +1,17 @@
 import SwiftUI
-import SwiftVLC
+@_spi(Qualification) import SwiftVLC
 import UIKit
 
 /// A deterministic, physical-device-only lane for the live-stream PiP
 /// regression. The URL is supplied through `-UITestPiPLiveURL`; production
 /// showcase launches never discover or play it accidentally.
 struct PiPLiveValidationCase: View {
+  @Environment(\.scenePhase) private var scenePhase
   @State private var player = Player()
   @State private var controller: PiPController?
   @State private var playbackError: String?
+  @State private var capturedRendererDiagnostics = "not-captured"
+  @State private var diagnosticCaptureOrdinal: UInt64 = 0
 
   private var renderingPath: PiPValidationRenderingPath {
     PiPValidationRenderingPath(
@@ -20,7 +23,6 @@ struct PiPLiveValidationCase: View {
     // Statistics are point-in-time snapshots. Reading the observable clock
     // makes SwiftUI refresh this validation panel as playback advances.
     _ = player.currentTime
-
     return Form {
       Section {
         videoSurface
@@ -30,6 +32,7 @@ struct PiPLiveValidationCase: View {
           .frame(height: 260)
           .listRowInsets(EdgeInsets())
           .accessibilityIdentifier(AccessibilityID.PiPLiveValidation.videoView)
+          .accessibilityValue(Text(capturedRendererDiagnostics))
       }
 
       Section("Measured state") {
@@ -78,7 +81,31 @@ struct PiPLiveValidationCase: View {
     }
     .showcaseFormStyle()
     .navigationTitle("Live PiP validation")
+    .toolbar {
+      if renderingPath == .direct {
+        // System PiP occupies the top-right corner on iPhone. Keep this
+        // qualification-only probe on the opposite side so XCUI can capture
+        // phase telemetry while the overlay is active.
+        ToolbarItem(placement: .topBarLeading) {
+          Button("Capture diagnostics", systemImage: "waveform.path.ecg") {
+            captureRendererDiagnostics()
+          }
+          .accessibilityIdentifier(AccessibilityID.PiPLiveValidation.captureDiagnosticsButton)
+          .accessibilityLabel(capturedRendererDiagnostics)
+        }
+      }
+    }
     .task { startPlayback() }
+    .onChange(of: controller?.isPossible) { _, _ in
+      captureRendererDiagnostics()
+    }
+    .onChange(of: controller?.isActive) { _, _ in
+      captureRendererDiagnostics()
+    }
+    .onChange(of: scenePhase) { _, newPhase in
+      guard newPhase == .active else { return }
+      captureRendererDiagnostics()
+    }
     .onDisappear { player.stop() }
   }
 
@@ -113,6 +140,49 @@ struct PiPLiveValidationCase: View {
     }
   }
 
+  private func captureRendererDiagnostics() {
+    diagnosticCaptureOrdinal &+= 1
+    guard renderingPath == .direct, let controller else {
+      capturedRendererDiagnostics = "capture=\(diagnosticCaptureOrdinal);not-direct"
+      return
+    }
+    let snapshot = controller.timebaseDiagnosticSnapshot()
+    capturedRendererDiagnostics = [
+      "capture=\(diagnosticCaptureOrdinal)",
+      "decoded=\(snapshot.decodedFrameCount)",
+      "contentChanges=\(snapshot.decodedContentChangeCount)",
+      "fingerprint=\(snapshot.lastDecodedContentFingerprint.map(String.init) ?? "nil")",
+      "renderGeneration=\(snapshot.renderGeneration)",
+      "presentationCopyRequired=\(snapshot.presentationCopyRequired)",
+      "presentationCopies=\(snapshot.presentationCopyFrameCount)",
+      "presentationCopyFailures=\(snapshot.presentationCopyFailureCount)",
+      "flushRequests=\(snapshot.displayLayerFlushRequestCount)",
+      "decodePoolFailures=\(snapshot.decodePoolAllocationFailureCount)",
+      "decodePoolStatus=\(snapshot.lastDecodePoolAllocationStatus.map(String.init) ?? "nil")",
+      "renderPoolFailures=\(snapshot.renderPoolAllocationFailureCount)",
+      "renderPoolStatus=\(snapshot.lastRenderPoolAllocationStatus.map(String.init) ?? "nil")",
+      "lockAttempts=\(snapshot.vmemLockAttemptCount)",
+      "lockSuccesses=\(snapshot.vmemLockSuccessCount)",
+      "poolUnavailable=\(snapshot.vmemPoolUnavailableCount)",
+      "baseLockFailures=\(snapshot.vmemBaseAddressLockFailureCount)",
+      "pendingInstallFailures=\(snapshot.vmemPendingInstallFailureCount)",
+      "unlocks=\(snapshot.vmemUnlockCallbackCount)",
+      "displayCallbacks=\(snapshot.vmemDisplayCallbackCount)",
+      "displayConsumeFailures=\(snapshot.vmemDisplayConsumeFailureCount)",
+      "enqueued=\(snapshot.enqueuedFrameCount)",
+      "delivered=\(snapshot.deliveredFrameCount)",
+      "dropped=\(snapshot.droppedFrameCount)",
+      "media=\(snapshot.mediaTimeSeconds)",
+      "timebase=\(snapshot.controlTimebaseSeconds ?? -1)",
+      "rate=\(snapshot.controlTimebaseRate ?? -1)",
+      "lastPTS=\(snapshot.lastDeliveredSampleTimeSeconds ?? -1)",
+      "layer=\(snapshot.displayLayerStatus)",
+      "ready=\(snapshot.isDisplayLayerReadyForDisplay)",
+      "requiresFlush=\(snapshot.displayLayerRequiresFlush)",
+      "layerError=\(snapshot.displayLayerError ?? "nil")"
+    ].joined(separator: ";")
+  }
+
   private func valueRow(_ title: String, value: String, identifier: String) -> some View {
     HStack {
       Text(title)
@@ -138,6 +208,7 @@ struct DirectPiPValidationSurface: UIViewRepresentable {
   func makeUIView(context: Context) -> DirectPiPLayerHostView {
     let view = DirectPiPLayerHostView()
     let controller = PiPController(player: player)
+    controller.enableFrameContentDiagnostics()
     view.displayLayer = controller.layer
     context.coordinator.controller = controller
     context.coordinator.publish(controller, to: $controller)

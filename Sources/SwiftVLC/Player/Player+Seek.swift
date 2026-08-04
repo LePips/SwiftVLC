@@ -78,11 +78,13 @@ extension Player {
     // accepted revision and pending request untouched.
     let revision = eventBridge.advanceTimelineRevision()
     let nativeSeekToken = nativeSeekMonitor.stageCommand()
+    let pipRebuildPermit = stageNativePiPVideoOutputRebuildPermit()
     // Publishing before checking the result reported a target libVLC had
     // refused, leaving the observable timeline describing a position playback
     // never reached.
     guard libvlc_media_player_set_time(pointer, milliseconds, fast) == 0 else {
       nativeSeekMonitor.cancelStagedCommand(nativeSeekToken)
+      cancelNativePiPVideoOutputRebuildPermit(pipRebuildPermit)
       throw .operationFailed("Seek to \(milliseconds) ms")
     }
     supersedePendingSeekSettlement()
@@ -140,8 +142,10 @@ extension Player {
 
     let revision = eventBridge.advanceTimelineRevision()
     let nativeSeekToken = nativeSeekMonitor.stageCommand()
+    let pipRebuildPermit = stageNativePiPVideoOutputRebuildPermit()
     guard libvlc_media_player_set_time(pointer, targetMs, fast) == 0 else {
       nativeSeekMonitor.cancelStagedCommand(nativeSeekToken)
+      cancelNativePiPVideoOutputRebuildPermit(pipRebuildPermit)
       throw .operationFailed("Jump to \(targetMs) ms")
     }
     supersedePendingSeekSettlement()
@@ -191,8 +195,10 @@ extension Player {
     guard hasLenientSeekSession else { return false }
     let revision = eventBridge.advanceTimelineRevision()
     let nativeSeekToken = nativeSeekMonitor.stageCommand()
+    let pipRebuildPermit = stageNativePiPVideoOutputRebuildPermit()
     guard issueNativeSeek(toPosition: position.rawValue, fast: fast) == 0 else {
       nativeSeekMonitor.cancelStagedCommand(nativeSeekToken)
+      cancelNativePiPVideoOutputRebuildPermit(pipRebuildPermit)
       return false
     }
     supersedePendingSeekSettlement()
@@ -286,8 +292,10 @@ extension Player {
     }
     let revision = eventBridge.advanceTimelineRevision()
     let commandToken = nativeSeekToken ?? nativeSeekMonitor.stageCommand()
+    let pipRebuildPermit = stageNativePiPVideoOutputRebuildPermit()
     guard issueNativeJump(byMilliseconds: offsetMs) == 0 else {
       nativeSeekMonitor.cancelStagedCommand(commandToken)
+      cancelNativePiPVideoOutputRebuildPermit(pipRebuildPermit)
       return nil
     }
     #if DEBUG
@@ -338,6 +346,22 @@ extension Player {
     }
     #endif
     return libvlc_media_player_jump_time(pointer, offset)
+  }
+
+  private func stageNativePiPVideoOutputRebuildPermit() -> UInt64? {
+    #if os(iOS)
+    return nativePiPVideoOutputRebuildPermit.stage(for: generation)
+    #else
+    return nil
+    #endif
+  }
+
+  private func cancelNativePiPVideoOutputRebuildPermit(_ token: UInt64?) {
+    #if os(iOS)
+    if let token {
+      nativePiPVideoOutputRebuildPermit.cancel(token)
+    }
+    #endif
   }
 
   /// Creates the single pending request and starts its bounded timeout.

@@ -44,7 +44,7 @@ final class MusicPlayerUITests: ShowcaseIOSTestCase {
     let fixtures = try makeDistinctMusicFixtures()
     app.launchArguments += [
       LaunchArguments.musicFixtureURLs,
-      fixtures.map(\.path).joined(separator: "|")
+      fixtures.map(\.absoluteString).joined(separator: "|")
     ]
     launch(route: .musicPlayer)
 
@@ -66,6 +66,14 @@ final class MusicPlayerUITests: ShowcaseIOSTestCase {
   }
 
   private func makeDistinctMusicFixtures() throws -> [URL] {
+    if let fixture = physicalDeviceFixtureURL {
+      return try ["one", "two", "three"].map { name in
+        var components = try XCTUnwrap(URLComponents(url: fixture, resolvingAgainstBaseURL: false))
+        components.queryItems = [URLQueryItem(name: "track", value: name)]
+        return try XCTUnwrap(components.url)
+      }
+    }
+
     let bundle = Bundle(for: Self.self)
     let source = try XCTUnwrap(
       bundle.url(forResource: "test", withExtension: "mp4", subdirectory: "Fixtures")

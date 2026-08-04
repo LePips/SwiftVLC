@@ -31,10 +31,12 @@ private final class PixelBufferPoolAuxiliaryAttributes: @unchecked Sendable {
   }
 }
 
-/// Thresholds are constrained to 3...12. Build each immutable auxiliary
+/// Thresholds are constrained to 3...13. The thirteenth slot is one-frame
+/// transition headroom used only while active PiP isolates presentation from
+/// the decode pool. Build each immutable auxiliary
 /// dictionary once so the per-frame allocation guard does not itself allocate
 /// a Swift dictionary on the decode hot path.
-private let pixelBufferRendererPoolAuxiliaryAttributes = (3...12).map {
+private let pixelBufferRendererPoolAuxiliaryAttributes = (3...13).map {
   PixelBufferPoolAuxiliaryAttributes(allocationThreshold: $0)
 }
 
@@ -61,8 +63,19 @@ func pixelBufferRendererPoolMinimumBufferCount(width: Int, height: Int) -> Int {
 /// Hard upper bound for buffers allocated from one pool. Three is the minimum
 /// safe pipeline shape (one being produced, one pending, one processing), and
 /// the threshold never undercuts the configured recycled pool floor.
-func pixelBufferRendererPoolAllocationThreshold(width: Int, height: Int) -> Int {
-  max(3, pixelBufferRendererPoolMinimumBufferCount(width: width, height: height))
+func pixelBufferRendererPoolAllocationThreshold(
+  width: Int,
+  height: Int,
+  additionalAllocationHeadroom: Int = 0
+) -> Int {
+  let residentFloor = max(
+    3,
+    pixelBufferRendererPoolMinimumBufferCount(width: width, height: height)
+  )
+  // Only the active direct-PiP decode path requests headroom, and only one frame.
+  // Clamp here as a second line of defense so this helper can never turn a
+  // caller mistake into an unbounded Core Video queue.
+  return residentFloor + min(max(0, additionalAllocationHeadroom), 1)
 }
 
 /// Allocates with an explicit threshold so a stalled display layer cannot turn
@@ -70,9 +83,14 @@ func pixelBufferRendererPoolAllocationThreshold(width: Int, height: Int) -> Int 
 func pixelBufferRendererAllocatePixelBuffer(
   from pool: CVPixelBufferPool,
   width: Int,
-  height: Int
+  height: Int,
+  additionalAllocationHeadroom: Int = 0
 ) -> (status: CVReturn, buffer: CVPixelBuffer?) {
-  let threshold = pixelBufferRendererPoolAllocationThreshold(width: width, height: height)
+  let threshold = pixelBufferRendererPoolAllocationThreshold(
+    width: width,
+    height: height,
+    additionalAllocationHeadroom: additionalAllocationHeadroom
+  )
   let auxiliaryAttributes = pixelBufferRendererPoolAuxiliaryAttributes[threshold - 3]
   var buffer: CVPixelBuffer?
   let status = CVPixelBufferPoolCreatePixelBufferWithAuxAttributes(

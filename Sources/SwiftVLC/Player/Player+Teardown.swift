@@ -264,6 +264,9 @@ extension Player {
     let resumeBeforeRelease = shouldResumeNativePlayerBeforeStop
     publishPlaybackIntent(false)
     supersedePendingSeekSettlement()
+    #if os(iOS)
+    nativePiPVideoOutputRebuildPermit.invalidate()
+    #endif
     pauseTransition = nil
     deferredPauseCommand = nil
     eventBridge.finishCurrentPlaybackGeneration(

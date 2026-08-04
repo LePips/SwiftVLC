@@ -467,6 +467,9 @@ extension Player {
   /// is loaded or replaced.
   func resetMediaDerivedState(preservingPlaybackIntent: Bool = false) {
     supersedePendingSeekSettlement()
+    #if os(iOS)
+    nativePiPVideoOutputRebuildPermit.invalidate()
+    #endif
     nativeSeekMonitor.resetForTimelineReplacement()
     // New media, new timeline: clock samples still queued from the previous
     // one describe a media that is no longer loaded and must not be applied.

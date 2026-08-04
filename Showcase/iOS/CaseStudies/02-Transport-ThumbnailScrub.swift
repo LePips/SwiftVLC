@@ -24,14 +24,20 @@ struct ThumbnailScrubCase: View {
         VideoView(player)
           .aspectRatio(16 / 9, contentMode: .fit)
           .listRowInsets(EdgeInsets())
+          .accessibilityIdentifier(AccessibilityID.ThumbnailScrub.videoView)
       } footer: {
         PlayPauseFooter(player: player)
+          .accessibilityIdentifier(AccessibilityID.ThumbnailScrub.playPauseButton)
       }
 
       Section("Scrub") {
         scrubSlider
         timeRow("Preview", value: format(previewPosition))
-        timeRow("Current", value: format(player.position))
+        timeRow(
+          "Current",
+          value: format(player.position),
+          identifier: AccessibilityID.ThumbnailScrub.currentTimeLabel
+        )
         timeRow("Tiles", value: tilesStatus)
       }
     }
@@ -46,7 +52,12 @@ struct ThumbnailScrubCase: View {
   private var scrubSlider: some View {
     VStack(spacing: 0) {
       ScrubBubble(
-        isVisible: isScrubbing,
+        // XCUITest's slider adjustment is synchronous: by the time the test
+        // process can query the hierarchy, the drag has ended. Keep the exact
+        // production bubble mounted in UI-test mode so the physical-device
+        // suite can still verify that generated tiles reach the presentation
+        // layer. Normal showcase behavior remains drag-only.
+        isVisible: isScrubbing || LaunchArguments.isUITestMode,
         fraction: previewPosition,
         image: nearestTile()?.image,
         timeLabel: format(previewPosition)
@@ -61,14 +72,22 @@ struct ThumbnailScrubCase: View {
           }
         }
       )
+      .accessibilityIdentifier(AccessibilityID.ThumbnailScrub.slider)
     }
   }
 
-  private func timeRow(_ label: String, value: String) -> some View {
+  private func timeRow(
+    _ label: String,
+    value: String,
+    identifier: String? = nil
+  ) -> some View {
     HStack {
       Text(label)
       Spacer()
-      Text(value).foregroundStyle(.secondary).monospacedDigit()
+      Text(value)
+        .foregroundStyle(.secondary)
+        .monospacedDigit()
+        .accessibilityIdentifier(ifPresent: identifier)
     }
   }
 

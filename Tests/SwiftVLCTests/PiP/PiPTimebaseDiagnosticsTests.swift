@@ -12,7 +12,9 @@ struct PiPTimebaseDiagnosticsTests {
     let controller = PiPController(player: player)
 
     let before = controller._controlTimebaseSecondsForTesting()
+    let rendererBefore = controller.renderer.telemetrySnapshot
     let snapshot = controller.timebaseDiagnosticSnapshot()
+    let rendererAfter = controller.renderer.telemetrySnapshot
 
     #expect(snapshot.playbackGeneration == 0)
     #expect(snapshot.isPlaybackActive == false)
@@ -21,10 +23,35 @@ struct PiPTimebaseDiagnosticsTests {
     #expect(snapshot.controlTimebaseSeconds == before)
     #expect(snapshot.controlTimebaseRate == 0)
     #expect(snapshot.decodedFrameCount == 0)
+    #expect(snapshot.decodedContentChangeCount == 0)
+    #expect(snapshot.lastDecodedContentFingerprint == nil)
+    #expect(snapshot.renderGeneration == rendererBefore.renderGeneration)
+    #expect(snapshot.presentationCopyRequired == false)
+    #expect(snapshot.presentationCopyFrameCount == 0)
+    #expect(snapshot.presentationCopyFailureCount == 0)
+    #expect(
+      snapshot.displayLayerFlushRequestCount
+        == rendererBefore.displayLayerFlushRequestCount
+    )
+    #expect(snapshot.decodePoolAllocationFailureCount == 0)
+    #expect(snapshot.lastDecodePoolAllocationStatus == nil)
+    #expect(snapshot.renderPoolAllocationFailureCount == 0)
+    #expect(snapshot.lastRenderPoolAllocationStatus == nil)
+    #expect(snapshot.vmemLockAttemptCount == 0)
+    #expect(snapshot.vmemLockSuccessCount == 0)
+    #expect(snapshot.vmemPoolUnavailableCount == 0)
+    #expect(snapshot.vmemBaseAddressLockFailureCount == 0)
+    #expect(snapshot.vmemPendingInstallFailureCount == 0)
+    #expect(snapshot.vmemUnlockCallbackCount == 0)
+    #expect(snapshot.vmemDisplayCallbackCount == 0)
+    #expect(snapshot.vmemDisplayConsumeFailureCount == 0)
     #expect(snapshot.deliveredFrameCount == 0)
+    #expect(snapshot.displayLayerStatus == "unknown")
+    #expect(snapshot.displayLayerError == nil)
     #expect(snapshot.lastDeliveredSamplePlaybackGeneration == nil)
     #expect(snapshot.correctionCount >= 1)
     #expect(controller._controlTimebaseSecondsForTesting() == before)
+    #expect(rendererAfter == rendererBefore)
     _ = try JSONEncoder().encode(snapshot)
   }
 

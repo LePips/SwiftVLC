@@ -38,7 +38,28 @@ final class PixelBufferRenderer: Sendable {
     var renderPool: CVPixelBufferPool?
     var renderPoolWidth: Int = 0
     var renderPoolHeight: Int = 0
+    /// Direct PiP must not hand libVLC's bounded decode buffers to AVKit.
+    /// AVKit can retain those buffers across the PiP transition, starving
+    /// vmem before another frame can be decoded. While this is true, frames
+    /// are copied into the independently bounded presentation pool even when
+    /// the requested render geometry matches the source.
+    var presentationCopyRequired = false
+    var presentationCopyFrameCount: UInt64 = 0
+    var presentationCopyFailureCount: UInt64 = 0
     var renderGeneration: UInt64 = 0
+    var displayLayerFlushRequestCount: UInt64 = 0
+    var decodePoolAllocationFailureCount: UInt64 = 0
+    var lastDecodePoolAllocationStatus: CVReturn?
+    var renderPoolAllocationFailureCount: UInt64 = 0
+    var lastRenderPoolAllocationStatus: CVReturn?
+    var vmemLockAttemptCount: UInt64 = 0
+    var vmemLockSuccessCount: UInt64 = 0
+    var vmemPoolUnavailableCount: UInt64 = 0
+    var vmemBaseAddressLockFailureCount: UInt64 = 0
+    var vmemPendingInstallFailureCount: UInt64 = 0
+    var vmemUnlockCallbackCount: UInt64 = 0
+    var vmemDisplayCallbackCount: UInt64 = 0
+    var vmemDisplayConsumeFailureCount: UInt64 = 0
     var cachedFormatDescription: CachedFormatDescription?
     var formatDescriptionCreationCount: UInt64 = 0
     var scalingResources: PixelBufferScalingResources?
@@ -57,6 +78,11 @@ final class PixelBufferRenderer: Sendable {
     var frameDuration: CMTime = .invalid
     var decodedFrameCount: UInt64 = 0
     var lastDecodedAt: ContinuousClock.Instant?
+    /// Opt-in qualification probe. Disabled for normal clients so sampling
+    /// decoded pixels adds no work to the production hot path.
+    var contentFingerprintingEnabled = false
+    var lastDecodedContentFingerprint: UInt64?
+    var decodedContentChangeCount: UInt64 = 0
     var playbackGeneration: UInt64?
 
     init(displayLayer: AVSampleBufferDisplayLayer?) {
@@ -70,6 +96,14 @@ final class PixelBufferRenderer: Sendable {
   }
 
   let state: Mutex<State>
+  /// Lock-free copy-isolation signal mirrored into the active callback handle.
+  /// libVLC reads it for every decoded frame, so it must not require renderer
+  /// or callback-context mutexes on the normal zero-copy path.
+  let presentationCopyEnabled = Atomic<Bool>(false)
+  /// Fast gate for qualification-only callback counters. The callback context
+  /// mirrors this value so disabled production callbacks avoid entering the
+  /// renderer and callback-context mutexes solely for telemetry.
+  let contentDiagnosticsEnabled = Atomic<Bool>(false)
   let enqueueQueue: DispatchQueue
   let enqueueState = Mutex(PixelBufferEnqueueState())
   let displayLayerAPI: PixelBufferDisplayLayerAPI
@@ -113,6 +147,82 @@ final class PixelBufferRenderer: Sendable {
 
   func setTimebase(_ tb: CMTimebase?) {
     state.withLock { $0.timebase = tb }
+  }
+
+  func setContentFingerprintingEnabled(_ enabled: Bool) {
+    if !enabled {
+      contentDiagnosticsEnabled.store(false, ordering: .releasing)
+    }
+    state.withLock { state in
+      state.contentFingerprintingEnabled = enabled
+      state.lastDecodedContentFingerprint = nil
+      state.decodedContentChangeCount = 0
+    }
+    if enabled {
+      contentDiagnosticsEnabled.store(true, ordering: .releasing)
+    }
+  }
+
+  /// Samples a fixed grid of BGRA pixels. This is deliberately not a full
+  /// frame hash: qualification only needs to prove that decoded content keeps
+  /// changing after backgrounding, and bounded sampling avoids turning the
+  /// diagnostic into a material renderer workload.
+  func recordContentFingerprintIfEnabled(of pixelBuffer: CVPixelBuffer) {
+    guard contentDiagnosticsEnabled.load(ordering: .acquiring) else { return }
+    guard let fingerprint = Self.sampledContentFingerprint(of: pixelBuffer) else { return }
+    state.withLock { state in
+      guard state.contentFingerprintingEnabled else { return }
+      if
+        let previous = state.lastDecodedContentFingerprint,
+        previous != fingerprint {
+        state.decodedContentChangeCount &+= 1
+      }
+      state.lastDecodedContentFingerprint = fingerprint
+    }
+  }
+
+  static func sampledContentFingerprint(of pixelBuffer: CVPixelBuffer) -> UInt64? {
+    guard CVPixelBufferGetPixelFormatType(pixelBuffer) == kCVPixelFormatType_32BGRA else {
+      return nil
+    }
+    guard CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly) == kCVReturnSuccess else {
+      return nil
+    }
+    defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
+    guard let baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer) else { return nil }
+
+    let width = CVPixelBufferGetWidth(pixelBuffer)
+    let height = CVPixelBufferGetHeight(pixelBuffer)
+    let bytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer)
+    guard width > 0, height > 0, bytesPerRow >= width * 4 else { return nil }
+
+    let bytes = baseAddress.assumingMemoryBound(to: UInt8.self)
+    var fingerprint: UInt64 = 0xcbf29ce484222325
+    func mix(_ byte: UInt8) {
+      fingerprint ^= UInt64(byte)
+      fingerprint &*= 0x100000001b3
+    }
+
+    // Include geometry so equal prefixes from differently sized buffers never
+    // compare as the same decoded frame.
+    for shift in stride(from: 0, through: 56, by: 8) {
+      mix(UInt8(truncatingIfNeeded: UInt64(width) >> UInt64(shift)))
+      mix(UInt8(truncatingIfNeeded: UInt64(height) >> UInt64(shift)))
+    }
+    let columns = min(width, 16)
+    let rows = min(height, 9)
+    for row in 0..<rows {
+      let y = rows == 1 ? 0 : row * (height - 1) / (rows - 1)
+      for column in 0..<columns {
+        let x = columns == 1 ? 0 : column * (width - 1) / (columns - 1)
+        let offset = y * bytesPerRow + x * 4
+        mix(bytes[offset])
+        mix(bytes[offset + 1])
+        mix(bytes[offset + 2])
+        mix(bytes[offset + 3])
+      }
+    }
+    return fingerprint
   }
 
   /// Publishes the source's frame cadence for the sample timing of subsequent
@@ -169,8 +279,20 @@ final class PixelBufferRenderer: Sendable {
     }
   }
 
+  /// Isolates AVKit's presentation ownership from libVLC's decode pool.
+  ///
+  /// The copy is scoped to active PiP. Inline playback keeps the zero-copy
+  /// path, and stopping PiP immediately restores it.
+  func setPresentationCopyRequired(_ required: Bool) {
+    presentationCopyEnabled.store(required, ordering: .releasing)
+    state.withLock { $0.presentationCopyRequired = required }
+  }
+
   func flushDisplayLayer() {
-    let layer = state.withLock { $0.displayLayer.layer }
+    let layer = state.withLock { state in
+      state.displayLayerFlushRequestCount &+= 1
+      return state.displayLayer.layer
+    }
     DispatchQueue.main.async { [layer] in
       layer?.sampleBufferRenderer.flush()
     }
@@ -179,60 +301,97 @@ final class PixelBufferRenderer: Sendable {
   func outputPixelBuffer(from source: CVPixelBuffer) -> (buffer: CVPixelBuffer, generation: UInt64)? {
     let interval = Signposts.signposter.beginInterval("PixelBufferRenderer.outputPixelBuffer")
     defer { Signposts.signposter.endInterval("PixelBufferRenderer.outputPixelBuffer", interval) }
-    let (target, generation) = state.withLock { ($0.renderSize, $0.renderGeneration) }
-    guard
-      let target,
-      target.width > 0,
-      target.height > 0
-    else {
+    let (target, generation, copyRequired) = state.withLock {
+      ($0.renderSize, $0.renderGeneration, $0.presentationCopyRequired)
+    }
+    let sourcePixelWidth = CVPixelBufferGetWidth(source)
+    let sourcePixelHeight = CVPixelBufferGetHeight(source)
+    guard sourcePixelWidth > 0, sourcePixelHeight > 0 else { return (source, generation) }
+
+    let width: Int
+    let height: Int
+    if let target, target.width > 0, target.height > 0 {
+      width = Int(target.width)
+      height = Int(target.height)
+    } else if copyRequired {
+      width = sourcePixelWidth
+      height = sourcePixelHeight
+    } else {
       return (source, generation)
     }
 
-    let width = Int(target.width)
-    let height = Int(target.height)
-    if CVPixelBufferGetWidth(source) == width, CVPixelBufferGetHeight(source) == height {
+    if sourcePixelWidth == width, sourcePixelHeight == height, !copyRequired {
       return (source, generation)
     }
 
-    guard let output = makeRenderPixelBuffer(width: width, height: height) else {
-      return nil
+    // libVLC invokes this on its decode thread, which has no run-loop-owned
+    // autorelease pool. Core Image's Objective-C graph objects retain the
+    // source pixel buffer; without a local pool, a completed conversion can
+    // therefore keep the one transition-headroom buffer alive indefinitely.
+    return autoreleasepool {
+      guard let output = makeRenderPixelBuffer(width: width, height: height) else {
+        return nil
+      }
+
+      let sourceWidth = CGFloat(sourcePixelWidth)
+      let sourceHeight = CGFloat(sourcePixelHeight)
+      let targetWidth = CGFloat(width)
+      let targetHeight = CGFloat(height)
+      let scale = min(targetWidth / sourceWidth, targetHeight / sourceHeight)
+      let fittedWidth = sourceWidth * scale
+      let fittedHeight = sourceHeight * scale
+      let offsetX = (targetWidth - fittedWidth) / 2
+      let offsetY = (targetHeight - fittedHeight) / 2
+
+      let transform = CGAffineTransform(
+        a: scale,
+        b: 0,
+        c: 0,
+        d: scale,
+        tx: offsetX,
+        ty: offsetY
+      )
+      let frame = CGRect(x: 0, y: 0, width: targetWidth, height: targetHeight)
+      let background = CIImage(color: CIColor(red: 0, green: 0, blue: 0, alpha: 1))
+        .cropped(to: frame)
+      let image = CIImage(cvPixelBuffer: source)
+        .transformed(by: transform)
+        .composited(over: background)
+
+      let resources = scalingResourcesForResize()
+      if copyRequired {
+        // `CIContext.render(_:to:bounds:colorSpace:)` may return after GPU work
+        // has merely been scheduled. PiP's one-frame decode headroom cannot
+        // make forward progress if Core Image still retains that source buffer,
+        // so make completion of the ownership transfer explicit.
+        do {
+          let destination = CIRenderDestination(pixelBuffer: output)
+          destination.colorSpace = resources.colorSpace
+          let task = try resources.context.startTask(toRender: image, to: destination)
+          _ = try task.waitUntilCompleted()
+          state.withLock {
+            if $0.contentFingerprintingEnabled {
+              $0.presentationCopyFrameCount &+= 1
+            }
+          }
+        } catch {
+          state.withLock {
+            if $0.contentFingerprintingEnabled {
+              $0.presentationCopyFailureCount &+= 1
+            }
+          }
+          return nil
+        }
+      } else {
+        resources.context.render(
+          image,
+          to: output,
+          bounds: frame,
+          colorSpace: resources.colorSpace
+        )
+      }
+      return (output, generation)
     }
-
-    let sourceWidth = CGFloat(CVPixelBufferGetWidth(source))
-    let sourceHeight = CGFloat(CVPixelBufferGetHeight(source))
-    let targetWidth = CGFloat(width)
-    let targetHeight = CGFloat(height)
-    guard sourceWidth > 0, sourceHeight > 0 else { return (source, generation) }
-
-    let scale = min(targetWidth / sourceWidth, targetHeight / sourceHeight)
-    let fittedWidth = sourceWidth * scale
-    let fittedHeight = sourceHeight * scale
-    let offsetX = (targetWidth - fittedWidth) / 2
-    let offsetY = (targetHeight - fittedHeight) / 2
-
-    let transform = CGAffineTransform(
-      a: scale,
-      b: 0,
-      c: 0,
-      d: scale,
-      tx: offsetX,
-      ty: offsetY
-    )
-    let frame = CGRect(x: 0, y: 0, width: targetWidth, height: targetHeight)
-    let background = CIImage(color: CIColor(red: 0, green: 0, blue: 0, alpha: 1))
-      .cropped(to: frame)
-    let image = CIImage(cvPixelBuffer: source)
-      .transformed(by: transform)
-      .composited(over: background)
-
-    let resources = scalingResourcesForResize()
-    resources.context.render(
-      image,
-      to: output,
-      bounds: frame,
-      colorSpace: resources.colorSpace
-    )
-    return (output, generation)
   }
 
   private func scalingResourcesForResize() -> PixelBufferScalingResources {
@@ -272,7 +431,11 @@ final class PixelBufferRenderer: Sendable {
         attrs as CFDictionary,
         &newPool
       )
-      guard status == kCVReturnSuccess, let newPool else { return nil }
+      guard status == kCVReturnSuccess, let newPool else {
+        state.renderPoolAllocationFailureCount &+= 1
+        state.lastRenderPoolAllocationStatus = status
+        return nil
+      }
 
       state.renderPool = newPool
       state.renderPoolWidth = width
@@ -286,8 +449,14 @@ final class PixelBufferRenderer: Sendable {
       width: width,
       height: height
     )
-    guard allocation.status == kCVReturnSuccess else { return nil }
-    return allocation.buffer
+    guard allocation.status == kCVReturnSuccess, let buffer = allocation.buffer else {
+      state.withLock {
+        $0.renderPoolAllocationFailureCount &+= 1
+        $0.lastRenderPoolAllocationStatus = allocation.status
+      }
+      return nil
+    }
+    return buffer
   }
 }
 
@@ -459,7 +628,21 @@ final class DirectPiPVideoCallbackRegistration {
     slot.context.beginPlaybackGeneration(playbackGeneration)
     renderer.beginPlaybackGeneration(playbackGeneration)
     slot.activate(renderer: renderer)
+    slot.context.setQualificationTelemetryEnabled(
+      renderer.contentDiagnosticsEnabled.load(ordering: .acquiring)
+    )
+    slot.context.setPresentationCopyRequired(
+      renderer.presentationCopyEnabled.load(ordering: .acquiring)
+    )
     current = Binding(slot: slot, generation: generation)
+  }
+
+  func setQualificationTelemetryEnabled(_ enabled: Bool) {
+    current?.slot.context.setQualificationTelemetryEnabled(enabled)
+  }
+
+  func setPresentationCopyRequired(_ required: Bool) {
+    current?.slot.context.setPresentationCopyRequired(required)
   }
 
   func unbind(generation: UInt64) {
@@ -520,6 +703,8 @@ final class PixelBufferRendererCallbackContext: Sendable {
   }
 
   private let state: Mutex<State>
+  private let presentationCopyRequired: Atomic<Bool>
+  private let qualificationTelemetryEnabled: Atomic<Bool>
   private let playbackGeneration: Mutex<UInt64>
   private let voutGenerationCounter: PixelBufferVoutGenerationCounter
 
@@ -529,6 +714,12 @@ final class PixelBufferRendererCallbackContext: Sendable {
     voutGenerationCounter: PixelBufferVoutGenerationCounter = PixelBufferVoutGenerationCounter()
   ) {
     state = Mutex(State(displayRenderer: renderer))
+    presentationCopyRequired = Atomic(
+      renderer.presentationCopyEnabled.load(ordering: .acquiring)
+    )
+    qualificationTelemetryEnabled = Atomic(
+      renderer.contentDiagnosticsEnabled.load(ordering: .acquiring)
+    )
     self.playbackGeneration = Mutex(playbackGeneration)
     self.voutGenerationCounter = voutGenerationCounter
   }
@@ -566,12 +757,28 @@ final class PixelBufferRendererCallbackContext: Sendable {
     return body(renderer)
   }
 
+  func setQualificationTelemetryEnabled(_ enabled: Bool) {
+    qualificationTelemetryEnabled.store(enabled, ordering: .releasing)
+  }
+
+  var isQualificationTelemetryEnabled: Bool {
+    qualificationTelemetryEnabled.load(ordering: .acquiring)
+  }
+
+  func setPresentationCopyRequired(_ required: Bool) {
+    presentationCopyRequired.store(required, ordering: .releasing)
+  }
+
+  var isPresentationCopyRequired: Bool {
+    presentationCopyRequired.load(ordering: .acquiring)
+  }
+
   /// Atomically hands an already-open vout's future display callbacks to a
   /// successor controller. Returns `false` only after permanent retirement
   /// or exact native-handle release.
   @discardableResult
   func setDisplayRenderer(_ renderer: PixelBufferRenderer?) -> Bool {
-    state.withLock { state -> Bool in
+    let accepted = state.withLock { state -> Bool in
       guard
         !state.retirementRequested,
         !state.nativePlayerHandleReleased,
@@ -580,6 +787,15 @@ final class PixelBufferRendererCallbackContext: Sendable {
       state.displayRenderer = renderer
       return true
     }
+    if accepted {
+      setPresentationCopyRequired(
+        renderer?.presentationCopyEnabled.load(ordering: .acquiring) ?? false
+      )
+      setQualificationTelemetryEnabled(
+        renderer?.contentDiagnosticsEnabled.load(ordering: .acquiring) ?? false
+      )
+    }
+    return accepted
   }
 
   /// Creates the callback object for one negotiated vout. Every vout owns a
@@ -721,6 +937,24 @@ final class PixelBufferRendererVoutCallbackContext: @unchecked Sendable {
     handleContext.withRenderer(opaque: handleOpaque, body)
   }
 
+  /// Records callback-path telemetry only when the active qualification
+  /// renderer explicitly enabled content diagnostics. Normal clients do not
+  /// take an extra renderer-state lock on every vmem callback.
+  func recordQualificationCallback(
+    _ update: (inout PixelBufferRenderer.State) -> Void
+  ) {
+    guard handleContext.isQualificationTelemetryEnabled else { return }
+    _ = withDisplayRenderer { renderer in
+      renderer.state.withLock { state in
+        update(&state)
+      }
+    }
+  }
+
+  var isPresentationCopyRequired: Bool {
+    handleContext.isPresentationCopyRequired
+  }
+
   /// Pins one callback picture until display consumes it, a later lock
   /// supersedes it, or vout cleanup drains it. Pinned vmem exposes only one
   /// `pic_opaque` slot, so a second successful lock proves the predecessor can
@@ -848,18 +1082,30 @@ func pixelBufferLockCallback(
   guard let context = pixelBufferVoutCallbackContext(from: opaque) else { return nil }
 
   let renderer = context.decodeRenderer
+  context.recordQualificationCallback { $0.vmemLockAttemptCount &+= 1 }
   let storage = renderer.state.withLock { ($0.pool, $0.width, $0.height) }
-  guard let pool = storage.0 else { return nil }
+  guard let pool = storage.0 else {
+    context.recordQualificationCallback { $0.vmemPoolUnavailableCount &+= 1 }
+    return nil
+  }
 
   let allocation = pixelBufferRendererAllocatePixelBuffer(
     from: pool,
     width: storage.1,
-    height: storage.2
+    height: storage.2,
+    additionalAllocationHeadroom: context.isPresentationCopyRequired ? 1 : 0
   )
-  guard allocation.status == kCVReturnSuccess, let pb = allocation.buffer else { return nil }
+  guard allocation.status == kCVReturnSuccess, let pb = allocation.buffer else {
+    context.recordQualificationCallback {
+      $0.decodePoolAllocationFailureCount &+= 1
+      $0.lastDecodePoolAllocationStatus = allocation.status
+    }
+    return nil
+  }
 
   let lockStatus = CVPixelBufferLockBaseAddress(pb, [])
   guard lockStatus == kCVReturnSuccess, let baseAddress = CVPixelBufferGetBaseAddress(pb) else {
+    context.recordQualificationCallback { $0.vmemBaseAddressLockFailureCount &+= 1 }
     if lockStatus == kCVReturnSuccess {
       CVPixelBufferUnlockBaseAddress(pb, [])
     }
@@ -867,9 +1113,11 @@ func pixelBufferLockCallback(
   }
 
   guard let picture = context.installPendingPicture(pb, isLocked: true) else {
+    context.recordQualificationCallback { $0.vmemPendingInstallFailureCount &+= 1 }
     CVPixelBufferUnlockBaseAddress(pb, [])
     return nil
   }
+  context.recordQualificationCallback { $0.vmemLockSuccessCount &+= 1 }
   planes[0] = baseAddress
   return picture
 }
@@ -884,6 +1132,7 @@ func pixelBufferUnlockCallback(
     let picture,
     let context = pixelBufferVoutCallbackContext(from: opaque)
   else { return }
+  context.recordQualificationCallback { $0.vmemUnlockCallbackCount &+= 1 }
   context.unlockPendingPicture(matching: picture)
 }
 
@@ -895,9 +1144,13 @@ func pixelBufferDisplayCallback(
 ) {
   guard
     let picture,
-    let context = pixelBufferVoutCallbackContext(from: opaque),
-    let consumed = context.consumePendingPicture(matching: picture)
+    let context = pixelBufferVoutCallbackContext(from: opaque)
   else { return }
+  context.recordQualificationCallback { $0.vmemDisplayCallbackCount &+= 1 }
+  guard let consumed = context.consumePendingPicture(matching: picture) else {
+    context.recordQualificationCallback { $0.vmemDisplayConsumeFailureCount &+= 1 }
+    return
+  }
 
   let pb = consumed.buffer
   let playbackGeneration = consumed.playbackGeneration
@@ -914,6 +1167,7 @@ func pixelBufferDisplayCallback(
     guard let output = renderer.outputPixelBuffer(from: pb) else { return }
     let outputBuffer = output.buffer
     let renderGeneration = output.generation
+    renderer.recordContentFingerprintIfEnabled(of: outputBuffer)
 
     let (timebase, layer, frameDuration) = renderer.state.withLock {
       ($0.timebase, $0.displayLayer.layer, $0.frameDuration)

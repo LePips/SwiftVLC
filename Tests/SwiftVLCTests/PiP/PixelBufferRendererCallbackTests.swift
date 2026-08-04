@@ -458,6 +458,14 @@ extension Integration {
       let pool = try #require(vout.context.decodeRenderer.state.withLock { $0.pool })
       let threshold = pixelBufferRendererPoolAllocationThreshold(width: 64, height: 36)
       expectNoDifference(threshold, 12)
+      expectNoDifference(
+        pixelBufferRendererPoolAllocationThreshold(
+          width: 64,
+          height: 36,
+          additionalAllocationHeadroom: 1
+        ),
+        13
+      )
 
       var heldBuffers: [CVPixelBuffer] = []
       for _ in 0..<threshold {
@@ -478,6 +486,26 @@ extension Integration {
       expectNoDifference(exhausted.status, kCVReturnWouldExceedAllocationThreshold)
       #expect(exhausted.buffer == nil)
 
+      let transitionHeadroom = pixelBufferRendererAllocatePixelBuffer(
+        from: pool,
+        width: 64,
+        height: 36,
+        additionalAllocationHeadroom: 1
+      )
+      expectNoDifference(transitionHeadroom.status, kCVReturnSuccess)
+      try heldBuffers.append(#require(transitionHeadroom.buffer))
+      let exhaustedTransitionHeadroom = pixelBufferRendererAllocatePixelBuffer(
+        from: pool,
+        width: 64,
+        height: 36,
+        additionalAllocationHeadroom: 1
+      )
+      expectNoDifference(
+        exhaustedTransitionHeadroom.status,
+        kCVReturnWouldExceedAllocationThreshold
+      )
+      #expect(exhaustedTransitionHeadroom.buffer == nil)
+
       let sentinel = try #require(UnsafeMutableRawPointer(bitPattern: 0x1))
       var failedPlane: UnsafeMutableRawPointer? = sentinel
       let failedPicture = withUnsafeMutablePointer(to: &failedPlane) {
@@ -487,7 +515,7 @@ extension Integration {
       #expect(failedPlane == sentinel)
       #expect(!vout.context.hasPendingPictureForTesting)
 
-      heldBuffers.removeLast()
+      heldBuffers.removeLast(2)
       var recoveredPlane: UnsafeMutableRawPointer? = sentinel
       let recoveredPicture = try #require(withUnsafeMutablePointer(to: &recoveredPlane) {
         pixelBufferLockCallback(opaque: vout.opaque, planes: $0)
@@ -500,6 +528,86 @@ extension Integration {
       )
       pixelBufferDisplayCallback(opaque: vout.opaque, picture: recoveredPicture)
       #expect(!vout.context.hasPendingPictureForTesting)
+    }
+
+    @Test
+    func `active PiP gets exactly one decode buffer to cross into presentation storage`() throws {
+      let renderer = PixelBufferRenderer(displayLayer: AVSampleBufferDisplayLayer())
+      let lease = CallbackLease(displayRenderer: renderer)
+      let vout = try lease.negotiate(width: 64, height: 36)
+      defer { lease.close(vout) }
+      let pool = try #require(vout.context.decodeRenderer.state.withLock { $0.pool })
+      let threshold = pixelBufferRendererPoolAllocationThreshold(width: 64, height: 36)
+
+      var heldBuffers: [CVPixelBuffer] = []
+      for _ in 0..<threshold {
+        let allocation = pixelBufferRendererAllocatePixelBuffer(
+          from: pool,
+          width: 64,
+          height: 36
+        )
+        try heldBuffers.append(#require(allocation.buffer))
+      }
+
+      var inlinePlane: UnsafeMutableRawPointer?
+      #expect(withUnsafeMutablePointer(to: &inlinePlane) {
+        pixelBufferLockCallback(opaque: vout.opaque, planes: $0)
+      } == nil)
+
+      renderer.setPresentationCopyRequired(true)
+      lease.handleContext.setPresentationCopyRequired(true)
+      var pipPlane: UnsafeMutableRawPointer?
+      let pipPicture = try #require(withUnsafeMutablePointer(to: &pipPlane) {
+        pixelBufferLockCallback(opaque: vout.opaque, planes: $0)
+      })
+      #expect(pipPlane != nil)
+
+      let exhausted = pixelBufferRendererAllocatePixelBuffer(
+        from: pool,
+        width: 64,
+        height: 36,
+        additionalAllocationHeadroom: 1
+      )
+      expectNoDifference(exhausted.status, kCVReturnWouldExceedAllocationThreshold)
+      #expect(exhausted.buffer == nil)
+
+      pixelBufferUnlockCallback(opaque: vout.opaque, picture: pipPicture, planes: nil)
+      pixelBufferDisplayCallback(opaque: vout.opaque, picture: pipPicture)
+      #expect(!vout.context.hasPendingPictureForTesting)
+      _ = heldBuffers
+    }
+
+    @Test
+    func `qualification callback counters are opt-in`() throws {
+      let renderer = PixelBufferRenderer(displayLayer: AVSampleBufferDisplayLayer())
+      let lease = CallbackLease(displayRenderer: renderer)
+      let vout = try lease.negotiate(width: 16, height: 16)
+      defer { lease.close(vout) }
+
+      func deliverOneFrame() throws {
+        var plane: UnsafeMutableRawPointer?
+        let picture = try #require(withUnsafeMutablePointer(to: &plane) {
+          pixelBufferLockCallback(opaque: vout.opaque, planes: $0)
+        })
+        pixelBufferUnlockCallback(opaque: vout.opaque, picture: picture, planes: nil)
+        pixelBufferDisplayCallback(opaque: vout.opaque, picture: picture)
+      }
+
+      try deliverOneFrame()
+      var telemetry = renderer.telemetrySnapshot
+      #expect(telemetry.vmemLockAttemptCount == 0)
+      #expect(telemetry.vmemUnlockCallbackCount == 0)
+      #expect(telemetry.vmemDisplayCallbackCount == 0)
+
+      renderer.setContentFingerprintingEnabled(true)
+        lease.handleContext.setQualificationTelemetryEnabled(true)
+      try deliverOneFrame()
+      telemetry = renderer.telemetrySnapshot
+      #expect(telemetry.vmemLockAttemptCount == 1)
+      #expect(telemetry.vmemLockSuccessCount == 1)
+      #expect(telemetry.vmemUnlockCallbackCount == 1)
+      #expect(telemetry.vmemDisplayCallbackCount == 1)
+      #expect(telemetry.vmemDisplayConsumeFailureCount == 0)
     }
 
     /// Pinned vmem owns only one `pic_opaque`. A second successful lock means

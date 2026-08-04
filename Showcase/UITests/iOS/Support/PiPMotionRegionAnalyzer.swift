@@ -111,9 +111,10 @@ struct PiPMotionRegionAnalysis: Equatable {
 /// evidence expected of a landscape system PiP window.
 ///
 /// The oracle intentionally does not use a whole-screen changed-pixel ratio:
-/// every accepted pair must support the same connected component, its center
-/// must remain stable, and the same bounded region must contain both sustained
-/// motion and non-black pixels.
+/// every accepted pair must support the same persistent component, and the
+/// same bounded region must contain both sustained motion and non-black
+/// pixels. Pair-component centers are retained as diagnostics only: motion
+/// inside a fixed video window can legitimately traverse its full width.
 struct PiPMotionRegionAnalyzer {
   struct Configuration: Equatable {
     var minimumFrames = 5
@@ -122,16 +123,21 @@ struct PiPMotionRegionAnalyzer {
     var tileSize = 3
     var activeTileChangedRatio = 0.10
     var minimumRegionAreaRatio = 0.012
-    var maximumRegionAreaRatio = 0.18
+    var maximumRegionAreaRatio = 0.30
     var minimumRegionAspectRatio = 1.45
     var maximumRegionAspectRatio = 2.05
     var minimumPersistentFillRatio = 0.30
+    var minimumClusterPersistentFillRatio = 0.08
     var minimumPairComponentSupportRatio = 0.35
     var minimumPairRegionAreaScale = 0.25
-    var maximumPairRegionAreaScale = 2.0
+    /// A pair can contain much more connected motion than the persistent
+    /// component (for example, a fast scene cut inside the fixed PiP window).
+    /// Bound that match by the screen, not by the often-small persistent
+    /// subcomponent. This still rejects a whole-screen transition while
+    /// allowing legitimate high-motion PiP content.
+    var maximumPairRegionAreaRatio = 0.35
     var minimumPairMotionRatio = 0.06
     var minimumFrameNonBlackRatio = 0.20
-    var maximumCenterDriftRatio = 0.15
     var ambiguitySizeRatio = 0.65
 
     static let physicalPiP = Self()
@@ -182,12 +188,21 @@ struct PiPMotionRegionAnalyzer {
       columns: tileColumns,
       rows: tileRows
     )
-    let evaluatedComponents = persistentComponents.map {
+    var componentsToEvaluate = persistentComponents.map { (component: $0, isCluster: false) }
+    if persistentComponents.count > 1 {
+      componentsToEvaluate.append(
+        (component: combinedComponent(persistentComponents), isCluster: true)
+      )
+    }
+    let evaluatedComponents = componentsToEvaluate.map {
       evaluate(
-        component: $0,
+        component: $0.component,
         frameWidth: width,
         frameHeight: height,
-        tileColumns: tileColumns
+        tileColumns: tileColumns,
+        minimumFillRatio: $0.isCluster
+          ? configuration.minimumClusterPersistentFillRatio
+          : configuration.minimumPersistentFillRatio
       )
     }
     let largestAreaRatio = evaluatedComponents.map(\.areaRatio).max() ?? 0
@@ -242,20 +257,12 @@ struct PiPMotionRegionAnalyzer {
         columns: tileColumns,
         rows: tileRows
       )
-      let match = components
-        .map { component in
-          let overlap = component.indices.count { persistentIndices.contains($0) }
-          return (component: component, overlap: overlap)
-        }
-        .max {
-          if $0.overlap == $1.overlap {
-            return $0.component.indices.count < $1.component.indices.count
-          }
-          return $0.overlap < $1.overlap
-        }
-      let supportRatio = match.map {
-        Double($0.overlap) / Double(max(1, candidate.component.indices.count))
-      } ?? 0
+      let matchingComponents = components.filter {
+        $0.indices.contains { persistentIndices.contains($0) }
+      }
+      let match = matchingComponents.isEmpty ? nil : combinedComponent(matchingComponents)
+      let overlap = match?.indices.count { persistentIndices.contains($0) } ?? 0
+      let supportRatio = Double(overlap) / Double(max(1, candidate.component.indices.count))
       let motionRatio = changedRatio(
         in: candidate.region,
         changedPixels: data.changedPixels,
@@ -265,16 +272,17 @@ struct PiPMotionRegionAnalyzer {
 
       if let match {
         let matchedRegion = region(
-          for: match.component,
+          for: match,
           frameWidth: width,
           frameHeight: height,
           tileColumns: tileColumns
         )
         let areaScale = Double(matchedRegion.area) / Double(candidate.region.area)
+        let matchedAreaRatio = Double(matchedRegion.area) / Double(width * height)
         guard
           supportRatio >= configuration.minimumPairComponentSupportRatio,
           areaScale >= configuration.minimumPairRegionAreaScale,
-          areaScale <= configuration.maximumPairRegionAreaScale
+          matchedAreaRatio <= configuration.maximumPairRegionAreaRatio
         else { continue }
 
         matchingPairCount += 1
@@ -301,10 +309,7 @@ struct PiPMotionRegionAnalyzer {
     }
     let requiredNonBlackFrameCount = max(2, frames.count - 1)
 
-    let failure: PiPMotionRegionAnalysis.Failure? = if
-      matchingPairCount < requiredPairCount
-      || horizontalDrift > configuration.maximumCenterDriftRatio
-      || verticalDrift > configuration.maximumCenterDriftRatio {
+    let failure: PiPMotionRegionAnalysis.Failure? = if matchingPairCount < requiredPairCount {
       .unstableRegion
     } else if sustainedMotionPairCount < requiredPairCount {
       .insufficientSustainedMotion
@@ -464,7 +469,8 @@ extension PiPMotionRegionAnalyzer {
     component: TileComponent,
     frameWidth: Int,
     frameHeight: Int,
-    tileColumns: Int
+    tileColumns: Int,
+    minimumFillRatio: Double
   ) -> EvaluatedComponent {
     let componentRegion = region(
       for: component,
@@ -481,7 +487,7 @@ extension PiPMotionRegionAnalyzer {
       && areaRatio <= configuration.maximumRegionAreaRatio
       && aspectRatio >= configuration.minimumRegionAspectRatio
       && aspectRatio <= configuration.maximumRegionAspectRatio
-      && fillRatio >= configuration.minimumPersistentFillRatio
+      && fillRatio >= minimumFillRatio
 
     return EvaluatedComponent(
       component: component,
@@ -490,6 +496,17 @@ extension PiPMotionRegionAnalyzer {
       aspectRatio: aspectRatio,
       fillRatio: fillRatio,
       isPiPSized: isPiPSized
+    )
+  }
+
+  private func combinedComponent(_ components: [TileComponent]) -> TileComponent {
+    precondition(!components.isEmpty)
+    return TileComponent(
+      indices: Array(Set(components.flatMap(\.indices))),
+      minimumColumn: components.map(\.minimumColumn).min()!,
+      maximumColumn: components.map(\.maximumColumn).max()!,
+      minimumRow: components.map(\.minimumRow).min()!,
+      maximumRow: components.map(\.maximumRow).max()!
     )
   }
 

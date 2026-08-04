@@ -54,6 +54,7 @@ struct ScrubBubble: View {
         .foregroundStyle(.white)
         .padding(.top, 2)
         .padding(.bottom, 4)
+        .accessibilityIdentifier(AccessibilityID.ThumbnailScrub.previewTimeLabel)
     }
     .padding(4)
     .background(.black.opacity(0.85), in: .rect(cornerRadius: 8))
@@ -69,12 +70,15 @@ struct ScrubBubble: View {
   @ViewBuilder
   private var preview: some View {
     if let image {
-      Image(platformImage: image).resizable()
+      Image(platformImage: image)
+        .resizable()
+        .accessibilityIdentifier(AccessibilityID.ThumbnailScrub.previewOverlayImage)
     } else {
       ZStack {
         Rectangle().fill(.gray.opacity(0.5))
         ProgressView().controlSize(.small).tint(.white)
       }
+      .accessibilityIdentifier(AccessibilityID.ThumbnailScrub.previewLoadingPlaceholder)
     }
   }
 

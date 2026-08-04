@@ -45,6 +45,26 @@ final class RelativeSeekUITests: ShowcaseIOSTestCase {
     return minutes * 60 + secs
   }
 
+  /// Native seeks settle asynchronously. Poll the observable label instead of
+  /// sampling one arbitrary second later, which can catch an intermediate
+  /// demux timestamp even though the accepted target is correct.
+  private func waitForCurrentTime(
+    near expected: Int,
+    tolerance: Int = 2,
+    timeout: TimeInterval = 5
+  ) -> Int? {
+    let deadline = Date().addingTimeInterval(timeout)
+    var latest: Int?
+    repeat {
+      latest = seconds(from: currentTimeLabel.label)
+      if let latest, abs(latest - expected) <= tolerance {
+        return latest
+      }
+      Thread.sleep(forTimeInterval: 0.1)
+    } while Date() < deadline
+    return latest
+  }
+
   // MARK: - Smoke
 
   /// Page loads, reaches playing, all four skip buttons are hittable.
@@ -84,8 +104,7 @@ final class RelativeSeekUITests: ShowcaseIOSTestCase {
     }
 
     skipForward10.tap()
-    Thread.sleep(forTimeInterval: 1)
-    guard let after10 = seconds(from: currentTimeLabel.label) else {
+    guard let after10 = waitForCurrentTime(near: before + 10) else {
       XCTFail("currentTime unparseable after +10s skip: '\(currentTimeLabel.label)'")
       return
     }
@@ -119,16 +138,14 @@ final class RelativeSeekUITests: ShowcaseIOSTestCase {
 
     // Skip forward 30 first to give us room to skip back.
     skipForward30.tap()
-    Thread.sleep(forTimeInterval: 1)
-    guard let mid = seconds(from: currentTimeLabel.label) else {
+    guard let mid = waitForCurrentTime(near: 30) else {
       XCTFail("currentTime unparseable after seeding: '\(currentTimeLabel.label)'")
       return
     }
     XCTAssertGreaterThanOrEqual(mid, 25, "Couldn't skip forward 30s — only landed at \(mid)s")
 
     skipBack10.tap()
-    Thread.sleep(forTimeInterval: 1)
-    guard let after = seconds(from: currentTimeLabel.label) else {
+    guard let after = waitForCurrentTime(near: mid - 10) else {
       XCTFail("currentTime unparseable after −10s skip: '\(currentTimeLabel.label)'")
       return
     }

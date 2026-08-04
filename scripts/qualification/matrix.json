@@ -171,6 +171,34 @@
       }
     },
     {
+      "id": "native-hls-seek-continuity",
+      "issues": [185],
+      "summary": "Native PiP remains visible, active, and controllable through forward, backward, and absolute HLS seeks",
+      "requiredEvidenceFields": [
+        "seekResults.forward",
+        "seekResults.backward",
+        "seekResults.absolute",
+        "events.unexpectedStopCount",
+        "pipMotion",
+        "inlineRecovery",
+        "measurements.maximumVideoGapMilliseconds",
+        "videoContinuityWithinBudget",
+        "controls",
+        "libraryErrorCount"
+      ],
+      "expectedEvidenceValues": {
+        "seekResults.forward": "pass",
+        "seekResults.backward": "pass",
+        "seekResults.absolute": "pass",
+        "events.unexpectedStopCount": 0,
+        "pipMotion": "pass",
+        "inlineRecovery": "pass",
+        "videoContinuityWithinBudget": true,
+        "controls": "pass",
+        "libraryErrorCount": 0
+      }
+    },
+    {
       "id": "native-lifecycle",
       "issues": [84],
       "hardware": ["iphone-current"],

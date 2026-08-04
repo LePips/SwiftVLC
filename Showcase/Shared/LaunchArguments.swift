@@ -6,6 +6,9 @@ import Foundation
 /// dash-prefixed string here is the launch-arg name and the un-prefixed
 /// version is the `UserDefaults` key.
 enum LaunchArguments {
+  static let fixtureURLEnvironment = "SWIFTVLC_APP_FIXTURE_URL"
+  static let pipLiveURLEnvironment = "SWIFTVLC_APP_PIP_LIVE_URL"
+
   /// `YES` when running under XCUITest. Gates showcase behavior that should
   /// only run in UI tests.
   static let uiTestMode = "-UITestMode"
@@ -13,20 +16,22 @@ enum LaunchArguments {
   /// Absolute path to a media file. When set, showcase media helpers resolve
   /// to this file instead of their bundled or remote sources.
   static let fixtureURL = "-UITestFixtureURL"
+  static let fixtureURLBase64 = "-UITestFixtureURLBase64"
 
   /// Absolute path where the showcase mirrors `VLCInstance.shared.logStream`
   /// as JSONL records (one entry per line).
   static let logPath = "-UITestLogPath"
 
-  /// Pipe-separated absolute paths used by Music Player UI tests to
-  /// exercise distinct local media swaps without depending on network
-  /// streams.
+  /// Pipe-separated absolute paths or URLs used by Music Player UI tests to
+  /// exercise distinct media swaps. Physical-device tests use HTTP because a
+  /// runner-bundle path on the Mac is not reachable from the device app.
   static let musicFixtureURLs = "-UITestMusicFixtureURLs"
 
   /// Indefinite MPEG-TS stream used by the physical-device PiP validation
   /// lane. This remains operator-supplied so the repository never embeds a
   /// private or short-lived stream URL.
   static let pipLiveURL = "-UITestPiPLiveURL"
+  static let pipLiveURLBase64 = "-UITestPiPLiveURLBase64"
 
   /// Selects the PiP implementation exercised by the physical-device
   /// validation surface: `native` for `PiPVideoView`, `direct` for a hosted
@@ -42,7 +47,17 @@ enum LaunchArguments {
   }
 
   static var fixtureURLValue: URL? {
-    UserDefaults.standard.string(forKey: key(fixtureURL)).map { URL(fileURLWithPath: $0) }
+    if let url = encodedEnvironmentURL(named: fixtureURLEnvironment) {
+      return url
+    }
+    if let url = encodedArgumentURL(named: fixtureURLBase64) {
+      return url
+    }
+    guard let value = UserDefaults.standard.string(forKey: key(fixtureURL)) else { return nil }
+    if let url = URL(string: value), url.scheme != nil {
+      return url
+    }
+    return URL(fileURLWithPath: value)
   }
 
   static var logPathValue: String? {
@@ -52,12 +67,20 @@ enum LaunchArguments {
   static var musicFixtureURLValues: [URL] {
     UserDefaults.standard.string(forKey: key(musicFixtureURLs))?
       .split(separator: "|")
-      .map { URL(fileURLWithPath: String($0)) }
+      .map { value in
+        let rawValue = String(value)
+        if let url = URL(string: rawValue), url.scheme != nil {
+          return url
+        }
+        return URL(fileURLWithPath: rawValue)
+      }
       ?? []
   }
 
   static var pipLiveURLValue: URL? {
-    UserDefaults.standard.string(forKey: key(pipLiveURL)).flatMap(URL.init(string:))
+    encodedEnvironmentURL(named: pipLiveURLEnvironment)
+      ?? encodedArgumentURL(named: pipLiveURLBase64)
+      ?? UserDefaults.standard.string(forKey: key(pipLiveURL)).flatMap(URL.init(string:))
   }
 
   static var pipRenderingPathValue: String? {
@@ -70,6 +93,25 @@ enum LaunchArguments {
 
   private static func key(_ argument: String) -> String {
     String(argument.dropFirst())
+  }
+
+  private static func encodedEnvironmentURL(named name: String) -> URL? {
+    ProcessInfo.processInfo.environment[name].flatMap(decodeURL)
+  }
+
+  private static func encodedArgumentURL(named name: String) -> URL? {
+    UserDefaults.standard.string(forKey: key(name)).flatMap(decodeURL)
+  }
+
+  private static func decodeURL(_ encoded: String) -> URL? {
+    guard
+      let data = Data(base64Encoded: encoded),
+      let value = String(data: data, encoding: .utf8)
+    else { return nil }
+    if let url = URL(string: value), url.scheme != nil {
+      return url
+    }
+    return URL(fileURLWithPath: value)
   }
 }
 
