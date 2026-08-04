@@ -378,6 +378,13 @@ extension Integration {
       #expect(recorder.pauseRecordsPlaybackIntent == [false])
       #expect(controller.isPlaybackSuspendedForManagedAudioLifecycle)
       #expect(!controller.hasActivatedAudioSession)
+
+      // The active intent is deliberately preserved across this library-owned
+      // pause. A copy already queued in the observer must not reactivate audio
+      // before foreground or PiP recovery authorizes it.
+      controller.handlePlaybackIntentChanged(true)
+      #expect(!controller.hasActivatedAudioSession)
+
       controller.applicationWillEnterForeground()
       await player.shutdown()
     }
@@ -513,6 +520,39 @@ extension Integration {
       #expect(recorder.resumeCount == 1)
       #expect(!controller.isPlaybackSuspendedForManagedAudioLifecycle)
       #expect(!controller.isManagedAudioResumePendingActivation)
+      await player.shutdown()
+    }
+
+    @Test
+    func `A playback signal retries an approved pending activation`() async {
+      let player = Player(instance: TestInstance.makeAudioOnly())
+      let recorder = PauseRecorder()
+      let controller = makeController(player: player, recorder: recorder)
+      player.setPlaybackIntentFromExternalControl(true)
+      controller.isPlaybackSuspendedForManagedAudioLifecycle = true
+      controller.isManagedAudioResumePendingActivation = true
+
+      controller.handlePlaybackIntentChanged(true)
+
+      #expect(controller.hasActivatedAudioSession)
+      #expect(recorder.resumeCount == 1)
+      #expect(!controller.isPlaybackSuspendedForManagedAudioLifecycle)
+      #expect(!controller.isManagedAudioResumePendingActivation)
+      await player.shutdown()
+    }
+
+    @Test
+    func `A stale active intent preserves an interruption resume denial`() async {
+      let player = Player(instance: TestInstance.makeAudioOnly())
+      let controller = makeController(player: player, recorder: PauseRecorder())
+      controller.isPlaybackSuspendedForManagedAudioLifecycle = true
+      controller.isManagedAudioResumeDeniedByInterruption = true
+
+      controller.handlePlaybackIntentChanged(true)
+
+      #expect(controller.isManagedAudioResumeDeniedByInterruption)
+      #expect(!controller.hasActivatedAudioSession)
+      #expect(controller.isPlaybackSuspendedForManagedAudioLifecycle)
       await player.shutdown()
     }
 
