@@ -213,6 +213,18 @@ enum AccessibilityID {
     static let errorLabel = "pipCapability.error"
   }
 
+  enum PiPDeferredPauseValidation {
+    static let videoView = "pipDeferredPause.videoView"
+    static let stateLabel = "pipDeferredPause.state"
+    static let intentLabel = "pipDeferredPause.intent"
+    static let possibleLabel = "pipDeferredPause.possible"
+    static let activeLabel = "pipDeferredPause.active"
+    static let resultLabel = "pipDeferredPause.result"
+    static let toggleButton = "pipDeferredPause.toggle"
+    static let runButton = "pipDeferredPause.run"
+    static let errorLabel = "pipDeferredPause.error"
+  }
+
   enum MatrixHValidation {
     static let stateLabel = "validation.matrixH.state"
     static let currentTimeLabel = "validation.matrixH.currentTime"

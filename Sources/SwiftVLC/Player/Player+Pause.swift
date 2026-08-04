@@ -258,10 +258,16 @@ extension Player {
       // Refreshing observable capabilities here could publish values from a
       // successor under the outgoing media's generation.
       #if DEBUG
-      let nativeCanPause = _nativeCanPauseOverrideForTesting
+      let probedNativeCanPause = _nativeCanPauseOverrideForTesting
         ?? libvlc_media_player_can_pause(pointer)
       #else
-      let nativeCanPause = libvlc_media_player_can_pause(pointer)
+      let probedNativeCanPause = libvlc_media_player_can_pause(pointer)
+      #endif
+      #if os(iOS) || os(macOS)
+      let nativeCanPause = consumeQualificationNativeCanPauseOverride()
+        ?? probedNativeCanPause
+      #else
+      let nativeCanPause = probedNativeCanPause
       #endif
       let nativePauseIsSafe = canIssueNativePause
       #if DEBUG
@@ -308,6 +314,9 @@ extension Player {
       publishPauseIntent()
       let issuedPlaybackControlRevision = playbackControlIntentRevision
       libvlc_media_player_set_pause(pointer, 1)
+      #if os(iOS) || os(macOS)
+      recordQualificationNativePauseCommand()
+      #endif
       #if DEBUG
       _pauseProbeHookForTesting?(.nativePause)
       #endif
