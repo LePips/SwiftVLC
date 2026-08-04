@@ -409,7 +409,8 @@ extension MacShowcase {
          .pipLiveValidation,
          .pipCapabilityValidation,
          .pipDeferredPauseValidation,
-         .pipDelayedStartFailureValidation:
+         .pipDelayedStartFailureValidation,
+         .pipVODControlsValidation:
       return nil
     }
   }
