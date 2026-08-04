@@ -517,7 +517,8 @@ extension TVShowcase {
          .pipLiveValidation,
          .pipCapabilityValidation,
          .pipDeferredPauseValidation,
-         .pipDelayedStartFailureValidation:
+         .pipDelayedStartFailureValidation,
+         .pipVODControlsValidation:
       return nil
     }
   }
