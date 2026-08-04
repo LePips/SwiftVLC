@@ -8,6 +8,10 @@ import XCTest
 final class ThumbnailScrubUITests: ShowcaseIOSTestCase {
   // Inherits `@MainActor` from `ShowcaseIOSTestCase`.
 
+  private var videoView: XCUIElement {
+    app.otherElements[AccessibilityID.ThumbnailScrub.videoView]
+  }
+
   private var playPauseButton: XCUIElement {
     app.buttons[AccessibilityID.ThumbnailScrub.playPauseButton]
   }
@@ -121,6 +125,7 @@ final class ThumbnailScrubUITests: ShowcaseIOSTestCase {
       after, before,
       "Current-time label didn't advance after scrub release (before=\(before)s, after=\(after)s)"
     )
+    assertRendersNonBlackFrame(videoView, timeout: 10)
 
     assertNoLibraryErrors()
   }

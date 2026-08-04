@@ -9,6 +9,7 @@ import mimetypes
 import os
 import re
 import socket
+import sys
 import time
 from datetime import datetime, timezone
 from http import HTTPStatus
@@ -29,6 +30,7 @@ class FixtureHandler(BaseHTTPRequestHandler):
         started = time.monotonic()
         status = HTTPStatus.OK
         self.response_status = HTTPStatus.OK
+        self.response_content_range: str | None = None
         transferred = 0
         try:
             route = unquote(urlsplit(self.path).path)
@@ -96,6 +98,8 @@ class FixtureHandler(BaseHTTPRequestHandler):
                     "method": "GET",
                     "path": self.path,
                     "status": int(status),
+                    "requestRange": self.headers.get("Range"),
+                    "responseContentRange": self.response_content_range,
                     "bytes": transferred,
                     "durationSeconds": round(time.monotonic() - started, 6),
                 }
@@ -134,8 +138,9 @@ class FixtureHandler(BaseHTTPRequestHandler):
             start, end, partial = self._range(size)
         except RangeNotSatisfiable:
             self.response_status = HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE
+            self.response_content_range = f"bytes */{size}"
             self.send_response(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
-            self.send_header("Content-Range", f"bytes */{size}")
+            self.send_header("Content-Range", self.response_content_range)
             self.send_header("Content-Length", "0")
             self.end_headers()
             return 0
@@ -147,7 +152,8 @@ class FixtureHandler(BaseHTTPRequestHandler):
         self.send_header("Accept-Ranges", "bytes")
         self.send_header("Content-Length", str(length))
         if partial:
-            self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+            self.response_content_range = f"bytes {start}-{end}/{size}"
+            self.send_header("Content-Range", self.response_content_range)
         self.end_headers()
 
         transferred = 0
@@ -215,6 +221,16 @@ class FixtureHTTPServer(ThreadingHTTPServer):
         self.chunk_size = chunk_size
         self.chunk_delay = chunk_delay
         self.verbose = verbose
+
+    def handle_error(self, request: object, client_address: tuple[str, int]) -> None:
+        # Media clients commonly abandon a keep-alive connection after a seek
+        # or EOF probe. BaseServer otherwise prints a full traceback even
+        # though the request itself completed and was recorded successfully.
+        # Preserve tracebacks for every unexpected server failure.
+        error = sys.exc_info()[1]
+        if isinstance(error, (BrokenPipeError, ConnectionResetError)):
+            return
+        super().handle_error(request, client_address)
 
     def record(self, value: dict) -> None:
         if self.request_log is None:

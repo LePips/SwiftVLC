@@ -9,14 +9,26 @@ import SwiftVLC
 /// from querying each value independently. The visual result is the same.
 struct SeekBar: View {
   let player: Player
+  @State private var scrubPosition: Double?
 
   var body: some View {
     CompatSlider(
       value: Binding(
-        get: { player.position },
-        set: { try? player.seek(to: PlaybackPosition($0)) }
+        get: { scrubPosition ?? player.position },
+        set: { position in
+          scrubPosition = position
+          try? player.seek(to: PlaybackPosition(position), fast: true)
+        }
       ),
-      range: 0...1
+      range: 0...1,
+      onEditingChanged: { isEditing in
+        if isEditing {
+          scrubPosition = player.position
+        } else if let position = scrubPosition {
+          scrubPosition = nil
+          try? player.seek(to: PlaybackPosition(position))
+        }
+      }
     )
     .accessibilityIdentifier(AccessibilityID.SeekBar.slider)
 

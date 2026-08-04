@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import contextlib
 import http.client
 import hashlib
 import importlib.util
+import io
 import json
 import plistlib
 import tempfile
@@ -68,8 +70,9 @@ class DeviceInfoTests(unittest.TestCase):
 
 
 class XCTestrunTests(unittest.TestCase):
-    def test_destination_artifact_transform_removes_local_paths(self):
-        original = {
+    @staticmethod
+    def ui_test_plan():
+        return {
             "TestConfigurations": [
                 {
                     "TestTargets": [
@@ -84,12 +87,31 @@ class XCTestrunTests(unittest.TestCase):
                 }
             ]
         }
+
+    def test_destination_artifact_transform_removes_local_paths(self):
+        original = self.ui_test_plan()
         transformed = prepare_xctestrun.transform(original, {"ATTACH": "YES"})
         target = transformed["TestConfigurations"][0]["TestTargets"][0]
         for key in prepare_xctestrun.REMOVED_PATH_KEYS:
             self.assertNotIn(key, target)
         self.assertTrue(target["UseDestinationArtifacts"])
         self.assertEqual(target["TestingEnvironmentVariables"]["ATTACH"], "YES")
+
+    def test_build_product_transform_preserves_paths_and_injects_environment(self):
+        original = self.ui_test_plan()
+        transformed = prepare_xctestrun.transform(
+            original,
+            {"FIXTURE": "http://127.0.0.1/media.mp4"},
+            use_destination_artifacts=False,
+        )
+        target = transformed["TestConfigurations"][0]["TestTargets"][0]
+        self.assertEqual(target["TestBundlePath"], "/tmp/test.xctest")
+        self.assertEqual(target["TestHostPath"], "/tmp/Runner.app")
+        self.assertNotIn("UseDestinationArtifacts", target)
+        self.assertEqual(
+            target["TestingEnvironmentVariables"]["FIXTURE"],
+            "http://127.0.0.1/media.mp4",
+        )
 
 
 class CandidateMetadataTests(unittest.TestCase):
@@ -185,6 +207,11 @@ class FixtureServerTests(unittest.TestCase):
         self.assertEqual(response.read(), (self.root / "sample.bin").read_bytes()[10:20])
         connection.close()
 
+        size = (self.root / "sample.bin").stat().st_size
+        record = json.loads(self.log.read_text().splitlines()[-1])
+        self.assertEqual(record["requestRange"], "bytes=10-19")
+        self.assertEqual(record["responseContentRange"], f"bytes 10-19/{size}")
+
     def test_out_of_bounds_range_uses_rfc_status(self):
         size = (self.root / "sample.bin").stat().st_size
         connection, response = self.request(
@@ -194,6 +221,19 @@ class FixtureServerTests(unittest.TestCase):
         self.assertEqual(response.getheader("Content-Range"), f"bytes */{size}")
         self.assertEqual(response.read(), b"")
         connection.close()
+
+        record = json.loads(self.log.read_text().splitlines()[-1])
+        self.assertEqual(record["requestRange"], f"bytes={size}-")
+        self.assertEqual(record["responseContentRange"], f"bytes */{size}")
+
+    def test_client_reset_does_not_emit_server_traceback(self):
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            try:
+                raise ConnectionResetError("fixture client closed keep-alive")
+            except ConnectionResetError:
+                self.server.handle_error(object(), ("127.0.0.1", 1234))
+        self.assertEqual(stderr.getvalue(), "")
 
     def test_stall_endpoint_delays_then_completes(self):
         started = time.monotonic()

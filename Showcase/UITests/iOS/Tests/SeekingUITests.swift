@@ -8,6 +8,10 @@ import XCTest
 final class SeekingUITests: ShowcaseIOSTestCase {
   // Inherits `@MainActor` from `ShowcaseIOSTestCase`.
 
+  private var videoView: XCUIElement {
+    app.otherElements[AccessibilityID.Seeking.videoView]
+  }
+
   private var playPauseButton: XCUIElement {
     app.buttons[AccessibilityID.Seeking.playPauseButton]
   }
@@ -102,6 +106,7 @@ final class SeekingUITests: ShowcaseIOSTestCase {
       high - low, total / 2,
       "Seeks 0.1→0.9 should span >half of duration (\(total)s); got only \(high - low)s"
     )
+    assertRendersNonBlackFrame(videoView, timeout: 10)
 
     assertNoLibraryErrors()
   }
@@ -134,6 +139,7 @@ final class SeekingUITests: ShowcaseIOSTestCase {
       playPauseButton.label, "Play",
       "Player resumed unexpectedly after seek-while-paused"
     )
+    assertRendersNonBlackFrame(videoView, timeout: 10)
 
     assertNoLibraryErrors()
   }
@@ -161,6 +167,7 @@ final class SeekingUITests: ShowcaseIOSTestCase {
 
     XCTAssertTrue(playPauseButton.exists, "App crashed during rapid seeks")
     XCTAssertTrue(playPauseButton.isHittable, "Player unresponsive after rapid seeks")
+    assertRendersNonBlackFrame(videoView, timeout: 10)
 
     assertNoLibraryErrors()
   }

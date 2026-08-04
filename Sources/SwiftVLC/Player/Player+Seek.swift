@@ -97,13 +97,23 @@ extension Player {
   /// method still throws if the player does not yet know media duration or
   /// if the current media is not seekable. For live or unknown-duration
   /// media use the non-throwing ``seek(toPosition:fast:)`` instead.
-  public func seek(to position: PlaybackPosition) throws(VLCError) {
+  ///
+  /// - Parameters:
+  ///   - position: The fractional target in the current media.
+  ///   - fast: Prefer fast (keyframe) seeking over precise seeking. Interactive
+  ///     scrubbers should use fast seeks while their value changes, then issue
+  ///     one precise seek when editing ends.
+  public func seek(
+    to position: PlaybackPosition,
+    fast: Bool = false
+  )
+    throws(VLCError) {
     guard let duration else {
       throw .invalidState("duration is not known")
     }
     let durationMs = try duration.checkedNonnegativeMilliseconds(parameter: "duration")
     let target = checkedMilliseconds(for: position, durationMs: durationMs)
-    try seek(to: .milliseconds(target))
+    try seek(to: .milliseconds(target), fast: fast)
   }
 
   /// Seeks by a relative offset from the current position.

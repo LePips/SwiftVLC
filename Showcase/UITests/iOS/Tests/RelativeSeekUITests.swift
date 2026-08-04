@@ -7,6 +7,10 @@ import XCTest
 final class RelativeSeekUITests: ShowcaseIOSTestCase {
   // Inherits `@MainActor` from `ShowcaseIOSTestCase`.
 
+  private var videoView: XCUIElement {
+    app.otherElements[AccessibilityID.RelativeSeek.videoView]
+  }
+
   private var playPauseButton: XCUIElement {
     app.buttons[AccessibilityID.RelativeSeek.playPauseButton]
   }
@@ -120,6 +124,7 @@ final class RelativeSeekUITests: ShowcaseIOSTestCase {
       delta10, 12,
       "+10s skip overshot to \(delta10)s"
     )
+    assertRendersNonBlackFrame(videoView, timeout: 10)
 
     assertNoLibraryErrors()
   }
@@ -153,6 +158,7 @@ final class RelativeSeekUITests: ShowcaseIOSTestCase {
     let delta = mid - after
     XCTAssertGreaterThanOrEqual(delta, 8, "−10s skip only rewound \(delta)s")
     XCTAssertLessThanOrEqual(delta, 12, "−10s skip overshot to \(delta)s")
+    assertRendersNonBlackFrame(videoView, timeout: 10)
 
     assertNoLibraryErrors()
   }
@@ -178,6 +184,7 @@ final class RelativeSeekUITests: ShowcaseIOSTestCase {
 
     XCTAssertTrue(playPauseButton.exists, "App died during rapid alternating skips")
     XCTAssertTrue(playPauseButton.isHittable, "Player unresponsive after rapid skips")
+    assertRendersNonBlackFrame(videoView, timeout: 10)
 
     assertNoLibraryErrors()
   }
