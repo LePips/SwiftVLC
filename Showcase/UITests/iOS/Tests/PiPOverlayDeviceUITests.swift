@@ -86,7 +86,6 @@ final class PiPOverlayDeviceUITests: ShowcaseIOSTestCase {
       overlaySupport.label.contains("composited"),
       "The linked engine does not advertise native PiP overlay composition"
     )
-
   }
 
   private func startPictureInPicture() -> XCUIElement {
