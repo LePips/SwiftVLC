@@ -45,7 +45,9 @@ Mirroring and does not ask an operator to copy observations out of the app:
 
 That default path builds the app and runner from a clean checkout, embeds the
 source commit and release-source digest in the signed app, and creates its
-candidate metadata automatically. A reused `--candidate-app` or `--skip-build`
+candidate metadata automatically. It builds a disposable `HEAD` export against
+the exact local `Vendor/libvlc.xcframework`, so remote package resolution cannot
+silently substitute an older wrapper or engine. A reused `--candidate-app` or `--skip-build`
 requires `--candidate-metadata`; metadata creation succeeds only for an app
 that was built with the `SwiftVLCSourceCommit` and
 `SwiftVLCReleaseSourceDigest` Info.plist keys. Use

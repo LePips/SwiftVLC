@@ -61,7 +61,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-for command in python3 xcodebuild xcrun jq shasum; do
+for command in git jq python3 shasum tar xcodebuild xcrun; do
   if ! command -v "$command" >/dev/null 2>&1; then
     echo "Error: required command is unavailable: $command" >&2
     exit 1
@@ -81,7 +81,9 @@ cleanup() {
   fi
   rm -rf "$WORK_DIR"
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 device_args=(--matrix "$SCRIPT_DIR/matrix.json")
 if [[ -n "$DEVICE_SELECTOR" ]]; then
@@ -137,19 +139,29 @@ PIP_LIVE_URL_BASE64=$(printf '%s' "$BASE_URL/live/live.ts" | base64)
 VOD_URL_BASE64=$(printf '%s' "$BASE_URL/files/vod.mp4" | base64)
 
 if [[ "$SKIP_BUILD" == false ]]; then
+  if [[ ! -d "$ROOT_DIR/Vendor/libvlc.xcframework" ]]; then
+    echo "Error: local Vendor/libvlc.xcframework is required to build the candidate." >&2
+    exit 1
+  fi
   BUILD_SOURCE_IDENTITY=$(python3 "$SCRIPT_DIR/candidate-metadata.py" source \
     --source-root "$ROOT_DIR" \
     --version "$VERSION")
   BUILD_SOURCE_COMMIT=$(jq -r '.sourceCommit' <<< "$BUILD_SOURCE_IDENTITY")
   BUILD_SOURCE_DIGEST=$(jq -r '.releaseSourceDigest' <<< "$BUILD_SOURCE_IDENTITY")
+  BUILD_SOURCE_ROOT="$WORK_DIR/source"
+  mkdir -p "$BUILD_SOURCE_ROOT"
+  git -C "$ROOT_DIR" archive HEAD | tar -x -C "$BUILD_SOURCE_ROOT"
+  ln -s "$ROOT_DIR/Vendor" "$BUILD_SOURCE_ROOT/Vendor"
+  "$BUILD_SOURCE_ROOT/scripts/setup-dev.sh" --skip-download \
+    > "$OUTPUT_DIR/setup-local-source.log"
   xcodebuild build-for-testing \
-    -project "$ROOT_DIR/Showcase/SwiftVLCShowcase.xcodeproj" \
+    -project "$BUILD_SOURCE_ROOT/Showcase/SwiftVLCShowcase.xcodeproj" \
     -scheme iOS \
     -configuration Release \
     -destination 'generic/platform=iOS' \
     -derivedDataPath "$DERIVED_DATA" \
-    INFOPLIST_KEY_SwiftVLCSourceCommit="$BUILD_SOURCE_COMMIT" \
-    INFOPLIST_KEY_SwiftVLCReleaseSourceDigest="$BUILD_SOURCE_DIGEST" \
+    SWIFTVLC_SOURCE_COMMIT="$BUILD_SOURCE_COMMIT" \
+    SWIFTVLC_RELEASE_SOURCE_DIGEST="$BUILD_SOURCE_DIGEST" \
     CODE_SIGNING_ALLOWED=YES \
     > "$OUTPUT_DIR/build.log"
 fi
