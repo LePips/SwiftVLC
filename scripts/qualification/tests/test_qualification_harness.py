@@ -492,6 +492,7 @@ class QualificationRecordAssemblyTests(unittest.TestCase):
                     "qualificationMatrixChecksum": self.matrix_checksum,
                     "qualificationEligibleEnvironment": release_type == "stable",
                     "mode": "qualification" if release_type == "stable" else "exploratory",
+                    "result": "pass",
                     "qualificationRows": [
                         {
                             "scenario": "seek",
@@ -553,6 +554,20 @@ class QualificationRecordAssemblyTests(unittest.TestCase):
         report = self.make_report("iphone")
         payload = json.loads(report.read_text())
         payload["releaseSourceDigest"] = "d" * 64
+        report.write_text(json.dumps(payload))
+        with self.assertRaises(assemble_record.AssemblyError):
+            assemble_record.assemble(
+                "1.1.0",
+                self.candidate,
+                self.matrix,
+                [report],
+                self.root / "qualification" / "1.1.0.json",
+            )
+
+    def test_rejects_failed_report_even_when_it_contains_passing_rows(self):
+        report = self.make_report("iphone")
+        payload = json.loads(report.read_text())
+        payload["result"] = "fail"
         report.write_text(json.dumps(payload))
         with self.assertRaises(assemble_record.AssemblyError):
             assemble_record.assemble(

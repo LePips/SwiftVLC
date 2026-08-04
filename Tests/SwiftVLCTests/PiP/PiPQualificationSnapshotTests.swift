@@ -23,7 +23,15 @@ extension Integration {
           isSeekable: false
         )
       )
-      #expect(native.nativePlaybackQualificationSnapshot == nil)
+      expectNoDifference(
+        native.nativePlaybackQualificationSnapshot,
+        NativePiPPlaybackQualificationSnapshot(
+          mediaGeneration: nativePlayer.playbackQualificationGeneration.value,
+          durationMilliseconds: 0,
+          currentTimeMilliseconds: 0,
+          isSeekable: false
+        )
+      )
 
       let directPlayer = Player(instance: TestInstance.shared)
       let direct = PiPController(player: directPlayer)

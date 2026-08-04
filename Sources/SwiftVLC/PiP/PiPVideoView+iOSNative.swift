@@ -1696,12 +1696,16 @@ final class IOSNativePiPMediaController: NSObject, IOSNativePiPMediaControlling,
   // uses to publish its successor. That closes the interval between copying a
   // raw pointer and entering libVLC without ever blocking on the main actor.
 
-  private func retainedCallbackPlayer() -> OpaquePointer? {
+  private func retainedCallbackPlaybackIdentity() -> (pointer: OpaquePointer, generation: UInt64)? {
     callbackSnapshot.withLock { snapshot in
       guard let pointer = snapshot.playerPointer else { return nil }
       _ = libvlc_media_player_retain(pointer)
-      return pointer
+      return (pointer, snapshot.playbackGeneration?.value ?? 0)
     }
+  }
+
+  private func retainedCallbackPlayer() -> OpaquePointer? {
+    retainedCallbackPlaybackIdentity()?.pointer
   }
 
   @objc(mediaPlaybackSnapshotWithLength:time:seekable:)
@@ -1710,12 +1714,32 @@ final class IOSNativePiPMediaController: NSObject, IOSNativePiPMediaControlling,
     time: UnsafeMutablePointer<Int64>,
     seekable: UnsafeMutablePointer<ObjCBool>
   ) -> Bool {
-    guard let pointer = retainedCallbackPlayer() else {
+    qualificationPlaybackSnapshot(
+      length: length,
+      time: time,
+      seekable: seekable,
+      generation: nil
+    )
+  }
+
+  /// Reads playback values and the media identity from one retained callback
+  /// snapshot. Keeping the generation in this operation prevents replacement
+  /// from pairing a successor identity with outgoing-player measurements.
+  func qualificationPlaybackSnapshot(
+    length: UnsafeMutablePointer<Int64>,
+    time: UnsafeMutablePointer<Int64>,
+    seekable: UnsafeMutablePointer<ObjCBool>,
+    generation: UnsafeMutablePointer<UInt64>?
+  ) -> Bool {
+    guard let identity = retainedCallbackPlaybackIdentity() else {
       length.pointee = 0
       time.pointee = 0
       seekable.pointee = false
+      generation?.pointee = 0
       return false
     }
+    let pointer = identity.pointer
+    generation?.pointee = identity.generation
     defer { libvlc_media_player_release(pointer) }
 
     var snapshot = swiftvlc_media_player_playback_snapshot_t()

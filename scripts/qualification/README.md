@@ -88,7 +88,10 @@ VOD-to-live-to-VOD sequence on the same player while native PiP is active. It
 records the successor generation, AVKit playback-policy snapshot, first video
 and audio output gaps, PiP motion, ordered lifecycle, and any stale successor
 event that escaped generation filtering. The two tests materialize independent
-`replacement` and `replacement-continuity` rows from the same device run.
+`replacement` and `replacement-continuity` rows from the same device run on
+`iphone-current`. Other hardware runs only the matrix-wide `replacement` test
+and row. Multi-row evidence is committed to the report only after every
+expected attachment materializes successfully.
 
 The HLS seek lane is another complete machine-readable matrix slice. It
 executes forward, backward, and absolute seeks, measures the return of decoded

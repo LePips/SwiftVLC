@@ -101,15 +101,17 @@ extension PiPController {
     var duration: Int64 = 0
     var time: Int64 = 0
     var seekable = ObjCBool(false)
+    var generation: UInt64 = 0
     guard
-      nativeBackend.mediaController.mediaPlaybackSnapshot(
+      nativeBackend.mediaController.qualificationPlaybackSnapshot(
         length: &duration,
         time: &time,
-        seekable: &seekable
+        seekable: &seekable,
+        generation: &generation
       )
     else { return nil }
     return NativePiPPlaybackQualificationSnapshot(
-      mediaGeneration: nativeBackend.mediaController.mediaPlaybackGeneration(),
+      mediaGeneration: generation,
       durationMilliseconds: duration,
       currentTimeMilliseconds: time,
       isSeekable: seekable.boolValue

@@ -338,10 +338,11 @@ run_scenario() {
       selected_xctestrun="$DESTINATION_XCTESTRUN"
       ;;
     continuity)
-      test_identifiers=(
-        "iOSUITests/PiPContinuityDeviceUITests/test_nativePiPSurvivesSamePlayerReplacement"
-        "iOSUITests/PiPContinuityDeviceUITests/test_nativePiPReplacementContinuityAcrossVODAndLive"
-      )
+      test_identifiers=("iOSUITests/PiPContinuityDeviceUITests/test_nativePiPSurvivesSamePlayerReplacement")
+      if jq -e '.selected.matchingHardwareRows | index("iphone-current") != null' \
+          "$OUTPUT_DIR/device.json" >/dev/null; then
+        test_identifiers+=("iOSUITests/PiPContinuityDeviceUITests/test_nativePiPReplacementContinuityAcrossVODAndLive")
+      fi
       route="HarnessHome"
       selected_xctestrun="$DESTINATION_XCTESTRUN"
       ;;
@@ -554,11 +555,13 @@ PY
       qualification_attachments=("qualification-background-audio.json")
       ;;
     continuity)
-      qualification_scenarios=("replacement" "replacement-continuity")
-      qualification_attachments=(
-        "qualification-replacement.json"
-        "qualification-replacement-continuity.json"
-      )
+      qualification_scenarios=("replacement")
+      qualification_attachments=("qualification-replacement.json")
+      if jq -e '.selected.matchingHardwareRows | index("iphone-current") != null' \
+          "$OUTPUT_DIR/device.json" >/dev/null; then
+        qualification_scenarios+=("replacement-continuity")
+        qualification_attachments+=("qualification-replacement-continuity.json")
+      fi
       ;;
   esac
   if [[ ${#qualification_scenarios[@]} -gt 0 ]]; then
@@ -568,6 +571,8 @@ PY
       local attachments="$OUTPUT_DIR/$scenario-attachments"
       local hardware_id evidence_file evidence_relative export_status materialize_status
       local evidence_index qualification_scenario qualification_attachment
+      local materialized_scenarios=()
+      local materialized_evidence=()
       local materialized_count=0
       set +e
       xcrun xcresulttool export attachments \
@@ -600,10 +605,17 @@ PY
             continue
           fi
           materialized_count=$((materialized_count + 1))
-          python3 - \
-              "$OUTPUT_DIR/device.json" "$QUALIFICATION_ROWS" "$evidence_relative" \
-              "$FIXTURE_MANIFEST_CHECKSUM" "$((ended - started))" \
-              "$qualification_scenario" <<'PY'
+          materialized_scenarios+=("$qualification_scenario")
+          materialized_evidence+=("$evidence_relative")
+        done
+        if [[ "$materialized_count" -eq "${#qualification_scenarios[@]}" ]]; then
+          evidence_status="captured"
+          for evidence_index in "${!materialized_scenarios[@]}"; do
+            python3 - \
+                "$OUTPUT_DIR/device.json" "$QUALIFICATION_ROWS" \
+                "${materialized_evidence[$evidence_index]}" \
+                "$FIXTURE_MANIFEST_CHECKSUM" "$((ended - started))" \
+                "${materialized_scenarios[$evidence_index]}" <<'PY'
 import json
 import sys
 
@@ -627,9 +639,7 @@ row = {
 with open(rows_path, "a") as output:
     output.write(json.dumps(row, sort_keys=True) + "\n")
 PY
-        done
-        if [[ "$materialized_count" -eq "${#qualification_scenarios[@]}" ]]; then
-          evidence_status="captured"
+          done
         fi
       fi
     fi
