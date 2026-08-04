@@ -318,6 +318,78 @@ class QualificationEvidenceTests(unittest.TestCase):
                 evidence["measurements"]["playedAudioBuffersBeforeBackground"],
             )
 
+    def test_materializes_replacement_continuity_evidence(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.make_export(
+                root,
+                {
+                    "formatVersion": 1,
+                    "scenario": "replacement-continuity",
+                    "combinations": {
+                        "vodToLive": "pass",
+                        "liveToVOD": "pass",
+                    },
+                    "snapshotCoherence": "pass",
+                    "measurements": {
+                        "audioGapMilliseconds": 325,
+                        "videoGapMilliseconds": 210,
+                    },
+                    "audioContinuityWithinBudget": True,
+                    "videoContinuityWithinBudget": True,
+                    "controls": "pass",
+                    "recoveryOutcome": "preserved",
+                    "staleSuccessorMutations": 0,
+                },
+                attachment_name="qualification-replacement-continuity.json",
+                test_identifier="PiPContinuityDeviceUITests/test_nativePiPReplacementContinuityAcrossVODAndLive",
+            )
+            evidence = materialize_evidence.materialize(
+                root,
+                "qualification-replacement-continuity.json",
+                "replacement-continuity",
+                "iphone-current",
+                "a" * 64,
+                "b" * 64,
+            )
+            self.assertEqual(evidence["combinations"]["vodToLive"], "pass")
+            self.assertEqual(evidence["combinations"]["liveToVOD"], "pass")
+            self.assertEqual(evidence["staleSuccessorMutations"], 0)
+            self.assertGreater(evidence["measurements"]["audioGapMilliseconds"], 0)
+            self.assertTrue(evidence["audioContinuityWithinBudget"])
+            self.assertTrue(evidence["videoContinuityWithinBudget"])
+
+    def test_materializes_focused_replacement_evidence(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.make_export(
+                root,
+                {
+                    "formatVersion": 1,
+                    "scenario": "replacement",
+                    "events": {
+                        "controllerReplacementCount": 1,
+                        "unattributedStopCount": 0,
+                        "order": "pass",
+                    },
+                    "controls": "pass",
+                    "recoveryOutcome": "preserved",
+                },
+                attachment_name="qualification-replacement.json",
+                test_identifier="PiPContinuityDeviceUITests/test_nativePiPSurvivesSamePlayerReplacement",
+            )
+            evidence = materialize_evidence.materialize(
+                root,
+                "qualification-replacement.json",
+                "replacement",
+                "iphone-current",
+                "a" * 64,
+                "b" * 64,
+            )
+            self.assertEqual(evidence["events"]["controllerReplacementCount"], 1)
+            self.assertEqual(evidence["events"]["unattributedStopCount"], 0)
+            self.assertEqual(evidence["recoveryOutcome"], "preserved")
+
     def test_rejects_duplicate_attachments_and_forged_identity(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

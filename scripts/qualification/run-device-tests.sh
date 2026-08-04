@@ -338,7 +338,10 @@ run_scenario() {
       selected_xctestrun="$DESTINATION_XCTESTRUN"
       ;;
     continuity)
-      test_identifiers=("iOSUITests/PiPContinuityDeviceUITests/test_nativePiPSurvivesSamePlayerReplacement")
+      test_identifiers=(
+        "iOSUITests/PiPContinuityDeviceUITests/test_nativePiPSurvivesSamePlayerReplacement"
+        "iOSUITests/PiPContinuityDeviceUITests/test_nativePiPReplacementContinuityAcrossVODAndLive"
+      )
       route="HarnessHome"
       selected_xctestrun="$DESTINATION_XCTESTRUN"
       ;;
@@ -535,28 +538,37 @@ PY
     fi
   fi
 
-  local qualification_scenario=""
-  local qualification_attachment=""
+  local qualification_scenarios=()
+  local qualification_attachments=()
   case "$scenario" in
     hls-seek)
-      qualification_scenario="native-hls-seek-continuity"
-      qualification_attachment="qualification-native-hls-seek-continuity.json"
+      qualification_scenarios=("native-hls-seek-continuity")
+      qualification_attachments=("qualification-native-hls-seek-continuity.json")
       ;;
     live-media)
-      qualification_scenario="live-media"
-      qualification_attachment="qualification-live-media.json"
+      qualification_scenarios=("live-media")
+      qualification_attachments=("qualification-live-media.json")
       ;;
     background-audio)
-      qualification_scenario="background-audio"
-      qualification_attachment="qualification-background-audio.json"
+      qualification_scenarios=("background-audio")
+      qualification_attachments=("qualification-background-audio.json")
+      ;;
+    continuity)
+      qualification_scenarios=("replacement" "replacement-continuity")
+      qualification_attachments=(
+        "qualification-replacement.json"
+        "qualification-replacement-continuity.json"
+      )
       ;;
   esac
-  if [[ -n "$qualification_scenario" ]]; then
+  if [[ ${#qualification_scenarios[@]} -gt 0 ]]; then
     evidence_status="missing"
     if [[ "$test_status" -eq 0 ]] && [[ "$error_count" -eq 0 ]] \
       && [[ "$log_status" == "captured" ]] && [[ -d "$result_bundle" ]]; then
       local attachments="$OUTPUT_DIR/$scenario-attachments"
       local hardware_id evidence_file evidence_relative export_status materialize_status
+      local evidence_index qualification_scenario qualification_attachment
+      local materialized_count=0
       set +e
       xcrun xcresulttool export attachments \
         --path "$result_bundle" \
@@ -567,26 +579,31 @@ PY
       hardware_id=$(jq -r '.selected.matchingHardwareRows | if length == 1 then .[0] else "" end' \
         "$OUTPUT_DIR/device.json")
       if [[ "$export_status" -eq 0 ]] && [[ -n "$hardware_id" ]]; then
-        evidence_relative="evidence/$qualification_scenario-$hardware_id.json"
-        evidence_file="$OUTPUT_DIR/$evidence_relative"
-        set +e
-        python3 "$SCRIPT_DIR/materialize-evidence.py" \
-          --attachments "$attachments" \
-          --attachment-name "$qualification_attachment" \
-          --scenario "$qualification_scenario" \
-          --hardware "$hardware_id" \
-          --artifact-digest "$ARTIFACT_DIGEST" \
-          --source-digest "$SOURCE_DIGEST" \
-          --output "$evidence_file" \
-          > "$OUTPUT_DIR/$scenario-materialize-evidence.log" 2>&1
-        materialize_status=$?
-        set -e
-        if [[ "$materialize_status" -eq 0 ]]; then
-          evidence_status="captured"
+        for evidence_index in "${!qualification_scenarios[@]}"; do
+          qualification_scenario="${qualification_scenarios[$evidence_index]}"
+          qualification_attachment="${qualification_attachments[$evidence_index]}"
+          evidence_relative="evidence/$qualification_scenario-$hardware_id.json"
+          evidence_file="$OUTPUT_DIR/$evidence_relative"
+          set +e
+          python3 "$SCRIPT_DIR/materialize-evidence.py" \
+            --attachments "$attachments" \
+            --attachment-name "$qualification_attachment" \
+            --scenario "$qualification_scenario" \
+            --hardware "$hardware_id" \
+            --artifact-digest "$ARTIFACT_DIGEST" \
+            --source-digest "$SOURCE_DIGEST" \
+            --output "$evidence_file" \
+            > "$OUTPUT_DIR/$scenario-$qualification_scenario-materialize-evidence.log" 2>&1
+          materialize_status=$?
+          set -e
+          if [[ "$materialize_status" -ne 0 ]]; then
+            continue
+          fi
+          materialized_count=$((materialized_count + 1))
           python3 - \
-            "$OUTPUT_DIR/device.json" "$QUALIFICATION_ROWS" "$evidence_relative" \
-            "$FIXTURE_MANIFEST_CHECKSUM" "$((ended - started))" \
-            "$qualification_scenario" <<'PY'
+              "$OUTPUT_DIR/device.json" "$QUALIFICATION_ROWS" "$evidence_relative" \
+              "$FIXTURE_MANIFEST_CHECKSUM" "$((ended - started))" \
+              "$qualification_scenario" <<'PY'
 import json
 import sys
 
@@ -610,6 +627,9 @@ row = {
 with open(rows_path, "a") as output:
     output.write(json.dumps(row, sort_keys=True) + "\n")
 PY
+        done
+        if [[ "$materialized_count" -eq "${#qualification_scenarios[@]}" ]]; then
+          evidence_status="captured"
         fi
       fi
     fi

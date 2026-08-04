@@ -167,12 +167,18 @@
         "snapshotCoherence",
         "measurements.audioGapMilliseconds",
         "measurements.videoGapMilliseconds",
+        "audioContinuityWithinBudget",
+        "videoContinuityWithinBudget",
         "controls",
         "recoveryOutcome",
         "staleSuccessorMutations"
       ],
       "expectedEvidenceValues": {
+        "combinations.vodToLive": "pass",
+        "combinations.liveToVOD": "pass",
         "snapshotCoherence": "pass",
+        "audioContinuityWithinBudget": true,
+        "videoContinuityWithinBudget": true,
         "staleSuccessorMutations": 0
       },
       "allowedEvidenceValues": {

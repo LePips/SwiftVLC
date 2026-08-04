@@ -83,6 +83,13 @@ and native PiP is active. A row is emitted only when played audio buffers
 increased during that interval, PiP remained active with ordered lifecycle
 events, and the app and host logs contain no library error records.
 
+The continuity lane performs one focused VOD-to-live replacement and a second
+VOD-to-live-to-VOD sequence on the same player while native PiP is active. It
+records the successor generation, AVKit playback-policy snapshot, first video
+and audio output gaps, PiP motion, ordered lifecycle, and any stale successor
+event that escaped generation filtering. The two tests materialize independent
+`replacement` and `replacement-continuity` rows from the same device run.
+
 The HLS seek lane is another complete machine-readable matrix slice. It
 executes forward, backward, and absolute seeks, measures the return of decoded
 video, checks ordered PiP continuity, samples real system-PiP motion after each

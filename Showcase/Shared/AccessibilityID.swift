@@ -181,6 +181,18 @@ enum AccessibilityID {
   enum PiPContinuityValidation {
     static let loadVODButton = "pipContinuity.loadVOD"
     static let loadLiveTSButton = "pipContinuity.loadLiveTS"
+    static let stateLabel = "pipContinuity.state"
+    static let generationLabel = "pipContinuity.generation"
+    static let displayedPicturesLabel = "pipContinuity.displayedPictures"
+    static let playedAudioBuffersLabel = "pipContinuity.playedAudioBuffers"
+    static let possibleLabel = "pipContinuity.possible"
+    static let activeLabel = "pipContinuity.active"
+    static let playbackSnapshotLabel = "pipContinuity.playbackSnapshot"
+    static let nativePlaybackSnapshotLabel = "pipContinuity.nativePlaybackSnapshot"
+    static let continuityEventsLabel = "pipContinuity.continuityEvents"
+    static let lifecycleEventsLabel = "pipContinuity.lifecycleEvents"
+    static let replacementMeasurementLabel = "pipContinuity.replacementMeasurement"
+    static let staleSuccessorMutationsLabel = "pipContinuity.staleSuccessorMutations"
   }
 
   enum MatrixHValidation {

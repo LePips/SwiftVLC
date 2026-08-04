@@ -23,6 +23,7 @@ extension Integration {
           isSeekable: false
         )
       )
+      #expect(native.nativePlaybackQualificationSnapshot == nil)
 
       let directPlayer = Player(instance: TestInstance.shared)
       let direct = PiPController(player: directPlayer)
@@ -38,6 +39,7 @@ extension Integration {
           isSeekable: true
         )
       )
+      #expect(direct.nativePlaybackQualificationSnapshot == nil)
     }
   }
 }
