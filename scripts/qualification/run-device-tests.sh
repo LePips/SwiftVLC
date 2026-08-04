@@ -34,6 +34,7 @@ Options:
   --only SCENARIO         Repeat to select: analyzer, ui-suite, native-live,
                           direct-live, live-media, background-audio,
                           continuity, capability-convergence,
+                          vod-controls,
                           deferred-pause-rejection,
                           accepted-start-delayed-failure, hls-seek,
                           harness-regressions, ui-failures, thumbnail-preview
@@ -227,6 +228,7 @@ python3 "$SCRIPT_DIR/prepare-xctestrun.py" "$XCTESTRUN" "$DESTINATION_XCTESTRUN"
   --environment SWIFTVLC_PIP_LIVE_URL_BASE64="$PIP_LIVE_URL_BASE64" \
   --environment SWIFTVLC_PIP_CONTINUITY_DEVICE=YES \
   --environment SWIFTVLC_PIP_CAPABILITY_DEVICE=YES \
+  --environment SWIFTVLC_PIP_VOD_CONTROLS_DEVICE=YES \
   --environment SWIFTVLC_PIP_DEFERRED_PAUSE_DEVICE=YES \
   --environment SWIFTVLC_PIP_DELAYED_START_FAILURE_DEVICE=YES \
   --environment SWIFTVLC_PIP_OVERLAY_DEVICE=YES \
@@ -280,7 +282,7 @@ xcrun devicectl device copy to \
   --destination Documents/streams.local.json \
   > "$OUTPUT_DIR/stage-streams.log"
 
-DEFAULT_SCENARIOS=(analyzer ui-suite harness-regressions live-media background-audio continuity capability-convergence deferred-pause-rejection accepted-start-delayed-failure hls-seek)
+DEFAULT_SCENARIOS=(analyzer ui-suite harness-regressions live-media background-audio continuity capability-convergence vod-controls deferred-pause-rejection accepted-start-delayed-failure hls-seek)
 SCENARIOS_WERE_EXPLICIT=false
 if [[ ${#ONLY_SCENARIOS[@]} -eq 0 ]]; then
   ONLY_SCENARIOS=("${DEFAULT_SCENARIOS[@]}")
@@ -289,7 +291,7 @@ else
 fi
 for scenario in "${ONLY_SCENARIOS[@]}"; do
   case "$scenario" in
-    analyzer|ui-suite|native-live|direct-live|live-media|background-audio|continuity|capability-convergence|deferred-pause-rejection|accepted-start-delayed-failure|hls-seek|harness-regressions|ui-failures|thumbnail-preview) ;;
+    analyzer|ui-suite|native-live|direct-live|live-media|background-audio|continuity|capability-convergence|vod-controls|deferred-pause-rejection|accepted-start-delayed-failure|hls-seek|harness-regressions|ui-failures|thumbnail-preview) ;;
     *) echo "Error: unknown scenario: $scenario" >&2; exit 2 ;;
   esac
 done
@@ -388,6 +390,13 @@ run_scenario() {
       route="PiPCapabilityValidation"
       selected_xctestrun="$DESTINATION_XCTESTRUN"
       ;;
+    vod-controls)
+      test_identifiers=(
+        "iOSUITests/PiPVODControlsDeviceUITests/test_vodControlsAcrossNativeAndDirectBackends"
+      )
+      route="PiPVODControlsValidation"
+      selected_xctestrun="$DESTINATION_XCTESTRUN"
+      ;;
     deferred-pause-rejection)
       test_identifiers=(
         "iOSUITests/PiPDeferredPauseDeviceUITests/test_deferredPauseRejectionAndCancellationStayTruthful"
@@ -442,6 +451,7 @@ run_scenario() {
       --environment SWIFTVLC_PIP_LIVE_URL_BASE64="$PIP_LIVE_URL_BASE64" \
       --environment SWIFTVLC_PIP_CONTINUITY_DEVICE=YES \
       --environment SWIFTVLC_PIP_CAPABILITY_DEVICE=YES \
+      --environment SWIFTVLC_PIP_VOD_CONTROLS_DEVICE=YES \
       --environment SWIFTVLC_PIP_DEFERRED_PAUSE_DEVICE=YES \
       --environment SWIFTVLC_PIP_DELAYED_START_FAILURE_DEVICE=YES \
       --environment SWIFTVLC_PIP_OVERLAY_DEVICE=YES \
@@ -469,6 +479,7 @@ run_scenario() {
       -skip-testing:iOSUITests/PiPLiveDeviceUITests
       -skip-testing:iOSUITests/PiPContinuityDeviceUITests
       -skip-testing:iOSUITests/PiPCapabilityDeviceUITests
+      -skip-testing:iOSUITests/PiPVODControlsDeviceUITests
       -skip-testing:iOSUITests/PiPDeferredPauseDeviceUITests
       -skip-testing:iOSUITests/PiPDelayedStartFailureDeviceUITests
       -skip-testing:iOSUITests/PiPOverlayDeviceUITests
@@ -628,6 +639,10 @@ PY
     capability-convergence)
       qualification_scenarios=("capability-convergence")
       qualification_attachments=("qualification-capability-convergence.json")
+      ;;
+    vod-controls)
+      qualification_scenarios=("vod-controls")
+      qualification_attachments=("qualification-vod-controls.json")
       ;;
     deferred-pause-rejection)
       qualification_scenarios=("deferred-pause-rejection")

@@ -440,6 +440,45 @@ class QualificationEvidenceTests(unittest.TestCase):
             self.assertEqual(evidence["duplicatePauseCount"], 0)
             self.assertTrue(evidence["truthfulControls"])
 
+    def test_materializes_vod_controls_evidence(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.make_export(
+                root,
+                {
+                    "formatVersion": 1,
+                    "scenario": "vod-controls",
+                    "events": {
+                        "started": True,
+                        "unexpectedStopCount": 0,
+                        "order": "pass",
+                    },
+                    "controls": {
+                        "play": "pass",
+                        "pause": "pass",
+                        "scrub": "pass",
+                        "skipForward": "pass",
+                        "skipBackward": "pass",
+                    },
+                    "backendResults": {"native": {}, "direct": {}},
+                    "systemPiPMotion": {"native": "pass", "direct": "pass"},
+                },
+                attachment_name="qualification-vod-controls.json",
+                test_identifier="PiPVODControlsDeviceUITests/test_vodControlsAcrossNativeAndDirectBackends",
+            )
+            evidence = materialize_evidence.materialize(
+                root,
+                "qualification-vod-controls.json",
+                "vod-controls",
+                "ipad-minimum",
+                "a" * 64,
+                "b" * 64,
+            )
+            self.assertEqual(evidence["hardware"], "ipad-minimum")
+            self.assertEqual(evidence["events"]["unexpectedStopCount"], 0)
+            self.assertEqual(evidence["controls"]["scrub"], "pass")
+            self.assertEqual(evidence["systemPiPMotion"]["native"], "pass")
+
     def test_materializes_accepted_start_delayed_failure_evidence(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
