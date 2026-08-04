@@ -77,6 +77,12 @@ system-PiP motion while backgrounded, foreground recovery, continued decoded
 pictures, and zero library errors. It emits one combined `live-media` row so a
 passing backend cannot hide a failure in the other.
 
+The background-audio lane samples libVLC's native audio-output counter twice
+inside a timed interval while the application state is actually backgrounded
+and native PiP is active. A row is emitted only when played audio buffers
+increased during that interval, PiP remained active with ordered lifecycle
+events, and the app and host logs contain no library error records.
+
 The HLS seek lane is another complete machine-readable matrix slice. It
 executes forward, backward, and absolute seeks, measures the return of decoded
 video, checks ordered PiP continuity, samples real system-PiP motion after each
