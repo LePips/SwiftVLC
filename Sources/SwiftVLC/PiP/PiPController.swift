@@ -994,10 +994,21 @@ public final class PiPController: NSObject {
     }
   }
 
-  private func handlePlaybackIntentChanged(_ active: Bool) {
+  func handlePlaybackIntentChanged(_ active: Bool) {
     if active {
-      isManagedAudioResumeDeniedByInterruption = false
-      activateAudioSessionIfNeeded()
+      // Lifecycle and media-services suspension preserve active playback
+      // intent on purpose. A queued copy of that intent is therefore not a
+      // recovery signal and must not retake audio focus after the suspension
+      // path released it. Foregrounding, PiP activation, or media-services
+      // reset owns the corresponding reactivation and resume. The one
+      // exception is an activation that those recovery paths already approved
+      // but could not complete transiently; a later signal must retry it.
+      if
+        isManagedAudioResumePendingActivation
+        || (!isPlaybackSuspendedForManagedAudioLifecycle
+          && !isPlaybackSuspendedForMediaServices) {
+        activateAudioSessionIfNeeded()
+      }
     }
     if let pendingPiPPlaybackState, pendingPiPPlaybackState != active {
       self.pendingPiPPlaybackState = active
