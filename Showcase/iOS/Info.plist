@@ -25,5 +25,7 @@
 	<string>$(SWIFTVLC_SOURCE_COMMIT)</string>
 	<key>SwiftVLCReleaseSourceDigest</key>
 	<string>$(SWIFTVLC_RELEASE_SOURCE_DIGEST)</string>
+	<key>SwiftVLCArtifactDigest</key>
+	<string>$(SWIFTVLC_ARTIFACT_DIGEST)</string>
 </dict>
 </plist>

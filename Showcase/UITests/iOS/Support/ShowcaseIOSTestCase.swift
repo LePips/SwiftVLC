@@ -143,6 +143,41 @@ class ShowcaseIOSTestCase: XCTestCase {
     }
   }
 
+  /// Adds a machine-readable payload that the physical-device runner turns
+  /// into candidate-bound qualification evidence. Identity fields are added
+  /// by the host after exporting the xcresult attachment; a test process must
+  /// never guess which source tree or signed app bundle launched it.
+  func attachQualificationEvidence(
+    _ payload: [String: Any],
+    scenario: String,
+    file: StaticString = #filePath,
+    line: UInt = #line
+  ) {
+    guard JSONSerialization.isValidJSONObject(payload) else {
+      XCTFail("Qualification evidence is not valid JSON", file: file, line: line)
+      return
+    }
+    do {
+      let data = try JSONSerialization.data(
+        withJSONObject: payload,
+        options: [.prettyPrinted, .sortedKeys]
+      )
+      let attachment = XCTAttachment(
+        data: data,
+        uniformTypeIdentifier: "public.json"
+      )
+      attachment.name = "qualification-\(scenario).json"
+      attachment.lifetime = .keepAlways
+      add(attachment)
+    } catch {
+      XCTFail(
+        "Could not encode qualification evidence: \(error)",
+        file: file,
+        line: line
+      )
+    }
+  }
+
   // MARK: - Wait helpers
 
   /// Spins until `element.label == expected`, or fails after `timeout`.

@@ -48,18 +48,93 @@ final class PiPOverlayDeviceUITests: ShowcaseIOSTestCase {
     }
 
     openMatrixH()
-    let stopPiP = startPictureInPicture()
+    _ = startPictureInPicture()
 
-    for title in ["Seek +10 seconds", "Seek −10 seconds", "Reload same media"] {
-      let transition = app.buttons[title]
+    let active = app.descendants(matching: .any)[AccessibilityID.MatrixHValidation.activeLabel]
+    let state = app.descendants(matching: .any)[AccessibilityID.MatrixHValidation.stateLabel]
+    let displayedPictures = app.descendants(matching: .any)[
+      AccessibilityID.MatrixHValidation.displayedPicturesLabel
+    ]
+    let unexpectedStops = app.descendants(matching: .any)[
+      AccessibilityID.MatrixHValidation.unexpectedStopCountLabel
+    ]
+    waitForLabel(active, equals: "yes", timeout: 10)
+    waitForLabel(state, equals: "playing", timeout: 20)
+    var displayed = waitForIntegerLabel(displayedPictures, greaterThan: 0, timeout: 10)
+    var maximumVideoGapMilliseconds = 0
+
+    let transitions = [
+      (
+        "forward",
+        AccessibilityID.MatrixHValidation.seekForwardButton,
+        AccessibilityID.MatrixHValidation.forwardResultLabel
+      ),
+      (
+        "backward",
+        AccessibilityID.MatrixHValidation.seekBackwardButton,
+        AccessibilityID.MatrixHValidation.backwardResultLabel
+      ),
+      (
+        "absolute",
+        AccessibilityID.MatrixHValidation.seekAbsoluteButton,
+        AccessibilityID.MatrixHValidation.absoluteResultLabel
+      )
+    ]
+    for (name, identifier, resultIdentifier) in transitions {
+      let transition = app.buttons[identifier]
       reveal(transition, swiping: .up)
       XCTAssertTrue(transition.isHittable)
+      let started = ContinuousClock.now
       transition.tap()
-      RunLoop.current.run(until: Date().addingTimeInterval(1))
-      XCTAssertTrue(stopPiP.exists, "Native PiP stopped after \(title)")
+      let seekResult = app.descendants(matching: .any)[resultIdentifier]
+      waitForLabel(seekResult, equals: "accepted", timeout: 3)
+      displayed = waitForIntegerLabel(
+        displayedPictures,
+        greaterThan: displayed,
+        timeout: 5
+      )
+      let elapsed = started.duration(to: .now)
+      let gapMilliseconds = Int(elapsed / .milliseconds(1))
+      maximumVideoGapMilliseconds = max(maximumVideoGapMilliseconds, gapMilliseconds)
+      waitForLabel(active, equals: "yes", timeout: 5)
+
+      XCUIDevice.shared.press(.home)
+      if let failure = captureSystemPictureInPictureMotion() {
+        XCTFail("\(name) seek PiP motion failed: \(failure)")
+      }
+      app.activate()
+      waitForLabel(state, equals: "playing", timeout: 10)
+      waitForLabel(active, equals: "yes", timeout: 10)
     }
 
+    XCTAssertEqual(Int(unexpectedStops.label), 0, "Native PiP stopped during a seek")
+    XCTAssertLessThanOrEqual(
+      maximumVideoGapMilliseconds,
+      5000,
+      "Video did not resume within the 5-second continuity budget"
+    )
     assertNoLibraryErrors()
+    attachQualificationEvidence(
+      [
+        "formatVersion": 1,
+        "scenario": "native-hls-seek-continuity",
+        "seekResults": [
+          "forward": "pass",
+          "backward": "pass",
+          "absolute": "pass"
+        ],
+        "events": ["unexpectedStopCount": 0],
+        "pipMotion": "pass",
+        "inlineRecovery": "pass",
+        "measurements": [
+          "maximumVideoGapMilliseconds": maximumVideoGapMilliseconds
+        ],
+        "videoContinuityWithinBudget": maximumVideoGapMilliseconds <= 5000,
+        "controls": "pass",
+        "libraryErrorCount": 0
+      ],
+      scenario: "native-hls-seek-continuity"
+    )
     #endif
   }
 

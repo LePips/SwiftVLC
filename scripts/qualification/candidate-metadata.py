@@ -32,13 +32,20 @@ def command_output(arguments: list[str]) -> str:
         raise CandidateMetadataError(detail) from error
 
 
-def validate(metadata: dict, version: str, app_digest: str) -> dict:
+def validate(
+    metadata: dict,
+    version: str,
+    app_digest: str,
+    artifact_digest: str,
+) -> dict:
     required = {
         "formatVersion": 1,
         "version": version,
         "releaseSourceDigestAlgorithm": "swiftvlc-git-tree-v1",
         "candidateAppDigestAlgorithm": "swiftvlc-tree-v1",
         "candidateAppDigest": app_digest,
+        "artifactDigestAlgorithm": "swiftvlc-tree-v1",
+        "artifactDigest": artifact_digest,
     }
     for key, expected in required.items():
         if metadata.get(key) != expected:
@@ -70,13 +77,22 @@ def source_identity(source_root: Path, version: str) -> dict:
     }
 
 
-def create(app: Path, version: str, digest_script: Path) -> dict:
+def create(app: Path, xcframework: Path, version: str, digest_script: Path) -> dict:
     try:
         with (app / "Info.plist").open("rb") as source:
             info = plistlib.load(source)
     except (OSError, plistlib.InvalidFileException) as error:
         raise CandidateMetadataError(f"cannot read candidate Info.plist: {error}") from error
     app_digest = command_output(["python3", str(digest_script), str(app)])
+    artifact_digest = command_output(
+        ["python3", str(digest_script), str(xcframework)]
+    )
+    embedded_artifact_digest = info.get("SwiftVLCArtifactDigest")
+    if embedded_artifact_digest != artifact_digest:
+        raise CandidateMetadataError(
+            "candidate embedded artifact digest mismatch: "
+            f"{embedded_artifact_digest!r} != {artifact_digest!r}"
+        )
     metadata = {
         "formatVersion": 1,
         "version": version,
@@ -85,8 +101,33 @@ def create(app: Path, version: str, digest_script: Path) -> dict:
         "releaseSourceDigest": info.get("SwiftVLCReleaseSourceDigest"),
         "candidateAppDigestAlgorithm": "swiftvlc-tree-v1",
         "candidateAppDigest": app_digest,
+        "artifactDigestAlgorithm": "swiftvlc-tree-v1",
+        "artifactDigest": embedded_artifact_digest,
     }
-    return validate(metadata, version, app_digest)
+    return validate(metadata, version, app_digest, artifact_digest)
+
+
+def verify(
+    metadata: dict,
+    app: Path,
+    xcframework: Path,
+    version: str,
+    digest_script: Path,
+) -> dict:
+    embedded = create(app, xcframework, version, digest_script)
+    validated = validate(
+        metadata,
+        version,
+        embedded["candidateAppDigest"],
+        embedded["artifactDigest"],
+    )
+    for field in ("sourceCommit", "releaseSourceDigest"):
+        if validated.get(field) != embedded[field]:
+            raise CandidateMetadataError(
+                f"candidate metadata {field} does not match the signed app: "
+                f"{validated.get(field)!r} != {embedded[field]!r}"
+            )
+    return validated
 
 
 def main() -> None:
@@ -95,6 +136,7 @@ def main() -> None:
 
     create_parser = subparsers.add_parser("create")
     create_parser.add_argument("--candidate-app", type=Path, required=True)
+    create_parser.add_argument("--xcframework", type=Path, required=True)
     create_parser.add_argument("--version", required=True)
     create_parser.add_argument("--digest-script", type=Path, required=True)
     create_parser.add_argument("--output", type=Path, required=True)
@@ -105,6 +147,7 @@ def main() -> None:
 
     verify_parser = subparsers.add_parser("verify")
     verify_parser.add_argument("--candidate-app", type=Path, required=True)
+    verify_parser.add_argument("--xcframework", type=Path, required=True)
     verify_parser.add_argument("--metadata", type=Path, required=True)
     verify_parser.add_argument("--version", required=True)
     verify_parser.add_argument("--digest-script", type=Path, required=True)
@@ -112,16 +155,24 @@ def main() -> None:
     args = parser.parse_args()
     try:
         if args.command == "create":
-            metadata = create(args.candidate_app, args.version, args.digest_script)
+            metadata = create(
+                args.candidate_app,
+                args.xcframework,
+                args.version,
+                args.digest_script,
+            )
             args.output.parent.mkdir(parents=True, exist_ok=True)
             args.output.write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n")
         elif args.command == "source":
             metadata = source_identity(args.source_root.resolve(), args.version)
         else:
-            app_digest = command_output(
-                ["python3", str(args.digest_script), str(args.candidate_app)]
+            metadata = verify(
+                json.loads(args.metadata.read_text()),
+                args.candidate_app,
+                args.xcframework,
+                args.version,
+                args.digest_script,
             )
-            metadata = validate(json.loads(args.metadata.read_text()), args.version, app_digest)
     except (CandidateMetadataError, OSError, json.JSONDecodeError) as error:
         parser.error(str(error))
     print(json.dumps(metadata, sort_keys=True))

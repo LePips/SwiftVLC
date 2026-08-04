@@ -178,6 +178,20 @@ enum AccessibilityID {
     static let loadLiveTSButton = "pipContinuity.loadLiveTS"
   }
 
+  enum MatrixHValidation {
+    static let stateLabel = "validation.matrixH.state"
+    static let currentTimeLabel = "validation.matrixH.currentTime"
+    static let displayedPicturesLabel = "validation.matrixH.displayedPictures"
+    static let activeLabel = "validation.matrixH.active"
+    static let unexpectedStopCountLabel = "validation.matrixH.unexpectedStops"
+    static let forwardResultLabel = "validation.matrixH.forwardResult"
+    static let backwardResultLabel = "validation.matrixH.backwardResult"
+    static let absoluteResultLabel = "validation.matrixH.absoluteResult"
+    static let seekBackwardButton = "validation.matrixH.seekBackward"
+    static let seekForwardButton = "validation.matrixH.seekForward"
+    static let seekAbsoluteButton = "validation.matrixH.seekAbsolute"
+  }
+
   enum AudioOutputs {
     static let videoView = "audioout.videoView"
     static let playPauseButton = "audioout.playPause"

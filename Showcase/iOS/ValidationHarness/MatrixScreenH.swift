@@ -21,6 +21,10 @@ struct MatrixScreenH: View {
   @State private var pip: PiPController?
   @State private var log: [LogLine] = []
   @State private var marqueeVisible = false
+  @State private var unexpectedStopCount = 0
+  @State private var forwardSeekAccepted: Bool?
+  @State private var backwardSeekAccepted: Bool?
+  @State private var absoluteSeekAccepted: Bool?
 
   private struct LogLine: Identifiable {
     let id = UUID()
@@ -43,6 +47,7 @@ struct MatrixScreenH: View {
         if let pip {
           LabeledContent("Possible", value: pip.isPossible ? "yes" : "no")
           LabeledContent("Active", value: pip.isActive ? "yes" : "no")
+            .accessibilityIdentifier(AccessibilityID.MatrixHValidation.activeLabel)
           LabeledContent("Overlay support", value: String(describing: pip.overlaySupport))
             .accessibilityIdentifier("validation.matrixH.overlaySupport")
           Button(
@@ -57,17 +62,47 @@ struct MatrixScreenH: View {
         }
       }
 
+      Section("Measured state") {
+        LabeledContent("Playback", value: String(describing: player.state))
+          .accessibilityIdentifier(AccessibilityID.MatrixHValidation.stateLabel)
+        LabeledContent("Current time", value: player.currentTime.formatted)
+          .accessibilityIdentifier(AccessibilityID.MatrixHValidation.currentTimeLabel)
+        LabeledContent(
+          "Displayed pictures",
+          value: String(player.statistics?.displayedPictures ?? 0)
+        )
+        .accessibilityIdentifier(AccessibilityID.MatrixHValidation.displayedPicturesLabel)
+        LabeledContent("Unexpected PiP stops", value: String(unexpectedStopCount))
+          .accessibilityIdentifier(AccessibilityID.MatrixHValidation.unexpectedStopCountLabel)
+        LabeledContent("Forward seek", value: resultDescription(forwardSeekAccepted))
+          .accessibilityIdentifier(AccessibilityID.MatrixHValidation.forwardResultLabel)
+        LabeledContent("Backward seek", value: resultDescription(backwardSeekAccepted))
+          .accessibilityIdentifier(AccessibilityID.MatrixHValidation.backwardResultLabel)
+        LabeledContent("Absolute seek", value: resultDescription(absoluteSeekAccepted))
+          .accessibilityIdentifier(AccessibilityID.MatrixHValidation.absoluteResultLabel)
+      }
+
       subtitleTrackSection
 
       Section("Transitions") {
         Button("Seek −10 seconds") {
           let accepted = player.jump(by: .seconds(-10))
+          backwardSeekAccepted = accepted
           append("jump(-10s) → \(accepted)")
         }
+        .accessibilityIdentifier(AccessibilityID.MatrixHValidation.seekBackwardButton)
         Button("Seek +10 seconds") {
           let accepted = player.jump(by: .seconds(10))
+          forwardSeekAccepted = accepted
           append("jump(+10s) → \(accepted)")
         }
+        .accessibilityIdentifier(AccessibilityID.MatrixHValidation.seekForwardButton)
+        Button("Seek to 50%") {
+          let accepted = player.seek(toPosition: 0.5)
+          absoluteSeekAccepted = accepted
+          append("seek(50%) → \(accepted)")
+        }
+        .accessibilityIdentifier(AccessibilityID.MatrixHValidation.seekAbsoluteButton)
         Button("Reload same media") {
           activate()
           append("reload() requested")
@@ -96,6 +131,14 @@ struct MatrixScreenH: View {
     .task {
       activate()
       await observeEvents()
+    }
+    .task(id: pip == nil) {
+      guard let pip else { return }
+      for await event in pip.pipEvents {
+        if case .didStop = event {
+          unexpectedStopCount += 1
+        }
+      }
     }
     .onChange(of: marqueeVisible) { _, visible in
       if visible {
@@ -200,6 +243,14 @@ struct MatrixScreenH: View {
     log.insert(LogLine(text: "\(timestamp)  \(text)"), at: 0)
     if log.count > 200 {
       log.removeLast()
+    }
+  }
+
+  private func resultDescription(_ accepted: Bool?) -> String {
+    switch accepted {
+    case true: "accepted"
+    case false: "rejected"
+    case nil: "pending"
     }
   }
 }
