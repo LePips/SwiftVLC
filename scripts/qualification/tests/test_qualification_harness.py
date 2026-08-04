@@ -275,6 +275,49 @@ class QualificationEvidenceTests(unittest.TestCase):
                 evidence["backendResults"], {"native": "pass", "direct": "pass"}
             )
 
+    def test_materializes_background_audio_counter_evidence(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.make_export(
+                root,
+                {
+                    "formatVersion": 1,
+                    "scenario": "background-audio",
+                    "events": {
+                        "started": True,
+                        "unexpectedStopCount": 0,
+                        "order": "pass",
+                    },
+                    "audioContinuity": "pass",
+                    "backgroundApplicationState": True,
+                    "measurementMethod": "libvlc-played-audio-buffers",
+                    "measurements": {
+                        "playedAudioBuffersBeforeBackground": 100,
+                        "playedAudioBuffersAfterBackground": 180,
+                    },
+                },
+                attachment_name="qualification-background-audio.json",
+                test_identifier="PiPLiveDeviceUITests/test_backgroundAudioQualificationWhileAppIsBackgrounded",
+            )
+            evidence = materialize_evidence.materialize(
+                root,
+                "qualification-background-audio.json",
+                "background-audio",
+                "iphone-minimum",
+                "a" * 64,
+                "b" * 64,
+            )
+            self.assertEqual(evidence["scenario"], "background-audio")
+            self.assertEqual(evidence["hardware"], "iphone-minimum")
+            self.assertTrue(evidence["backgroundApplicationState"])
+            self.assertEqual(
+                evidence["measurementMethod"], "libvlc-played-audio-buffers"
+            )
+            self.assertGreater(
+                evidence["measurements"]["playedAudioBuffersAfterBackground"],
+                evidence["measurements"]["playedAudioBuffersBeforeBackground"],
+            )
+
     def test_rejects_duplicate_attachments_and_forged_identity(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

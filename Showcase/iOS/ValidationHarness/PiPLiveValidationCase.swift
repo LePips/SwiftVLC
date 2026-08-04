@@ -13,6 +13,8 @@ struct PiPLiveValidationCase: View {
   @State private var capturedRendererDiagnostics = "not-captured"
   @State private var diagnosticCaptureOrdinal: UInt64 = 0
   @State private var lifecycleEvents: [String] = []
+  @State private var backgroundAudioObservation = "none"
+  @State private var backgroundAudioProbe: Task<Void, Never>?
 
   private var renderingPath: PiPValidationRenderingPath {
     PiPValidationRenderingPath(
@@ -51,6 +53,16 @@ struct PiPLiveValidationCase: View {
           "Displayed pictures",
           value: String(player.statistics?.displayedPictures ?? 0),
           identifier: AccessibilityID.PiPLiveValidation.displayedPicturesLabel
+        )
+        valueRow(
+          "Played audio buffers",
+          value: String(player.statistics?.playedAudioBuffers ?? 0),
+          identifier: AccessibilityID.PiPLiveValidation.playedAudioBuffersLabel
+        )
+        valueRow(
+          "Background audio probe",
+          value: backgroundAudioObservation,
+          identifier: AccessibilityID.PiPLiveValidation.backgroundAudioObservationLabel
         )
         valueRow(
           "PiP possible",
@@ -128,10 +140,19 @@ struct PiPLiveValidationCase: View {
       captureRendererDiagnostics()
     }
     .onChange(of: scenePhase) { _, newPhase in
-      guard newPhase == .active else { return }
-      captureRendererDiagnostics()
+      switch newPhase {
+      case .background:
+        startBackgroundAudioProbe()
+      case .active:
+        captureRendererDiagnostics()
+      default:
+        break
+      }
     }
-    .onDisappear { player.stop() }
+    .onDisappear {
+      backgroundAudioProbe?.cancel()
+      player.stop()
+    }
   }
 
   @ViewBuilder
@@ -206,6 +227,18 @@ struct PiPLiveValidationCase: View {
       "requiresFlush=\(snapshot.displayLayerRequiresFlush)",
       "layerError=\(snapshot.displayLayerError ?? "nil")"
     ].joined(separator: ";")
+  }
+
+  private func startBackgroundAudioProbe() {
+    backgroundAudioProbe?.cancel()
+    let before = player.statistics?.playedAudioBuffers ?? 0
+    backgroundAudioObservation = "sampling:\(before)"
+    backgroundAudioProbe = Task { @MainActor in
+      try? await Task.sleep(for: .seconds(3))
+      guard !Task.isCancelled, UIApplication.shared.applicationState == .background else { return }
+      let after = player.statistics?.playedAudioBuffers ?? 0
+      backgroundAudioObservation = "\(before):\(after)"
+    }
   }
 
   private func lifecycleName(_ event: PiPEvent) -> String {

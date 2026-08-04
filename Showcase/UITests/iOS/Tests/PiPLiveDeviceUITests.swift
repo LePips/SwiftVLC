@@ -47,10 +47,48 @@ final class PiPLiveDeviceUITests: ShowcaseIOSTestCase {
     #endif
   }
 
+  func test_backgroundAudioQualificationWhileAppIsBackgrounded() throws {
+    #if targetEnvironment(simulator)
+    throw XCTSkip("Background audio qualification requires a physical iOS device")
+    #else
+    let evidence = try runLivePictureInPicture(renderingPath: "native")
+    XCTAssertGreaterThan(
+      evidence.playedAudioBuffersAfterBackground,
+      evidence.playedAudioBuffersBeforeBackground
+    )
+    attachQualificationEvidence(
+      [
+        "formatVersion": 1,
+        "scenario": "background-audio",
+        "events": [
+          "started": true,
+          "unexpectedStopCount": evidence.unexpectedStopCount,
+          "order": "pass"
+        ],
+        "audioContinuity": "pass",
+        "backgroundApplicationState": true,
+        "measurementMethod": "libvlc-played-audio-buffers",
+        "measurements": [
+          "playedAudioBuffersBeforeBackground": evidence.playedAudioBuffersBeforeBackground,
+          "playedAudioBuffersAfterBackground": evidence.playedAudioBuffersAfterBackground
+        ]
+      ],
+      scenario: "background-audio"
+    )
+    #endif
+  }
+
   private struct LiveRunEvidence {
     let playbackRange: String
     let linearPlayback: Bool
     let unexpectedStopCount: Int
+    let playedAudioBuffersBeforeBackground: Int
+    let playedAudioBuffersAfterBackground: Int
+  }
+
+  private struct BackgroundAudioObservation {
+    let before: Int
+    let after: Int
   }
 
   private func runLivePictureInPicture(renderingPath: String) throws -> LiveRunEvidence {
@@ -92,6 +130,12 @@ final class PiPLiveDeviceUITests: ShowcaseIOSTestCase {
     let displayedPictures = app.descendants(matching: .any)[
       AccessibilityID.PiPLiveValidation.displayedPicturesLabel
     ]
+    let playedAudioBuffers = app.descendants(matching: .any)[
+      AccessibilityID.PiPLiveValidation.playedAudioBuffersLabel
+    ]
+    let backgroundAudioObservation = app.descendants(matching: .any)[
+      AccessibilityID.PiPLiveValidation.backgroundAudioObservationLabel
+    ]
     let possible = app.descendants(matching: .any)[AccessibilityID.PiPLiveValidation.possibleLabel]
     let active = app.descendants(matching: .any)[AccessibilityID.PiPLiveValidation.activeLabel]
     let linearPlayback = app.descendants(matching: .any)[
@@ -118,6 +162,7 @@ final class PiPLiveDeviceUITests: ShowcaseIOSTestCase {
       greaterThan: 0,
       timeout: 10
     )
+    _ = waitForIntegerLabel(playedAudioBuffers, greaterThan: 0, timeout: 10)
     assertRendersNonBlackFrame(video, timeout: 10)
     if renderingPath == "direct" {
       attachDirectRendererDiagnostics(
@@ -190,6 +235,15 @@ final class PiPLiveDeviceUITests: ShowcaseIOSTestCase {
       greaterThan: displayedBeforePiP,
       timeout: 10
     )
+    let audioObservation = waitForBackgroundAudioObservation(
+      backgroundAudioObservation,
+      timeout: 10
+    )
+    XCTAssertGreaterThan(
+      audioObservation.after,
+      audioObservation.before,
+      "Native audio output did not play buffers during the background interval"
+    )
     if renderingPath == "direct" {
       attachDirectRendererDiagnostics(
         video,
@@ -220,7 +274,9 @@ final class PiPLiveDeviceUITests: ShowcaseIOSTestCase {
     return LiveRunEvidence(
       playbackRange: playbackRange.label,
       linearPlayback: linearPlayback.label == "yes",
-      unexpectedStopCount: unexpectedStops.count
+      unexpectedStopCount: unexpectedStops.count,
+      playedAudioBuffersBeforeBackground: audioObservation.before,
+      playedAudioBuffersAfterBackground: audioObservation.after
     )
     #endif
   }
@@ -236,6 +292,32 @@ final class PiPLiveDeviceUITests: ShowcaseIOSTestCase {
     }
     let expectation = expectation(for: predicate, evaluatedWith: NSObject())
     XCTAssertEqual(XCTWaiter.wait(for: [expectation], timeout: timeout), .completed)
+  }
+
+  private func waitForBackgroundAudioObservation(
+    _ element: XCUIElement,
+    timeout: TimeInterval
+  ) -> BackgroundAudioObservation {
+    let predicate = NSPredicate { _, _ in
+      self.parseBackgroundAudioObservation(element.label).map { $0.after > $0.before } == true
+    }
+    let expectation = expectation(for: predicate, evaluatedWith: NSObject())
+    XCTAssertEqual(XCTWaiter.wait(for: [expectation], timeout: timeout), .completed)
+    guard let observation = parseBackgroundAudioObservation(element.label) else {
+      XCTFail("Background audio probe did not publish two counters: \(element.label)")
+      return BackgroundAudioObservation(before: Int.max, after: Int.min)
+    }
+    return observation
+  }
+
+  private func parseBackgroundAudioObservation(_ value: String) -> BackgroundAudioObservation? {
+    let components = value.split(separator: ":")
+    guard
+      components.count == 2,
+      let before = Int(components[0]),
+      let after = Int(components[1])
+    else { return nil }
+    return BackgroundAudioObservation(before: before, after: after)
   }
 
   private func reveal(_ element: XCUIElement) {

@@ -32,7 +32,8 @@ Options:
   --fixtures PATH         Generated fixture directory
   --output PATH           Evidence output root
   --only SCENARIO         Repeat to select: analyzer, ui-suite, native-live,
-                          direct-live, live-media, continuity, hls-seek,
+                          direct-live, live-media, background-audio,
+                          continuity, hls-seek,
                           harness-regressions, ui-failures, thumbnail-preview
   --require-stable        Refuse beta/unknown OS or a non-matching matrix row
   --skip-build            Reuse an existing signed runner in derived data
@@ -274,13 +275,13 @@ xcrun devicectl device copy to \
   --destination Documents/streams.local.json \
   > "$OUTPUT_DIR/stage-streams.log"
 
-DEFAULT_SCENARIOS=(analyzer ui-suite harness-regressions live-media continuity hls-seek)
+DEFAULT_SCENARIOS=(analyzer ui-suite harness-regressions live-media background-audio continuity hls-seek)
 if [[ ${#ONLY_SCENARIOS[@]} -eq 0 ]]; then
   ONLY_SCENARIOS=("${DEFAULT_SCENARIOS[@]}")
 fi
 for scenario in "${ONLY_SCENARIOS[@]}"; do
   case "$scenario" in
-    analyzer|ui-suite|native-live|direct-live|live-media|continuity|hls-seek|harness-regressions|ui-failures|thumbnail-preview) ;;
+    analyzer|ui-suite|native-live|direct-live|live-media|background-audio|continuity|hls-seek|harness-regressions|ui-failures|thumbnail-preview) ;;
     *) echo "Error: unknown scenario: $scenario" >&2; exit 2 ;;
   esac
 done
@@ -327,6 +328,13 @@ run_scenario() {
       test_identifiers=("iOSUITests/PiPLiveDeviceUITests/test_liveMediaQualificationAcrossNativeAndDirectBackends")
       route="PiPLiveValidation"
       pip_url="$BASE_URL/live/live.ts"
+      selected_xctestrun="$DESTINATION_XCTESTRUN"
+      ;;
+    background-audio)
+      test_identifiers=("iOSUITests/PiPLiveDeviceUITests/test_backgroundAudioQualificationWhileAppIsBackgrounded")
+      route="PiPLiveValidation"
+      pip_url="$BASE_URL/live/live.ts"
+      rendering_path="native"
       selected_xctestrun="$DESTINATION_XCTESTRUN"
       ;;
     continuity)
@@ -537,6 +545,10 @@ PY
     live-media)
       qualification_scenario="live-media"
       qualification_attachment="qualification-live-media.json"
+      ;;
+    background-audio)
+      qualification_scenario="background-audio"
+      qualification_attachment="qualification-background-audio.json"
       ;;
   esac
   if [[ -n "$qualification_scenario" ]]; then

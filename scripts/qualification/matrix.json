@@ -105,12 +105,21 @@
       "id": "background-audio",
       "issues": [87, 88],
       "summary": "Audio continues with the app backgrounded",
-      "requiredEvidenceFields": ["events", "audioContinuity"],
+      "requiredEvidenceFields": [
+        "events",
+        "audioContinuity",
+        "backgroundApplicationState",
+        "measurementMethod",
+        "measurements.playedAudioBuffersBeforeBackground",
+        "measurements.playedAudioBuffersAfterBackground"
+      ],
       "expectedEvidenceValues": {
         "events.started": true,
         "events.unexpectedStopCount": 0,
         "events.order": "pass",
-        "audioContinuity": "pass"
+        "audioContinuity": "pass",
+        "backgroundApplicationState": true,
+        "measurementMethod": "libvlc-played-audio-buffers"
       }
     },
     {
