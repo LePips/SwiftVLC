@@ -34,7 +34,8 @@ Options:
   --only SCENARIO         Repeat to select: analyzer, ui-suite, native-live,
                           direct-live, live-media, background-audio,
                           continuity, capability-convergence,
-                          deferred-pause-rejection, hls-seek,
+                          deferred-pause-rejection,
+                          accepted-start-delayed-failure, hls-seek,
                           harness-regressions, ui-failures, thumbnail-preview
   --require-stable        Refuse beta/unknown OS or a non-matching matrix row
   --skip-build            Reuse an existing signed runner in derived data
@@ -227,6 +228,7 @@ python3 "$SCRIPT_DIR/prepare-xctestrun.py" "$XCTESTRUN" "$DESTINATION_XCTESTRUN"
   --environment SWIFTVLC_PIP_CONTINUITY_DEVICE=YES \
   --environment SWIFTVLC_PIP_CAPABILITY_DEVICE=YES \
   --environment SWIFTVLC_PIP_DEFERRED_PAUSE_DEVICE=YES \
+  --environment SWIFTVLC_PIP_DELAYED_START_FAILURE_DEVICE=YES \
   --environment SWIFTVLC_PIP_OVERLAY_DEVICE=YES \
   --environment SWIFTVLC_PIP_SEEK_DEVICE=YES
 cp "$DESTINATION_XCTESTRUN" "$OUTPUT_DIR/destination.xctestrun"
@@ -278,7 +280,7 @@ xcrun devicectl device copy to \
   --destination Documents/streams.local.json \
   > "$OUTPUT_DIR/stage-streams.log"
 
-DEFAULT_SCENARIOS=(analyzer ui-suite harness-regressions live-media background-audio continuity capability-convergence deferred-pause-rejection hls-seek)
+DEFAULT_SCENARIOS=(analyzer ui-suite harness-regressions live-media background-audio continuity capability-convergence deferred-pause-rejection accepted-start-delayed-failure hls-seek)
 SCENARIOS_WERE_EXPLICIT=false
 if [[ ${#ONLY_SCENARIOS[@]} -eq 0 ]]; then
   ONLY_SCENARIOS=("${DEFAULT_SCENARIOS[@]}")
@@ -287,7 +289,7 @@ else
 fi
 for scenario in "${ONLY_SCENARIOS[@]}"; do
   case "$scenario" in
-    analyzer|ui-suite|native-live|direct-live|live-media|background-audio|continuity|capability-convergence|deferred-pause-rejection|hls-seek|harness-regressions|ui-failures|thumbnail-preview) ;;
+    analyzer|ui-suite|native-live|direct-live|live-media|background-audio|continuity|capability-convergence|deferred-pause-rejection|accepted-start-delayed-failure|hls-seek|harness-regressions|ui-failures|thumbnail-preview) ;;
     *) echo "Error: unknown scenario: $scenario" >&2; exit 2 ;;
   esac
 done
@@ -302,7 +304,7 @@ device_matches_hardware_row() {
 if ! device_matches_hardware_row "iphone-current"; then
   if [[ "$SCENARIOS_WERE_EXPLICIT" == true ]]; then
     for scenario in "${ONLY_SCENARIOS[@]}"; do
-      if [[ "$scenario" == "capability-convergence" || "$scenario" == "deferred-pause-rejection" ]]; then
+      if [[ "$scenario" == "capability-convergence" || "$scenario" == "deferred-pause-rejection" || "$scenario" == "accepted-start-delayed-failure" ]]; then
         echo "Error: $scenario requires the iphone-current hardware row." >&2
         exit 2
       fi
@@ -310,7 +312,7 @@ if ! device_matches_hardware_row "iphone-current"; then
   else
     FILTERED_SCENARIOS=()
     for scenario in "${ONLY_SCENARIOS[@]}"; do
-      if [[ "$scenario" != "capability-convergence" && "$scenario" != "deferred-pause-rejection" ]]; then
+      if [[ "$scenario" != "capability-convergence" && "$scenario" != "deferred-pause-rejection" && "$scenario" != "accepted-start-delayed-failure" ]]; then
         FILTERED_SCENARIOS+=("$scenario")
       fi
     done
@@ -393,6 +395,13 @@ run_scenario() {
       route="PiPDeferredPauseValidation"
       selected_xctestrun="$DESTINATION_XCTESTRUN"
       ;;
+    accepted-start-delayed-failure)
+      test_identifiers=(
+        "iOSUITests/PiPDelayedStartFailureDeviceUITests/test_acceptedStartRetainsAttributionThroughDelayedFailure"
+      )
+      route="PiPDelayedStartFailureValidation"
+      selected_xctestrun="$DESTINATION_XCTESTRUN"
+      ;;
     hls-seek)
       test_identifiers=("iOSUITests/PiPOverlayDeviceUITests/test_nativePiPHLSSeekAndReloadRemainActive")
       route="HarnessHome"
@@ -434,6 +443,7 @@ run_scenario() {
       --environment SWIFTVLC_PIP_CONTINUITY_DEVICE=YES \
       --environment SWIFTVLC_PIP_CAPABILITY_DEVICE=YES \
       --environment SWIFTVLC_PIP_DEFERRED_PAUSE_DEVICE=YES \
+      --environment SWIFTVLC_PIP_DELAYED_START_FAILURE_DEVICE=YES \
       --environment SWIFTVLC_PIP_OVERLAY_DEVICE=YES \
       --environment SWIFTVLC_PIP_SEEK_DEVICE=YES \
       --environment SWIFTVLC_DEVICE_LOG_PREFIX="$run_id-$scenario"
@@ -460,6 +470,7 @@ run_scenario() {
       -skip-testing:iOSUITests/PiPContinuityDeviceUITests
       -skip-testing:iOSUITests/PiPCapabilityDeviceUITests
       -skip-testing:iOSUITests/PiPDeferredPauseDeviceUITests
+      -skip-testing:iOSUITests/PiPDelayedStartFailureDeviceUITests
       -skip-testing:iOSUITests/PiPOverlayDeviceUITests
     )
   fi
@@ -621,6 +632,10 @@ PY
     deferred-pause-rejection)
       qualification_scenarios=("deferred-pause-rejection")
       qualification_attachments=("qualification-deferred-pause-rejection.json")
+      ;;
+    accepted-start-delayed-failure)
+      qualification_scenarios=("accepted-start-delayed-failure")
+      qualification_attachments=("qualification-accepted-start-delayed-failure.json")
       ;;
   esac
   if [[ ${#qualification_scenarios[@]} -gt 0 ]]; then

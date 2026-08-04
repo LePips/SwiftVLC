@@ -440,6 +440,43 @@ class QualificationEvidenceTests(unittest.TestCase):
             self.assertEqual(evidence["duplicatePauseCount"], 0)
             self.assertTrue(evidence["truthfulControls"])
 
+    def test_materializes_accepted_start_delayed_failure_evidence(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.make_export(
+                root,
+                {
+                    "formatVersion": 1,
+                    "scenario": "accepted-start-delayed-failure",
+                    "startResult": "accepted",
+                    "orderedEvents": ["willStart", "failedToStart"],
+                    "controllerGeneration": 3,
+                    "mediaGeneration": 7,
+                    "expectedControllerGeneration": 3,
+                    "expectedMediaGeneration": 7,
+                    "orderedAttribution": True,
+                    "quiescenceMilliseconds": 3000,
+                    "controllerActiveAfterCleanup": False,
+                    "failureDomain": "SwiftVLC.Qualification.DelayedPiPStartFailure",
+                    "failureCode": 1,
+                },
+                attachment_name="qualification-accepted-start-delayed-failure.json",
+                test_identifier="PiPDelayedStartFailureDeviceUITests/test_acceptedStartRetainsAttributionThroughDelayedFailure",
+            )
+            evidence = materialize_evidence.materialize(
+                root,
+                "qualification-accepted-start-delayed-failure.json",
+                "accepted-start-delayed-failure",
+                "iphone-current",
+                "a" * 64,
+                "b" * 64,
+            )
+            self.assertEqual(evidence["startResult"], "accepted")
+            self.assertEqual(evidence["orderedEvents"][-1], "failedToStart")
+            self.assertEqual(evidence["controllerGeneration"], 3)
+            self.assertEqual(evidence["mediaGeneration"], 7)
+            self.assertTrue(evidence["orderedAttribution"])
+
     def test_materializes_focused_replacement_evidence(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
