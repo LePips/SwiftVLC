@@ -49,8 +49,10 @@ final class PiPDelayedStartFailureDeviceUITests: ShowcaseIOSTestCase {
       evidence["expectedMediaGeneration"] as? Int
     )
     let events = try XCTUnwrap(evidence["orderedEvents"] as? [String])
-    XCTAssertEqual(events.last, "failedToStart")
+    XCTAssertTrue(events.contains("failedToStart"))
     XCTAssertFalse(events.contains("didStart"))
+    XCTAssertEqual(evidence["quiescenceMilliseconds"] as? Int, 3000)
+    XCTAssertEqual(evidence["controllerActiveAfterCleanup"] as? Bool, false)
     XCTAssertEqual(
       evidence["failureDomain"] as? String,
       "SwiftVLC.Qualification.DelayedPiPStartFailure"

@@ -93,18 +93,37 @@ struct PiPDelayedStartFailureValidationCase: View {
     do {
       let expectedControllerGeneration = controller.qualificationControllerGeneration
       let expectedMediaGeneration = player.playbackQualificationGeneration
+      let recorder = FailureRecorder()
       let stream = controller.pipEventEnvelopes
       let collector = Task {
-        try await collectFailure(from: stream, timeout: .seconds(5))
+        for await envelope in stream {
+          await recorder.record(envelope)
+        }
       }
+      defer { collector.cancel() }
       let startResult = controller.performAcceptedStartDelayedFailureQualification()
       guard startResult == .accepted else {
-        collector.cancel()
         throw ValidationFailure("Start returned \(startResult.name)")
       }
-      let collection = try await collector.value
-      let orderedAttribution = collection.events.last == "failedToStart"
+      try await waitForFailure(in: recorder, timeout: .seconds(5))
+      // Keep the stream live after the injected callback. A real AVKit start
+      // from the still-accepted request must invalidate this evidence rather
+      // than arriving after the collector has already declared a pass.
+      try await Task.sleep(for: .seconds(3))
+      controller.stop()
+      try await Task.sleep(for: .seconds(1))
+      guard let collection = await recorder.snapshot() else {
+        throw ValidationFailure("Failure disappeared before evidence capture")
+      }
+      let failureIndex = collection.events.firstIndex(of: "failedToStart")
+      let laterStartSignal = failureIndex.map { index in
+        collection.events[collection.events.index(after: index)...].contains {
+          $0 == "willStart" || $0 == "didStart" || $0 == "failedToStart"
+        }
+      } ?? true
+      let orderedAttribution = !laterStartSignal
         && !collection.events.contains("didStart")
+        && controller.isActive == false
         && collection.failure.controllerGeneration == expectedControllerGeneration
         && collection.failure.mediaGeneration == expectedMediaGeneration
       let evidence = QualificationEvidence(
@@ -115,6 +134,8 @@ struct PiPDelayedStartFailureValidationCase: View {
         expectedControllerGeneration: expectedControllerGeneration,
         expectedMediaGeneration: expectedMediaGeneration.qualificationValue,
         orderedAttribution: orderedAttribution,
+        quiescenceMilliseconds: 3000,
+        controllerActiveAfterCleanup: controller.isActive,
         failureDomain: collection.failureDomain,
         failureCode: collection.failureCode
       )
@@ -131,38 +152,19 @@ struct PiPDelayedStartFailureValidationCase: View {
     }
   }
 
-  private func collectFailure(
-    from stream: AsyncStream<PiPEventEnvelope>,
+  private func waitForFailure(
+    in recorder: FailureRecorder,
     timeout: Duration
   )
-    async throws -> FailureCollection {
-    try await withThrowingTaskGroup(of: FailureCollection.self) { group in
-      group.addTask {
-        var events: [String] = []
-        for await envelope in stream {
-          let eventName = envelope.event.name
-          events.append(eventName)
-          if case .failedToStart(let error) = envelope.event {
-            let failure = error as NSError
-            return FailureCollection(
-              events: events,
-              failure: envelope,
-              failureDomain: failure.domain,
-              failureCode: failure.code
-            )
-          }
-        }
-        throw ValidationFailure("Lifecycle stream ended before start failure")
-      }
-      group.addTask {
-        try await Task.sleep(for: timeout)
+    async throws {
+    let clock = ContinuousClock()
+    let deadline = clock.now.advanced(by: timeout)
+    while await recorder.hasFailure == false {
+      try Task.checkCancellation()
+      guard clock.now < deadline else {
         throw ValidationFailure("Delayed start failure timed out")
       }
-      defer { group.cancelAll() }
-      guard let first = try await group.next() else {
-        throw ValidationFailure("No lifecycle result")
-      }
-      return first
+      try await Task.sleep(for: .milliseconds(50))
     }
   }
 
@@ -184,6 +186,37 @@ private struct FailureCollection: Sendable {
   let failureCode: Int
 }
 
+private actor FailureRecorder {
+  private var events: [String] = []
+  private var failure: PiPEventEnvelope?
+  private var failureDomain: String?
+  private var failureCode: Int?
+
+  var hasFailure: Bool {
+    failure != nil
+  }
+
+  func record(_ envelope: PiPEventEnvelope) {
+    events.append(envelope.event.name)
+    if case .failedToStart(let error) = envelope.event, failure == nil {
+      let value = error as NSError
+      failure = envelope
+      failureDomain = value.domain
+      failureCode = value.code
+    }
+  }
+
+  func snapshot() -> FailureCollection? {
+    guard let failure, let failureDomain, let failureCode else { return nil }
+    return FailureCollection(
+      events: events,
+      failure: failure,
+      failureDomain: failureDomain,
+      failureCode: failureCode
+    )
+  }
+}
+
 private struct QualificationEvidence: Encodable {
   let formatVersion = 1
   let scenario = "accepted-start-delayed-failure"
@@ -194,6 +227,8 @@ private struct QualificationEvidence: Encodable {
   let expectedControllerGeneration: UInt64
   let expectedMediaGeneration: UInt64
   let orderedAttribution: Bool
+  let quiescenceMilliseconds: Int
+  let controllerActiveAfterCleanup: Bool
   let failureDomain: String
   let failureCode: Int
 }

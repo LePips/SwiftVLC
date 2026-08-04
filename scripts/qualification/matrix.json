@@ -442,11 +442,13 @@
       "id": "accepted-start-delayed-failure",
       "issues": [104],
       "hardware": ["iphone-current"],
-      "summary": "An accepted native start followed by delayed AVKit failure retains ordered controller/media attribution",
-      "requiredEvidenceFields": ["startResult", "orderedEvents", "controllerGeneration", "mediaGeneration"],
+      "summary": "An accepted direct AVKit start followed by delayed failure retains ordered controller/media attribution",
+      "requiredEvidenceFields": ["startResult", "orderedEvents", "controllerGeneration", "mediaGeneration", "quiescenceMilliseconds", "controllerActiveAfterCleanup"],
       "expectedEvidenceValues": {
         "startResult": "accepted",
-        "orderedAttribution": true
+        "orderedAttribution": true,
+        "quiescenceMilliseconds": 3000,
+        "controllerActiveAfterCleanup": false
       }
     }
   ],

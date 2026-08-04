@@ -185,8 +185,13 @@ extension PiPController {
   public func performAcceptedStartDelayedFailureQualification() -> PiPStartResult {
     guard nativeBackend == nil else { return .backendUnavailable }
     let result = start()
-    guard result == .accepted, let avController = pipController else { return result }
-    pictureInPictureController(
+    guard
+      result == .accepted,
+      let avController = pipController,
+      let delegate = avController.delegate,
+      (delegate as AnyObject) === self
+    else { return result }
+    delegate.pictureInPictureController?(
       avController,
       failedToStartPictureInPictureWithError: NSError(
         domain: "SwiftVLC.Qualification.DelayedPiPStartFailure",

@@ -455,6 +455,8 @@ class QualificationEvidenceTests(unittest.TestCase):
                     "expectedControllerGeneration": 3,
                     "expectedMediaGeneration": 7,
                     "orderedAttribution": True,
+                    "quiescenceMilliseconds": 3000,
+                    "controllerActiveAfterCleanup": False,
                     "failureDomain": "SwiftVLC.Qualification.DelayedPiPStartFailure",
                     "failureCode": 1,
                 },
