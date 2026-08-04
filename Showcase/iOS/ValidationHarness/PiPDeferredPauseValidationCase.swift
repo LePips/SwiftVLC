@@ -303,6 +303,8 @@ private struct CancellationEvidence {
 }
 
 private struct QualificationEvidence: Codable {
+  let formatVersion = 1
+  let scenario = "deferred-pause-rejection"
   let permanentCase: PauseCaseEvidence
   let transientCase: PauseCaseEvidence
   let cancellationCases: String
