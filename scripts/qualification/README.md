@@ -187,6 +187,28 @@ the current identities itself and rejects stale source, a weakened or expanded
 matrix, a record from another candidate, or evidence captured against another
 wrapper revision.
 
+Candidate-bound rows from separate device runs can be accumulated without
+hand-editing JSON. Pass every retained `report.json` to the assembler, along
+with the candidate metadata used by the device runner:
+
+```bash
+python3 scripts/qualification/assemble-record.py \
+  --version 1.1.0 \
+  --candidate-metadata /absolute/path/to/candidate-metadata.json \
+  --matrix scripts/qualification/matrix.json \
+  --report /absolute/path/to/iphone-results/report.json \
+  --report /absolute/path/to/ipad-results/report.json \
+  --output scripts/qualification/1.1.0.json
+```
+
+The assembler rejects exploratory or beta-OS reports, identity mismatches,
+unknown or duplicate rows, failures, unsafe evidence paths, and evidence from a
+different artifact, source, scenario, or hardware row. It copies accepted
+attachments under `evidence/<version>/` and writes the record atomically. A
+partial record is allowed so multiple devices can be accumulated over time;
+only `check-qualification.sh` is the final gate, and it continues to reject the
+record until all required rows and scenario-specific evidence pass.
+
 ## Checking before release
 
 ```bash
