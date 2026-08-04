@@ -31,6 +31,7 @@ fixture_server = load_script("fixture-server.py")
 prepare_xctestrun = load_script("prepare-xctestrun.py")
 verify_fixtures = load_script("verify-fixtures.py")
 candidate_metadata = load_script("candidate-metadata.py")
+materialize_evidence = load_script("materialize-evidence.py")
 
 
 class DeviceInfoTests(unittest.TestCase):
@@ -125,33 +126,48 @@ class CandidateMetadataTests(unittest.TestCase):
             "releaseSourceDigest": "c" * 64,
             "candidateAppDigestAlgorithm": "swiftvlc-tree-v1",
             "candidateAppDigest": app_digest,
+            "artifactDigestAlgorithm": "swiftvlc-tree-v1",
+            "artifactDigest": "d" * 64,
         }
         self.assertEqual(
-            candidate_metadata.validate(metadata, "1.1.0", app_digest), metadata
+            candidate_metadata.validate(metadata, "1.1.0", app_digest, "d" * 64),
+            metadata,
         )
         with self.assertRaises(candidate_metadata.CandidateMetadataError):
-            candidate_metadata.validate(metadata, "1.1.0", "d" * 64)
+            candidate_metadata.validate(metadata, "1.1.0", "e" * 64, "d" * 64)
 
     def test_metadata_reads_source_identity_from_the_signed_app_payload(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             app = root / "iOS.app"
             app.mkdir()
+            xcframework = root / "libvlc.xcframework"
+            xcframework.mkdir()
             with (app / "Info.plist").open("wb") as output:
                 plistlib.dump(
                     {
                         "SwiftVLCSourceCommit": "b" * 40,
                         "SwiftVLCReleaseSourceDigest": "c" * 64,
+                        "SwiftVLCArtifactDigest": "a" * 64,
                     },
                     output,
                 )
             digest_script = root / "digest.py"
             digest_script.write_text(f'print("{"a" * 64}")\n')
 
-            metadata = candidate_metadata.create(app, "1.1.0", digest_script)
+            metadata = candidate_metadata.create(
+                app, xcframework, "1.1.0", digest_script
+            )
             self.assertEqual(metadata["sourceCommit"], "b" * 40)
             self.assertEqual(metadata["releaseSourceDigest"], "c" * 64)
             self.assertEqual(metadata["candidateAppDigest"], "a" * 64)
+            self.assertEqual(metadata["artifactDigest"], "a" * 64)
+
+            forged = dict(metadata, sourceCommit="d" * 40)
+            with self.assertRaises(candidate_metadata.CandidateMetadataError):
+                candidate_metadata.verify(
+                    forged, app, xcframework, "1.1.0", digest_script
+                )
 
 
 class FixtureManifestTests(unittest.TestCase):
@@ -175,6 +191,85 @@ class FixtureManifestTests(unittest.TestCase):
             sample.write_bytes(b"corrupted")
             with self.assertRaises(verify_fixtures.FixtureVerificationError):
                 verify_fixtures.verify(root)
+
+
+class QualificationEvidenceTests(unittest.TestCase):
+    def make_export(self, root: Path, payload: dict, attachment_count: int = 1):
+        exported = root / "attachment.json"
+        exported.write_text(json.dumps(payload))
+        attachment = {
+            "exportedFileName": exported.name,
+            "suggestedHumanReadableName": "qualification-native-hls-seek-continuity.json",
+        }
+        manifest = [
+            {
+                "testIdentifier": "PiPOverlayDeviceUITests/test_nativePiPHLSSeekAndReloadRemainActive",
+                "attachments": [attachment] * attachment_count,
+            }
+        ]
+        (root / "manifest.json").write_text(json.dumps(manifest))
+
+    def test_materializes_test_payload_with_host_owned_identity(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.make_export(
+                root,
+                {
+                    "formatVersion": 1,
+                    "scenario": "native-hls-seek-continuity",
+                    "seekResults": {"forward": "pass"},
+                },
+            )
+            evidence = materialize_evidence.materialize(
+                root,
+                "qualification-native-hls-seek-continuity.json",
+                "native-hls-seek-continuity",
+                "iphone-current",
+                "a" * 64,
+                "b" * 64,
+            )
+            self.assertEqual(evidence["artifactDigest"], "a" * 64)
+            self.assertEqual(evidence["releaseSourceDigest"], "b" * 64)
+            self.assertEqual(evidence["hardware"], "iphone-current")
+            self.assertEqual(evidence["seekResults"]["forward"], "pass")
+
+    def test_rejects_duplicate_attachments_and_forged_identity(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.make_export(
+                root,
+                {
+                    "scenario": "native-hls-seek-continuity",
+                    "artifactDigest": "forged",
+                },
+                attachment_count=2,
+            )
+            with self.assertRaises(materialize_evidence.EvidenceError):
+                materialize_evidence.materialize(
+                    root,
+                    "qualification-native-hls-seek-continuity.json",
+                    "native-hls-seek-continuity",
+                    "iphone-current",
+                    "a" * 64,
+                    "b" * 64,
+                )
+
+            self.make_export(
+                root,
+                {
+                    "scenario": "native-hls-seek-continuity",
+                    "artifactDigest": "forged",
+                },
+            )
+            with self.assertRaises(materialize_evidence.EvidenceError):
+                materialize_evidence.materialize(
+                    root,
+                    "qualification-native-hls-seek-continuity.json",
+                    "native-hls-seek-continuity",
+                    "iphone-current",
+                    "a" * 64,
+                    "b" * 64,
+                )
 
 
 class FixtureServerTests(unittest.TestCase):

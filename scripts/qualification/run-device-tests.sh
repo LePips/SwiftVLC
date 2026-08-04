@@ -113,6 +113,7 @@ if [[ ! -f "$FIXTURES/manifest.json" ]]; then
 fi
 python3 "$SCRIPT_DIR/verify-fixtures.py" "$FIXTURES" > /dev/null
 cp "$FIXTURES/manifest.json" "$OUTPUT_DIR/fixture-manifest.json"
+FIXTURE_MANIFEST_CHECKSUM=$(shasum -a 256 "$FIXTURES/manifest.json" | cut -d' ' -f1)
 
 READY_FILE="$WORK_DIR/server-ready.json"
 python3 "$SCRIPT_DIR/fixture-server.py" \
@@ -148,6 +149,8 @@ if [[ "$SKIP_BUILD" == false ]]; then
     --version "$VERSION")
   BUILD_SOURCE_COMMIT=$(jq -r '.sourceCommit' <<< "$BUILD_SOURCE_IDENTITY")
   BUILD_SOURCE_DIGEST=$(jq -r '.releaseSourceDigest' <<< "$BUILD_SOURCE_IDENTITY")
+  BUILD_ARTIFACT_DIGEST=$(python3 "$ROOT_DIR/scripts/artifact-tree-digest.py" \
+    "$ROOT_DIR/Vendor/libvlc.xcframework")
   BUILD_SOURCE_ROOT="$WORK_DIR/source"
   mkdir -p "$BUILD_SOURCE_ROOT"
   git -C "$ROOT_DIR" archive HEAD | tar -x -C "$BUILD_SOURCE_ROOT"
@@ -162,6 +165,7 @@ if [[ "$SKIP_BUILD" == false ]]; then
     -derivedDataPath "$DERIVED_DATA" \
     SWIFTVLC_SOURCE_COMMIT="$BUILD_SOURCE_COMMIT" \
     SWIFTVLC_RELEASE_SOURCE_DIGEST="$BUILD_SOURCE_DIGEST" \
+    SWIFTVLC_ARTIFACT_DIGEST="$BUILD_ARTIFACT_DIGEST" \
     CODE_SIGNING_ALLOWED=YES \
     > "$OUTPUT_DIR/build.log"
 fi
@@ -190,6 +194,7 @@ if [[ "$PREBUILT_CANDIDATE" == true ]]; then
   fi
   python3 "$SCRIPT_DIR/candidate-metadata.py" verify \
     --candidate-app "$CANDIDATE_APP" \
+    --xcframework "$ROOT_DIR/Vendor/libvlc.xcframework" \
     --metadata "$CANDIDATE_METADATA" \
     --version "$VERSION" \
     --digest-script "$ROOT_DIR/scripts/artifact-tree-digest.py" \
@@ -198,12 +203,14 @@ if [[ "$PREBUILT_CANDIDATE" == true ]]; then
 else
   python3 "$SCRIPT_DIR/candidate-metadata.py" create \
     --candidate-app "$CANDIDATE_APP" \
+    --xcframework "$ROOT_DIR/Vendor/libvlc.xcframework" \
     --version "$VERSION" \
     --digest-script "$ROOT_DIR/scripts/artifact-tree-digest.py" \
     --output "$CANDIDATE_IDENTITY" \
     > /dev/null
 fi
 CANDIDATE_APP_DIGEST=$(jq -r '.candidateAppDigest' "$CANDIDATE_IDENTITY")
+ARTIFACT_DIGEST=$(jq -r '.artifactDigest' "$CANDIDATE_IDENTITY")
 SOURCE_COMMIT=$(jq -r '.sourceCommit' "$CANDIDATE_IDENTITY")
 SOURCE_DIGEST=$(jq -r '.releaseSourceDigest' "$CANDIDATE_IDENTITY")
 
@@ -280,6 +287,8 @@ done
 
 RESULTS_TSV="$WORK_DIR/results.tsv"
 : > "$RESULTS_TSV"
+QUALIFICATION_ROWS="$WORK_DIR/qualification-rows.jsonl"
+: > "$QUALIFICATION_ROWS"
 
 run_scenario() {
   local scenario="$1"
@@ -370,7 +379,7 @@ run_scenario() {
     cp "$selected_xctestrun" "$OUTPUT_DIR/destination-$scenario.xctestrun"
   fi
 
-  local started ended test_status result error_count log_status
+  local started ended test_status result error_count log_status evidence_status
   local xcodebuild_log="$OUTPUT_DIR/$scenario-xcodebuild.log"
   local result_bundle="$OUTPUT_DIR/$scenario.xcresult"
   local test_selection_args=()
@@ -417,6 +426,7 @@ run_scenario() {
 
   error_count=0
   log_status="none"
+  evidence_status="not-applicable"
   if [[ "$scenario" == "ui-suite" || "$scenario" == "harness-regressions" || "$scenario" == "ui-failures" || "$scenario" == "thumbnail-preview" ]]; then
     local document_capture="$OUTPUT_DIR/$scenario-documents"
     set +e
@@ -511,12 +521,76 @@ PY
     fi
   fi
 
+  if [[ "$scenario" == "hls-seek" ]]; then
+    evidence_status="missing"
+    if [[ "$test_status" -eq 0 ]] && [[ "$error_count" -eq 0 ]] \
+      && [[ "$log_status" == "captured" ]] && [[ -d "$result_bundle" ]]; then
+      local attachments="$OUTPUT_DIR/$scenario-attachments"
+      local hardware_id evidence_file evidence_relative export_status materialize_status
+      set +e
+      xcrun xcresulttool export attachments \
+        --path "$result_bundle" \
+        --output-path "$attachments" \
+        > "$OUTPUT_DIR/$scenario-export-attachments.log" 2>&1
+      export_status=$?
+      set -e
+      hardware_id=$(jq -r '.selected.matchingHardwareRows | if length == 1 then .[0] else "" end' \
+        "$OUTPUT_DIR/device.json")
+      if [[ "$export_status" -eq 0 ]] && [[ -n "$hardware_id" ]]; then
+        evidence_relative="evidence/native-hls-seek-continuity-$hardware_id.json"
+        evidence_file="$OUTPUT_DIR/$evidence_relative"
+        set +e
+        python3 "$SCRIPT_DIR/materialize-evidence.py" \
+          --attachments "$attachments" \
+          --attachment-name qualification-native-hls-seek-continuity.json \
+          --scenario native-hls-seek-continuity \
+          --hardware "$hardware_id" \
+          --artifact-digest "$ARTIFACT_DIGEST" \
+          --source-digest "$SOURCE_DIGEST" \
+          --output "$evidence_file" \
+          > "$OUTPUT_DIR/$scenario-materialize-evidence.log" 2>&1
+        materialize_status=$?
+        set -e
+        if [[ "$materialize_status" -eq 0 ]]; then
+          evidence_status="captured"
+          python3 - \
+            "$OUTPUT_DIR/device.json" "$QUALIFICATION_ROWS" "$evidence_relative" \
+            "$FIXTURE_MANIFEST_CHECKSUM" "$((ended - started))" <<'PY'
+import json
+import sys
+
+device_path, rows_path, evidence, fixture_checksum, duration = sys.argv[1:]
+device = json.load(open(device_path))["selected"]
+row = {
+    "scenario": "native-hls-seek-continuity",
+    "hardware": device["matchingHardwareRows"][0],
+    "device": device["marketingName"],
+    "deviceFamily": device["deviceFamily"],
+    "productType": device["productType"],
+    "osVersion": device["osVersion"],
+    "osBuild": device["osBuild"],
+    "osReleaseType": device["osReleaseType"],
+    "fixture": f"qualification-fixtures:{fixture_checksum}",
+    "duration": f"{duration}s",
+    "durationSeconds": int(duration),
+    "evidence": evidence,
+    "result": "pass",
+}
+with open(rows_path, "a") as output:
+    output.write(json.dumps(row, sort_keys=True) + "\n")
+PY
+        fi
+      fi
+    fi
+  fi
+
   result="pass"
-  if [[ "$test_status" -ne 0 ]] || [[ "$error_count" -ne 0 ]] || [[ "$log_status" == "missing" ]]; then
+  if [[ "$test_status" -ne 0 ]] || [[ "$error_count" -ne 0 ]] || [[ "$log_status" == "missing" ]] \
+    || [[ "$evidence_status" == "missing" ]]; then
     result="fail"
   fi
-  printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
-    "$scenario" "$result" "$test_status" "$error_count" "$log_status" "$((ended - started))" \
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$scenario" "$result" "$test_status" "$error_count" "$log_status" "$evidence_status" "$((ended - started))" \
     >> "$RESULTS_TSV"
   echo "$scenario: $result"
 }
@@ -530,7 +604,7 @@ MATRIX_CHECKSUM=$(shasum -a 256 "$SCRIPT_DIR/matrix.json" | cut -d' ' -f1)
 python3 - \
   "$RESULTS_TSV" "$OUTPUT_DIR/report.json" "$OUTPUT_DIR/device.json" \
   "$VERSION" "$SOURCE_COMMIT" "$SOURCE_DIGEST" "$MATRIX_CHECKSUM" \
-  "$CANDIDATE_APP_DIGEST" "$RUN_MODE" <<'PY'
+  "$CANDIDATE_APP_DIGEST" "$ARTIFACT_DIGEST" "$RUN_MODE" "$QUALIFICATION_ROWS" <<'PY'
 import json
 import sys
 
@@ -543,13 +617,15 @@ import sys
     source_digest,
     matrix_checksum,
     app_digest,
+    artifact_digest,
     mode,
+    qualification_rows_path,
 ) = sys.argv[1:]
 
 scenarios = []
 with open(results_path) as source:
     for line in source:
-        scenario, result, exit_code, errors, log_status, duration = line.rstrip("\n").split("\t")
+        scenario, result, exit_code, errors, log_status, evidence_status, duration = line.rstrip("\n").split("\t")
         scenarios.append(
             {
                 "scenario": scenario,
@@ -557,11 +633,14 @@ with open(results_path) as source:
                 "xcodebuildExitCode": int(exit_code),
                 "libraryErrorCount": int(errors),
                 "appLog": log_status,
+                "qualificationEvidence": evidence_status,
                 "durationSeconds": int(duration),
             }
         )
 
 device = json.load(open(device_path))["selected"]
+with open(qualification_rows_path) as source:
+    qualification_rows = [json.loads(line) for line in source if line.strip()]
 report = {
     "formatVersion": 1,
     "version": version,
@@ -575,8 +654,11 @@ report = {
     "qualificationMatrixChecksum": matrix_checksum,
     "candidateAppDigestAlgorithm": "swiftvlc-tree-v1",
     "candidateAppDigest": app_digest,
+    "artifactDigestAlgorithm": "swiftvlc-tree-v1",
+    "artifactDigest": artifact_digest,
     "device": device,
     "scenarios": scenarios,
+    "qualificationRows": qualification_rows,
     "result": "pass" if scenarios and all(row["result"] == "pass" for row in scenarios) else "fail",
 }
 with open(output_path, "w") as output:

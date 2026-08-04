@@ -50,10 +50,14 @@ the exact local `Vendor/libvlc.xcframework`, so remote package resolution cannot
 silently substitute an older wrapper or engine. A reused `--candidate-app` or `--skip-build`
 requires `--candidate-metadata`; metadata creation succeeds only for an app
 that was built with the `SwiftVLCSourceCommit` and
-`SwiftVLCReleaseSourceDigest` Info.plist keys. Use
+`SwiftVLCReleaseSourceDigest` Info.plist keys. The signed app also embeds
+`SwiftVLCArtifactDigest`, and metadata creation rejects it unless that value
+matches the complete XCFramework tree supplied to the runner. Use
 `candidate-metadata.py source` before an external build to obtain those values,
 then `candidate-metadata.py create` after signing to bind them to the app-tree
-digest.
+digest. Candidate metadata also records and verifies the complete XCFramework
+tree digest; a signed app cannot be paired with evidence naming a different
+engine artifact.
 
 The command identifies the physical device and OS release type, generates and
 serves deterministic local media, installs the exact signed candidate and UI
@@ -61,10 +65,19 @@ test runner, executes the analyzer, general UI stress suite, native/direct live
 PiP, same-player continuity, and HLS seek lanes, then pulls app logs and writes
 a machine-readable `report.json`. It retains every attempt log and xcresult,
 records and verifies candidate metadata that binds the app tree digest to its
-source commit and release-source digest, and retries only a small allowlist of
-Xcode/device-launch infrastructure failures. Every run reinstalls both exact
-signed apps; an assertion, product failure, or provenance mismatch is never
-retried into a pass.
+source commit, release-source digest, and XCFramework digest, and retries only
+a small allowlist of Xcode/device-launch infrastructure failures. Every run
+reinstalls both exact signed apps; an assertion, product failure, or provenance
+mismatch is never retried into a pass.
+
+The HLS seek lane is the first complete machine-readable matrix slice. It
+executes forward, backward, and absolute seeks, measures the return of decoded
+video, checks ordered PiP continuity, samples real system-PiP motion after each
+seek, verifies inline recovery, and exports an XCTest JSON attachment. The host
+materializes that attachment under `evidence/`, adding artifact, source, and
+hardware identity fields that the test process is forbidden to provide. The
+matching row appears under `qualificationRows` in `report.json`; beta-OS rows
+remain exploratory and are rejected by `check-qualification.sh`.
 
 Use `--require-stable` for release evidence. It fails before testing if the
 device is a simulator, runs beta or unknown software, or does not match a
