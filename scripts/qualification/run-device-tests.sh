@@ -7,12 +7,12 @@ ROOT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 VERSION="1.1.0"
 DEVICE_SELECTOR=""
 CANDIDATE_APP=""
+CANDIDATE_METADATA=""
 DERIVED_DATA="${SWIFTVLC_DEVICE_DERIVED_DATA:-$ROOT_DIR/.device-test-build}"
 FIXTURES="${SWIFTVLC_DEVICE_FIXTURES:-$ROOT_DIR/.qualification-fixtures}"
 OUTPUT_ROOT="${SWIFTVLC_DEVICE_RESULTS:-$ROOT_DIR/.qualification-results}"
 REQUIRE_STABLE=false
 SKIP_BUILD=false
-SKIP_INSTALL=false
 ONLY_SCENARIOS=()
 
 usage() {
@@ -26,6 +26,8 @@ Options:
   --version VERSION       Candidate version (default: 1.1.0)
   --device IDENTIFIER     CoreDevice id, UDID, ECID, or exact device name
   --candidate-app PATH    Prebuilt signed iOS.app to install and test
+  --candidate-metadata PATH
+                          Source/app identity JSON for a prebuilt candidate
   --derived-data PATH     Signed UI-test runner build directory
   --fixtures PATH         Generated fixture directory
   --output PATH           Evidence output root
@@ -34,7 +36,6 @@ Options:
                           harness-regressions, ui-failures, thumbnail-preview
   --require-stable        Refuse beta/unknown OS or a non-matching matrix row
   --skip-build            Reuse an existing signed runner in derived data
-  --skip-install          Reuse candidate and runner already installed on device
   -h, --help              Show this help
 
 Connecting, unlocking, trusting, and enabling Developer Mode are the only
@@ -48,13 +49,13 @@ while [[ $# -gt 0 ]]; do
     --version) VERSION="$2"; shift 2 ;;
     --device) DEVICE_SELECTOR="$2"; shift 2 ;;
     --candidate-app) CANDIDATE_APP="$2"; shift 2 ;;
+    --candidate-metadata) CANDIDATE_METADATA="$2"; shift 2 ;;
     --derived-data) DERIVED_DATA="$2"; shift 2 ;;
     --fixtures) FIXTURES="$2"; shift 2 ;;
     --output) OUTPUT_ROOT="$2"; shift 2 ;;
     --only) ONLY_SCENARIOS+=("$2"); shift 2 ;;
     --require-stable) REQUIRE_STABLE=true; shift ;;
     --skip-build) SKIP_BUILD=true; shift ;;
-    --skip-install) SKIP_INSTALL=true; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Error: unknown option $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -108,6 +109,7 @@ echo "Selected $(jq -r '.selected.marketingName' "$OUTPUT_DIR/device.json") on $
 if [[ ! -f "$FIXTURES/manifest.json" ]]; then
   "$SCRIPT_DIR/generate-fixtures.sh" "$FIXTURES"
 fi
+python3 "$SCRIPT_DIR/verify-fixtures.py" "$FIXTURES" > /dev/null
 cp "$FIXTURES/manifest.json" "$OUTPUT_DIR/fixture-manifest.json"
 
 READY_FILE="$WORK_DIR/server-ready.json"
@@ -135,17 +137,28 @@ PIP_LIVE_URL_BASE64=$(printf '%s' "$BASE_URL/live/live.ts" | base64)
 VOD_URL_BASE64=$(printf '%s' "$BASE_URL/files/vod.mp4" | base64)
 
 if [[ "$SKIP_BUILD" == false ]]; then
+  BUILD_SOURCE_IDENTITY=$(python3 "$SCRIPT_DIR/candidate-metadata.py" source \
+    --source-root "$ROOT_DIR" \
+    --version "$VERSION")
+  BUILD_SOURCE_COMMIT=$(jq -r '.sourceCommit' <<< "$BUILD_SOURCE_IDENTITY")
+  BUILD_SOURCE_DIGEST=$(jq -r '.releaseSourceDigest' <<< "$BUILD_SOURCE_IDENTITY")
   xcodebuild build-for-testing \
     -project "$ROOT_DIR/Showcase/SwiftVLCShowcase.xcodeproj" \
     -scheme iOS \
     -configuration Release \
     -destination 'generic/platform=iOS' \
     -derivedDataPath "$DERIVED_DATA" \
+    INFOPLIST_KEY_SwiftVLCSourceCommit="$BUILD_SOURCE_COMMIT" \
+    INFOPLIST_KEY_SwiftVLCReleaseSourceDigest="$BUILD_SOURCE_DIGEST" \
     CODE_SIGNING_ALLOWED=YES \
     > "$OUTPUT_DIR/build.log"
 fi
 
 RUNNER_APP="$DERIVED_DATA/Build/Products/Release-iphoneos/iOSUITests-Runner.app"
+PREBUILT_CANDIDATE=false
+if [[ -n "$CANDIDATE_APP" ]] || [[ "$SKIP_BUILD" == true ]]; then
+  PREBUILT_CANDIDATE=true
+fi
 if [[ -z "$CANDIDATE_APP" ]]; then
   CANDIDATE_APP="$DERIVED_DATA/Build/Products/Release-iphoneos/iOS.app"
 fi
@@ -156,6 +169,31 @@ for app in "$CANDIDATE_APP" "$RUNNER_APP"; do
   fi
   codesign --verify --deep --strict "$app"
 done
+
+CANDIDATE_IDENTITY="$OUTPUT_DIR/candidate-metadata.json"
+if [[ "$PREBUILT_CANDIDATE" == true ]]; then
+  if [[ -z "$CANDIDATE_METADATA" || ! -f "$CANDIDATE_METADATA" ]]; then
+    echo "Error: --candidate-metadata is required for a prebuilt candidate." >&2
+    exit 1
+  fi
+  python3 "$SCRIPT_DIR/candidate-metadata.py" verify \
+    --candidate-app "$CANDIDATE_APP" \
+    --metadata "$CANDIDATE_METADATA" \
+    --version "$VERSION" \
+    --digest-script "$ROOT_DIR/scripts/artifact-tree-digest.py" \
+    > "$WORK_DIR/verified-candidate-metadata.json"
+  jq . "$CANDIDATE_METADATA" > "$CANDIDATE_IDENTITY"
+else
+  python3 "$SCRIPT_DIR/candidate-metadata.py" create \
+    --candidate-app "$CANDIDATE_APP" \
+    --version "$VERSION" \
+    --digest-script "$ROOT_DIR/scripts/artifact-tree-digest.py" \
+    --output "$CANDIDATE_IDENTITY" \
+    > /dev/null
+fi
+CANDIDATE_APP_DIGEST=$(jq -r '.candidateAppDigest' "$CANDIDATE_IDENTITY")
+SOURCE_COMMIT=$(jq -r '.sourceCommit' "$CANDIDATE_IDENTITY")
+SOURCE_DIGEST=$(jq -r '.releaseSourceDigest' "$CANDIDATE_IDENTITY")
 
 XCTESTRUN=$(find "$DERIVED_DATA/Build/Products" -maxdepth 1 -name '*.xctestrun' -type f -print -quit)
 if [[ -z "$XCTESTRUN" ]]; then
@@ -186,15 +224,8 @@ install_app() {
   fi
 }
 
-if [[ "$SKIP_INSTALL" == false ]]; then
-  install_app "$CANDIDATE_APP" > "$OUTPUT_DIR/install-candidate.log"
-  install_app "$RUNNER_APP" > "$OUTPUT_DIR/install-runner.log"
-else
-  printf 'Reused candidate already installed on %s.\n' "$DEVICE_UDID" \
-    > "$OUTPUT_DIR/install-candidate.log"
-  printf 'Reused runner already installed on %s.\n' "$DEVICE_UDID" \
-    > "$OUTPUT_DIR/install-runner.log"
-fi
+install_app "$CANDIDATE_APP" > "$OUTPUT_DIR/install-candidate.log"
+install_app "$RUNNER_APP" > "$OUTPUT_DIR/install-runner.log"
 
 STREAMS_FILE="$WORK_DIR/streams.local.json"
 python3 - "$BASE_URL" "$STREAMS_FILE" <<'PY'
@@ -482,16 +513,7 @@ for scenario in "${ONLY_SCENARIOS[@]}"; do
   run_scenario "$scenario"
 done
 
-CANDIDATE_APP_DIGEST=$(python3 "$ROOT_DIR/scripts/artifact-tree-digest.py" "$CANDIDATE_APP")
-SOURCE_COMMIT=$(git -C "$ROOT_DIR" rev-parse HEAD)
 MATRIX_CHECKSUM=$(shasum -a 256 "$SCRIPT_DIR/matrix.json" | cut -d' ' -f1)
-set +e
-SOURCE_DIGEST=$("$ROOT_DIR/scripts/release-source-digest.py" "$VERSION" 2>/dev/null)
-source_digest_status=$?
-set -e
-if [[ "$source_digest_status" -ne 0 ]]; then
-  SOURCE_DIGEST="unavailable-dirty-source"
-fi
 
 python3 - \
   "$RESULTS_TSV" "$OUTPUT_DIR/report.json" "$OUTPUT_DIR/device.json" \
@@ -536,6 +558,7 @@ report = {
     "releaseGateSatisfied": False,
     "releaseGateReason": "automated smoke coverage is not yet the complete required matrix",
     "sourceCommit": source_commit,
+    "releaseSourceDigestAlgorithm": "swiftvlc-git-tree-v1",
     "releaseSourceDigest": source_digest,
     "qualificationMatrixChecksum": matrix_checksum,
     "candidateAppDigestAlgorithm": "swiftvlc-tree-v1",

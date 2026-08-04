@@ -39,19 +39,30 @@ Mirroring and does not ask an operator to copy observations out of the app:
 
 ```bash
 ./scripts/qualification/run-device-tests.sh \
-  --candidate-app /absolute/path/to/iOS.app \
-  --derived-data /absolute/path/to/signed-test-products \
+  --derived-data /absolute/path/to/device-build \
   --output /absolute/path/to/evidence
 ```
+
+That default path builds the app and runner from a clean checkout, embeds the
+source commit and release-source digest in the signed app, and creates its
+candidate metadata automatically. A reused `--candidate-app` or `--skip-build`
+requires `--candidate-metadata`; metadata creation succeeds only for an app
+that was built with the `SwiftVLCSourceCommit` and
+`SwiftVLCReleaseSourceDigest` Info.plist keys. Use
+`candidate-metadata.py source` before an external build to obtain those values,
+then `candidate-metadata.py create` after signing to bind them to the app-tree
+digest.
 
 The command identifies the physical device and OS release type, generates and
 serves deterministic local media, installs the exact signed candidate and UI
 test runner, executes the analyzer, general UI stress suite, native/direct live
 PiP, same-player continuity, and HLS seek lanes, then pulls app logs and writes
 a machine-readable `report.json`. It retains every attempt log and xcresult,
-records the candidate app tree digest, and retries only a small allowlist of
-Xcode/device-launch infrastructure failures. An assertion or product failure
-is never retried into a pass.
+records and verifies candidate metadata that binds the app tree digest to its
+source commit and release-source digest, and retries only a small allowlist of
+Xcode/device-launch infrastructure failures. Every run reinstalls both exact
+signed apps; an assertion, product failure, or provenance mismatch is never
+retried into a pass.
 
 Use `--require-stable` for release evidence. It fails before testing if the
 device is a simulator, runs beta or unknown software, or does not match a

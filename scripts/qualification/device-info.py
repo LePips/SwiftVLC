@@ -25,6 +25,11 @@ def release_type(properties: dict) -> str:
     build = str(properties.get("osBuildUpdate", ""))
     if re.fullmatch(r"\d+[A-Z]\d+", build):
         return "stable"
+    # Public Rapid Security Responses append a lowercase revision to a much
+    # longer numeric component (for example 20E772520a). Seed builds use the
+    # ordinary four/five-digit component followed by a lowercase suffix.
+    if re.fullmatch(r"\d+[A-Z]\d{6,}[a-z]+", build):
+        return "stable"
     if re.fullmatch(r"\d+[A-Z]\d+[a-z]+", build):
         return "beta"
     return "unknown"

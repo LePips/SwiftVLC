@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import http.client
+import hashlib
 import importlib.util
+import json
 import plistlib
 import tempfile
 import threading
@@ -25,12 +27,15 @@ def load_script(name: str):
 device_info = load_script("device-info.py")
 fixture_server = load_script("fixture-server.py")
 prepare_xctestrun = load_script("prepare-xctestrun.py")
+verify_fixtures = load_script("verify-fixtures.py")
+candidate_metadata = load_script("candidate-metadata.py")
 
 
 class DeviceInfoTests(unittest.TestCase):
     def test_release_classification_is_fail_closed(self):
         self.assertEqual(device_info.release_type({"releaseType": "Beta"}), "beta")
         self.assertEqual(device_info.release_type({"osBuildUpdate": "24A5390f"}), "beta")
+        self.assertEqual(device_info.release_type({"osBuildUpdate": "20E772520a"}), "stable")
         self.assertEqual(device_info.release_type({"osBuildUpdate": "23G80"}), "stable")
         self.assertEqual(device_info.release_type({"osBuildUpdate": "unexpected"}), "unknown")
 
@@ -85,6 +90,69 @@ class XCTestrunTests(unittest.TestCase):
             self.assertNotIn(key, target)
         self.assertTrue(target["UseDestinationArtifacts"])
         self.assertEqual(target["TestingEnvironmentVariables"]["ATTACH"], "YES")
+
+
+class CandidateMetadataTests(unittest.TestCase):
+    def test_metadata_is_bound_to_the_exact_candidate_digest(self):
+        app_digest = "a" * 64
+        metadata = {
+            "formatVersion": 1,
+            "version": "1.1.0",
+            "sourceCommit": "b" * 40,
+            "releaseSourceDigestAlgorithm": "swiftvlc-git-tree-v1",
+            "releaseSourceDigest": "c" * 64,
+            "candidateAppDigestAlgorithm": "swiftvlc-tree-v1",
+            "candidateAppDigest": app_digest,
+        }
+        self.assertEqual(
+            candidate_metadata.validate(metadata, "1.1.0", app_digest), metadata
+        )
+        with self.assertRaises(candidate_metadata.CandidateMetadataError):
+            candidate_metadata.validate(metadata, "1.1.0", "d" * 64)
+
+    def test_metadata_reads_source_identity_from_the_signed_app_payload(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            app = root / "iOS.app"
+            app.mkdir()
+            with (app / "Info.plist").open("wb") as output:
+                plistlib.dump(
+                    {
+                        "SwiftVLCSourceCommit": "b" * 40,
+                        "SwiftVLCReleaseSourceDigest": "c" * 64,
+                    },
+                    output,
+                )
+            digest_script = root / "digest.py"
+            digest_script.write_text(f'print("{"a" * 64}")\n')
+
+            metadata = candidate_metadata.create(app, "1.1.0", digest_script)
+            self.assertEqual(metadata["sourceCommit"], "b" * 40)
+            self.assertEqual(metadata["releaseSourceDigest"], "c" * 64)
+            self.assertEqual(metadata["candidateAppDigest"], "a" * 64)
+
+
+class FixtureManifestTests(unittest.TestCase):
+    def test_cached_fixture_bytes_must_match_the_manifest_exactly(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            sample = root / "sample.bin"
+            sample.write_bytes(b"candidate-bound fixture")
+            manifest = {
+                "formatVersion": 1,
+                "files": {
+                    "sample.bin": {
+                        "bytes": sample.stat().st_size,
+                        "sha256": hashlib.sha256(sample.read_bytes()).hexdigest(),
+                    }
+                },
+            }
+            (root / "manifest.json").write_text(json.dumps(manifest))
+            self.assertEqual(verify_fixtures.verify(root), manifest)
+
+            sample.write_bytes(b"corrupted")
+            with self.assertRaises(verify_fixtures.FixtureVerificationError):
+                verify_fixtures.verify(root)
 
 
 class FixtureServerTests(unittest.TestCase):

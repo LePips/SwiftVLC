@@ -91,6 +91,10 @@ extension Integration {
       permits.cancel(canceled)
       #expect(permits.consume(for: generation) == false)
 
+      _ = permits.stage(for: generation)
+      permits.invalidate()
+      #expect(permits.consume(for: generation) == false)
+
       _ = first
       _ = permits.stage(for: generation, validity: .zero)
       #expect(permits.consume(for: generation) == false)
@@ -99,6 +103,28 @@ extension Integration {
       permits.setPiPActive(false)
       permits.setPiPActive(true)
       #expect(permits.consume(for: generation) == false)
+    }
+
+    @Test
+    func `terminal player events invalidate a staged seek rebuild permit`() throws {
+      let player = Player()
+      player.nativePiPVideoOutputRebuildPermit.setPiPActive(true)
+
+      _ = try #require(
+        player.nativePiPVideoOutputRebuildPermit.stage(for: player.generation)
+      )
+      player.handleEvent(.stateChanged(.stopped))
+      #expect(
+        player.nativePiPVideoOutputRebuildPermit.consume(for: player.generation) == false
+      )
+
+      _ = try #require(
+        player.nativePiPVideoOutputRebuildPermit.stage(for: player.generation)
+      )
+      player.handleEvent(.encounteredError)
+      #expect(
+        player.nativePiPVideoOutputRebuildPermit.consume(for: player.generation) == false
+      )
     }
 
     @Test
