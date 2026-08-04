@@ -57,6 +57,16 @@ public struct PiPPlaybackQualificationSnapshot: Sendable, Equatable {
   public let isSeekable: Bool
 }
 
+/// One atomic engine query used to prove native PiP never combines playback
+/// values from different media generations during replacement.
+@_spi(Qualification)
+public struct NativePiPPlaybackQualificationSnapshot: Sendable, Equatable {
+  public let mediaGeneration: UInt64
+  public let durationMilliseconds: Int64
+  public let currentTimeMilliseconds: Int64
+  public let isSeekable: Bool
+}
+
 extension PiPController {
   /// A snapshot of the iOS native PiP backend's private wiring, or
   /// `nil` when this controller doesn't drive the native backend (the
@@ -81,6 +91,40 @@ extension PiPController {
       durationMilliseconds: playbackStateObservation.durationMilliseconds,
       isSeekable: playbackStateObservation.isSeekable
     )
+  }
+
+  /// The exact atomic length/time/seekability query exported to libVLC's
+  /// native PiP module, paired with its current media identity.
+  @_spi(Qualification)
+  public var nativePlaybackQualificationSnapshot: NativePiPPlaybackQualificationSnapshot? {
+    guard let nativeBackend else { return nil }
+    var duration: Int64 = 0
+    var time: Int64 = 0
+    var seekable = ObjCBool(false)
+    var generation: UInt64 = 0
+    guard
+      nativeBackend.mediaController.qualificationPlaybackSnapshot(
+        length: &duration,
+        time: &time,
+        seekable: &seekable,
+        generation: &generation
+      )
+    else { return nil }
+    return NativePiPPlaybackQualificationSnapshot(
+      mediaGeneration: generation,
+      durationMilliseconds: duration,
+      currentTimeMilliseconds: time,
+      isSeekable: seekable.boolValue
+    )
+  }
+}
+
+extension Player {
+  /// The current media identity used by the in-repo replacement qualification
+  /// lane to reject measurements and callbacks from an outgoing item.
+  @_spi(Qualification)
+  public var playbackQualificationGeneration: PlaybackGeneration {
+    generation
   }
 }
 

@@ -110,17 +110,20 @@ struct PiPCallbackForwardProgressTests {
     var length: Int64 = 123
     var time: Int64 = 456
     var seekable = ObjCBool(true)
+    var generation: UInt64 = 789
 
-    let captured = controller.mediaPlaybackSnapshot(
+    let captured = controller.qualificationPlaybackSnapshot(
       length: &length,
       time: &time,
-      seekable: &seekable
+      seekable: &seekable,
+      generation: &generation
     )
 
     #expect(!captured)
     #expect(length == 0)
     #expect(time == 0)
     #expect(!seekable.boolValue)
+    #expect(generation == 0)
   }
   #endif
 

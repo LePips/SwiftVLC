@@ -138,6 +138,8 @@ def assemble(
     rows: dict[tuple[str, str], tuple[dict, Path]] = {}
     for report_path in report_paths:
         report = load_object(report_path, "device report")
+        if report.get("result") != "pass":
+            raise AssemblyError(f"report {report_path} did not pass")
         if report.get("qualificationEligibleEnvironment") is not True:
             raise AssemblyError(f"report {report_path} is not from a qualifying environment")
         if report.get("mode") != "qualification":

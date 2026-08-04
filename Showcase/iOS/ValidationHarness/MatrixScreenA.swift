@@ -1,5 +1,5 @@
 import SwiftUI
-import SwiftVLC
+@_spi(Qualification) import SwiftVLC
 
 private let readMe = """
 Tap a channel button to start playback, then start PiP from the button \
@@ -18,6 +18,14 @@ struct MatrixScreenA: View {
   @State private var player = Player()
   @State private var pip: PiPController?
   @State private var continuityStatus = "none"
+  @State private var continuityEvents: [String] = []
+  @State private var lifecycleEvents: [String] = []
+  @State private var latestGeneration: PlaybackGeneration?
+  @State private var replacementMeasurement = "none"
+  @State private var replacementProbe: Task<Void, Never>?
+  @State private var pendingReplacement: PendingReplacement?
+  @State private var staleSuccessorMutations = 0
+  @State private var hasLoadedMedia = false
   @State private var log: [LogLine] = []
 
   private struct LogLine: Identifiable {
@@ -25,12 +33,19 @@ struct MatrixScreenA: View {
     let text: String
   }
 
+  private struct PendingReplacement {
+    let stream: String
+    let generation: PlaybackGeneration
+    let startedAt: ContinuousClock.Instant
+  }
+
   private var zapTargets: [(key: HarnessStreams.Key, url: URL)] {
     streams.configured.filter { [.liveTS, .hlsLive, .vod].contains($0.key) }
   }
 
   var body: some View {
-    Form {
+    _ = player.currentTime
+    return Form {
       Section { AboutView(readMe: readMe) }
 
       Section {
@@ -44,7 +59,9 @@ struct MatrixScreenA: View {
       Section("Picture in Picture") {
         if let pip {
           LabeledContent("Possible", value: pip.isPossible ? "yes" : "no")
+            .accessibilityIdentifier(AccessibilityID.PiPContinuityValidation.possibleLabel)
           LabeledContent("Active", value: pip.isActive ? "yes" : "no")
+            .accessibilityIdentifier(AccessibilityID.PiPContinuityValidation.activeLabel)
           LabeledContent("Continuity", value: continuityStatus)
             .accessibilityIdentifier("validation.matrixA.continuity")
           Button(
@@ -57,6 +74,60 @@ struct MatrixScreenA: View {
           Text("Preparing…")
             .foregroundStyle(.secondary)
         }
+      }
+
+      Section("Measured state") {
+        LabeledContent("Playback", value: String(describing: player.state))
+          .accessibilityIdentifier(AccessibilityID.PiPContinuityValidation.stateLabel)
+        LabeledContent(
+          "Media generation",
+          value: player.playbackQualificationGeneration.description
+        )
+        .accessibilityIdentifier(AccessibilityID.PiPContinuityValidation.generationLabel)
+        LabeledContent(
+          "Displayed pictures",
+          value: String(player.statistics?.displayedPictures ?? 0)
+        )
+        .accessibilityIdentifier(
+          AccessibilityID.PiPContinuityValidation.displayedPicturesLabel
+        )
+        LabeledContent(
+          "Played audio buffers",
+          value: String(player.statistics?.playedAudioBuffers ?? 0)
+        )
+        .accessibilityIdentifier(
+          AccessibilityID.PiPContinuityValidation.playedAudioBuffersLabel
+        )
+        LabeledContent("Playback snapshot", value: playbackSnapshot)
+          .accessibilityIdentifier(
+            AccessibilityID.PiPContinuityValidation.playbackSnapshotLabel
+          )
+        LabeledContent("Native atomic snapshot", value: nativePlaybackSnapshot)
+          .accessibilityIdentifier(
+            AccessibilityID.PiPContinuityValidation.nativePlaybackSnapshotLabel
+          )
+        LabeledContent(
+          "Continuity events",
+          value: continuityEvents.isEmpty ? "none" : continuityEvents.joined(separator: "|")
+        )
+        .accessibilityIdentifier(
+          AccessibilityID.PiPContinuityValidation.continuityEventsLabel
+        )
+        LabeledContent(
+          "Lifecycle events",
+          value: lifecycleEvents.isEmpty ? "none" : lifecycleEvents.joined(separator: "|")
+        )
+        .accessibilityIdentifier(
+          AccessibilityID.PiPContinuityValidation.lifecycleEventsLabel
+        )
+        LabeledContent("Replacement measurement", value: replacementMeasurement)
+          .accessibilityIdentifier(
+            AccessibilityID.PiPContinuityValidation.replacementMeasurementLabel
+          )
+        LabeledContent("Stale successor mutations", value: String(staleSuccessorMutations))
+          .accessibilityIdentifier(
+            AccessibilityID.PiPContinuityValidation.staleSuccessorMutationsLabel
+          )
       }
 
       Section("Channel zap") {
@@ -86,12 +157,21 @@ struct MatrixScreenA: View {
       guard let pip else { return }
       await observeContinuityEvents(from: pip)
     }
+    .task(id: pip.map(ObjectIdentifier.init)) {
+      guard let pip else { return }
+      for await envelope in pip.pipEventEnvelopes {
+        lifecycleEvents.append(lifecycleName(envelope.event))
+      }
+    }
     .onChange(of: pip?.isActive) { _, isActive in
       if let isActive {
         append("pip.isActive → \(isActive)")
       }
     }
-    .onDisappear { player.stop() }
+    .onDisappear {
+      replacementProbe?.cancel()
+      player.stop()
+    }
   }
 
   @ViewBuilder
@@ -108,7 +188,26 @@ struct MatrixScreenA: View {
 
   private func load(_ target: (key: HarnessStreams.Key, url: URL)) {
     append("load() → \(target.key.rawValue)")
-    try? player.play(url: target.url)
+    replacementProbe?.cancel()
+    let replacementStartedAt = hasLoadedMedia ? ContinuousClock.now : nil
+    do {
+      try player.play(url: target.url)
+      let generation = player.playbackQualificationGeneration
+      latestGeneration = generation
+      if let replacementStartedAt {
+        pendingReplacement = PendingReplacement(
+          stream: target.key.rawValue,
+          generation: generation,
+          startedAt: replacementStartedAt
+        )
+        replacementMeasurement = "pending:\(target.key.rawValue):\(generation)"
+      } else {
+        hasLoadedMedia = true
+      }
+    } catch {
+      replacementMeasurement = "failed:\(error)"
+      append("load() failed → \(error)")
+    }
   }
 
   private var logSection: some View {
@@ -146,11 +245,87 @@ struct MatrixScreenA: View {
 
   private func observeContinuityEvents(from pip: PiPController) async {
     for await event in pip.pipContinuityEvents {
+      if let latestGeneration, event.mediaGeneration < latestGeneration {
+        staleSuccessorMutations += 1
+      }
       continuityStatus = "\(event.outcome)"
+      let elapsedMilliseconds = Int(event.elapsed / .milliseconds(1))
+      continuityEvents.append(
+        "\(event.outcome):\(event.previousMediaGeneration):\(event.mediaGeneration):"
+          + "\(event.controllerGeneration):\(elapsedMilliseconds)"
+      )
+      if case .restored = event.outcome {
+        completeReplacementProbe(for: event.mediaGeneration)
+      }
       let detail = "continuity \(event.outcome): \(event.previousMediaGeneration) → "
         + "\(event.mediaGeneration), controller \(event.controllerGeneration), "
         + "elapsed \(event.elapsed)"
       append(detail)
+    }
+  }
+
+  private var playbackSnapshot: String {
+    guard let pip else { return "none" }
+    let snapshot = pip.playbackQualificationSnapshot
+    let duration = snapshot.durationMilliseconds == nil ? "unbounded" : "finite"
+    let seekable = snapshot.isSeekable ? "seekable" : "unseekable"
+    let controls = snapshot.requiresLinearPlayback ? "linear" : "interactive"
+    return "\(duration):\(seekable):\(controls)"
+  }
+
+  private var nativePlaybackSnapshot: String {
+    guard let snapshot = pip?.nativePlaybackQualificationSnapshot else { return "none" }
+    return "\(snapshot.mediaGeneration):\(snapshot.durationMilliseconds):"
+      + "\(snapshot.currentTimeMilliseconds):\(snapshot.isSeekable ? "yes" : "no")"
+  }
+
+  private func completeReplacementProbe(for generation: PlaybackGeneration) {
+    guard
+      let pendingReplacement,
+      pendingReplacement.generation == generation
+    else { return }
+    self.pendingReplacement = nil
+    replacementProbe = Task { @MainActor in
+      var videoGapMilliseconds: Int?
+      var audioGapMilliseconds: Int?
+      while pendingReplacement.startedAt.duration(to: .now) < .seconds(15) {
+        guard
+          !Task.isCancelled,
+          player.playbackQualificationGeneration == generation
+        else { return }
+        let statistics = player.statistics
+        let elapsed = Int(
+          pendingReplacement.startedAt.duration(to: .now) / .milliseconds(1)
+        )
+        if videoGapMilliseconds == nil, statistics?.displayedPictures ?? 0 > 0 {
+          videoGapMilliseconds = elapsed
+        }
+        if audioGapMilliseconds == nil, statistics?.playedAudioBuffers ?? 0 > 0 {
+          audioGapMilliseconds = elapsed
+        }
+        if let videoGapMilliseconds, let audioGapMilliseconds {
+          replacementMeasurement = "complete:\(pendingReplacement.stream):\(generation):"
+            + "\(videoGapMilliseconds):\(audioGapMilliseconds)"
+          return
+        }
+        try? await Task.sleep(for: .milliseconds(50))
+      }
+      replacementMeasurement = "timed-out:\(pendingReplacement.stream):\(generation)"
+    }
+  }
+
+  private func lifecycleName(_ event: PiPEvent) -> String {
+    switch event {
+    case .willStart:
+      "willStart"
+    case .didStart:
+      "didStart"
+    case .willStop(let reason):
+      "willStop:\(String(describing: reason))"
+    case .didStop(let reason):
+      "didStop:\(String(describing: reason))"
+    case .failedToStart:
+      "failedToStart"
     }
   }
 
