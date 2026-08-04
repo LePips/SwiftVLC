@@ -27,8 +27,7 @@ final class PiPContinuityDeviceUITests: ShowcaseIOSTestCase {
     XCTAssertTrue(matrix.waitForExistence(timeout: 5))
     matrix.tap()
 
-    let initialMedia = app.buttons["Load vod"]
-    reveal(initialMedia, swiping: .up)
+    let initialMedia = app.buttons[AccessibilityID.PiPContinuityValidation.loadVODButton]
     XCTAssertTrue(initialMedia.isHittable)
     initialMedia.tap()
 
@@ -40,8 +39,7 @@ final class PiPContinuityDeviceUITests: ShowcaseIOSTestCase {
     let stopPiP = app.buttons["Stop PiP"]
     XCTAssertTrue(stopPiP.waitForExistence(timeout: 10), "Native PiP did not become active")
 
-    let successorMedia = app.buttons["Load liveTS"]
-    reveal(successorMedia, swiping: .up)
+    let successorMedia = app.buttons[AccessibilityID.PiPContinuityValidation.loadLiveTSButton]
     XCTAssertTrue(successorMedia.isHittable)
     successorMedia.tap()
 

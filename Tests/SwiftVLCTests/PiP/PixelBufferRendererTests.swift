@@ -250,6 +250,24 @@ extension Integration {
     }
 
     @Test
+    func `active PiP copies a matching source buffer into presentation storage`() throws {
+      let renderer = PixelBufferRenderer(displayLayer: AVSampleBufferDisplayLayer())
+      renderer.setRenderSize(CMVideoDimensions(width: 16, height: 16))
+      renderer.setPresentationCopyRequired(true)
+
+      let sourceBuffer = try makeBGRAImageBuffer(width: 16, height: 16)
+      let output = try #require(renderer.outputPixelBuffer(from: sourceBuffer)?.buffer)
+
+      #expect(output !== sourceBuffer)
+      #expect(CVPixelBufferGetWidth(output) == 16)
+      #expect(CVPixelBufferGetHeight(output) == 16)
+
+      renderer.setPresentationCopyRequired(false)
+      let inlineOutput = try #require(renderer.outputPixelBuffer(from: sourceBuffer)?.buffer)
+      #expect(inlineOutput === sourceBuffer)
+    }
+
+    @Test
     func `Scaling resources stay unallocated for passthrough frames`() throws {
       let renderer = PixelBufferRenderer(displayLayer: AVSampleBufferDisplayLayer())
       let sourceBuffer = try makeBGRAImageBuffer(width: 16, height: 16)

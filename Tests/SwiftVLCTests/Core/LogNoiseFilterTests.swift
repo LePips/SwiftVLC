@@ -107,6 +107,51 @@ extension Logic {
     }
 
     @Test
+    func `Paused prefetch recovery at error is demoted to warning`() {
+      let result = LogNoiseFilter.reclassify(
+        level: .error,
+        module: "libvlc",
+        message: "reading while paused (buggy demux?)"
+      )
+      #expect(result == .warning)
+    }
+
+    @Test(
+      arguments: [
+        "ES_OUT_SET_(GROUP_)PCR  is called 852 ms late (pts_delay increased to 1841 ms)",
+        "ES_OUT_SET_(GROUP_)PCR  is called 0 ms late (pts_delay increased to 4685 ms)",
+        "ES_OUT_SET_(GROUP_)PCR  is called 2436 ms late (jitter of 6319 ms ignored)",
+        "ES_OUT_SET_(GROUP_)PCR  is called 12 ms late (jitter of -4 ms ignored)"
+      ]
+    )
+    func `Self-healing PCR correction at error is demoted to warning`(message: String) {
+      let result = LogNoiseFilter.reclassify(
+        level: .error,
+        module: "libvlc",
+        message: message
+      )
+      #expect(result == .warning)
+    }
+
+    @Test(
+      arguments: [
+        "ES_OUT_SET_(GROUP_)PCR is called 12 ms late (pts_delay increased to 34 ms)",
+        "ES_OUT_SET_(GROUP_)PCR  is called late (pts_delay increased to 34 ms)",
+        "ES_OUT_SET_(GROUP_)PCR  is called 12 ms late (pts_delay increased to unknown ms)",
+        "ES_OUT_SET_(GROUP_)PCR  is called 12 ms late (clock failed)",
+        "fatal: ES_OUT_SET_(GROUP_)PCR  is called 12 ms late (jitter of 34 ms ignored)"
+      ]
+    )
+    func `Adjacent PCR messages remain errors`(message: String) {
+      let result = LogNoiseFilter.reclassify(
+        level: .error,
+        module: "libvlc",
+        message: message
+      )
+      #expect(result == .error)
+    }
+
+    @Test
     func `Module field is irrelevant — rule fires regardless`() {
       // libVLC 4.0 reports the umbrella "libvlc" for every entry; future
       // versions or our own shim may surface the per-module name. Rules

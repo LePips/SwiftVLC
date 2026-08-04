@@ -4,8 +4,14 @@ struct CompatSlider<Value: BinaryFloatingPoint>: View where Value.Stride: Binary
   @Binding var value: Value
   let range: ClosedRange<Value>
   var step: Value.Stride = 0.01
+  var onEditingChanged: (Bool) -> Void = { _ in }
 
   var body: some View {
-    Slider(value: $value, in: range, step: step)
+    Slider(
+      value: $value,
+      in: range,
+      step: step,
+      onEditingChanged: onEditingChanged
+    )
   }
 }

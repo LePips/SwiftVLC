@@ -11,7 +11,7 @@ acceptance gate, and `release.sh` refuses to package an artifact without one.
 `matrix.json` lists the required scenarios and hardware. A scenario without a
 `hardware` list runs on every hardware row; focused performance, soak, and
 failure scenarios name the exact hardware they require. The current matrix has
-49 required rows. Simulator runs never satisfy a row: PiP is force-disabled
+53 required rows. Simulator runs never satisfy a row: PiP is force-disabled
 there, and a simulator can report PiP active while its window stays black.
 
 The matrix covers the device-only acceptance criteria of every open v1.1.0
@@ -30,6 +30,54 @@ unsupported feature, a regression, or a failed acceptance condition.
 The original cross-device PiP rows apply the same rule to each control,
 lifecycle order, recovery path, and stop reason; a top-level `result: "pass"`
 cannot mask a failed pause, missing restoration, or unsuccessful recovery.
+
+### Unattended physical-device lane
+
+Once a device is connected, unlocked, trusted, and has Developer Mode enabled,
+the smoke and regression lane is unattended. It does not require iPhone
+Mirroring and does not ask an operator to copy observations out of the app:
+
+```bash
+./scripts/qualification/run-device-tests.sh \
+  --derived-data /absolute/path/to/device-build \
+  --output /absolute/path/to/evidence
+```
+
+That default path builds the app and runner from a clean checkout, embeds the
+source commit and release-source digest in the signed app, and creates its
+candidate metadata automatically. It builds a disposable `HEAD` export against
+the exact local `Vendor/libvlc.xcframework`, so remote package resolution cannot
+silently substitute an older wrapper or engine. A reused `--candidate-app` or `--skip-build`
+requires `--candidate-metadata`; metadata creation succeeds only for an app
+that was built with the `SwiftVLCSourceCommit` and
+`SwiftVLCReleaseSourceDigest` Info.plist keys. Use
+`candidate-metadata.py source` before an external build to obtain those values,
+then `candidate-metadata.py create` after signing to bind them to the app-tree
+digest.
+
+The command identifies the physical device and OS release type, generates and
+serves deterministic local media, installs the exact signed candidate and UI
+test runner, executes the analyzer, general UI stress suite, native/direct live
+PiP, same-player continuity, and HLS seek lanes, then pulls app logs and writes
+a machine-readable `report.json`. It retains every attempt log and xcresult,
+records and verifies candidate metadata that binds the app tree digest to its
+source commit and release-source digest, and retries only a small allowlist of
+Xcode/device-launch infrastructure failures. Every run reinstalls both exact
+signed apps; an assertion, product failure, or provenance mismatch is never
+retried into a pass.
+
+Use `--require-stable` for release evidence. It fails before testing if the
+device is a simulator, runs beta or unknown software, or does not match a
+hardware row in `matrix.json`. Without that option, the same command is useful
+for exploratory beta-OS testing, but its report remains ineligible for release.
+
+This lane is intentionally fail-closed: its current automated scenarios are a
+candidate smoke/regression subset, not a claim that all 53 qualification rows
+passed. `report.json` therefore keeps `releaseGateSatisfied` false until a
+matrix runner has produced the complete candidate-bound records described
+below. Long soaks, performance captures, interruption/route-change coverage,
+subtitle-format coverage, and every required hardware/OS row must still be
+represented by automated evidence before the stable gate can open.
 
 Qualification is bound to both halves of the shipped package. The
 XCFramework tree digest identifies the native engine and headers, while the

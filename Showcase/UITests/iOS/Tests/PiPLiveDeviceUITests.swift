@@ -17,10 +17,12 @@ final class PiPLiveDeviceUITests: ShowcaseIOSTestCase {
     throw XCTSkip("System Picture in Picture requires a physical iOS device")
     #else
     guard
-      let rawURL = ProcessInfo.processInfo.environment["SWIFTVLC_PIP_LIVE_URL"],
+      let encodedURL = ProcessInfo.processInfo.environment["SWIFTVLC_PIP_LIVE_URL_BASE64"],
+      let data = Data(base64Encoded: encodedURL),
+      let rawURL = String(data: data, encoding: .utf8),
       let liveURL = URL(string: rawURL)
     else {
-      throw XCTSkip("Set SWIFTVLC_PIP_LIVE_URL to an indefinite MPEG-TS stream")
+      throw XCTSkip("Set SWIFTVLC_PIP_LIVE_URL_BASE64 to an encoded indefinite MPEG-TS stream")
     }
 
     addUIInterruptionMonitor(withDescription: "Local network permission") { alert in
@@ -30,7 +32,9 @@ final class PiPLiveDeviceUITests: ShowcaseIOSTestCase {
       return true
     }
 
-    app.launchArguments += [LaunchArguments.pipLiveURL, liveURL.absoluteString]
+    let encodedLiveURL = Data(liveURL.absoluteString.utf8).base64EncodedString()
+    app.launchArguments += [LaunchArguments.pipLiveURLBase64, encodedLiveURL]
+    app.launchEnvironment[LaunchArguments.pipLiveURLEnvironment] = encodedLiveURL
     app.launchArguments += [LaunchArguments.pipRenderingPath, renderingPath]
     launch(route: .pipLiveValidation)
     // UI interruption monitors run when the test sends an interaction after
@@ -51,6 +55,7 @@ final class PiPLiveDeviceUITests: ShowcaseIOSTestCase {
     let playbackError = app.descendants(matching: .any)[AccessibilityID.PiPLiveValidation.errorLabel]
     let toggle = app.buttons[AccessibilityID.PiPLiveValidation.toggleButton]
     let video = app.otherElements[AccessibilityID.PiPLiveValidation.videoView]
+    var previousDirectRendererDiagnostics: String?
 
     waitForLabel(state, equals: "playing", timeout: 20)
     waitForLabel(duration, equals: "unknown", timeout: 5)
@@ -61,15 +66,36 @@ final class PiPLiveDeviceUITests: ShowcaseIOSTestCase {
       timeout: 10
     )
     assertRendersNonBlackFrame(video, timeout: 10)
+    if renderingPath == "direct" {
+      attachDirectRendererDiagnostics(
+        video,
+        previous: &previousDirectRendererDiagnostics,
+        name: "inline-before-pip"
+      )
+    }
 
     XCTAssertTrue(toggle.waitForExistence(timeout: 5))
     XCTAssertTrue(toggle.isEnabled)
     for cycle in 0..<3 {
       toggle.tap()
       waitForLabel(active, equals: "yes", timeout: 10)
+      if renderingPath == "direct" {
+        attachDirectRendererDiagnostics(
+          video,
+          previous: &previousDirectRendererDiagnostics,
+          name: "cycle-\(cycle + 1)-started"
+        )
+      }
       if cycle < 2 {
         toggle.tap()
         waitForLabel(active, equals: "no", timeout: 10)
+        if renderingPath == "direct" {
+          attachDirectRendererDiagnostics(
+            video,
+            previous: &previousDirectRendererDiagnostics,
+            name: "cycle-\(cycle + 1)-stopped"
+          )
+        }
       }
     }
 
@@ -87,7 +113,7 @@ final class PiPLiveDeviceUITests: ShowcaseIOSTestCase {
 
     XCUIDevice.shared.press(.home)
     RunLoop.current.run(until: Date().addingTimeInterval(2))
-    assertSystemPictureInPictureRendersMotion()
+    let visualFailure = captureSystemPictureInPictureMotion()
 
     app.activate()
     waitForLabel(state, equals: "playing", timeout: 10)
@@ -97,10 +123,45 @@ final class PiPLiveDeviceUITests: ShowcaseIOSTestCase {
       greaterThan: displayedBeforePiP,
       timeout: 10
     )
+    if renderingPath == "direct" {
+      attachDirectRendererDiagnostics(
+        video,
+        previous: &previousDirectRendererDiagnostics,
+        name: "after-background"
+      )
+    }
     XCTAssertFalse(
       playbackError.exists,
       "Validation surface reported an asynchronous playback error: \(playbackError.label)"
     )
+    if let visualFailure {
+      XCTFail(visualFailure)
+    }
     #endif
+  }
+
+  private func attachDirectRendererDiagnostics(
+    _ diagnosticsElement: XCUIElement,
+    previous: inout String?,
+    name: String
+  ) {
+    XCTAssertTrue(diagnosticsElement.waitForExistence(timeout: 5))
+    let predicate = if let previous {
+      NSPredicate(format: "value != %@", previous)
+    } else {
+      NSPredicate(format: "value BEGINSWITH %@", "capture=")
+    }
+    let updated = XCTNSPredicateExpectation(predicate: predicate, object: diagnosticsElement)
+    XCTAssertEqual(
+      XCTWaiter.wait(for: [updated], timeout: 2),
+      .completed,
+      "Diagnostics capture did not publish a new snapshot"
+    )
+    let current = diagnosticsElement.value as? String ?? "missing-diagnostics-value"
+    previous = current
+    let attachment = XCTAttachment(string: current)
+    attachment.name = "direct-renderer-diagnostics-\(name)"
+    attachment.lifetime = .keepAlways
+    add(attachment)
   }
 }

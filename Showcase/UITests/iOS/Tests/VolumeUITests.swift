@@ -33,7 +33,7 @@ final class VolumeUITests: ShowcaseIOSTestCase {
   // MARK: - Smoke
 
   /// On first paint, the level label must be a sensible percentage —
-  /// never negative, never wildly above 125. This is the regression
+  /// never negative, never above the documented 200% amplification ceiling. This is the regression
   /// guard for the "I hear audio but the screen shows -100%" bug: the
   /// libVLC getter returns a sentinel value before the audio output
   /// is initialized, and that sentinel must not leak into the UI.
@@ -47,7 +47,7 @@ final class VolumeUITests: ShowcaseIOSTestCase {
       return
     }
     XCTAssertGreaterThanOrEqual(pct, 0, "Volume rendered as negative: \(pct)%")
-    XCTAssertLessThanOrEqual(pct, 125, "Volume exceeded maximum 125%: \(pct)%")
+    XCTAssertLessThanOrEqual(pct, 200, "Volume exceeded maximum 200%: \(pct)%")
 
     assertNoLibraryErrors()
   }
@@ -135,7 +135,7 @@ final class VolumeUITests: ShowcaseIOSTestCase {
       return
     }
     XCTAssertGreaterThanOrEqual(final, 0, "Volume rendered as negative: \(final)%")
-    XCTAssertLessThanOrEqual(final, 125, "Volume exceeded max: \(final)%")
+    XCTAssertLessThanOrEqual(final, 200, "Volume exceeded max: \(final)%")
 
     assertNoLibraryErrors()
   }

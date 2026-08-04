@@ -128,7 +128,12 @@ extension Player {
     case .stateChanged(let newState):
       publishPlaybackState(newState)
       switch newState {
-      case .idle, .stopped, .stopping, .error:
+      case .stopped, .error:
+        supersedePendingSeekSettlement(ifNotPredating: sourceTimelineRevision)
+        #if os(iOS)
+        nativePiPVideoOutputRebuildPermit.invalidate()
+        #endif
+      case .idle, .stopping:
         supersedePendingSeekSettlement(ifNotPredating: sourceTimelineRevision)
       case .opening, .buffering, .playing, .paused:
         break
@@ -249,6 +254,9 @@ extension Player {
     case .encounteredError:
       publishPlaybackState(.error)
       supersedePendingSeekSettlement(ifNotPredating: sourceTimelineRevision)
+      #if os(iOS)
+      nativePiPVideoOutputRebuildPermit.invalidate()
+      #endif
       clearPauseControlState(for: sessionGeneration)
       reconcilePlaybackIntent(for: .error)
 
@@ -467,6 +475,9 @@ extension Player {
   /// is loaded or replaced.
   func resetMediaDerivedState(preservingPlaybackIntent: Bool = false) {
     supersedePendingSeekSettlement()
+    #if os(iOS)
+    nativePiPVideoOutputRebuildPermit.invalidate()
+    #endif
     nativeSeekMonitor.resetForTimelineReplacement()
     // New media, new timeline: clock samples still queued from the previous
     // one describe a media that is no longer loaded and must not be applied.

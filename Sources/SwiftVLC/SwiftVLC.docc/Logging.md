@@ -53,8 +53,8 @@ comparison:
 ## Severity reclassification
 
 A small set of upstream libVLC messages declare themselves as
-``LogLevel/error`` even though they are emitted as part of normal probe
-cascades. For example, when Apple's hardware decoder is asked to handle
+``LogLevel/error`` even though they are emitted as part of normal probe or
+self-healing recovery paths. For example, when Apple's hardware decoder is asked to handle
 a codec it doesn't accept, libVLC logs the rejection at error level
 before falling back to software. SwiftVLC reclassifies these structural
 probe failures to ``LogLevel/warning`` so that subscribers filtering at
@@ -65,7 +65,10 @@ entries reach any subscriber. It runs in constant time for the common
 case and only inspects the message string for entries that arrive at
 ``LogLevel/error``. Terminal failures such as `"Codec 'XXXX' (...) is not
 supported."` (the "no decoder found" message from the core decoder
-cascade) are untouched and remain at ``LogLevel/error``.
+cascade) are untouched and remain at ``LogLevel/error``. Recoverable
+paused-seek prefetch and PCR rebuffer diagnostics remain visible at
+``LogLevel/warning``; neighboring PCR messages that do not match libVLC's
+complete recovery templates remain errors.
 
 ## Ending a stream
 

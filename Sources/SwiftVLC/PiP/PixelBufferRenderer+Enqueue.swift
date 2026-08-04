@@ -1,6 +1,7 @@
 #if os(iOS) || os(macOS)
 import AVFoundation
 import CoreMedia
+import CoreVideo
 import Foundation
 import Synchronization
 
@@ -75,6 +76,25 @@ struct PixelBufferRendererTelemetrySnapshot: Sendable, Equatable {
   let playbackGeneration: UInt64?
   let voutGeneration: UInt64?
   let decodedFrameCount: UInt64
+  let decodedContentChangeCount: UInt64
+  let lastDecodedContentFingerprint: UInt64?
+  let renderGeneration: UInt64
+  let presentationCopyRequired: Bool
+  let presentationCopyFrameCount: UInt64
+  let presentationCopyFailureCount: UInt64
+  let displayLayerFlushRequestCount: UInt64
+  let decodePoolAllocationFailureCount: UInt64
+  let lastDecodePoolAllocationStatus: CVReturn?
+  let renderPoolAllocationFailureCount: UInt64
+  let lastRenderPoolAllocationStatus: CVReturn?
+  let vmemLockAttemptCount: UInt64
+  let vmemLockSuccessCount: UInt64
+  let vmemPoolUnavailableCount: UInt64
+  let vmemBaseAddressLockFailureCount: UInt64
+  let vmemPendingInstallFailureCount: UInt64
+  let vmemUnlockCallbackCount: UInt64
+  let vmemDisplayCallbackCount: UInt64
+  let vmemDisplayConsumeFailureCount: UInt64
   let enqueuedFrameCount: UInt64
   let presentedFrameCount: UInt64
   let droppedFrameCount: UInt64
@@ -242,13 +262,54 @@ extension PixelBufferRenderer {
 
   var telemetrySnapshot: PixelBufferRendererTelemetrySnapshot {
     let decoded = state.withLock {
-      ($0.decodedFrameCount, $0.lastDecodedAt)
+      (
+        frameCount: $0.decodedFrameCount,
+        lastAt: $0.lastDecodedAt,
+        contentChangeCount: $0.decodedContentChangeCount,
+        contentFingerprint: $0.lastDecodedContentFingerprint,
+        renderGeneration: $0.renderGeneration,
+        presentationCopyRequired: $0.presentationCopyRequired,
+        presentationCopyFrameCount: $0.presentationCopyFrameCount,
+        presentationCopyFailureCount: $0.presentationCopyFailureCount,
+        flushRequestCount: $0.displayLayerFlushRequestCount,
+        decodePoolFailureCount: $0.decodePoolAllocationFailureCount,
+        decodePoolStatus: $0.lastDecodePoolAllocationStatus,
+        renderPoolFailureCount: $0.renderPoolAllocationFailureCount,
+        renderPoolStatus: $0.lastRenderPoolAllocationStatus,
+        lockAttemptCount: $0.vmemLockAttemptCount,
+        lockSuccessCount: $0.vmemLockSuccessCount,
+        poolUnavailableCount: $0.vmemPoolUnavailableCount,
+        baseAddressLockFailureCount: $0.vmemBaseAddressLockFailureCount,
+        pendingInstallFailureCount: $0.vmemPendingInstallFailureCount,
+        unlockCallbackCount: $0.vmemUnlockCallbackCount,
+        displayCallbackCount: $0.vmemDisplayCallbackCount,
+        displayConsumeFailureCount: $0.vmemDisplayConsumeFailureCount
+      )
     }
     return enqueueState.withLock {
       PixelBufferRendererTelemetrySnapshot(
         playbackGeneration: $0.latestPlaybackGeneration,
         voutGeneration: $0.latestVoutGeneration,
-        decodedFrameCount: decoded.0,
+        decodedFrameCount: decoded.frameCount,
+        decodedContentChangeCount: decoded.contentChangeCount,
+        lastDecodedContentFingerprint: decoded.contentFingerprint,
+        renderGeneration: decoded.renderGeneration,
+        presentationCopyRequired: decoded.presentationCopyRequired,
+        presentationCopyFrameCount: decoded.presentationCopyFrameCount,
+        presentationCopyFailureCount: decoded.presentationCopyFailureCount,
+        displayLayerFlushRequestCount: decoded.flushRequestCount,
+        decodePoolAllocationFailureCount: decoded.decodePoolFailureCount,
+        lastDecodePoolAllocationStatus: decoded.decodePoolStatus,
+        renderPoolAllocationFailureCount: decoded.renderPoolFailureCount,
+        lastRenderPoolAllocationStatus: decoded.renderPoolStatus,
+        vmemLockAttemptCount: decoded.lockAttemptCount,
+        vmemLockSuccessCount: decoded.lockSuccessCount,
+        vmemPoolUnavailableCount: decoded.poolUnavailableCount,
+        vmemBaseAddressLockFailureCount: decoded.baseAddressLockFailureCount,
+        vmemPendingInstallFailureCount: decoded.pendingInstallFailureCount,
+        vmemUnlockCallbackCount: decoded.unlockCallbackCount,
+        vmemDisplayCallbackCount: decoded.displayCallbackCount,
+        vmemDisplayConsumeFailureCount: decoded.displayConsumeFailureCount,
         enqueuedFrameCount: $0.enqueuedFrameCount,
         presentedFrameCount: $0.presentedFrameCount,
         droppedFrameCount: $0.replacementCount &+ $0.backpressureDropCount,
@@ -258,7 +319,7 @@ extension PixelBufferRenderer {
         replacementCount: $0.replacementCount,
         flushRecoveryRetryCount: $0.flushRecoveryTotalRetryCount,
         flushRecoveryFailureCount: $0.flushRecoveryFailureCount,
-        lastDecodedAt: decoded.1,
+        lastDecodedAt: decoded.lastAt,
         lastEnqueuedAt: $0.lastEnqueuedAt,
         lastPresentedAt: $0.lastPresentedAt,
         lastPresentedSampleTimeSeconds: $0.lastPresentedSampleTimeSeconds,

@@ -1,4 +1,5 @@
 #if os(iOS) || os(macOS)
+import AVFoundation
 import CoreMedia
 import Foundation
 
@@ -49,16 +50,46 @@ public struct PiPTimebaseDiagnosticSnapshot: Codable, Sendable, Equatable {
   public let controlTimebaseRate: Double?
   public let driftSeconds: Double?
   public let decodedFrameCount: UInt64
+  public let decodedContentChangeCount: UInt64
+  public let lastDecodedContentFingerprint: UInt64?
+  public let renderGeneration: UInt64
+  public let presentationCopyRequired: Bool
+  public let presentationCopyFrameCount: UInt64
+  public let presentationCopyFailureCount: UInt64
+  public let displayLayerFlushRequestCount: UInt64
+  public let decodePoolAllocationFailureCount: UInt64
+  public let lastDecodePoolAllocationStatus: Int32?
+  public let renderPoolAllocationFailureCount: UInt64
+  public let lastRenderPoolAllocationStatus: Int32?
+  public let vmemLockAttemptCount: UInt64
+  public let vmemLockSuccessCount: UInt64
+  public let vmemPoolUnavailableCount: UInt64
+  public let vmemBaseAddressLockFailureCount: UInt64
+  public let vmemPendingInstallFailureCount: UInt64
+  public let vmemUnlockCallbackCount: UInt64
+  public let vmemDisplayCallbackCount: UInt64
+  public let vmemDisplayConsumeFailureCount: UInt64
   public let enqueuedFrameCount: UInt64
   public let deliveredFrameCount: UInt64
   public let droppedFrameCount: UInt64
   public let lastDeliveredSampleTimeSeconds: Double?
   public let lastDeliveredSamplePlaybackGeneration: UInt64?
+  public let displayLayerStatus: String
+  public let isDisplayLayerReadyForDisplay: Bool
+  public let displayLayerRequiresFlush: Bool
+  public let displayLayerError: String?
   public let correctionCount: UInt64
 }
 
 @_spi(Qualification)
 extension PiPController {
+  /// Enables bounded pixel-grid fingerprints for a qualification run. Normal
+  /// clients never pay this cost; callers must opt in explicitly.
+  public func enableFrameContentDiagnostics() {
+    renderer.setContentFingerprintingEnabled(true)
+    callbackRegistration?.setQualificationTelemetryEnabled(true)
+  }
+
   /// Every control-timebase write, in issue order, without a sampling gap.
   public nonisolated var timebaseCorrections: AsyncStream<PiPTimebaseCorrection> {
     timebaseCorrectionBroadcaster.subscribe(policy: .unbounded)
@@ -71,6 +102,13 @@ extension PiPController {
       + Double(mediaTime.components.attoseconds) / 1e18
     let timebaseSeconds = controlTimebase.map { CMTimebaseGetTime($0).seconds }
     let telemetry = renderer.telemetrySnapshot
+    let displayLayer = layer
+    let displayLayerStatus = switch displayLayer.sampleBufferRenderer.status {
+    case .unknown: "unknown"
+    case .rendering: "rendering"
+    case .failed: "failed"
+    @unknown default: "future"
+    }
 
     return PiPTimebaseDiagnosticSnapshot(
       capturedAt: Date().timeIntervalSince1970,
@@ -84,11 +122,34 @@ extension PiPController {
       controlTimebaseRate: controlTimebase.map { CMTimebaseGetRate($0) },
       driftSeconds: timebaseSeconds.map { mediaTimeSeconds - $0 },
       decodedFrameCount: telemetry.decodedFrameCount,
+      decodedContentChangeCount: telemetry.decodedContentChangeCount,
+      lastDecodedContentFingerprint: telemetry.lastDecodedContentFingerprint,
+      renderGeneration: telemetry.renderGeneration,
+      presentationCopyRequired: telemetry.presentationCopyRequired,
+      presentationCopyFrameCount: telemetry.presentationCopyFrameCount,
+      presentationCopyFailureCount: telemetry.presentationCopyFailureCount,
+      displayLayerFlushRequestCount: telemetry.displayLayerFlushRequestCount,
+      decodePoolAllocationFailureCount: telemetry.decodePoolAllocationFailureCount,
+      lastDecodePoolAllocationStatus: telemetry.lastDecodePoolAllocationStatus,
+      renderPoolAllocationFailureCount: telemetry.renderPoolAllocationFailureCount,
+      lastRenderPoolAllocationStatus: telemetry.lastRenderPoolAllocationStatus,
+      vmemLockAttemptCount: telemetry.vmemLockAttemptCount,
+      vmemLockSuccessCount: telemetry.vmemLockSuccessCount,
+      vmemPoolUnavailableCount: telemetry.vmemPoolUnavailableCount,
+      vmemBaseAddressLockFailureCount: telemetry.vmemBaseAddressLockFailureCount,
+      vmemPendingInstallFailureCount: telemetry.vmemPendingInstallFailureCount,
+      vmemUnlockCallbackCount: telemetry.vmemUnlockCallbackCount,
+      vmemDisplayCallbackCount: telemetry.vmemDisplayCallbackCount,
+      vmemDisplayConsumeFailureCount: telemetry.vmemDisplayConsumeFailureCount,
       enqueuedFrameCount: telemetry.enqueuedFrameCount,
       deliveredFrameCount: telemetry.presentedFrameCount,
       droppedFrameCount: telemetry.droppedFrameCount,
       lastDeliveredSampleTimeSeconds: telemetry.lastPresentedSampleTimeSeconds,
       lastDeliveredSamplePlaybackGeneration: telemetry.lastPresentedSamplePlaybackGeneration,
+      displayLayerStatus: displayLayerStatus,
+      isDisplayLayerReadyForDisplay: displayLayer.isReadyForDisplay,
+      displayLayerRequiresFlush: displayLayer.sampleBufferRenderer.requiresFlushToResumeDecoding,
+      displayLayerError: displayLayer.sampleBufferRenderer.error?.localizedDescription,
       correctionCount: timebaseCorrectionSequence
     )
   }

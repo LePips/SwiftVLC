@@ -130,25 +130,18 @@ final class PiPMotionRegionAnalyzerTests: XCTestCase {
     XCTAssertEqual(analysis.nonBlackFrameCount, 0)
   }
 
-  func testPiPPositionDriftFails() {
+  func testPiPRelocationCreatesAmbiguousPersistentRegionsAndFails() {
     let frames = syntheticFrames { _, _, _, frameIndex in
-      let region = PiPMotionRegion(
-        x: 44 + frameIndex * 4,
-        y: self.expectedPiP.y,
-        width: self.expectedPiP.width,
-        height: self.expectedPiP.height
-      )
+      let region = frameIndex.isMultiple(of: 2)
+        ? PiPMotionRegion(x: 8, y: 30, width: 80, height: 45)
+        : PiPMotionRegion(x: 72, y: 156, width: 80, height: 45)
       return .animated(region: region, frameIndex: frameIndex)
     }
 
     let analysis = analyzer.analyze(frames)
 
     XCTAssertFalse(analysis.passed, diagnostics(for: analysis))
-    XCTAssertEqual(analysis.failure, .unstableRegion, diagnostics(for: analysis))
-    XCTAssertGreaterThan(
-      analysis.horizontalCenterDriftRatio,
-      PiPMotionRegionAnalyzer.Configuration.physicalPiP.maximumCenterDriftRatio
-    )
+    XCTAssertEqual(analysis.failure, .ambiguousMotionRegions, diagnostics(for: analysis))
   }
 
   func testRoundedCornersAndStaticControlsStillPass() throws {
@@ -171,6 +164,33 @@ final class PiPMotionRegionAnalyzerTests: XCTestCase {
       diagnostics(for: analysis)
     )
     XCTAssertGreaterThan(analysis.persistentFillRatio, 0.65)
+  }
+
+  func testDisconnectedMotionInsideOneFixedPiPRegionPasses() throws {
+    let frames = syntheticFrames { x, y, _, frameIndex in
+      guard self.expectedPiP.contains(x: x, y: y) else { return .background }
+
+      let localX = x - self.expectedPiP.x
+      let localY = y - self.expectedPiP.y
+      let movingDiagonal = abs(localY - ((localX + frameIndex * 3) % self.expectedPiP.height)) <= 2
+      let movingBlock = localX >= 52 && localX < 72
+        && localY >= 25 && localY < 39
+        && (localX / 3 + localY / 3 + frameIndex).isMultiple(of: 2)
+      if movingDiagonal || movingBlock {
+        return .animated(region: self.expectedPiP, frameIndex: frameIndex)
+      }
+      return .pixel(PiPMotionPixel(red: 60, green: 80, blue: 180))
+    }
+
+    let analysis = analyzer.analyze(frames)
+
+    XCTAssertTrue(analysis.passed, diagnostics(for: analysis))
+    let detected = try XCTUnwrap(analysis.region)
+    XCTAssertGreaterThanOrEqual(
+      Double(detected.intersectionArea(with: expectedPiP)) / Double(expectedPiP.area),
+      0.75,
+      diagnostics(for: analysis)
+    )
   }
 
   func testOneWholeScreenTransitionDoesNotDisplaceStablePiP() {

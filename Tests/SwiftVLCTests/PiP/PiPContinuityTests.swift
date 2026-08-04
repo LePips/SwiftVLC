@@ -50,6 +50,84 @@ extension Integration {
     }
 
     @Test
+    func `same-generation handoff requires explicit rebuild proof`() {
+      let events = Mutex<[Marker]>([])
+      let coordinator = IOSNativePiPContinuityCoordinator { transition in
+        events.withLock { $0.append(Self.marker(for: transition)) }
+      }
+      let controller = NSObject()
+      let generation = PlaybackGeneration(13)
+
+      coordinator.didBecomeReady(controller, mediaGeneration: generation)
+      #expect(coordinator.preserve(controller, for: generation) == false)
+      #expect(coordinator.preserve(
+        controller,
+        for: generation,
+        allowsSameGenerationRebuild: true
+      ))
+      #expect(coordinator.takePreservedController(for: generation) === controller)
+      coordinator.didBecomeReady(controller, mediaGeneration: generation)
+
+      #expect(events.withLock { $0 } == [
+        .rebuilding(generation, generation),
+        .restored(generation, generation)
+      ])
+    }
+
+    @Test
+    func `seek rebuild permit is generation-bound one-shot and cancelable`() throws {
+      let permits = IOSNativePiPVideoOutputRebuildPermit()
+      let generation = PlaybackGeneration(14)
+      let other = PlaybackGeneration(15)
+
+      #expect(permits.stage(for: generation) == nil)
+      permits.setPiPActive(true)
+      let first = try #require(permits.stage(for: generation))
+      #expect(permits.consume(for: other) == false)
+      #expect(permits.consume(for: generation))
+      #expect(permits.consume(for: generation) == false)
+
+      let canceled = try #require(permits.stage(for: generation))
+      permits.cancel(canceled)
+      #expect(permits.consume(for: generation) == false)
+
+      _ = permits.stage(for: generation)
+      permits.invalidate()
+      #expect(permits.consume(for: generation) == false)
+
+      _ = first
+      _ = permits.stage(for: generation, validity: .zero)
+      #expect(permits.consume(for: generation) == false)
+
+      _ = permits.stage(for: generation)
+      permits.setPiPActive(false)
+      permits.setPiPActive(true)
+      #expect(permits.consume(for: generation) == false)
+    }
+
+    @Test
+    func `terminal player events invalidate a staged seek rebuild permit`() throws {
+      let player = Player()
+      player.nativePiPVideoOutputRebuildPermit.setPiPActive(true)
+
+      _ = try #require(
+        player.nativePiPVideoOutputRebuildPermit.stage(for: player.generation)
+      )
+      player.handleEvent(.stateChanged(.stopped))
+      #expect(
+        player.nativePiPVideoOutputRebuildPermit.consume(for: player.generation) == false
+      )
+
+      _ = try #require(
+        player.nativePiPVideoOutputRebuildPermit.stage(for: player.generation)
+      )
+      player.handleEvent(.encounteredError)
+      #expect(
+        player.nativePiPVideoOutputRebuildPermit.consume(for: player.generation) == false
+      )
+    }
+
+    @Test
     func `the native timeout publishes one terminal outcome`() {
       let events = Mutex<[Marker]>([])
       let coordinator = IOSNativePiPContinuityCoordinator { transition in

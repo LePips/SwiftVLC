@@ -78,11 +78,13 @@ extension Player {
     // accepted revision and pending request untouched.
     let revision = eventBridge.advanceTimelineRevision()
     let nativeSeekToken = nativeSeekMonitor.stageCommand()
+    let pipRebuildPermit = stageNativePiPVideoOutputRebuildPermit()
     // Publishing before checking the result reported a target libVLC had
     // refused, leaving the observable timeline describing a position playback
     // never reached.
     guard libvlc_media_player_set_time(pointer, milliseconds, fast) == 0 else {
       nativeSeekMonitor.cancelStagedCommand(nativeSeekToken)
+      cancelNativePiPVideoOutputRebuildPermit(pipRebuildPermit)
       throw .operationFailed("Seek to \(milliseconds) ms")
     }
     supersedePendingSeekSettlement()
@@ -95,13 +97,23 @@ extension Player {
   /// method still throws if the player does not yet know media duration or
   /// if the current media is not seekable. For live or unknown-duration
   /// media use the non-throwing ``seek(toPosition:fast:)`` instead.
-  public func seek(to position: PlaybackPosition) throws(VLCError) {
+  ///
+  /// - Parameters:
+  ///   - position: The fractional target in the current media.
+  ///   - fast: Prefer fast (keyframe) seeking over precise seeking. Interactive
+  ///     scrubbers should use fast seeks while their value changes, then issue
+  ///     one precise seek when editing ends.
+  public func seek(
+    to position: PlaybackPosition,
+    fast: Bool = false
+  )
+    throws(VLCError) {
     guard let duration else {
       throw .invalidState("duration is not known")
     }
     let durationMs = try duration.checkedNonnegativeMilliseconds(parameter: "duration")
     let target = checkedMilliseconds(for: position, durationMs: durationMs)
-    try seek(to: .milliseconds(target))
+    try seek(to: .milliseconds(target), fast: fast)
   }
 
   /// Seeks by a relative offset from the current position.
@@ -140,8 +152,10 @@ extension Player {
 
     let revision = eventBridge.advanceTimelineRevision()
     let nativeSeekToken = nativeSeekMonitor.stageCommand()
+    let pipRebuildPermit = stageNativePiPVideoOutputRebuildPermit()
     guard libvlc_media_player_set_time(pointer, targetMs, fast) == 0 else {
       nativeSeekMonitor.cancelStagedCommand(nativeSeekToken)
+      cancelNativePiPVideoOutputRebuildPermit(pipRebuildPermit)
       throw .operationFailed("Jump to \(targetMs) ms")
     }
     supersedePendingSeekSettlement()
@@ -191,8 +205,10 @@ extension Player {
     guard hasLenientSeekSession else { return false }
     let revision = eventBridge.advanceTimelineRevision()
     let nativeSeekToken = nativeSeekMonitor.stageCommand()
+    let pipRebuildPermit = stageNativePiPVideoOutputRebuildPermit()
     guard issueNativeSeek(toPosition: position.rawValue, fast: fast) == 0 else {
       nativeSeekMonitor.cancelStagedCommand(nativeSeekToken)
+      cancelNativePiPVideoOutputRebuildPermit(pipRebuildPermit)
       return false
     }
     supersedePendingSeekSettlement()
@@ -286,8 +302,10 @@ extension Player {
     }
     let revision = eventBridge.advanceTimelineRevision()
     let commandToken = nativeSeekToken ?? nativeSeekMonitor.stageCommand()
+    let pipRebuildPermit = stageNativePiPVideoOutputRebuildPermit()
     guard issueNativeJump(byMilliseconds: offsetMs) == 0 else {
       nativeSeekMonitor.cancelStagedCommand(commandToken)
+      cancelNativePiPVideoOutputRebuildPermit(pipRebuildPermit)
       return nil
     }
     #if DEBUG
@@ -338,6 +356,22 @@ extension Player {
     }
     #endif
     return libvlc_media_player_jump_time(pointer, offset)
+  }
+
+  private func stageNativePiPVideoOutputRebuildPermit() -> UInt64? {
+    #if os(iOS)
+    return nativePiPVideoOutputRebuildPermit.stage(for: generation)
+    #else
+    return nil
+    #endif
+  }
+
+  private func cancelNativePiPVideoOutputRebuildPermit(_ token: UInt64?) {
+    #if os(iOS)
+    if let token {
+      nativePiPVideoOutputRebuildPermit.cancel(token)
+    }
+    #endif
   }
 
   /// Creates the single pending request and starts its bounded timeout.

@@ -59,11 +59,13 @@ final class IOSNativePiPContinuityCoordinator: @unchecked Sendable {
     self.emit = emit
   }
 
-  /// Holds an active native window controller only when the player has
-  /// already advanced to a different media generation.
+  /// Holds an active native window controller when the player advanced to a
+  /// different media generation, or when the engine consumed explicit proof
+  /// that this same-generation close is a seek-driven video-output rebuild.
   func preserve(
     _ controller: AnyObject,
-    for mediaGeneration: PlaybackGeneration?
+    for mediaGeneration: PlaybackGeneration?,
+    allowsSameGenerationRebuild: Bool = false
   ) -> Bool {
     guard let mediaGeneration else { return false }
     let startedAt = clock.now
@@ -91,7 +93,7 @@ final class IOSNativePiPContinuityCoordinator: @unchecked Sendable {
 
       guard
         let previous = state.readyMediaGeneration,
-        previous != mediaGeneration
+        previous != mediaGeneration || allowsSameGenerationRebuild
       else { return (false, nil) }
 
       state.pending = Pending(

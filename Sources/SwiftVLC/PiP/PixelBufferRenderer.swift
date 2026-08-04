@@ -38,7 +38,28 @@ final class PixelBufferRenderer: Sendable {
     var renderPool: CVPixelBufferPool?
     var renderPoolWidth: Int = 0
     var renderPoolHeight: Int = 0
+    /// Direct PiP must not hand libVLC's bounded decode buffers to AVKit.
+    /// AVKit can retain those buffers across the PiP transition, starving
+    /// vmem before another frame can be decoded. While this is true, frames
+    /// are copied into the independently bounded presentation pool even when
+    /// the requested render geometry matches the source.
+    var presentationCopyRequired = false
+    var presentationCopyFrameCount: UInt64 = 0
+    var presentationCopyFailureCount: UInt64 = 0
     var renderGeneration: UInt64 = 0
+    var displayLayerFlushRequestCount: UInt64 = 0
+    var decodePoolAllocationFailureCount: UInt64 = 0
+    var lastDecodePoolAllocationStatus: CVReturn?
+    var renderPoolAllocationFailureCount: UInt64 = 0
+    var lastRenderPoolAllocationStatus: CVReturn?
+    var vmemLockAttemptCount: UInt64 = 0
+    var vmemLockSuccessCount: UInt64 = 0
+    var vmemPoolUnavailableCount: UInt64 = 0
+    var vmemBaseAddressLockFailureCount: UInt64 = 0
+    var vmemPendingInstallFailureCount: UInt64 = 0
+    var vmemUnlockCallbackCount: UInt64 = 0
+    var vmemDisplayCallbackCount: UInt64 = 0
+    var vmemDisplayConsumeFailureCount: UInt64 = 0
     var cachedFormatDescription: CachedFormatDescription?
     var formatDescriptionCreationCount: UInt64 = 0
     var scalingResources: PixelBufferScalingResources?
@@ -57,6 +78,11 @@ final class PixelBufferRenderer: Sendable {
     var frameDuration: CMTime = .invalid
     var decodedFrameCount: UInt64 = 0
     var lastDecodedAt: ContinuousClock.Instant?
+    /// Opt-in qualification probe. Disabled for normal clients so sampling
+    /// decoded pixels adds no work to the production hot path.
+    var contentFingerprintingEnabled = false
+    var lastDecodedContentFingerprint: UInt64?
+    var decodedContentChangeCount: UInt64 = 0
     var playbackGeneration: UInt64?
 
     init(displayLayer: AVSampleBufferDisplayLayer?) {
@@ -70,6 +96,14 @@ final class PixelBufferRenderer: Sendable {
   }
 
   let state: Mutex<State>
+  /// Lock-free copy-isolation signal mirrored into the active callback handle.
+  /// libVLC reads it for every decoded frame, so it must not require renderer
+  /// or callback-context mutexes on the normal zero-copy path.
+  let presentationCopyEnabled = Atomic<Bool>(false)
+  /// Fast gate for qualification-only callback counters. The callback context
+  /// mirrors this value so disabled production callbacks avoid entering the
+  /// renderer and callback-context mutexes solely for telemetry.
+  let contentDiagnosticsEnabled = Atomic<Bool>(false)
   let enqueueQueue: DispatchQueue
   let enqueueState = Mutex(PixelBufferEnqueueState())
   let displayLayerAPI: PixelBufferDisplayLayerAPI
@@ -113,6 +147,82 @@ final class PixelBufferRenderer: Sendable {
 
   func setTimebase(_ tb: CMTimebase?) {
     state.withLock { $0.timebase = tb }
+  }
+
+  func setContentFingerprintingEnabled(_ enabled: Bool) {
+    if !enabled {
+      contentDiagnosticsEnabled.store(false, ordering: .releasing)
+    }
+    state.withLock { state in
+      state.contentFingerprintingEnabled = enabled
+      state.lastDecodedContentFingerprint = nil
+      state.decodedContentChangeCount = 0
+    }
+    if enabled {
+      contentDiagnosticsEnabled.store(true, ordering: .releasing)
+    }
+  }
+
+  /// Samples a fixed grid of BGRA pixels. This is deliberately not a full
+  /// frame hash: qualification only needs to prove that decoded content keeps
+  /// changing after backgrounding, and bounded sampling avoids turning the
+  /// diagnostic into a material renderer workload.
+  func recordContentFingerprintIfEnabled(of pixelBuffer: CVPixelBuffer) {
+    guard contentDiagnosticsEnabled.load(ordering: .acquiring) else { return }
+    guard let fingerprint = Self.sampledContentFingerprint(of: pixelBuffer) else { return }
+    state.withLock { state in
+      guard state.contentFingerprintingEnabled else { return }
+      if
+        let previous = state.lastDecodedContentFingerprint,
+        previous != fingerprint {
+        state.decodedContentChangeCount &+= 1
+      }
+      state.lastDecodedContentFingerprint = fingerprint
+    }
+  }
+
+  static func sampledContentFingerprint(of pixelBuffer: CVPixelBuffer) -> UInt64? {
+    guard CVPixelBufferGetPixelFormatType(pixelBuffer) == kCVPixelFormatType_32BGRA else {
+      return nil
+    }
+    guard CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly) == kCVReturnSuccess else {
+      return nil
+    }
+    defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
+    guard let baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer) else { return nil }
+
+    let width = CVPixelBufferGetWidth(pixelBuffer)
+    let height = CVPixelBufferGetHeight(pixelBuffer)
+    let bytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer)
+    guard width > 0, height > 0, bytesPerRow >= width * 4 else { return nil }
+
+    let bytes = baseAddress.assumingMemoryBound(to: UInt8.self)
+    var fingerprint: UInt64 = 0xCBF2_9CE4_8422_2325
+    func mix(_ byte: UInt8) {
+      fingerprint ^= UInt64(byte)
+      fingerprint &*= 0x100_0000_01B3
+    }
+
+    // Include geometry so equal prefixes from differently sized buffers never
+    // compare as the same decoded frame.
+    for shift in stride(from: 0, through: 56, by: 8) {
+      mix(UInt8(truncatingIfNeeded: UInt64(width) >> UInt64(shift)))
+      mix(UInt8(truncatingIfNeeded: UInt64(height) >> UInt64(shift)))
+    }
+    let columns = min(width, 16)
+    let rows = min(height, 9)
+    for row in 0..<rows {
+      let y = rows == 1 ? 0 : row * (height - 1) / (rows - 1)
+      for column in 0..<columns {
+        let x = columns == 1 ? 0 : column * (width - 1) / (columns - 1)
+        let offset = y * bytesPerRow + x * 4
+        mix(bytes[offset])
+        mix(bytes[offset + 1])
+        mix(bytes[offset + 2])
+        mix(bytes[offset + 3])
+      }
+    }
+    return fingerprint
   }
 
   /// Publishes the source's frame cadence for the sample timing of subsequent
@@ -169,8 +279,20 @@ final class PixelBufferRenderer: Sendable {
     }
   }
 
+  /// Isolates AVKit's presentation ownership from libVLC's decode pool.
+  ///
+  /// The copy is scoped to active PiP. Inline playback keeps the zero-copy
+  /// path, and stopping PiP immediately restores it.
+  func setPresentationCopyRequired(_ required: Bool) {
+    presentationCopyEnabled.store(required, ordering: .releasing)
+    state.withLock { $0.presentationCopyRequired = required }
+  }
+
   func flushDisplayLayer() {
-    let layer = state.withLock { $0.displayLayer.layer }
+    let layer = state.withLock { state in
+      state.displayLayerFlushRequestCount &+= 1
+      return state.displayLayer.layer
+    }
     DispatchQueue.main.async { [layer] in
       layer?.sampleBufferRenderer.flush()
     }
@@ -179,60 +301,97 @@ final class PixelBufferRenderer: Sendable {
   func outputPixelBuffer(from source: CVPixelBuffer) -> (buffer: CVPixelBuffer, generation: UInt64)? {
     let interval = Signposts.signposter.beginInterval("PixelBufferRenderer.outputPixelBuffer")
     defer { Signposts.signposter.endInterval("PixelBufferRenderer.outputPixelBuffer", interval) }
-    let (target, generation) = state.withLock { ($0.renderSize, $0.renderGeneration) }
-    guard
-      let target,
-      target.width > 0,
-      target.height > 0
-    else {
+    let (target, generation, copyRequired) = state.withLock {
+      ($0.renderSize, $0.renderGeneration, $0.presentationCopyRequired)
+    }
+    let sourcePixelWidth = CVPixelBufferGetWidth(source)
+    let sourcePixelHeight = CVPixelBufferGetHeight(source)
+    guard sourcePixelWidth > 0, sourcePixelHeight > 0 else { return (source, generation) }
+
+    let width: Int
+    let height: Int
+    if let target, target.width > 0, target.height > 0 {
+      width = Int(target.width)
+      height = Int(target.height)
+    } else if copyRequired {
+      width = sourcePixelWidth
+      height = sourcePixelHeight
+    } else {
       return (source, generation)
     }
 
-    let width = Int(target.width)
-    let height = Int(target.height)
-    if CVPixelBufferGetWidth(source) == width, CVPixelBufferGetHeight(source) == height {
+    if sourcePixelWidth == width, sourcePixelHeight == height, !copyRequired {
       return (source, generation)
     }
 
-    guard let output = makeRenderPixelBuffer(width: width, height: height) else {
-      return nil
+    // libVLC invokes this on its decode thread, which has no run-loop-owned
+    // autorelease pool. Core Image's Objective-C graph objects retain the
+    // source pixel buffer; without a local pool, a completed conversion can
+    // therefore keep the one transition-headroom buffer alive indefinitely.
+    return autoreleasepool {
+      guard let output = makeRenderPixelBuffer(width: width, height: height) else {
+        return nil
+      }
+
+      let sourceWidth = CGFloat(sourcePixelWidth)
+      let sourceHeight = CGFloat(sourcePixelHeight)
+      let targetWidth = CGFloat(width)
+      let targetHeight = CGFloat(height)
+      let scale = min(targetWidth / sourceWidth, targetHeight / sourceHeight)
+      let fittedWidth = sourceWidth * scale
+      let fittedHeight = sourceHeight * scale
+      let offsetX = (targetWidth - fittedWidth) / 2
+      let offsetY = (targetHeight - fittedHeight) / 2
+
+      let transform = CGAffineTransform(
+        a: scale,
+        b: 0,
+        c: 0,
+        d: scale,
+        tx: offsetX,
+        ty: offsetY
+      )
+      let frame = CGRect(x: 0, y: 0, width: targetWidth, height: targetHeight)
+      let background = CIImage(color: CIColor(red: 0, green: 0, blue: 0, alpha: 1))
+        .cropped(to: frame)
+      let image = CIImage(cvPixelBuffer: source)
+        .transformed(by: transform)
+        .composited(over: background)
+
+      let resources = scalingResourcesForResize()
+      if copyRequired {
+        // `CIContext.render(_:to:bounds:colorSpace:)` may return after GPU work
+        // has merely been scheduled. PiP's one-frame decode headroom cannot
+        // make forward progress if Core Image still retains that source buffer,
+        // so make completion of the ownership transfer explicit.
+        do {
+          let destination = CIRenderDestination(pixelBuffer: output)
+          destination.colorSpace = resources.colorSpace
+          let task = try resources.context.startTask(toRender: image, to: destination)
+          _ = try task.waitUntilCompleted()
+          state.withLock {
+            if $0.contentFingerprintingEnabled {
+              $0.presentationCopyFrameCount &+= 1
+            }
+          }
+        } catch {
+          state.withLock {
+            if $0.contentFingerprintingEnabled {
+              $0.presentationCopyFailureCount &+= 1
+            }
+          }
+          return nil
+        }
+      } else {
+        resources.context.render(
+          image,
+          to: output,
+          bounds: frame,
+          colorSpace: resources.colorSpace
+        )
+      }
+      return (output, generation)
     }
-
-    let sourceWidth = CGFloat(CVPixelBufferGetWidth(source))
-    let sourceHeight = CGFloat(CVPixelBufferGetHeight(source))
-    let targetWidth = CGFloat(width)
-    let targetHeight = CGFloat(height)
-    guard sourceWidth > 0, sourceHeight > 0 else { return (source, generation) }
-
-    let scale = min(targetWidth / sourceWidth, targetHeight / sourceHeight)
-    let fittedWidth = sourceWidth * scale
-    let fittedHeight = sourceHeight * scale
-    let offsetX = (targetWidth - fittedWidth) / 2
-    let offsetY = (targetHeight - fittedHeight) / 2
-
-    let transform = CGAffineTransform(
-      a: scale,
-      b: 0,
-      c: 0,
-      d: scale,
-      tx: offsetX,
-      ty: offsetY
-    )
-    let frame = CGRect(x: 0, y: 0, width: targetWidth, height: targetHeight)
-    let background = CIImage(color: CIColor(red: 0, green: 0, blue: 0, alpha: 1))
-      .cropped(to: frame)
-    let image = CIImage(cvPixelBuffer: source)
-      .transformed(by: transform)
-      .composited(over: background)
-
-    let resources = scalingResourcesForResize()
-    resources.context.render(
-      image,
-      to: output,
-      bounds: frame,
-      colorSpace: resources.colorSpace
-    )
-    return (output, generation)
   }
 
   private func scalingResourcesForResize() -> PixelBufferScalingResources {
@@ -272,7 +431,11 @@ final class PixelBufferRenderer: Sendable {
         attrs as CFDictionary,
         &newPool
       )
-      guard status == kCVReturnSuccess, let newPool else { return nil }
+      guard status == kCVReturnSuccess, let newPool else {
+        state.renderPoolAllocationFailureCount &+= 1
+        state.lastRenderPoolAllocationStatus = status
+        return nil
+      }
 
       state.renderPool = newPool
       state.renderPoolWidth = width
@@ -286,708 +449,15 @@ final class PixelBufferRenderer: Sendable {
       width: width,
       height: height
     )
-    guard allocation.status == kCVReturnSuccess else { return nil }
-    return allocation.buffer
-  }
-}
-
-/// Injectable native registration operations. Production uses libVLC; tests
-/// record the exact handle each install/clear targets without requiring a
-/// timing-sensitive video output.
-struct DirectPiPVideoCallbackAPI {
-  let install: @MainActor (OpaquePointer, UnsafeMutableRawPointer) -> Void
-  let clear: @MainActor (OpaquePointer) -> Void
-
-  static var live: Self {
-    Self(
-      install: { player, opaque in
-        libvlc_video_set_callbacks(
-          player,
-          pixelBufferLockCallback,
-          pixelBufferUnlockCallback,
-          pixelBufferDisplayCallback,
-          opaque
-        )
-        let installedExtended = swiftvlc_video_set_format_callbacks_ex_if_available(
-          player,
-          pixelBufferFormatCallbackEx,
-          pixelBufferCleanupCallback
-        )
-        if !installedExtended {
-          // A libVLC binary without the extended `_ex` format callbacks cannot
-          // supply atomic vmem geometry. Fall back to the legacy callback,
-          // which cannot prove crop/PAR.
-          libvlc_video_set_format_callbacks(
-            player,
-            pixelBufferFormatCallback,
-            pixelBufferCleanupCallback
-          )
-        }
-      },
-      clear: { player in
-        libvlc_video_set_callbacks(player, nil, nil, nil, nil)
-        if !swiftvlc_video_set_format_callbacks_ex_if_available(player, nil, nil) {
-          libvlc_video_set_format_callbacks(player, nil, nil)
-        }
+    guard allocation.status == kCVReturnSuccess, let buffer = allocation.buffer else {
+      state.withLock {
+        $0.renderPoolAllocationFailureCount &+= 1
+        $0.lastRenderPoolAllocationStatus = allocation.status
       }
-    )
-  }
-}
-
-/// The stable callback slot for one exact native-player handle.
-///
-/// libVLC copies `vmem` callbacks and their opaque value when a video output
-/// opens. Replacing the media-player variables does not update that copy, so
-/// every controller using the same native handle must share this slot. The
-/// copied handle opaque routes display to the current controller; setup then
-/// replaces each vout's copy with a retained per-vout opaque and decode pool.
-/// A replacement native handle receives a new slot and handle opaque.
-@MainActor
-final class DirectPiPVideoCallbackSlot {
-  let lifetime: NativePlayerHandleLifetime
-  let context: PixelBufferRendererCallbackContext
-  let opaque: UnsafeMutableRawPointer
-  private let api: DirectPiPVideoCallbackAPI
-  private var callbacksInstalled = false
-  private(set) var isRetired = false
-
-  init(
-    lifetime: NativePlayerHandleLifetime,
-    decodeRenderer: PixelBufferRenderer,
-    playbackGeneration: UInt64 = 0,
-    voutGenerationCounter: PixelBufferVoutGenerationCounter = PixelBufferVoutGenerationCounter(),
-    api: DirectPiPVideoCallbackAPI
-  ) {
-    precondition(!lifetime.isReleased)
-    self.lifetime = lifetime
-    self.api = api
-    let context = PixelBufferRendererCallbackContext(
-      renderer: decodeRenderer,
-      playbackGeneration: playbackGeneration,
-      voutGenerationCounter: voutGenerationCounter
-    )
-    self.context = context
-    let retained = Unmanaged.passRetained(context)
-    let opaque = retained.toOpaque()
-    self.opaque = opaque
-    nonisolated(unsafe) let callbackOpaque = opaque
-    let accepted = lifetime.whenReleased { [context] in
-      context.nativePlayerHandleDidRelease(opaque: callbackOpaque)
+      return nil
     }
-    precondition(accepted, "Cannot create callbacks for a released native player handle")
+    return buffer
   }
-
-  /// Makes `renderer` the destination for this handle's frames and restores
-  /// the same handle opaque into the media-player variables for future vouts.
-  /// An already-open vout owns a child opaque that resolves through this same
-  /// handle context and observes the handoff on its next display callback.
-  func activate(renderer: PixelBufferRenderer) {
-    precondition(!isRetired && !lifetime.isReleased)
-    precondition(context.setDisplayRenderer(renderer))
-    if !callbacksInstalled {
-      api.install(lifetime.pointer, opaque)
-      callbacksInstalled = true
-    }
-  }
-
-  /// Removes the controller target while preserving the per-handle slot.
-  /// A later controller can reactivate this same opaque, including when an
-  /// already-open vout still holds it. The media-player variables are cleared
-  /// while the slot is dormant and reinstalled with this same opaque on the
-  /// next activation.
-  func deactivate() {
-    guard !isRetired else { return }
-    _ = context.setDisplayRenderer(nil)
-    clearCallbacksIfInstalled()
-  }
-
-  /// Permanently retires the slot because its exact handle is being replaced
-  /// or released. The opaque remains retained by `lifetime` until native
-  /// teardown has joined that handle's vout.
-  func retire() {
-    guard !isRetired else { return }
-    isRetired = true
-    context.requestRetirement()
-    clearCallbacksIfInstalled()
-  }
-
-  private func clearCallbacksIfInstalled() {
-    guard callbacksInstalled else { return }
-    callbacksInstalled = false
-    api.clear(lifetime.pointer)
-  }
-}
-
-/// One logical direct-PiP controller claim. The Player binds it to the stable
-/// slot for the current native handle and uses the generation to reject stale
-/// teardown from a superseded controller.
-@MainActor
-final class DirectPiPVideoCallbackRegistration {
-  private struct Binding {
-    let slot: DirectPiPVideoCallbackSlot
-    let generation: UInt64
-  }
-
-  private let renderer: PixelBufferRenderer
-  private let api: DirectPiPVideoCallbackAPI
-  private let playbackGeneration: @Sendable () -> UInt64
-  private var current: Binding?
-
-  init(
-    renderer: PixelBufferRenderer,
-    playbackGeneration: @escaping @Sendable () -> UInt64 = { 0 },
-    api: DirectPiPVideoCallbackAPI = .live
-  ) {
-    self.renderer = renderer
-    self.playbackGeneration = playbackGeneration
-    self.api = api
-  }
-
-  func makeSlot(on lifetime: NativePlayerHandleLifetime) -> DirectPiPVideoCallbackSlot {
-    DirectPiPVideoCallbackSlot(
-      lifetime: lifetime,
-      decodeRenderer: renderer,
-      playbackGeneration: playbackGeneration(),
-      voutGenerationCounter: current?.slot.context.voutGenerationSequence
-        ?? PixelBufferVoutGenerationCounter(),
-      api: api
-    )
-  }
-
-  func bind(to slot: DirectPiPVideoCallbackSlot, generation: UInt64) {
-    let playbackGeneration = playbackGeneration()
-    slot.context.beginPlaybackGeneration(playbackGeneration)
-    renderer.beginPlaybackGeneration(playbackGeneration)
-    slot.activate(renderer: renderer)
-    current = Binding(slot: slot, generation: generation)
-  }
-
-  func unbind(generation: UInt64) {
-    guard current?.generation == generation else { return }
-    current = nil
-  }
-
-  var currentGeneration: UInt64? {
-    current?.generation
-  }
-
-  var currentLifetime: NativePlayerHandleLifetime? {
-    current?.slot.lifetime
-  }
-
-  var currentSlot: DirectPiPVideoCallbackSlot? {
-    current?.slot
-  }
-
-  var currentContextForTesting: PixelBufferRendererCallbackContext? {
-    current?.slot.context
-  }
-
-  var currentOpaqueForTesting: UnsafeMutableRawPointer? {
-    current?.slot.opaque
-  }
-
-  var telemetrySnapshot: PixelBufferRendererTelemetrySnapshot {
-    renderer.telemetrySnapshot
-  }
-
-  func beginPlaybackGeneration(_ generation: UInt64) {
-    current?.slot.context.beginPlaybackGeneration(generation)
-    renderer.beginPlaybackGeneration(generation)
-  }
-}
-
-/// Stable object passed to libVLC's vmem callbacks.
-///
-/// libVLC copies the callback function pointers and `opaque` value into a
-/// video output while it opens. Clearing or replacing the media-player
-/// variables cannot prove that no future callback will use that copy. The
-/// opaque retain is therefore released only when its exact
-/// ``NativePlayerHandleLifetime`` ends, never from a timeout or a transient
-/// `voutOpen == false` observation.
-final class PixelBufferRendererCallbackContext: Sendable {
-  private struct CallbackEntry {
-    let displayRenderer: PixelBufferRenderer?
-  }
-
-  private struct State: @unchecked Sendable {
-    var displayRenderer: PixelBufferRenderer?
-    var activeCallbacks = 0
-    var openVoutCount = 0
-    var retirementRequested = false
-    var nativePlayerHandleReleased = false
-    var opaqueRetainReleased = false
-  }
-
-  private let state: Mutex<State>
-  private let playbackGeneration: Mutex<UInt64>
-  private let voutGenerationCounter: PixelBufferVoutGenerationCounter
-
-  init(
-    renderer: PixelBufferRenderer,
-    playbackGeneration: UInt64 = 0,
-    voutGenerationCounter: PixelBufferVoutGenerationCounter = PixelBufferVoutGenerationCounter()
-  ) {
-    state = Mutex(State(displayRenderer: renderer))
-    self.playbackGeneration = Mutex(playbackGeneration)
-    self.voutGenerationCounter = voutGenerationCounter
-  }
-
-  /// Advances the generation captured by subsequently negotiated vouts.
-  /// Already-open vouts retain their original value and are therefore rejected
-  /// by the display renderer after a media boundary.
-  func beginPlaybackGeneration(_ generation: UInt64) {
-    playbackGeneration.withLock { $0 = generation }
-  }
-
-  var hasOpenVoutForTesting: Bool {
-    state.withLock { $0.openVoutCount > 0 }
-  }
-
-  var voutGenerationSequence: PixelBufferVoutGenerationCounter {
-    voutGenerationCounter
-  }
-
-  var retirementRequestedForTesting: Bool {
-    state.withLock { $0.retirementRequested }
-  }
-
-  var nativePlayerHandleReleasedForTesting: Bool {
-    state.withLock { $0.nativePlayerHandleReleased }
-  }
-
-  func withRenderer<T>(
-    opaque: UnsafeMutableRawPointer,
-    _ body: (PixelBufferRenderer) -> T
-  ) -> T? {
-    guard let entry = beginCallback() else { return nil }
-    defer { endCallback(opaque: opaque) }
-    guard let renderer = entry.displayRenderer else { return nil }
-    return body(renderer)
-  }
-
-  /// Atomically hands an already-open vout's future display callbacks to a
-  /// successor controller. Returns `false` only after permanent retirement
-  /// or exact native-handle release.
-  @discardableResult
-  func setDisplayRenderer(_ renderer: PixelBufferRenderer?) -> Bool {
-    state.withLock { state -> Bool in
-      guard
-        !state.retirementRequested,
-        !state.nativePlayerHandleReleased,
-        !state.opaqueRetainReleased
-      else { return false }
-      state.displayRenderer = renderer
-      return true
-    }
-  }
-
-  /// Creates the callback object for one negotiated vout. Every vout owns a
-  /// separate decode renderer/pool, while display forwarding remains dynamic
-  /// through this handle context so a successor PiPController can take over an
-  /// already-open output.
-  func makeVoutContext(
-    handleOpaque: UnsafeMutableRawPointer,
-    decodeRenderer: PixelBufferRenderer,
-    sourceGeometry: PixelBufferSourceGeometry
-  ) -> PixelBufferRendererVoutCallbackContext? {
-    let accepted = state.withLock { state -> Bool in
-      guard !state.nativePlayerHandleReleased, !state.opaqueRetainReleased else {
-        return false
-      }
-      state.openVoutCount += 1
-      return true
-    }
-    guard accepted else { return nil }
-    return PixelBufferRendererVoutCallbackContext(
-      handleContext: self,
-      handleOpaque: handleOpaque,
-      decodeRenderer: decodeRenderer,
-      sourceGeometry: sourceGeometry,
-      playbackGeneration: playbackGeneration.withLock { $0 },
-      voutGeneration: voutGenerationCounter.next()
-    )
-  }
-
-  func noteVoutClosed() {
-    state.withLock {
-      $0.openVoutCount = max(0, $0.openVoutCount - 1)
-    }
-  }
-
-  /// Permanently removes the display target and suppresses future display
-  /// work. Decode storage remains available to a vout that already copied the
-  /// callbacks, and cleanup can still return its pool. In-flight callbacks
-  /// retain their captured renderer(s) until they return. The opaque itself
-  /// stays retained until
-  /// `nativePlayerHandleDidRelease`, because an opening vout may have copied
-  /// it before this retirement became visible.
-  func requestRetirement() {
-    state.withLock { state in
-      state.retirementRequested = true
-      state.displayRenderer = nil
-    }
-  }
-
-  /// Called only after `libvlc_media_player_release` for the exact handle
-  /// carrying this opaque has returned. No new callback can begin after this
-  /// point. If a callback was already in flight, it performs the balancing
-  /// release on exit.
-  func nativePlayerHandleDidRelease(opaque: UnsafeMutableRawPointer) {
-    let shouldRelease = state.withLock { state -> Bool in
-      guard !state.opaqueRetainReleased else { return false }
-      state.nativePlayerHandleReleased = true
-      state.displayRenderer = nil
-      guard state.activeCallbacks == 0 else { return false }
-      state.opaqueRetainReleased = true
-      return true
-    }
-    if shouldRelease {
-      Unmanaged<PixelBufferRendererCallbackContext>.fromOpaque(opaque).release()
-    }
-  }
-
-  private func beginCallback() -> CallbackEntry? {
-    state.withLock { state -> CallbackEntry? in
-      guard !state.opaqueRetainReleased else { return nil }
-      state.activeCallbacks += 1
-      return CallbackEntry(
-        displayRenderer: state.displayRenderer
-      )
-    }
-  }
-
-  private func endCallback(opaque: UnsafeMutableRawPointer) {
-    let shouldRelease = state.withLock { state -> Bool in
-      state.activeCallbacks -= 1
-      guard state.activeCallbacks == 0 else { return false }
-      guard state.nativePlayerHandleReleased, !state.opaqueRetainReleased else { return false }
-      state.opaqueRetainReleased = true
-      return true
-    }
-    if shouldRelease {
-      Unmanaged<PixelBufferRendererCallbackContext>.fromOpaque(opaque).release()
-    }
-  }
-}
-
-/// Callback storage owned by one exact pinned-vmem vout.
-///
-/// The media-player variables contain a handle-level context before setup.
-/// The format callback replaces that vout's copied opaque with a retained
-/// instance of this class. Its decode pool therefore cannot be replaced or
-/// cleared by an overlapping vout, while display callbacks still consult the
-/// handle context's current controller target.
-final class PixelBufferRendererVoutCallbackContext: @unchecked Sendable {
-  private struct PendingPicture: @unchecked Sendable {
-    let buffer: CVPixelBuffer
-    let opaque: UnsafeMutableRawPointer
-    var isLocked: Bool
-    let playbackGeneration: UInt64
-  }
-
-  private struct LifecycleState: @unchecked Sendable {
-    var isCleaned = false
-    var pendingPicture: PendingPicture?
-  }
-
-  let decodeRenderer: PixelBufferRenderer
-  let sourceGeometry: PixelBufferSourceGeometry
-  let voutGeneration: UInt64
-  private let handleContext: PixelBufferRendererCallbackContext
-  private let handleOpaque: UnsafeMutableRawPointer
-  private let lifecycleState = Mutex(LifecycleState())
-  private let playbackGeneration: UInt64
-
-  init(
-    handleContext: PixelBufferRendererCallbackContext,
-    handleOpaque: UnsafeMutableRawPointer,
-    decodeRenderer: PixelBufferRenderer,
-    sourceGeometry: PixelBufferSourceGeometry,
-    playbackGeneration: UInt64,
-    voutGeneration: UInt64
-  ) {
-    self.handleContext = handleContext
-    self.handleOpaque = handleOpaque
-    self.decodeRenderer = decodeRenderer
-    self.sourceGeometry = sourceGeometry
-    self.playbackGeneration = playbackGeneration
-    self.voutGeneration = voutGeneration
-  }
-
-  func withDisplayRenderer<T>(
-    _ body: (PixelBufferRenderer) -> T
-  ) -> T? {
-    handleContext.withRenderer(opaque: handleOpaque, body)
-  }
-
-  /// Pins one callback picture until display consumes it, a later lock
-  /// supersedes it, or vout cleanup drains it. Pinned vmem exposes only one
-  /// `pic_opaque` slot, so a second successful lock proves the predecessor can
-  /// no longer be delivered by that vout. If a malformed callback sequence
-  /// skipped unlock as well as display, drain also balances the Core Video
-  /// base-address lock before releasing the final strong reference.
-  func installPendingPicture(
-    _ buffer: CVPixelBuffer,
-    isLocked: Bool
-  ) -> UnsafeMutableRawPointer? {
-    let opaque = Unmanaged.passUnretained(buffer as AnyObject).toOpaque()
-    let accepted = lifecycleState.withLock { state -> Bool in
-      guard !state.isCleaned else { return false }
-      drainPendingPicture(&state)
-      state.pendingPicture = PendingPicture(
-        buffer: buffer,
-        opaque: opaque,
-        isLocked: isLocked,
-        playbackGeneration: playbackGeneration
-      )
-      return true
-    }
-    return accepted ? opaque : nil
-  }
-
-  /// Balances the base-address lock only for the currently owned picture.
-  /// A stale unlock after replacement is ignored without dereferencing its
-  /// potentially deallocated opaque pointer.
-  func unlockPendingPicture(matching opaque: UnsafeMutableRawPointer) {
-    lifecycleState.withLock { state in
-      guard
-        state.pendingPicture?.opaque == opaque,
-        state.pendingPicture?.isLocked == true
-      else { return }
-      CVPixelBufferUnlockBaseAddress(state.pendingPicture!.buffer, [])
-      state.pendingPicture!.isLocked = false
-    }
-  }
-
-  /// Transfers the exact pending buffer to display. A duplicate or stale
-  /// display callback observes no match and therefore cannot over-release or
-  /// dereference an already-drained picture.
-  func consumePendingPicture(
-    matching opaque: UnsafeMutableRawPointer
-  ) -> (buffer: CVPixelBuffer, playbackGeneration: UInt64)? {
-    lifecycleState.withLock { state -> (CVPixelBuffer, UInt64)? in
-      guard state.pendingPicture?.opaque == opaque else { return nil }
-      if state.pendingPicture?.isLocked == true {
-        CVPixelBufferUnlockBaseAddress(state.pendingPicture!.buffer, [])
-      }
-      guard let pending = state.pendingPicture else { return nil }
-      state.pendingPicture = nil
-      return (pending.buffer, pending.playbackGeneration)
-    }
-  }
-
-  var hasPendingPictureForTesting: Bool {
-    lifecycleState.withLock { $0.pendingPicture != nil }
-  }
-
-  func cleanupDecodeStorage() {
-    let shouldClean = lifecycleState.withLock { state -> Bool in
-      guard !state.isCleaned else { return false }
-      state.isCleaned = true
-      drainPendingPicture(&state)
-      return true
-    }
-    guard shouldClean else { return }
-
-    decodeRenderer.state.withLock {
-      $0.pool = nil
-      $0.width = 0
-      $0.height = 0
-      $0.renderPool = nil
-      $0.renderPoolWidth = 0
-      $0.renderPoolHeight = 0
-      $0.advanceRenderGeneration()
-    }
-    handleContext.noteVoutClosed()
-  }
-
-  private func drainPendingPicture(_ state: inout LifecycleState) {
-    guard let pending = state.pendingPicture else { return }
-    if pending.isLocked {
-      CVPixelBufferUnlockBaseAddress(pending.buffer, [])
-    }
-    state.pendingPicture = nil
-  }
-}
-
-/// Class wrapper around `weak var layer` so the ObjC weak-reference
-/// table sees a single stable address regardless of how `State` is
-/// copied in and out of the surrounding `Mutex`.
-final class DisplayLayerBox: @unchecked Sendable {
-  weak var layer: AVSampleBufferDisplayLayer?
-  init(_ layer: AVSampleBufferDisplayLayer?) {
-    self.layer = layer
-  }
-}
-
-// MARK: - Free Function Callbacks
-
-func pixelBufferHandleCallbackContext(
-  from opaque: UnsafeMutableRawPointer?
-) -> PixelBufferRendererCallbackContext? {
-  guard let opaque else { return nil }
-  let object = Unmanaged<AnyObject>.fromOpaque(opaque).takeUnretainedValue()
-  return object as? PixelBufferRendererCallbackContext
-}
-
-func pixelBufferVoutCallbackContext(
-  from opaque: UnsafeMutableRawPointer?
-) -> PixelBufferRendererVoutCallbackContext? {
-  guard let opaque else { return nil }
-  let object = Unmanaged<AnyObject>.fromOpaque(opaque).takeUnretainedValue()
-  return object as? PixelBufferRendererVoutCallbackContext
-}
-
-/// Lock callback. Dequeues a `CVPixelBuffer` from the pool for libVLC to write into.
-func pixelBufferLockCallback(
-  opaque: UnsafeMutableRawPointer?,
-  planes: UnsafeMutablePointer<UnsafeMutableRawPointer?>?
-) -> UnsafeMutableRawPointer? {
-  guard let opaque, let planes else { return nil }
-  guard let context = pixelBufferVoutCallbackContext(from: opaque) else { return nil }
-
-  let renderer = context.decodeRenderer
-  let storage = renderer.state.withLock { ($0.pool, $0.width, $0.height) }
-  guard let pool = storage.0 else { return nil }
-
-  let allocation = pixelBufferRendererAllocatePixelBuffer(
-    from: pool,
-    width: storage.1,
-    height: storage.2
-  )
-  guard allocation.status == kCVReturnSuccess, let pb = allocation.buffer else { return nil }
-
-  let lockStatus = CVPixelBufferLockBaseAddress(pb, [])
-  guard lockStatus == kCVReturnSuccess, let baseAddress = CVPixelBufferGetBaseAddress(pb) else {
-    if lockStatus == kCVReturnSuccess {
-      CVPixelBufferUnlockBaseAddress(pb, [])
-    }
-    return nil
-  }
-
-  guard let picture = context.installPendingPicture(pb, isLocked: true) else {
-    CVPixelBufferUnlockBaseAddress(pb, [])
-    return nil
-  }
-  planes[0] = baseAddress
-  return picture
-}
-
-/// Unlock callback. Unlocks the `CVPixelBuffer` base address.
-func pixelBufferUnlockCallback(
-  opaque: UnsafeMutableRawPointer?,
-  picture: UnsafeMutableRawPointer?,
-  planes _: UnsafePointer<UnsafeMutableRawPointer?>?
-) {
-  guard
-    let picture,
-    let context = pixelBufferVoutCallbackContext(from: opaque)
-  else { return }
-  context.unlockPendingPicture(matching: picture)
-}
-
-/// Display callback. Wraps the `CVPixelBuffer` in a `CMSampleBuffer`
-/// and enqueues it onto the `AVSampleBufferDisplayLayer`.
-func pixelBufferDisplayCallback(
-  opaque: UnsafeMutableRawPointer?,
-  picture: UnsafeMutableRawPointer?
-) {
-  guard
-    let picture,
-    let context = pixelBufferVoutCallbackContext(from: opaque),
-    let consumed = context.consumePendingPicture(matching: picture)
-  else { return }
-
-  let pb = consumed.buffer
-  let playbackGeneration = consumed.playbackGeneration
-
-  _ = context.withDisplayRenderer { renderer in
-    let acceptsPlaybackGeneration = renderer.state.withLock {
-      $0.playbackGeneration == playbackGeneration
-    }
-    guard acceptsPlaybackGeneration else { return }
-    renderer.state.withLock {
-      $0.decodedFrameCount &+= 1
-      $0.lastDecodedAt = .now
-    }
-    guard let output = renderer.outputPixelBuffer(from: pb) else { return }
-    let outputBuffer = output.buffer
-    let renderGeneration = output.generation
-
-    let (timebase, layer, frameDuration) = renderer.state.withLock {
-      ($0.timebase, $0.displayLayer.layer, $0.frameDuration)
-    }
-
-    guard let layer else { return }
-    guard
-      let desc = renderer.formatDescription(
-        for: outputBuffer,
-        generation: renderGeneration
-      )
-    else { return }
-
-    let pts: CMTime = if let timebase {
-      CMTimebaseGetTime(timebase)
-    } else {
-      CMClockGetTime(CMClockGetHostTimeClock())
-    }
-
-    // When the control timebase is frozen (rate 0, i.e. paused), its time
-    // does not advance, so a seek-while-paused frame carries a PTS no later
-    // than the already-presented one and the layer may never schedule it.
-    // Flag such frames for immediate display so paused scrubbing repaints.
-    // Steady-state playback (rate != 0, or no timebase) stays timebase- or
-    // host-clock-paced.
-    let displayImmediately = timebase.map { CMTimebaseGetRate($0) == 0 } ?? false
-
-    var timingInfo = CMSampleTimingInfo(
-      // `.invalid` when the source cadence is unknown. Inventing 30 fps here
-      // told AVFoundation something false about every non-30 fps source.
-      duration: frameDuration,
-      presentationTimeStamp: pts,
-      decodeTimeStamp: .invalid
-    )
-
-    var sampleBuffer: CMSampleBuffer?
-    let sbStatus = CMSampleBufferCreateReadyWithImageBuffer(
-      allocator: kCFAllocatorDefault,
-      imageBuffer: outputBuffer,
-      formatDescription: desc,
-      sampleTiming: &timingInfo,
-      sampleBufferOut: &sampleBuffer
-    )
-    guard sbStatus == noErr, let sb = sampleBuffer else { return }
-    if
-      displayImmediately,
-      let attachments = CMSampleBufferGetSampleAttachmentsArray(
-        sb,
-        createIfNecessary: true
-      ) as? [NSMutableDictionary], let attachment = attachments.first {
-      attachment[kCMSampleAttachmentKey_DisplayImmediately] = true
-    }
-    // CMSampleBuffer is a CF type that lacks Sendable conformance but is thread-safe for read access
-    nonisolated(unsafe) let sample = sb
-    renderer.enqueue(
-      sample,
-      generation: renderGeneration,
-      on: layer,
-      playbackGeneration: playbackGeneration,
-      voutGeneration: context.voutGeneration
-    )
-  }
-}
-
-/// Cleanup callback. Releases the pixel buffer pool.
-func pixelBufferCleanupCallback(opaque: UnsafeMutableRawPointer?) {
-  guard
-    let opaque,
-    let context = pixelBufferVoutCallbackContext(from: opaque)
-  else { return }
-
-  context.cleanupDecodeStorage()
-  // Balance the per-vout retain installed by the successful format callback.
-  Unmanaged<PixelBufferRendererVoutCallbackContext>.fromOpaque(opaque).release()
 }
 
 #endif

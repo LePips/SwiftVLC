@@ -1,10 +1,11 @@
 /// Reclassifies upstream libVLC log entries whose declared severity is
-/// incongruent with how the surrounding cascade actually works.
+/// incongruent with how the surrounding cascade or recovery path works.
 ///
 /// libVLC's decoder, video output, and demuxer subsystems pick a working
 /// module by *probing*: each candidate's `Open()` is called in turn, and
 /// a failure means "try the next one." A handful of upstream modules log
-/// those expected probe failures at `LIBVLC_ERROR`, so a subscriber
+/// expected probe failures and self-healing clock corrections at
+/// `LIBVLC_ERROR`, so a subscriber
 /// filtering at ``LogLevel/error`` sees false alarms even when playback
 /// is healthy. This filter demotes those specific messages to
 /// ``LogLevel/warning`` so ``LogLevel/error`` retains its meaning
@@ -26,9 +27,9 @@
 /// **Performance**: pure function, no allocations, called once per log entry
 /// from the libVLC log thread. The early `level == .error` short-circuit
 /// means non-error entries (the vast majority) pay one comparison and
-/// return. Each rule runs at most one prefix + suffix check or one equality
-/// check on the message string. See `LogNoiseFilterTests` for the pinned
-/// rules.
+/// return. Each rule runs a bounded number of equality, prefix, suffix, and
+/// numeric-template checks on the message string. See `LogNoiseFilterTests`
+/// for the pinned rules.
 ///
 /// Each rule documents the upstream source location and the structural
 /// reason the rule exists. When bumping `VLC_HASH` in
@@ -121,6 +122,63 @@ enum LogNoiseFilter {
       return .warning
     }
 
+    // The prefetch stream filter reports an error when a paused demuxer asks
+    // it to read during a seek, then immediately clears its own paused flag
+    // and wakes the producer. The media-player pause state remains unchanged;
+    // this is the filter's documented recovery path, not a terminal read
+    // failure. Pinned to the exact upstream wording from
+    // modules/stream_filter/prefetch.c.
+    if message == "reading while paused (buggy demux?)" {
+      return .warning
+    }
+
+    // A late PCR causes es_out to increase its delay or retain the previous
+    // jitter, reset PCR, flush stale buffers, and rebuffer. That correction is
+    // intentionally visible as a warning because repeated corrections can
+    // explain seek latency, but it is not a terminal playback error. Match the
+    // complete numeric templates from src/input/es_out.c so adjacent PCR
+    // failures with different wording remain errors.
+    if
+      matchesIntegerTemplate(
+        message,
+        prefix: "ES_OUT_SET_(GROUP_)PCR  is called ",
+        separator: " ms late (pts_delay increased to ",
+        suffix: " ms)"
+      ) || matchesIntegerTemplate(
+        message,
+        prefix: "ES_OUT_SET_(GROUP_)PCR  is called ",
+        separator: " ms late (jitter of ",
+        suffix: " ms ignored)"
+      ) {
+      return .warning
+    }
+
     return level
+  }
+
+  private static func matchesIntegerTemplate(
+    _ message: String,
+    prefix: String,
+    separator: String,
+    suffix: String
+  ) -> Bool {
+    guard message.hasPrefix(prefix), message.hasSuffix(suffix) else {
+      return false
+    }
+    let start = message.index(message.startIndex, offsetBy: prefix.count)
+    let end = message.index(message.endIndex, offsetBy: -suffix.count)
+    let body = message[start..<end]
+    guard let separatorRange = body.firstRange(of: separator) else {
+      return false
+    }
+    return isASCIIInteger(body[..<separatorRange.lowerBound])
+      && isASCIIInteger(body[separatorRange.upperBound...])
+  }
+
+  private static func isASCIIInteger(_ value: Substring) -> Bool {
+    let digits = value.first == "-" ? value.dropFirst() : value[...]
+    return !digits.isEmpty && digits.allSatisfy { character in
+      character.isASCII && character.isNumber
+    }
   }
 }

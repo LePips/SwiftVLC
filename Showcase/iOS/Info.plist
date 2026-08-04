@@ -19,5 +19,11 @@
 	<array>
 		<string>_googlecast._tcp</string>
 	</array>
+	<!-- Candidate provenance. Release qualification injects these values at
+	     build time; normal Showcase builds leave them empty. -->
+	<key>SwiftVLCSourceCommit</key>
+	<string>$(SWIFTVLC_SOURCE_COMMIT)</string>
+	<key>SwiftVLCReleaseSourceDigest</key>
+	<string>$(SWIFTVLC_RELEASE_SOURCE_DIGEST)</string>
 </dict>
 </plist>

@@ -371,6 +371,12 @@ private protocol IOSNativePiPDrawable: NSObjectProtocol {
   @objc(preservePictureInPictureWindowController:)
   func preservePictureInPictureWindowController(_ controller: AnyObject) -> Bool
 
+  @objc(preservePictureInPictureWindowController:sameMediaGenerationRebuild:)
+  func preservePictureInPictureWindowController(
+    _ controller: AnyObject,
+    sameMediaGenerationRebuild: Bool
+  ) -> Bool
+
   @objc(takePreservedPictureInPictureWindowController)
   func takePreservedPictureInPictureWindowController() -> AnyObject?
 
@@ -394,6 +400,8 @@ private protocol IOSNativePiPMediaControlling: NSObjectProtocol {
   ) -> Bool
 
   @objc func mediaPlaybackGeneration() -> UInt64
+
+  @objc func consumePictureInPictureVideoOutputRebuildPermit() -> Bool
 
   @objc func mediaLength() -> Int64
   @objc func mediaTime() -> Int64
@@ -506,6 +514,21 @@ final class IOSNativePiPDrawableAttachment: UIView, IOSNativePiPDrawable {
     return continuityCoordinator.preserve(
       controller,
       for: mediaGeneration
+    )
+  }
+
+  @objc(preservePictureInPictureWindowController:sameMediaGenerationRebuild:)
+  nonisolated func preservePictureInPictureWindowController(
+    _ controller: AnyObject,
+    sameMediaGenerationRebuild: Bool
+  ) -> Bool {
+    let mediaGeneration = nativeMediaController.callbackSnapshot.withLock {
+      $0.playbackGeneration
+    }
+    return continuityCoordinator.preserve(
+      controller,
+      for: mediaGeneration,
+      allowsSameGenerationRebuild: sameMediaGenerationRebuild
     )
   }
 
@@ -1722,6 +1745,16 @@ final class IOSNativePiPMediaController: NSObject, IOSNativePiPMediaControlling,
   /// media generation is currently published.
   @objc func mediaPlaybackGeneration() -> UInt64 {
     callbackSnapshot.withLock { $0.playbackGeneration?.value ?? 0 }
+  }
+
+  /// Consumes the one accepted-seek permit for this exact media generation.
+  /// A normal stop or drawable teardown has no permit and must close PiP.
+  @objc func consumePictureInPictureVideoOutputRebuildPermit() -> Bool {
+    guard
+      let mediaGeneration = callbackSnapshot.withLock({ $0.playbackGeneration }),
+      let player
+    else { return false }
+    return player.nativePiPVideoOutputRebuildPermit.consume(for: mediaGeneration)
   }
 
   @objc func mediaLength() -> Int64 {

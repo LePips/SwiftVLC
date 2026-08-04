@@ -366,6 +366,11 @@ public final class Player {
   /// main actor is what lets a teardown already waiting on them deadlock, so
   /// the value they need is published here and read atomically instead.
   nonisolated let nonisolatedPlaybackIntent = Atomic<Bool>(false)
+  #if os(iOS)
+  /// One-shot authorization for native PiP continuity across a seek-driven
+  /// video-output rebuild. Read synchronously by libVLC's callback thread.
+  nonisolated let nativePiPVideoOutputRebuildPermit = IOSNativePiPVideoOutputRebuildPermit()
+  #endif
   /// Duration and seekability tagged with the media generation they describe,
   /// for consumers that must not mistake the previous media's capability for
   /// the current one. See ``PlayerCapabilitySnapshot``.
@@ -841,6 +846,9 @@ public final class Player {
   /// before deactivating a shared `AVAudioSession`).
   public func stop() {
     supersedePendingSeekSettlement()
+    #if os(iOS)
+    nativePiPVideoOutputRebuildPermit.invalidate()
+    #endif
     if shouldResumeNativePlayerBeforeStop {
       libvlc_media_player_set_pause(pointer, 0)
     }

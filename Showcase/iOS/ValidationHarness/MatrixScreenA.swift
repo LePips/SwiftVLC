@@ -62,8 +62,7 @@ struct MatrixScreenA: View {
       Section("Channel zap") {
         ForEach(zapTargets, id: \.key) { target in
           Button("Load \(target.key.rawValue)") {
-            append("load() → \(target.key.rawValue)")
-            try? player.play(url: target.url)
+            load(target)
           }
         }
       }
@@ -74,6 +73,14 @@ struct MatrixScreenA: View {
     }
     .showcaseFormStyle()
     .navigationTitle("(a) PiP survival")
+    .toolbar {
+      if LaunchArguments.isUITestMode {
+        ToolbarItemGroup(placement: .bottomBar) {
+          qualificationLoadButton(for: .vod)
+          qualificationLoadButton(for: .liveTS)
+        }
+      }
+    }
     .task { await observeEvents() }
     .task(id: pip.map(ObjectIdentifier.init)) {
       guard let pip else { return }
@@ -85,6 +92,23 @@ struct MatrixScreenA: View {
       }
     }
     .onDisappear { player.stop() }
+  }
+
+  @ViewBuilder
+  private func qualificationLoadButton(for key: HarnessStreams.Key) -> some View {
+    if let target = zapTargets.first(where: { $0.key == key }) {
+      Button("Load \(key.rawValue)") { load(target) }
+        .accessibilityIdentifier(
+          key == .vod
+            ? AccessibilityID.PiPContinuityValidation.loadVODButton
+            : AccessibilityID.PiPContinuityValidation.loadLiveTSButton
+        )
+    }
+  }
+
+  private func load(_ target: (key: HarnessStreams.Key, url: URL)) {
+    append("load() → \(target.key.rawValue)")
+    try? player.play(url: target.url)
   }
 
   private var logSection: some View {

@@ -12,8 +12,22 @@ import XCTest
 /// the isolation, so test methods can call XCUI APIs directly.
 @MainActor
 class ShowcaseIOSTestCase: XCTestCase {
+  private static let attachToRunningAppEnvironment = "SWIFTVLC_ATTACH_TO_RUNNING_APP"
+  private static let deviceFixtureEnvironment = "SWIFTVLC_DEVICE_FIXTURE_URL_BASE64"
+  private static let deviceLogPrefixEnvironment = "SWIFTVLC_DEVICE_LOG_PREFIX"
+
   private(set) var app: XCUIApplication!
   private(set) var logURL: URL!
+
+  /// HTTP fixture staged by the physical-device runner. Simulator tests use
+  /// bundle files, but those runner-bundle paths do not exist inside an app on
+  /// a separate physical device.
+  var physicalDeviceFixtureURL: URL? {
+    ProcessInfo.processInfo.environment[Self.deviceFixtureEnvironment]
+      .flatMap { Data(base64Encoded: $0) }
+      .flatMap { String(data: $0, encoding: .utf8) }
+      .flatMap(URL.init(string:))
+  }
 
   override func setUp() async throws {
     try await super.setUp()
@@ -29,15 +43,27 @@ class ShowcaseIOSTestCase: XCTestCase {
       .replacingOccurrences(of: "[", with: "")
       .replacingOccurrences(of: "]", with: "")
       .replacingOccurrences(of: "-", with: "")
-    logURL = URL(fileURLWithPath: NSTemporaryDirectory())
-      .appendingPathComponent("uitest-\(safeName)-\(UUID().uuidString).jsonl")
+    let logName = "\(safeName)-\(UUID().uuidString).jsonl"
+    let deviceLogPrefix = ProcessInfo.processInfo.environment[Self.deviceLogPrefixEnvironment]
+    let logArgument: String
+    if let deviceLogPrefix {
+      logArgument = "\(deviceLogPrefix)-\(logName)"
+      logURL = URL(fileURLWithPath: logArgument)
+    } else {
+      logURL = URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent("uitest-\(logName)")
+      logArgument = logURL.path
+    }
 
     let fixtureURL = Self.fixtureURL()
+    let fixtureArgument = physicalDeviceFixtureURL?.absoluteString ?? fixtureURL.path
+    let encodedFixtureArgument = Data(fixtureArgument.utf8).base64EncodedString()
+    app.launchEnvironment[LaunchArguments.fixtureURLEnvironment] = encodedFixtureArgument
 
     app.launchArguments += [
       LaunchArguments.uiTestMode, "YES",
-      LaunchArguments.fixtureURL, fixtureURL.path,
-      LaunchArguments.logPath, logURL.path
+      LaunchArguments.fixtureURLBase64, encodedFixtureArgument,
+      LaunchArguments.logPath, logArgument
     ]
   }
 
@@ -59,13 +85,25 @@ class ShowcaseIOSTestCase: XCTestCase {
   /// navigation tree.
   func launch(route: UITestRoute) {
     app.launchArguments += [LaunchArguments.route, route.rawValue]
-    app.launch()
+    launchOrAttach()
   }
 
   /// Launches the app at the normal `RootView`. Use this for tests that
   /// exercise navigation itself.
   func launchAtRoot() {
-    app.launch()
+    launchOrAttach()
+  }
+
+  /// Physical-device qualification can prelaunch the exact signed candidate
+  /// with `devicectl`, then attach the separately built UI-test runner. This
+  /// avoids replacing the candidate and preserves its deterministic fixture
+  /// and evidence-log launch arguments.
+  private func launchOrAttach() {
+    if ProcessInfo.processInfo.environment[Self.attachToRunningAppEnvironment] == "YES" {
+      app.activate()
+    } else {
+      app.launch()
+    }
   }
 
   // MARK: - Log assertions
@@ -233,6 +271,18 @@ class ShowcaseIOSTestCase: XCTestCase {
     file: StaticString = #filePath,
     line: UInt = #line
   ) {
+    if let failure = captureSystemPictureInPictureMotion(samples: samples, interval: interval) {
+      XCTFail(failure, file: file, line: line)
+    }
+  }
+
+  /// Captures and analyzes system PiP without immediately failing the test.
+  /// Device lanes use this form when they must foreground the app and attach
+  /// renderer telemetry before reporting the visual failure.
+  func captureSystemPictureInPictureMotion(
+    samples: Int = 6,
+    interval: TimeInterval = 0.75
+  ) -> String? {
     precondition(samples >= 5)
 
     var screenshots: [XCUIScreenshot] = []
@@ -260,8 +310,7 @@ class ShowcaseIOSTestCase: XCTestCase {
       attachment.name = "system-pip-motion-diagnostics"
       attachment.lifetime = .keepAlways
       add(attachment)
-      XCTFail("Could not rasterize system PiP screenshots", file: file, line: line)
-      return
+      return "Could not rasterize system PiP screenshots"
     }
 
     let analysis = PiPMotionRegionAnalyzer().analyze(frames)
@@ -291,12 +340,8 @@ class ShowcaseIOSTestCase: XCTestCase {
       }
     }
 
-    guard let failure = analysis.failure else { return }
-    XCTFail(
-      "System PiP image oracle failed: \(failure.rawValue). \(diagnostics)",
-      file: file,
-      line: line
-    )
+    guard let failure = analysis.failure else { return nil }
+    return "System PiP image oracle failed: \(failure.rawValue). \(diagnostics)"
   }
 
   // MARK: - Fixtures

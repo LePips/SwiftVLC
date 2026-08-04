@@ -2,17 +2,21 @@ diff --git a/modules/video_output/apple/VLCDrawable.h b/modules/video_output/app
 index 42dacba037..b5fd8a3c2c 100644
 --- a/modules/video_output/apple/VLCDrawable.h
 +++ b/modules/video_output/apple/VLCDrawable.h
-@@ -55,6 +55,9 @@
+@@ -55,6 +55,13 @@
                                     time:(int64_t *)time
                                 seekable:(BOOL *)seekable;
  
 +/// Returns the current client media generation. Zero means no media.
 +- (uint64_t)mediaPlaybackGeneration;
 +
++/// Consumes one client-issued permit for a seek-driven video-output rebuild.
++/// Returns NO for ordinary stop, teardown, and navigation closes.
++- (BOOL)consumePictureInPictureVideoOutputRebuildPermit;
++
  @required
  
  /// Called by picture in picture to get the current media duration
-@@ -126,8 +129,25 @@
+@@ -126,8 +133,31 @@
  /// controller is passed
  - (void (^)(id<VLCPictureInPictureWindowControlling>)) pictureInPictureReady;
  
@@ -27,6 +31,12 @@ index 42dacba037..b5fd8a3c2c 100644
 +/// being constructed. Returns YES when the handoff was accepted.
 +- (BOOL)preservePictureInPictureWindowController:
 +    (id<VLCPictureInPictureWindowControlling>)controller;
++
++/// Retains an active controller for a replacement or an explicitly
++/// authorized same-media seek rebuild.
++- (BOOL)preservePictureInPictureWindowController:
++    (id<VLCPictureInPictureWindowControlling>)controller
++    sameMediaGenerationRebuild:(BOOL)sameMediaGenerationRebuild;
 +
 +/// Returns a controller retained for one same-player media replacement, or
 +/// nil when there is no pending handoff.
@@ -139,7 +149,7 @@ index 68dd7cc369..ab23e0a149 100644
      BOOL seekable = NO;
      if ([_mediaController respondsToSelector:
              @selector(mediaPlaybackSnapshotWithLength:time:seekable:)]) {
-@@ -120,27 +145,80 @@ - (void)prepare:(AVSampleBufferDisplayLayer *)layer {
+@@ -120,27 +145,99 @@ - (void)prepare:(AVSampleBufferDisplayLayer *)layer {
          seekable = [_mediaController isMediaSeekable];
      }
      avPipController.requiresLinearPlayback = !seekable;
@@ -182,37 +192,56 @@ index 68dd7cc369..ab23e0a149 100644
 +        currentGeneration != _mediaPlaybackGeneration;
 +    BOOL isActive = atomic_load_explicit(&_pictureInPictureActive,
 +                                         memory_order_acquire);
-+    if (isReplacement && isActive &&
-+        [drawable respondsToSelector:
-+            @selector(preservePictureInPictureWindowController:)]) {
++    BOOL isSameGenerationRebuild = NO;
++    if (isActive && !isReplacement && currentGeneration != 0 &&
++        currentGeneration == _mediaPlaybackGeneration &&
++        [_mediaController respondsToSelector:@selector(
++            consumePictureInPictureVideoOutputRebuildPermit)]) {
++        isSameGenerationRebuild = [_mediaController
++            consumePictureInPictureVideoOutputRebuildPermit];
++    }
++
++    BOOL shouldPreserve = isActive &&
++        (isReplacement || isSameGenerationRebuild);
++    BOOL didPreserve = NO;
++    if (shouldPreserve && [drawable respondsToSelector:@selector(
++            preservePictureInPictureWindowController:
++            sameMediaGenerationRebuild:)]) {
++        didPreserve = [drawable
++            preservePictureInPictureWindowController:self
++            sameMediaGenerationRebuild:isSameGenerationRebuild];
++    } else if (isReplacement && isActive &&
++               [drawable respondsToSelector:@selector(
++                   preservePictureInPictureWindowController:)]) {
++        didPreserve = [drawable
++            preservePictureInPictureWindowController:self];
++    }
++
++    if (didPreserve) {
 +        uint_fast64_t token = atomic_fetch_add_explicit(&_handoffToken, 1,
 +                                                        memory_order_acq_rel) + 1;
 +        atomic_store_explicit(&_awaitingSuccessor, true, memory_order_release);
-+        if ([drawable preservePictureInPictureWindowController:self]) {
-+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
-+                                         (int64_t)(3 * NSEC_PER_SEC)),
-+                           dispatch_get_main_queue(), ^{
-+                BOOL isPending =
-+                    atomic_load_explicit(&self->_awaitingSuccessor,
-+                                         memory_order_acquire);
-+                uint_fast64_t currentToken =
-+                    atomic_load_explicit(&self->_handoffToken,
-+                                         memory_order_acquire);
-+                if (isPending && currentToken == token) {
-+                    id<VLCPictureInPictureDrawable> currentDrawable =
-+                        self->_drawable;
-+                    if ([currentDrawable respondsToSelector:@selector(
-+                            pictureInPictureWindowControllerHandoffDidTimeOut:)])
-+                        [currentDrawable
-+                            pictureInPictureWindowControllerHandoffDidTimeOut:
-+                                self];
-+                    [self close];
-+                }
-+            });
-+            return;
-+        }
-+        atomic_store_explicit(&_awaitingSuccessor, false,
-+                              memory_order_release);
++        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
++                                     (int64_t)(3 * NSEC_PER_SEC)),
++                       dispatch_get_main_queue(), ^{
++            BOOL isPending =
++                atomic_load_explicit(&self->_awaitingSuccessor,
++                                     memory_order_acquire);
++            uint_fast64_t currentToken =
++                atomic_load_explicit(&self->_handoffToken,
++                                     memory_order_acquire);
++            if (isPending && currentToken == token) {
++                id<VLCPictureInPictureDrawable> currentDrawable =
++                    self->_drawable;
++                if ([currentDrawable respondsToSelector:@selector(
++                        pictureInPictureWindowControllerHandoffDidTimeOut:)])
++                    [currentDrawable
++                        pictureInPictureWindowControllerHandoffDidTimeOut:
++                            self];
++                [self close];
++            }
++        });
++        return;
 +    }
 +
 +    [self close];
@@ -226,7 +255,7 @@ index 68dd7cc369..ab23e0a149 100644
  
      dispatch_block_t cleanup = ^{
          AVPictureInPictureController *avPipController =
-@@ -289,11 +367,13 @@ - (void)pictureInPictureControllerWillStartPictureInPicture:(AVPictureInPictureC
+@@ -289,11 +386,13 @@ - (void)pictureInPictureControllerWillStartPictureInPicture:(AVPictureInPictureC
  }
  
  - (void)pictureInPictureControllerDidStartPictureInPicture:(AVPictureInPictureController *)pictureInPictureController {
@@ -240,7 +269,7 @@ index 68dd7cc369..ab23e0a149 100644
      if (!atomic_load_explicit(&_closed, memory_order_acquire) && _stateChangeEventHandler)
          _stateChangeEventHandler(NO);
  }
-@@ -357,7 +437,7 @@ static int CloseController( pip_controller_t *pipcontroller )
+@@ -357,7 +456,7 @@ static int CloseController( pip_controller_t *pipcontroller )
              (__bridge_transfer VLCPictureInPictureController*)pipcontroller->p_sys;
          pipcontroller->p_sys = NULL;
  
@@ -249,7 +278,7 @@ index 68dd7cc369..ab23e0a149 100644
      }
      
      return VLC_SUCCESS;
-@@ -375,9 +455,26 @@ static int OpenController( pip_controller_t *pipcontroller )
+@@ -375,9 +474,26 @@ static int OpenController( pip_controller_t *pipcontroller )
      pipcontroller->ops = &ops;
  
      if (@available(macOS 12.0, iOS 15.0, tvos 15.0, *)) {
