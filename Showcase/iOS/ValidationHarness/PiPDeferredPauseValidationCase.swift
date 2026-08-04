@@ -288,7 +288,7 @@ struct PiPDeferredPauseValidationCase: View {
   }
 }
 
-private struct PauseCaseEvidence: Codable {
+private struct PauseCaseEvidence: Encodable {
   let outcome: String
   let forcedRejectionCount: Int
   let nativePauseCommandCount: Int
@@ -302,7 +302,7 @@ private struct CancellationEvidence {
   let truthfulControls: Bool
 }
 
-private struct QualificationEvidence: Codable {
+private struct QualificationEvidence: Encodable {
   let formatVersion = 1
   let scenario = "deferred-pause-rejection"
   let permanentCase: PauseCaseEvidence
