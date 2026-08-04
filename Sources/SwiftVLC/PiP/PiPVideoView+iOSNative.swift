@@ -1691,6 +1691,21 @@ final class IOSNativePiPMediaController: NSObject, IOSNativePiPMediaControlling,
     }
   }
 
+  /// Qualification counterpart to VLC's Objective-C callback. It uses the
+  /// same generation check and relative-jump implementation but returns the
+  /// terminal result that the production callback intentionally erases when
+  /// satisfying its `void` completion contract.
+  @MainActor
+  func qualificationSeek(by offset: Int64) async -> PiPController.SkipOutcome {
+    let issued = callbackGeneration
+    guard callbackGeneration == issued, let player else { return .rejected }
+    let request = PiPController.performSkip(
+      on: player,
+      by: CMTime(value: offset, timescale: 1000)
+    )
+    return await request.outcome
+  }
+
   // Synchronous queries VLC's native PiP module makes from its own threads.
   // They retain the snapshotted player while holding the same lock replacement
   // uses to publish its successor. That closes the interval between copying a

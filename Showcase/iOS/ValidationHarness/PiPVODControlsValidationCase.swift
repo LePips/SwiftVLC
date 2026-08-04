@@ -125,20 +125,33 @@ struct PiPVODControlsValidationCase: View {
         player.currentTime.milliseconds >= 1000
       }
 
-      controller.performQualificationSetPlaying(false)
+      guard controller.performQualificationSetPlaying(false) else {
+        throw QualificationFailure("PiP pause delegate path was not installed")
+      }
       try await waitUntil("PiP pause did not settle") { !player.isActive }
       let pausedTime = player.currentTime.milliseconds
-      try await Task.sleep(for: .milliseconds(350))
-      guard abs(player.currentTime.milliseconds - pausedTime) <= 500 else {
+      try await Task.sleep(for: .seconds(1))
+      guard abs(player.currentTime.milliseconds - pausedTime) <= 250 else {
         throw QualificationFailure("Playback clock advanced while paused")
       }
 
-      controller.performQualificationSetPlaying(true)
+      guard controller.performQualificationSetPlaying(true) else {
+        throw QualificationFailure("PiP play delegate path was not installed")
+      }
       try await waitUntil("PiP play did not settle") { player.isActive }
 
+      let presentedBeforeScrub = player.playbackHealth.counters.presentedVideoFrames
       try player.seek(to: .seconds(15))
-      try await waitUntil("Absolute scrub did not land") {
-        abs(player.currentTime.milliseconds - 15000) <= 2000
+      guard case .waiting(.seeking) = player.playbackHealth.state else {
+        throw QualificationFailure("Absolute scrub did not enter seeking health state")
+      }
+      try await waitUntil("Absolute scrub produced no post-seek presentation") {
+        guard case .healthy = player.playbackHealth.state else { return false }
+        return player.playbackHealth.counters.presentedVideoFrames > presentedBeforeScrub
+      }
+      let scrubLandedTime = player.currentTime.milliseconds
+      guard abs(scrubLandedTime - 15000) <= 2000 else {
+        throw QualificationFailure("Absolute scrub presentation landed outside tolerance")
       }
 
       let forwardBefore = player.currentTime.milliseconds
@@ -167,6 +180,7 @@ struct PiPVODControlsValidationCase: View {
         skipBackward: "pass",
         pausedTimeMilliseconds: pausedTime,
         scrubTargetMilliseconds: 15000,
+        scrubLandedTimeMilliseconds: scrubLandedTime,
         forwardBeforeMilliseconds: forwardBefore,
         forwardAfterMilliseconds: forwardAfter,
         backwardBeforeMilliseconds: backwardBefore,
@@ -283,6 +297,7 @@ private struct ControlEvidence: Encodable {
   let skipBackward: String
   let pausedTimeMilliseconds: Int64
   let scrubTargetMilliseconds: Int64
+  let scrubLandedTimeMilliseconds: Int64
   let forwardBeforeMilliseconds: Int64
   let forwardAfterMilliseconds: Int64
   let backwardBeforeMilliseconds: Int64

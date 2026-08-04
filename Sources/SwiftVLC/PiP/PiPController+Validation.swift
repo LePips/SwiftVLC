@@ -172,14 +172,7 @@ extension PiPController {
     let interval = CMTime(seconds: seconds, preferredTimescale: 1000)
     if let nativeBackend {
       guard let offset = Self.skipOffsetMilliseconds(interval) else { return false }
-      let before = player.currentTime.milliseconds
-      await withCheckedContinuation { continuation in
-        nativeBackend.mediaController.seek(by: offset) {
-          continuation.resume()
-        }
-      }
-      let after = player.currentTime.milliseconds
-      return offset > 0 ? after > before : after < before
+      return await nativeBackend.mediaController.qualificationSeek(by: offset) == .settled
     }
     let request = Self.performSkip(
       on: player,
@@ -192,15 +185,22 @@ extension PiPController {
   /// Native drawable PiP enters through libVLC's media-controller bridge;
   /// direct sample-buffer PiP enters through AVKit's playback delegate.
   @_spi(Qualification)
-  public func performQualificationSetPlaying(_ playing: Bool) {
+  public func performQualificationSetPlaying(_ playing: Bool) -> Bool {
     if let nativeBackend {
       if playing {
         nativeBackend.mediaController.play()
       } else {
         nativeBackend.mediaController.pause()
       }
+      return true
     } else {
-      handleSetPlaying(playing)
+      guard
+        let avController = pipController,
+        let delegate = avController.contentSource?.sampleBufferPlaybackDelegate,
+        (delegate as AnyObject) === playbackDelegateProxy
+      else { return false }
+      delegate.pictureInPictureController(avController, setPlaying: playing)
+      return true
     }
   }
 
