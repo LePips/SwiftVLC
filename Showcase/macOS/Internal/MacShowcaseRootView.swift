@@ -405,7 +405,7 @@ extension MacShowcase {
     case .multiConsumer: self = .multiConsumerEvents
     case .statistics: self = .statistics
     case .logs: self = .logs
-    case .harnessHome, .pipLiveValidation: return nil
+    case .harnessHome, .pipLiveValidation, .pipCapabilityValidation: return nil
     }
   }
 }

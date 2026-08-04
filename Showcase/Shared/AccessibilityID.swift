@@ -195,6 +195,24 @@ enum AccessibilityID {
     static let staleSuccessorMutationsLabel = "pipContinuity.staleSuccessorMutations"
   }
 
+  enum PiPCapabilityValidation {
+    static let videoView = "pipCapability.videoView"
+    static let loadVODButton = "pipCapability.loadVOD"
+    static let loadLiveButton = "pipCapability.loadLive"
+    static let stateLabel = "pipCapability.state"
+    static let generationLabel = "pipCapability.generation"
+    static let currentTimeLabel = "pipCapability.currentTime"
+    static let snapshotLabel = "pipCapability.snapshot"
+    static let suppressionLabel = "pipCapability.suppression"
+    static let possibleLabel = "pipCapability.possible"
+    static let activeLabel = "pipCapability.active"
+    static let lifecycleEventsLabel = "pipCapability.lifecycleEvents"
+    static let skipResultLabel = "pipCapability.skipResult"
+    static let toggleButton = "pipCapability.toggle"
+    static let skipForwardButton = "pipCapability.skipForward"
+    static let errorLabel = "pipCapability.error"
+  }
+
   enum MatrixHValidation {
     static let stateLabel = "validation.matrixH.state"
     static let currentTimeLabel = "validation.matrixH.currentTime"

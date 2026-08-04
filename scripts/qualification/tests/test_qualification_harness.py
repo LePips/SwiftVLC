@@ -359,6 +359,37 @@ class QualificationEvidenceTests(unittest.TestCase):
             self.assertTrue(evidence["audioContinuityWithinBudget"])
             self.assertTrue(evidence["videoContinuityWithinBudget"])
 
+    def test_materializes_capability_convergence_evidence(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.make_export(
+                root,
+                {
+                    "formatVersion": 1,
+                    "scenario": "capability-convergence",
+                    "backendResults": {"native": "pass", "direct": "pass"},
+                    "transitions": "pass",
+                    "skipControls": "pass",
+                    "faultInjection": {"rawEventsSuppressed": True},
+                },
+                attachment_name="qualification-capability-convergence.json",
+                test_identifier="PiPCapabilityDeviceUITests/test_capabilityConvergenceAcrossNativeAndDirectBackends",
+            )
+            evidence = materialize_evidence.materialize(
+                root,
+                "qualification-capability-convergence.json",
+                "capability-convergence",
+                "iphone-current",
+                "a" * 64,
+                "b" * 64,
+            )
+            self.assertEqual(
+                evidence["backendResults"], {"native": "pass", "direct": "pass"}
+            )
+            self.assertEqual(evidence["transitions"], "pass")
+            self.assertEqual(evidence["skipControls"], "pass")
+            self.assertTrue(evidence["faultInjection"]["rawEventsSuppressed"])
+
     def test_materializes_focused_replacement_evidence(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

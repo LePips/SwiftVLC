@@ -62,8 +62,9 @@ engine artifact.
 The command identifies the physical device and OS release type, generates and
 serves deterministic local media, installs the exact signed candidate and UI
 test runner, executes the analyzer, general UI stress suite, native/direct live
-PiP, same-player continuity, and HLS seek lanes, then pulls app logs and writes
-a machine-readable `report.json`. It retains every attempt log and xcresult,
+PiP, same-player continuity, capability convergence, and HLS seek lanes, then
+pulls app logs and writes a machine-readable `report.json`. It retains every
+attempt log and xcresult,
 records and verifies candidate metadata that binds the app tree digest to its
 source commit, release-source digest, and XCFramework digest, and retries only
 a small allowlist of Xcode/device-launch infrastructure failures. Every run
@@ -92,6 +93,19 @@ event that escaped generation filtering. The two tests materialize independent
 `iphone-current`. Other hardware runs only the matrix-wide `replacement` test
 and row. Multi-row evidence is committed to the report only after every
 expected attachment materializes successfully.
+
+The iPhone-current-only capability-convergence lane runs VOD-to-live-to-VOD
+transitions while PiP is active on both the native drawable and direct
+sample-buffer backends. A
+qualification-only fault injector drops raw length and seekability callbacks
+from both independent Player and PiP-controller event consumers, forcing
+Player's native polling to publish the capability. The test requires
+finite seekable VOD to become interactive, unbounded live media to remain
+linear, the successor VOD to become interactive again, the real AVKit skip
+path to settle and advance playback, sustained system-PiP motion, and zero
+library errors before emitting the combined `capability-convergence` row. The
+default run omits this lane on other hardware rows, and an explicit unsupported
+request fails before testing rather than producing evidence for an unknown row.
 
 The HLS seek lane is another complete machine-readable matrix slice. It
 executes forward, backward, and absolute seeks, measures the return of decoded
