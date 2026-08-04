@@ -32,6 +32,7 @@ prepare_xctestrun = load_script("prepare-xctestrun.py")
 verify_fixtures = load_script("verify-fixtures.py")
 candidate_metadata = load_script("candidate-metadata.py")
 materialize_evidence = load_script("materialize-evidence.py")
+assemble_record = load_script("assemble-record.py")
 
 
 class DeviceInfoTests(unittest.TestCase):
@@ -270,6 +271,169 @@ class QualificationEvidenceTests(unittest.TestCase):
                     "a" * 64,
                     "b" * 64,
                 )
+
+
+class QualificationRecordAssemblyTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.matrix = self.root / "matrix.json"
+        self.matrix.write_text(
+            json.dumps(
+                {
+                    "scenarios": [{"id": "seek"}],
+                    "hardware": [
+                        {"id": "iphone", "deviceFamily": "iPhone", "osMajor": 26},
+                        {"id": "ipad", "deviceFamily": "iPad", "osMajor": 26},
+                    ],
+                }
+            )
+        )
+        self.matrix_checksum = hashlib.sha256(self.matrix.read_bytes()).hexdigest()
+        self.candidate = self.root / "candidate.json"
+        self.candidate.write_text(
+            json.dumps(
+                {
+                    "version": "1.1.0",
+                    "artifactDigestAlgorithm": "swiftvlc-tree-v1",
+                    "artifactDigest": "a" * 64,
+                    "sourceCommit": "b" * 40,
+                    "releaseSourceDigestAlgorithm": "swiftvlc-git-tree-v1",
+                    "releaseSourceDigest": "c" * 64,
+                }
+            )
+        )
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def make_report(self, hardware: str, release_type: str = "stable") -> Path:
+        directory = self.root / f"report-{hardware}"
+        evidence_directory = directory / "evidence"
+        evidence_directory.mkdir(parents=True)
+        evidence = evidence_directory / "seek.json"
+        evidence.write_text(
+            json.dumps(
+                {
+                    "artifactDigest": "a" * 64,
+                    "releaseSourceDigest": "c" * 64,
+                    "scenario": "seek",
+                    "hardware": hardware,
+                    "outcome": "pass",
+                }
+            )
+        )
+        report = directory / "report.json"
+        report.write_text(
+            json.dumps(
+                {
+                    "version": "1.1.0",
+                    "artifactDigestAlgorithm": "swiftvlc-tree-v1",
+                    "artifactDigest": "a" * 64,
+                    "sourceCommit": "b" * 40,
+                    "releaseSourceDigestAlgorithm": "swiftvlc-git-tree-v1",
+                    "releaseSourceDigest": "c" * 64,
+                    "qualificationMatrixChecksum": self.matrix_checksum,
+                    "qualificationEligibleEnvironment": release_type == "stable",
+                    "mode": "qualification" if release_type == "stable" else "exploratory",
+                    "qualificationRows": [
+                        {
+                            "scenario": "seek",
+                            "hardware": hardware,
+                            "device": f"Fixture {hardware}",
+                            "deviceFamily": "iPhone" if hardware == "iphone" else "iPad",
+                            "productType": "Fixture1,1",
+                            "osVersion": "26.0",
+                            "osBuild": "23A1",
+                            "osReleaseType": release_type,
+                            "fixture": "fixture:abc",
+                            "duration": "10s",
+                            "durationSeconds": 10,
+                            "evidence": "evidence/seek.json",
+                            "result": "pass",
+                        }
+                    ],
+                }
+            )
+        )
+        return report
+
+    def test_assembles_rows_and_copies_candidate_bound_evidence(self):
+        output = self.root / "qualification" / "1.1.0.json"
+        record = assemble_record.assemble(
+            "1.1.0",
+            self.candidate,
+            self.matrix,
+            [self.make_report("iphone"), self.make_report("ipad")],
+            output,
+        )
+        self.assertEqual(len(record["rows"]), 2)
+        self.assertEqual(record["artifactDigest"], "a" * 64)
+        for row in record["rows"]:
+            self.assertTrue((output.parent / row["evidence"]).is_file())
+
+    def test_rejects_exploratory_and_duplicate_rows(self):
+        output = self.root / "qualification" / "1.1.0.json"
+        with self.assertRaises(assemble_record.AssemblyError):
+            assemble_record.assemble(
+                "1.1.0",
+                self.candidate,
+                self.matrix,
+                [self.make_report("iphone", release_type="beta")],
+                output,
+            )
+
+        report = self.make_report("ipad")
+        with self.assertRaises(assemble_record.AssemblyError):
+            assemble_record.assemble(
+                "1.1.0",
+                self.candidate,
+                self.matrix,
+                [report, report],
+                output,
+            )
+
+    def test_rejects_report_identity_mismatch(self):
+        report = self.make_report("iphone")
+        payload = json.loads(report.read_text())
+        payload["releaseSourceDigest"] = "d" * 64
+        report.write_text(json.dumps(payload))
+        with self.assertRaises(assemble_record.AssemblyError):
+            assemble_record.assemble(
+                "1.1.0",
+                self.candidate,
+                self.matrix,
+                [report],
+                self.root / "qualification" / "1.1.0.json",
+            )
+
+    def test_rejects_candidate_algorithm_mismatch(self):
+        payload = json.loads(self.candidate.read_text())
+        payload["artifactDigestAlgorithm"] = "sha256-file-only"
+        self.candidate.write_text(json.dumps(payload))
+        with self.assertRaises(assemble_record.AssemblyError):
+            assemble_record.assemble(
+                "1.1.0",
+                self.candidate,
+                self.matrix,
+                [self.make_report("iphone")],
+                self.root / "qualification" / "1.1.0.json",
+            )
+
+    def test_rejects_evidence_that_escapes_report_directory(self):
+        report = self.make_report("iphone")
+        payload = json.loads(report.read_text())
+        payload["qualificationRows"][0]["evidence"] = "../outside.json"
+        report.write_text(json.dumps(payload))
+        (report.parent.parent / "outside.json").write_text("{}")
+        with self.assertRaises(assemble_record.AssemblyError):
+            assemble_record.assemble(
+                "1.1.0",
+                self.candidate,
+                self.matrix,
+                [report],
+                self.root / "qualification" / "1.1.0.json",
+            )
 
 
 class FixtureServerTests(unittest.TestCase):
