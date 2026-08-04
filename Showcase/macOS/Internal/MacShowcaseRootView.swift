@@ -408,7 +408,8 @@ extension MacShowcase {
     case .harnessHome,
          .pipLiveValidation,
          .pipCapabilityValidation,
-         .pipDeferredPauseValidation:
+         .pipDeferredPauseValidation,
+         .pipDelayedStartFailureValidation:
       return nil
     }
   }

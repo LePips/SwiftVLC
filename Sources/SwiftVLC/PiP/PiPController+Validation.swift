@@ -99,7 +99,21 @@ public struct DeferredPauseQualificationSnapshot: Sendable, Equatable {
   public let remainingTransientRejections: Int
 }
 
+extension PlaybackGeneration {
+  /// Numeric form used only for machine-readable qualification evidence.
+  @_spi(Qualification)
+  public var qualificationValue: UInt64 {
+    value
+  }
+}
+
 extension PiPController {
+  /// The AVKit-controller identity that qualification lifecycle envelopes use.
+  @_spi(Qualification)
+  public var qualificationControllerGeneration: UInt64 {
+    pipControllerGeneration
+  }
+
   /// A snapshot of the iOS native PiP backend's private wiring, or
   /// `nil` when this controller doesn't drive the native backend (the
   /// direct sample-buffer path).
@@ -160,6 +174,26 @@ extension PiPController {
       by: CMTime(seconds: seconds, preferredTimescale: 1000)
     )
     return await request.outcome == .settled
+  }
+
+  /// Issues a real direct-backend AVKit start request, then delivers a
+  /// deterministic asynchronous failure through the installed delegate path.
+  /// The request must first reach AVKit and return `.accepted`; the injected
+  /// callback changes no attribution state directly and is filtered by the
+  /// same current-controller identity check as a system callback.
+  @_spi(Qualification)
+  public func performAcceptedStartDelayedFailureQualification() -> PiPStartResult {
+    guard nativeBackend == nil else { return .backendUnavailable }
+    let result = start()
+    guard result == .accepted, let avController = pipController else { return result }
+    pictureInPictureController(
+      avController,
+      failedToStartPictureInPictureWithError: NSError(
+        domain: "SwiftVLC.Qualification.DelayedPiPStartFailure",
+        code: 1
+      )
+    )
+    return result
   }
 
   /// Exercises the same controller command entry point used by AVKit's

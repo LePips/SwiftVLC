@@ -118,6 +118,16 @@ controls, zero endless tasks, zero duplicate pauses, and zero library errors.
 The default run omits this lane on other hardware rows, and an explicit
 unsupported request fails before testing.
 
+The iPhone-current-only accepted-start-delayed-failure lane uses the direct
+sample-buffer backend to issue a real AVKit start request, requires the
+immediate result to be `accepted`, and then sends a deterministic asynchronous
+failure through the installed AVKit delegate path. The candidate passes only
+when the failure arrives before `didStart`, is the terminal recorded event, and
+retains the controller and media generations captured at request time. The
+attached evidence records those identities, ordered events, and injected error
+domain. The default run omits this lane on other hardware rows, and an explicit
+unsupported request fails before testing.
+
 The HLS seek lane is another complete machine-readable matrix slice. It
 executes forward, backward, and absolute seeks, measures the return of decoded
 video, checks ordered PiP continuity, samples real system-PiP motion after each
