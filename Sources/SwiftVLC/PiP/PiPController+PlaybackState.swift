@@ -134,6 +134,24 @@ extension PiPController {
     }
   }
 
+  /// Qualification fault injection must drop raw capability callbacks from
+  /// this observer as well as from Player's observable mirror. The two own
+  /// independent subscriptions to the same event bridge; suppressing only the
+  /// Player consumer would let this controller converge from the callback and
+  /// produce a false-positive polling result.
+  static func shouldObservePlaybackStateEvent(
+    _ event: PlayerEvent,
+    suppressingRawCapabilityEvents: Bool
+  ) -> Bool {
+    guard suppressingRawCapabilityEvents else { return true }
+    switch event {
+    case .lengthChanged, .seekableChanged:
+      return false
+    default:
+      return true
+    }
+  }
+
   static func applyPlaybackStateUpdate(
     _ update: PlaybackStateUpdate,
     setRequiresLinearPlayback: (Bool) -> Void,

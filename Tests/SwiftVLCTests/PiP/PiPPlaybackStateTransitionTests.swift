@@ -352,6 +352,60 @@ import Testing
     #expect(update == PiPController.PlaybackStateUpdate())
   }
 
+  /// A timeshift window can grow or slide without a new media generation.
+  /// Polling must republish the changed finite range without reverting the
+  /// already-interactive seek policy.
+  @Test
+  func `A sliding finite duration converges within one generation`() {
+    var state = PiPController.PlaybackStateObservationState(
+      duration: .seconds(120),
+      isSeekable: true
+    )
+
+    let update = state.consume(
+      .timeChanged(.seconds(30)),
+      capability: PlayerCapabilitySnapshot(
+        generation: 1,
+        durationMilliseconds: 180_000,
+        isSeekable: true
+      )
+    )
+
+    #expect(state.durationMilliseconds == 180_000)
+    #expect(state.isSeekable)
+    #expect(update.invalidatesPlaybackState)
+    #expect(update.requiresLinearPlayback == nil)
+    assertEffects(of: update, expectedLinearPlayback: nil)
+  }
+
+  @Test
+  func `Capability fault injection excludes raw callbacks from the PiP observer`() {
+    #expect(
+      !PiPController.shouldObservePlaybackStateEvent(
+        .lengthChanged(.seconds(30)),
+        suppressingRawCapabilityEvents: true
+      )
+    )
+    #expect(
+      !PiPController.shouldObservePlaybackStateEvent(
+        .seekableChanged(true),
+        suppressingRawCapabilityEvents: true
+      )
+    )
+    #expect(
+      PiPController.shouldObservePlaybackStateEvent(
+        .timeChanged(.seconds(1)),
+        suppressingRawCapabilityEvents: true
+      )
+    )
+    #expect(
+      PiPController.shouldObservePlaybackStateEvent(
+        .lengthChanged(.seconds(30)),
+        suppressingRawCapabilityEvents: false
+      )
+    )
+  }
+
   /// A poll that has not learned the length must not undo a length event that
   /// already arrived, or the two sources fight each other.
   @Test

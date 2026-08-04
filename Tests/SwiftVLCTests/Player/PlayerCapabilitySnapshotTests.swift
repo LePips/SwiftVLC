@@ -81,4 +81,19 @@ import Testing
     #expect(snapshot.durationMilliseconds == 90000)
     #expect(snapshot.isSeekable)
   }
+
+  @Test
+  func `Raw capability fault injection drops events without mutating the mirror`() {
+    let player = Player(instance: TestInstance.shared)
+    player._setStateForTesting(duration: .seconds(120), isSeekable: true)
+    player.isSuppressingRawCapabilityEvents = true
+
+    player._handleEventForTesting(.lengthChanged(.seconds(30)))
+    player._handleEventForTesting(.seekableChanged(false))
+
+    #expect(player.duration == .seconds(120))
+    #expect(player.isSeekable)
+    #expect(player.suppressedRawLengthEventCount == 1)
+    #expect(player.suppressedRawSeekableEventCount == 1)
+  }
 }

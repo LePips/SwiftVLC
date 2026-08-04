@@ -172,10 +172,18 @@ extension Player {
       }
 
     case .lengthChanged(let length):
-      duration = length
+      if isSuppressingRawCapabilityEvents {
+        suppressedRawLengthEventCount += 1
+      } else {
+        duration = length
+      }
 
     case .seekableChanged(let seekable):
-      isSeekable = seekable
+      if isSuppressingRawCapabilityEvents {
+        suppressedRawSeekableEventCount += 1
+      } else {
+        isSeekable = seekable
+      }
 
     case .pausableChanged(let pausable):
       isPausable = pausable

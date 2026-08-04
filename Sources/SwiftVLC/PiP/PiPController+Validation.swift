@@ -1,6 +1,7 @@
 #if os(iOS)
 
 import AVKit
+import CoreMedia
 
 /// A snapshot of libVLC's private native PiP machinery on iOS.
 ///
@@ -67,6 +68,15 @@ public struct NativePiPPlaybackQualificationSnapshot: Sendable, Equatable {
   public let isSeekable: Bool
 }
 
+/// State from the qualification-only fault injector that drops raw libVLC
+/// length and seekability callbacks while preserving native polling.
+@_spi(Qualification)
+public struct RawCapabilityEventSuppressionSnapshot: Sendable, Equatable {
+  public let isEnabled: Bool
+  public let suppressedLengthEventCount: Int
+  public let suppressedSeekableEventCount: Int
+}
+
 extension PiPController {
   /// A snapshot of the iOS native PiP backend's private wiring, or
   /// `nil` when this controller doesn't drive the native backend (the
@@ -117,6 +127,18 @@ extension PiPController {
       isSeekable: seekable.boolValue
     )
   }
+
+  /// Exercises the exact relative-skip path AVKit uses and waits for its
+  /// terminal result. The device harness uses this instead of trying to tap a
+  /// locale-dependent system PiP control by its accessibility label.
+  @_spi(Qualification)
+  public func performQualificationSkip(bySeconds seconds: Double) async -> Bool {
+    let request = Self.performSkip(
+      on: player,
+      by: CMTime(seconds: seconds, preferredTimescale: 1000)
+    )
+    return await request.outcome == .settled
+  }
 }
 
 extension Player {
@@ -125,6 +147,26 @@ extension Player {
   @_spi(Qualification)
   public var playbackQualificationGeneration: PlaybackGeneration {
     generation
+  }
+
+  /// Enables deterministic suppression of the two raw callbacks whose
+  /// absence the capability-convergence lane must tolerate.
+  @_spi(Qualification)
+  public func suppressRawCapabilityEventsForQualification(_ suppressed: Bool) {
+    isSuppressingRawCapabilityEvents = suppressed
+    if suppressed {
+      suppressedRawLengthEventCount = 0
+      suppressedRawSeekableEventCount = 0
+    }
+  }
+
+  @_spi(Qualification)
+  public var rawCapabilityEventSuppressionSnapshot: RawCapabilityEventSuppressionSnapshot {
+    RawCapabilityEventSuppressionSnapshot(
+      isEnabled: isSuppressingRawCapabilityEvents,
+      suppressedLengthEventCount: suppressedRawLengthEventCount,
+      suppressedSeekableEventCount: suppressedRawSeekableEventCount
+    )
   }
 }
 

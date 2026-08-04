@@ -386,6 +386,12 @@ public final class Player {
   /// per-property `didSet` publishes do not expose an intermediate mix of the
   /// outgoing and incoming media. See ``resetMediaDerivedState()``.
   @ObservationIgnored var isSuppressingCapabilityPublish = false
+  /// Qualification-only fault injection that drops raw length and seekability
+  /// events while leaving native polling active. This proves PiP capability
+  /// convergence does not depend on callbacks libVLC may omit in production.
+  @ObservationIgnored var isSuppressingRawCapabilityEvents = false
+  @ObservationIgnored var suppressedRawLengthEventCount = 0
+  @ObservationIgnored var suppressedRawSeekableEventCount = 0
   var eventTask: Task<Void, Never>?
   var playbackHealthSamplingTask: Task<Void, Never>?
   var playbackHealthMonitoringState = PlaybackHealthMonitoringState()

@@ -81,6 +81,11 @@ extension PiPController {
   /// The body both lane tasks run. Identical work either way: what differs
   /// between the lanes is delivery guarantees, not handling.
   private func handleStateObserverEvent(_ event: PlayerEvent) {
+    guard
+      Self.shouldObservePlaybackStateEvent(
+        event,
+        suppressingRawCapabilityEvents: player.isSuppressingRawCapabilityEvents
+      ) else { return }
     let active = player.isActive
     let rate = player.rate
     let playbackStateUpdate = playbackStateObservation.consume(
