@@ -107,6 +107,17 @@ library errors before emitting the combined `capability-convergence` row. The
 default run omits this lane on other hardware rows, and an explicit unsupported
 request fails before testing rather than producing evidence for an unknown row.
 
+The iPhone-current-only deferred-pause-rejection lane drives the exact AVKit
+playback command entry point while a qualification SPI changes only libVLC's
+native pause-capability answer. It proves a permanently unpausable input
+settles to `rejected` within the production retry bound without a late pause,
+a transient three-probe rejection issues exactly one native pause, and newer
+play, media replacement, and stop commands cancel pending work. The attached
+evidence includes the individual counters and requires truthful AVKit/player
+controls, zero endless tasks, zero duplicate pauses, and zero library errors.
+The default run omits this lane on other hardware rows, and an explicit
+unsupported request fails before testing.
+
 The HLS seek lane is another complete machine-readable matrix slice. It
 executes forward, backward, and absolute seeks, measures the return of decoded
 video, checks ordered PiP continuity, samples real system-PiP motion after each
