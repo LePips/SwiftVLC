@@ -5,14 +5,55 @@ import XCTest
 /// do not pretend to validate system PiP.
 final class PiPLiveDeviceUITests: ShowcaseIOSTestCase {
   func test_nativeLiveMPEGTSRendersMovingFramesInSystemPiP() throws {
-    try runLivePictureInPicture(renderingPath: "native")
+    _ = try runLivePictureInPicture(renderingPath: "native")
   }
 
   func test_directLiveMPEGTSRendersMovingFramesInSystemPiP() throws {
-    try runLivePictureInPicture(renderingPath: "direct")
+    _ = try runLivePictureInPicture(renderingPath: "direct")
   }
 
-  private func runLivePictureInPicture(renderingPath: String) throws {
+  func test_liveMediaQualificationAcrossNativeAndDirectBackends() throws {
+    #if targetEnvironment(simulator)
+    throw XCTSkip("System Picture in Picture requires a physical iOS device")
+    #else
+    let native = try runLivePictureInPicture(renderingPath: "native")
+    let direct = try runLivePictureInPicture(renderingPath: "direct")
+    XCTAssertEqual(native.playbackRange, "unbounded")
+    XCTAssertEqual(direct.playbackRange, "unbounded")
+    XCTAssertTrue(native.linearPlayback)
+    XCTAssertTrue(direct.linearPlayback)
+    attachQualificationEvidence(
+      [
+        "formatVersion": 1,
+        "scenario": "live-media",
+        "events": [
+          "started": true,
+          "unexpectedStopCount": native.unexpectedStopCount + direct.unexpectedStopCount,
+          "order": "pass"
+        ],
+        "playbackRange": "unbounded",
+        "linearPlayback": true,
+        "backendResults": [
+          "native": "pass",
+          "direct": "pass"
+        ],
+        "systemPiPMotion": [
+          "native": "pass",
+          "direct": "pass"
+        ]
+      ],
+      scenario: "live-media"
+    )
+    #endif
+  }
+
+  private struct LiveRunEvidence {
+    let playbackRange: String
+    let linearPlayback: Bool
+    let unexpectedStopCount: Int
+  }
+
+  private func runLivePictureInPicture(renderingPath: String) throws -> LiveRunEvidence {
     #if targetEnvironment(simulator)
     throw XCTSkip("System Picture in Picture requires a physical iOS device")
     #else
@@ -33,9 +74,10 @@ final class PiPLiveDeviceUITests: ShowcaseIOSTestCase {
     }
 
     let encodedLiveURL = Data(liveURL.absoluteString.utf8).base64EncodedString()
-    app.launchArguments += [LaunchArguments.pipLiveURLBase64, encodedLiveURL]
+    replaceLaunchArgument(LaunchArguments.pipLiveURLBase64, with: encodedLiveURL)
     app.launchEnvironment[LaunchArguments.pipLiveURLEnvironment] = encodedLiveURL
-    app.launchArguments += [LaunchArguments.pipRenderingPath, renderingPath]
+    replaceLaunchArgument(LaunchArguments.pipRenderingPath, with: renderingPath)
+    removeLaunchArgument(LaunchArguments.route)
     launch(route: .pipLiveValidation)
     // UI interruption monitors run when the test sends an interaction after
     // presentation. A harmless tap lets a fresh install accept local-network
@@ -52,6 +94,15 @@ final class PiPLiveDeviceUITests: ShowcaseIOSTestCase {
     ]
     let possible = app.descendants(matching: .any)[AccessibilityID.PiPLiveValidation.possibleLabel]
     let active = app.descendants(matching: .any)[AccessibilityID.PiPLiveValidation.activeLabel]
+    let linearPlayback = app.descendants(matching: .any)[
+      AccessibilityID.PiPLiveValidation.linearPlaybackLabel
+    ]
+    let playbackRange = app.descendants(matching: .any)[
+      AccessibilityID.PiPLiveValidation.playbackRangeLabel
+    ]
+    let lifecycleEvents = app.descendants(matching: .any)[
+      AccessibilityID.PiPLiveValidation.lifecycleEventsLabel
+    ]
     let playbackError = app.descendants(matching: .any)[AccessibilityID.PiPLiveValidation.errorLabel]
     let toggle = app.buttons[AccessibilityID.PiPLiveValidation.toggleButton]
     let video = app.otherElements[AccessibilityID.PiPLiveValidation.videoView]
@@ -60,6 +111,8 @@ final class PiPLiveDeviceUITests: ShowcaseIOSTestCase {
     waitForLabel(state, equals: "playing", timeout: 20)
     waitForLabel(duration, equals: "unknown", timeout: 5)
     waitForLabel(possible, equals: "yes", timeout: 15)
+    waitForLabel(linearPlayback, equals: "yes", timeout: 10)
+    waitForLabel(playbackRange, equals: "unbounded", timeout: 10)
     let displayedBeforePiP = waitForIntegerLabel(
       displayedPictures,
       greaterThan: 0,
@@ -75,10 +128,17 @@ final class PiPLiveDeviceUITests: ShowcaseIOSTestCase {
     }
 
     XCTAssertTrue(toggle.waitForExistence(timeout: 5))
+    reveal(toggle)
     XCTAssertTrue(toggle.isEnabled)
     for cycle in 0..<3 {
       toggle.tap()
       waitForLabel(active, equals: "yes", timeout: 10)
+      waitForLifecycleEvent(
+        "didStart",
+        count: cycle + 1,
+        in: lifecycleEvents,
+        timeout: 10
+      )
       if renderingPath == "direct" {
         attachDirectRendererDiagnostics(
           video,
@@ -89,6 +149,12 @@ final class PiPLiveDeviceUITests: ShowcaseIOSTestCase {
       if cycle < 2 {
         toggle.tap()
         waitForLabel(active, equals: "no", timeout: 10)
+        waitForLifecycleEvent(
+          "didStop:programmatic",
+          count: cycle + 1,
+          in: lifecycleEvents,
+          timeout: 10
+        )
         if renderingPath == "direct" {
           attachDirectRendererDiagnostics(
             video,
@@ -118,6 +184,7 @@ final class PiPLiveDeviceUITests: ShowcaseIOSTestCase {
     app.activate()
     waitForLabel(state, equals: "playing", timeout: 10)
     waitForLabel(duration, equals: "unknown", timeout: 5)
+    waitForLabel(active, equals: "yes", timeout: 10)
     _ = waitForIntegerLabel(
       displayedPictures,
       greaterThan: displayedBeforePiP,
@@ -137,7 +204,82 @@ final class PiPLiveDeviceUITests: ShowcaseIOSTestCase {
     if let visualFailure {
       XCTFail(visualFailure)
     }
+    let events = lifecycleEvents.label.split(separator: "|").map(String.init)
+    XCTAssertTrue(
+      lifecycleOrderIsValid(events),
+      "PiP lifecycle events were missing or out of order: \(events)"
+    )
+    let unexpectedStops = events.filter {
+      $0.hasPrefix("didStop:") && $0 != "didStop:programmatic"
+    }
+    XCTAssertTrue(
+      unexpectedStops.isEmpty,
+      "Live PiP stopped unexpectedly: \(unexpectedStops)"
+    )
+    assertNoLibraryErrors()
+    return LiveRunEvidence(
+      playbackRange: playbackRange.label,
+      linearPlayback: linearPlayback.label == "yes",
+      unexpectedStopCount: unexpectedStops.count
+    )
     #endif
+  }
+
+  private func waitForLifecycleEvent(
+    _ event: String,
+    count: Int,
+    in element: XCUIElement,
+    timeout: TimeInterval
+  ) {
+    let predicate = NSPredicate { _, _ in
+      element.label.split(separator: "|").count(where: { $0 == Substring(event) }) == count
+    }
+    let expectation = expectation(for: predicate, evaluatedWith: NSObject())
+    XCTAssertEqual(XCTWaiter.wait(for: [expectation], timeout: timeout), .completed)
+  }
+
+  private func reveal(_ element: XCUIElement) {
+    for _ in 0..<8 where !element.isHittable {
+      app.swipeUp()
+    }
+    XCTAssertTrue(element.isHittable)
+  }
+
+  private func replaceLaunchArgument(_ name: String, with value: String) {
+    removeLaunchArgument(name)
+    app.launchArguments += [name, value]
+  }
+
+  private func removeLaunchArgument(_ name: String) {
+    while let index = app.launchArguments.firstIndex(of: name) {
+      app.launchArguments.remove(at: index)
+      if index < app.launchArguments.endIndex {
+        app.launchArguments.remove(at: index)
+      }
+    }
+  }
+
+  private func lifecycleOrderIsValid(_ events: [String]) -> Bool {
+    var state = "idle"
+    var startCount = 0
+    var stopCount = 0
+    for event in events {
+      switch event {
+      case "willStart" where state == "idle":
+        state = "starting"
+      case "didStart" where state == "starting":
+        state = "active"
+        startCount += 1
+      case "willStop:programmatic" where state == "active":
+        state = "stopping"
+      case "didStop:programmatic" where state == "stopping":
+        state = "idle"
+        stopCount += 1
+      default:
+        return false
+      }
+    }
+    return state == "active" && startCount == 3 && stopCount == 2
   }
 
   private func attachDirectRendererDiagnostics(

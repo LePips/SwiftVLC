@@ -12,6 +12,7 @@ struct PiPLiveValidationCase: View {
   @State private var playbackError: String?
   @State private var capturedRendererDiagnostics = "not-captured"
   @State private var diagnosticCaptureOrdinal: UInt64 = 0
+  @State private var lifecycleEvents: [String] = []
 
   private var renderingPath: PiPValidationRenderingPath {
     PiPValidationRenderingPath(
@@ -61,6 +62,23 @@ struct PiPLiveValidationCase: View {
           value: controller?.isActive == true ? "yes" : "no",
           identifier: AccessibilityID.PiPLiveValidation.activeLabel
         )
+        valueRow(
+          "Linear playback",
+          value: controller?.playbackQualificationSnapshot.requiresLinearPlayback == true
+            ? "yes" : "no",
+          identifier: AccessibilityID.PiPLiveValidation.linearPlaybackLabel
+        )
+        valueRow(
+          "Playback range",
+          value: controller?.playbackQualificationSnapshot.durationMilliseconds == nil
+            ? "unbounded" : "finite",
+          identifier: AccessibilityID.PiPLiveValidation.playbackRangeLabel
+        )
+        valueRow(
+          "Lifecycle",
+          value: lifecycleEvents.isEmpty ? "none" : lifecycleEvents.joined(separator: "|"),
+          identifier: AccessibilityID.PiPLiveValidation.lifecycleEventsLabel
+        )
       }
 
       Section("Picture in Picture") {
@@ -96,6 +114,13 @@ struct PiPLiveValidationCase: View {
       }
     }
     .task { startPlayback() }
+    .task(id: controller.map(ObjectIdentifier.init)) {
+      lifecycleEvents.removeAll()
+      guard let controller else { return }
+      for await envelope in controller.pipEventEnvelopes {
+        lifecycleEvents.append(lifecycleName(envelope.event))
+      }
+    }
     .onChange(of: controller?.isPossible) { _, _ in
       captureRendererDiagnostics()
     }
@@ -181,6 +206,21 @@ struct PiPLiveValidationCase: View {
       "requiresFlush=\(snapshot.displayLayerRequiresFlush)",
       "layerError=\(snapshot.displayLayerError ?? "nil")"
     ].joined(separator: ";")
+  }
+
+  private func lifecycleName(_ event: PiPEvent) -> String {
+    switch event {
+    case .willStart:
+      "willStart"
+    case .didStart:
+      "didStart"
+    case .willStop(let reason):
+      "willStop:\(String(describing: reason))"
+    case .didStop(let reason):
+      "didStop:\(String(describing: reason))"
+    case .failedToStart:
+      "failedToStart"
+    }
   }
 
   private func valueRow(_ title: String, value: String, identifier: String) -> some View {
