@@ -164,6 +164,7 @@ enum UITestRoute: String, CaseIterable {
   case harnessHome = "HarnessHome"
   case pipLiveValidation = "PiPLiveValidation"
   case pipCapabilityValidation = "PiPCapabilityValidation"
+  case pipDeferredPauseValidation = "PiPDeferredPauseValidation"
 
   static var current: UITestRoute? {
     LaunchArguments.routeValue.flatMap(UITestRoute.init(rawValue:))

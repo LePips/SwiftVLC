@@ -127,6 +127,7 @@ extension UITestRoute {
     case .harnessHome: HarnessHome()
     case .pipLiveValidation: PiPLiveValidationCase()
     case .pipCapabilityValidation: PiPCapabilityValidationCase()
+    case .pipDeferredPauseValidation: PiPDeferredPauseValidationCase()
     }
   }
 }

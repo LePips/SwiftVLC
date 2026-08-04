@@ -77,6 +77,28 @@ public struct RawCapabilityEventSuppressionSnapshot: Sendable, Equatable {
   public let suppressedSeekableEventCount: Int
 }
 
+/// Deterministic native-pause capability fault used by the physical
+/// deferred-pause qualification lane.
+@_spi(Qualification)
+public enum DeferredPauseQualificationFault: Sendable, Equatable {
+  /// Restore the live libVLC capability probe and clear prior counters.
+  case disabled
+  /// Reject every native pause probe until explicitly disabled.
+  case permanentRejection
+  /// Reject a fixed number of probes, then return authority to libVLC.
+  case transientRejection(attempts: Int)
+}
+
+/// Counters captured from the live Player pause path while qualification fault
+/// injection is enabled.
+@_spi(Qualification)
+public struct DeferredPauseQualificationSnapshot: Sendable, Equatable {
+  public let isEnabled: Bool
+  public let forcedRejectionCount: Int
+  public let nativePauseCommandCount: Int
+  public let remainingTransientRejections: Int
+}
+
 extension PiPController {
   /// A snapshot of the iOS native PiP backend's private wiring, or
   /// `nil` when this controller doesn't drive the native backend (the
@@ -139,6 +161,29 @@ extension PiPController {
     )
     return await request.outcome == .settled
   }
+
+  /// Exercises the same controller command entry point used by AVKit's
+  /// sample-buffer playback delegate.
+  @_spi(Qualification)
+  public func performDeferredPauseQualificationCommand(playing: Bool) {
+    handleSetPlaying(playing)
+  }
+
+  /// Whether the bounded controller task is still scheduled.
+  @_spi(Qualification)
+  public var isDeferredPauseQualificationInFlight: Bool {
+    if case .scheduled = deferredPause {
+      true
+    } else {
+      false
+    }
+  }
+
+  /// Truth reported to AVKit's playback controls after a deferred command.
+  @_spi(Qualification)
+  public var deferredPauseQualificationControlsArePlaying: Bool {
+    pipPlaybackActive && player.isPlaybackRequestedActive
+  }
 }
 
 extension Player {
@@ -160,12 +205,43 @@ extension Player {
     }
   }
 
+  /// Configures candidate-bound pause-capability fault injection. This alters
+  /// only the capability decision; generation binding, retained commands,
+  /// native command issuance, and outcome reconciliation remain live.
+  @_spi(Qualification)
+  public func configureDeferredPauseQualificationFault(
+    _ fault: DeferredPauseQualificationFault
+  ) {
+    switch fault {
+    case .disabled:
+      configureQualificationPauseFault(mode: .disabled)
+    case .permanentRejection:
+      configureQualificationPauseFault(mode: .permanentRejection)
+    case .transientRejection(let attempts):
+      configureQualificationPauseFault(
+        mode: .transientRejection,
+        transientRejections: attempts
+      )
+    }
+  }
+
   @_spi(Qualification)
   public var rawCapabilityEventSuppressionSnapshot: RawCapabilityEventSuppressionSnapshot {
     RawCapabilityEventSuppressionSnapshot(
       isEnabled: isSuppressingRawCapabilityEvents,
       suppressedLengthEventCount: suppressedRawLengthEventCount,
       suppressedSeekableEventCount: suppressedRawSeekableEventCount
+    )
+  }
+
+  @_spi(Qualification)
+  public var deferredPauseQualificationSnapshot: DeferredPauseQualificationSnapshot {
+    let snapshot = qualificationPauseFaultSnapshot
+    return DeferredPauseQualificationSnapshot(
+      isEnabled: snapshot.isEnabled,
+      forcedRejectionCount: snapshot.forcedRejectionCount,
+      nativePauseCommandCount: snapshot.nativePauseCommandCount,
+      remainingTransientRejections: snapshot.remainingTransientRejections
     )
   }
 }

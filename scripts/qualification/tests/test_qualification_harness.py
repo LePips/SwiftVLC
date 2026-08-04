@@ -390,6 +390,56 @@ class QualificationEvidenceTests(unittest.TestCase):
             self.assertEqual(evidence["skipControls"], "pass")
             self.assertTrue(evidence["faultInjection"]["rawEventsSuppressed"])
 
+    def test_materializes_deferred_pause_rejection_evidence(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.make_export(
+                root,
+                {
+                    "formatVersion": 1,
+                    "scenario": "deferred-pause-rejection",
+                    "permanentCase": {
+                        "outcome": "rejected",
+                        "forcedRejectionCount": 40,
+                        "nativePauseCommandCount": 0,
+                        "taskStayedSettled": True,
+                        "truthfulControls": True,
+                    },
+                    "transientCase": {
+                        "outcome": "issued",
+                        "forcedRejectionCount": 3,
+                        "nativePauseCommandCount": 1,
+                        "taskStayedSettled": True,
+                        "truthfulControls": True,
+                    },
+                    "cancellationCases": "pass",
+                    "cancellationResults": {
+                        "newerCommand": "cancelled",
+                        "replacement": "cancelled",
+                        "stop": "cancelled",
+                    },
+                    "endlessTaskCount": 0,
+                    "duplicatePauseCount": 0,
+                    "truthfulControls": True,
+                },
+                attachment_name="qualification-deferred-pause-rejection.json",
+                test_identifier="PiPDeferredPauseDeviceUITests/test_deferredPauseRejectionAndCancellationStayTruthful",
+            )
+            evidence = materialize_evidence.materialize(
+                root,
+                "qualification-deferred-pause-rejection.json",
+                "deferred-pause-rejection",
+                "iphone-current",
+                "a" * 64,
+                "b" * 64,
+            )
+            self.assertEqual(evidence["permanentCase"]["outcome"], "rejected")
+            self.assertEqual(evidence["transientCase"]["outcome"], "issued")
+            self.assertEqual(evidence["cancellationCases"], "pass")
+            self.assertEqual(evidence["endlessTaskCount"], 0)
+            self.assertEqual(evidence["duplicatePauseCount"], 0)
+            self.assertTrue(evidence["truthfulControls"])
+
     def test_materializes_focused_replacement_evidence(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

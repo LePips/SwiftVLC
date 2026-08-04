@@ -515,7 +515,8 @@ extension TVShowcase {
          .multiConsumer,
          .harnessHome,
          .pipLiveValidation,
-         .pipCapabilityValidation:
+         .pipCapabilityValidation,
+         .pipDeferredPauseValidation:
       return nil
     }
   }

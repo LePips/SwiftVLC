@@ -102,7 +102,7 @@ extension Integration {
     func `Terminal rejection retires the player-owned deferred pause`() async {
       let player = Player(instance: TestInstance.makeAudioOnly())
       player._nativePlaybackStateOverrideForTesting = .playing
-      player._nativeCanPauseOverrideForTesting = false
+      player.configureQualificationPauseFault(mode: .permanentRejection)
       player._setStateForTesting(state: .playing, isPlaybackRequestedActive: true)
       let controller = PiPController(
         player: player,
@@ -118,6 +118,37 @@ extension Integration {
       #expect(player.deferredPauseCommandPlaybackGeneration == nil)
       #expect(player.playbackControlIntent == .resume)
       #expect(player.isPlaybackRequestedActive)
+      #expect(player.qualificationPauseFaultSnapshot.forcedRejectionCount >= 1)
+      #expect(player.qualificationPauseFaultSnapshot.nativePauseCommandCount == 0)
+    }
+
+    @Test
+    func `Transient qualification rejection returns to the live pause path`() async {
+      let player = Player(instance: TestInstance.makeAudioOnly())
+      player._nativePlaybackStateOverrideForTesting = .playing
+      player._nativeCanPauseOverrideForTesting = true
+      player._nativePauseSafetyOverrideForTesting = true
+      player.configureQualificationPauseFault(
+        mode: .transientRejection,
+        transientRejections: 3
+      )
+      player._setStateForTesting(state: .playing, isPlaybackRequestedActive: true)
+      let controller = PiPController(
+        player: player,
+        playbackDriver: .live(player: player),
+        pauseDebounce: .milliseconds(1)
+      )
+      controller._deferredPauseRetryHookForTesting = {
+        player.performDeferredPauseCommandIfNeeded()
+      }
+
+      controller._setPlayingForTesting(false)
+
+      #expect(await awaitDeferredPauseOutcome(controller))
+      #expect(controller.deferredPauseOutcome == .issued)
+      #expect(player.qualificationPauseFaultSnapshot.forcedRejectionCount == 3)
+      #expect(player.qualificationPauseFaultSnapshot.nativePauseCommandCount == 1)
+      #expect(player.qualificationPauseFaultSnapshot.remainingTransientRejections == 0)
     }
 
     /// Apps need to react when a deferred pause settles, rather than polling

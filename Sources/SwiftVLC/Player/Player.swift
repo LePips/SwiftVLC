@@ -435,6 +435,15 @@ public final class Player {
   @ObservationIgnored
   var lastIssuedPausePlaybackControlRevision: UInt64?
 
+  #if os(iOS) || os(macOS)
+  /// Candidate-bound fault state for the physical deferred-pause lane.
+  /// Mutation is reachable only through qualification SPI; keeping the state
+  /// in the live Player path ensures Release builds exercise the same pause
+  /// generation and cleanup machinery as production.
+  @ObservationIgnored
+  var qualificationPauseFault = QualificationPauseFaultState()
+  #endif
+
   #if DEBUG
   /// Lets deterministic tests advance the callback-lane generation at the
   /// otherwise unschedulable boundaries between a native probe and its

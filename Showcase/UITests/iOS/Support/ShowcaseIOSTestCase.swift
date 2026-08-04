@@ -148,11 +148,24 @@ class ShowcaseIOSTestCase: XCTestCase {
   /// by the host after exporting the xcresult attachment; a test process must
   /// never guess which source tree or signed app bundle launched it.
   func attachQualificationEvidence(
-    _ payload: [String: Any],
+    _ suppliedPayload: [String: Any],
     scenario: String,
     file: StaticString = #filePath,
     line: UInt = #line
   ) {
+    if
+      let embeddedScenario = suppliedPayload["scenario"],
+      embeddedScenario as? String != scenario {
+      XCTFail(
+        "Qualification evidence scenario does not match \(scenario)",
+        file: file,
+        line: line
+      )
+      return
+    }
+    var payload = suppliedPayload
+    payload["formatVersion"] = payload["formatVersion"] ?? 1
+    payload["scenario"] = scenario
     guard JSONSerialization.isValidJSONObject(payload) else {
       XCTFail("Qualification evidence is not valid JSON", file: file, line: line)
       return
