@@ -195,16 +195,23 @@ class FixtureManifestTests(unittest.TestCase):
 
 
 class QualificationEvidenceTests(unittest.TestCase):
-    def make_export(self, root: Path, payload: dict, attachment_count: int = 1):
+    def make_export(
+        self,
+        root: Path,
+        payload: dict,
+        attachment_count: int = 1,
+        attachment_name: str = "qualification-native-hls-seek-continuity.json",
+        test_identifier: str = "PiPOverlayDeviceUITests/test_nativePiPHLSSeekAndReloadRemainActive",
+    ):
         exported = root / "attachment.json"
         exported.write_text(json.dumps(payload))
         attachment = {
             "exportedFileName": exported.name,
-            "suggestedHumanReadableName": "qualification-native-hls-seek-continuity.json",
+            "suggestedHumanReadableName": attachment_name,
         }
         manifest = [
             {
-                "testIdentifier": "PiPOverlayDeviceUITests/test_nativePiPHLSSeekAndReloadRemainActive",
+                "testIdentifier": test_identifier,
                 "attachments": [attachment] * attachment_count,
             }
         ]
@@ -233,6 +240,40 @@ class QualificationEvidenceTests(unittest.TestCase):
             self.assertEqual(evidence["releaseSourceDigest"], "b" * 64)
             self.assertEqual(evidence["hardware"], "iphone-current")
             self.assertEqual(evidence["seekResults"]["forward"], "pass")
+
+    def test_materializes_combined_live_media_backend_evidence(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.make_export(
+                root,
+                {
+                    "formatVersion": 1,
+                    "scenario": "live-media",
+                    "events": {
+                        "started": True,
+                        "unexpectedStopCount": 0,
+                        "order": "pass",
+                    },
+                    "playbackRange": "unbounded",
+                    "linearPlayback": True,
+                    "backendResults": {"native": "pass", "direct": "pass"},
+                },
+                attachment_name="qualification-live-media.json",
+                test_identifier="PiPLiveDeviceUITests/test_liveMediaQualificationAcrossNativeAndDirectBackends",
+            )
+            evidence = materialize_evidence.materialize(
+                root,
+                "qualification-live-media.json",
+                "live-media",
+                "ipad-current",
+                "a" * 64,
+                "b" * 64,
+            )
+            self.assertEqual(evidence["scenario"], "live-media")
+            self.assertEqual(evidence["hardware"], "ipad-current")
+            self.assertEqual(
+                evidence["backendResults"], {"native": "pass", "direct": "pass"}
+            )
 
     def test_rejects_duplicate_attachments_and_forged_identity(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -460,6 +501,14 @@ class FixtureServerTests(unittest.TestCase):
         response = connection.getresponse()
         return connection, response
 
+    def last_log_record(self) -> dict:
+        deadline = time.monotonic() + 1
+        while time.monotonic() < deadline:
+            if self.log.exists() and (lines := self.log.read_text().splitlines()):
+                return json.loads(lines[-1])
+            time.sleep(0.01)
+        self.fail("fixture server did not record the completed request")
+
     def test_static_file_supports_byte_ranges(self):
         connection, response = self.request("/files/sample.bin", {"Range": "bytes=10-19"})
         self.assertEqual(response.status, 206)
@@ -467,7 +516,7 @@ class FixtureServerTests(unittest.TestCase):
         connection.close()
 
         size = (self.root / "sample.bin").stat().st_size
-        record = json.loads(self.log.read_text().splitlines()[-1])
+        record = self.last_log_record()
         self.assertEqual(record["requestRange"], "bytes=10-19")
         self.assertEqual(record["responseContentRange"], f"bytes 10-19/{size}")
 
@@ -481,7 +530,7 @@ class FixtureServerTests(unittest.TestCase):
         self.assertEqual(response.read(), b"")
         connection.close()
 
-        record = json.loads(self.log.read_text().splitlines()[-1])
+        record = self.last_log_record()
         self.assertEqual(record["requestRange"], f"bytes={size}-")
         self.assertEqual(record["responseContentRange"], f"bytes */{size}")
 

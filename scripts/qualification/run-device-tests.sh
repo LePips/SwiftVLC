@@ -32,7 +32,7 @@ Options:
   --fixtures PATH         Generated fixture directory
   --output PATH           Evidence output root
   --only SCENARIO         Repeat to select: analyzer, ui-suite, native-live,
-                          direct-live, continuity, hls-seek,
+                          direct-live, live-media, continuity, hls-seek,
                           harness-regressions, ui-failures, thumbnail-preview
   --require-stable        Refuse beta/unknown OS or a non-matching matrix row
   --skip-build            Reuse an existing signed runner in derived data
@@ -274,13 +274,13 @@ xcrun devicectl device copy to \
   --destination Documents/streams.local.json \
   > "$OUTPUT_DIR/stage-streams.log"
 
-DEFAULT_SCENARIOS=(analyzer ui-suite harness-regressions native-live direct-live continuity hls-seek)
+DEFAULT_SCENARIOS=(analyzer ui-suite harness-regressions live-media continuity hls-seek)
 if [[ ${#ONLY_SCENARIOS[@]} -eq 0 ]]; then
   ONLY_SCENARIOS=("${DEFAULT_SCENARIOS[@]}")
 fi
 for scenario in "${ONLY_SCENARIOS[@]}"; do
   case "$scenario" in
-    analyzer|ui-suite|native-live|direct-live|continuity|hls-seek|harness-regressions|ui-failures|thumbnail-preview) ;;
+    analyzer|ui-suite|native-live|direct-live|live-media|continuity|hls-seek|harness-regressions|ui-failures|thumbnail-preview) ;;
     *) echo "Error: unknown scenario: $scenario" >&2; exit 2 ;;
   esac
 done
@@ -321,6 +321,12 @@ run_scenario() {
       route="PiPLiveValidation"
       pip_url="$BASE_URL/live/live.ts"
       rendering_path="direct"
+      selected_xctestrun="$DESTINATION_XCTESTRUN"
+      ;;
+    live-media)
+      test_identifiers=("iOSUITests/PiPLiveDeviceUITests/test_liveMediaQualificationAcrossNativeAndDirectBackends")
+      route="PiPLiveValidation"
+      pip_url="$BASE_URL/live/live.ts"
       selected_xctestrun="$DESTINATION_XCTESTRUN"
       ;;
     continuity)
@@ -521,7 +527,19 @@ PY
     fi
   fi
 
-  if [[ "$scenario" == "hls-seek" ]]; then
+  local qualification_scenario=""
+  local qualification_attachment=""
+  case "$scenario" in
+    hls-seek)
+      qualification_scenario="native-hls-seek-continuity"
+      qualification_attachment="qualification-native-hls-seek-continuity.json"
+      ;;
+    live-media)
+      qualification_scenario="live-media"
+      qualification_attachment="qualification-live-media.json"
+      ;;
+  esac
+  if [[ -n "$qualification_scenario" ]]; then
     evidence_status="missing"
     if [[ "$test_status" -eq 0 ]] && [[ "$error_count" -eq 0 ]] \
       && [[ "$log_status" == "captured" ]] && [[ -d "$result_bundle" ]]; then
@@ -537,13 +555,13 @@ PY
       hardware_id=$(jq -r '.selected.matchingHardwareRows | if length == 1 then .[0] else "" end' \
         "$OUTPUT_DIR/device.json")
       if [[ "$export_status" -eq 0 ]] && [[ -n "$hardware_id" ]]; then
-        evidence_relative="evidence/native-hls-seek-continuity-$hardware_id.json"
+        evidence_relative="evidence/$qualification_scenario-$hardware_id.json"
         evidence_file="$OUTPUT_DIR/$evidence_relative"
         set +e
         python3 "$SCRIPT_DIR/materialize-evidence.py" \
           --attachments "$attachments" \
-          --attachment-name qualification-native-hls-seek-continuity.json \
-          --scenario native-hls-seek-continuity \
+          --attachment-name "$qualification_attachment" \
+          --scenario "$qualification_scenario" \
           --hardware "$hardware_id" \
           --artifact-digest "$ARTIFACT_DIGEST" \
           --source-digest "$SOURCE_DIGEST" \
@@ -555,14 +573,15 @@ PY
           evidence_status="captured"
           python3 - \
             "$OUTPUT_DIR/device.json" "$QUALIFICATION_ROWS" "$evidence_relative" \
-            "$FIXTURE_MANIFEST_CHECKSUM" "$((ended - started))" <<'PY'
+            "$FIXTURE_MANIFEST_CHECKSUM" "$((ended - started))" \
+            "$qualification_scenario" <<'PY'
 import json
 import sys
 
-device_path, rows_path, evidence, fixture_checksum, duration = sys.argv[1:]
+device_path, rows_path, evidence, fixture_checksum, duration, scenario = sys.argv[1:]
 device = json.load(open(device_path))["selected"]
 row = {
-    "scenario": "native-hls-seek-continuity",
+    "scenario": scenario,
     "hardware": device["matchingHardwareRows"][0],
     "device": device["marketingName"],
     "deviceFamily": device["deviceFamily"],

@@ -1,5 +1,7 @@
 #if os(iOS)
 
+import AVKit
+
 /// A snapshot of libVLC's private native PiP machinery on iOS.
 ///
 /// This is intentionally SPI, not stable public API. It exists for the
@@ -39,6 +41,22 @@ public struct NativePiPProbe: Sendable {
   public let isActive: Bool
 }
 
+/// The transport policy SwiftVLC most recently applied to AVKit.
+///
+/// This is qualification SPI rather than public API. It lets the in-repo
+/// physical-device lane prove that an indefinite live input actually reached
+/// AVKit as an unbounded, linear-playback timeline instead of inferring that
+/// policy from a working video window.
+@_spi(Qualification)
+public struct PiPPlaybackQualificationSnapshot: Sendable, Equatable {
+  /// Whether AVKit's skip and scrub controls are disabled for this input.
+  public let requiresLinearPlayback: Bool
+  /// The duration last published to AVKit, or `nil` for an unbounded range.
+  public let durationMilliseconds: Int64?
+  /// Whether the current input was published as seekable.
+  public let isSeekable: Bool
+}
+
 extension PiPController {
   /// A snapshot of the iOS native PiP backend's private wiring, or
   /// `nil` when this controller doesn't drive the native backend (the
@@ -51,6 +69,18 @@ extension PiPController {
   @_spi(ValidationHarness)
   public var nativeValidationProbe: NativePiPProbe? {
     nativeBackend?.makeValidationProbe()
+  }
+
+  /// A qualification-only snapshot of the playback policy sent to AVKit.
+  @_spi(Qualification)
+  public var playbackQualificationSnapshot: PiPPlaybackQualificationSnapshot {
+    PiPPlaybackQualificationSnapshot(
+      requiresLinearPlayback: nativeBackend?.requiresLinearPlayback
+        ?? pipController?.requiresLinearPlayback
+        ?? true,
+      durationMilliseconds: playbackStateObservation.durationMilliseconds,
+      isSeekable: playbackStateObservation.isSeekable
+    )
   }
 }
 

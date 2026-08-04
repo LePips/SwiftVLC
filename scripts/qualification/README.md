@@ -70,7 +70,14 @@ a small allowlist of Xcode/device-launch infrastructure failures. Every run
 reinstalls both exact signed apps; an assertion, product failure, or provenance
 mismatch is never retried into a pass.
 
-The HLS seek lane is the first complete machine-readable matrix slice. It
+The live-media lane runs both native and direct PiP against the same indefinite
+local stream. For each backend it verifies ordered start/stop events, AVKit's
+unbounded linear-playback policy, three start/stop cycles, sustained real
+system-PiP motion while backgrounded, foreground recovery, continued decoded
+pictures, and zero library errors. It emits one combined `live-media` row so a
+passing backend cannot hide a failure in the other.
+
+The HLS seek lane is another complete machine-readable matrix slice. It
 executes forward, backward, and absolute seeks, measures the return of decoded
 video, checks ordered PiP continuity, samples real system-PiP motion after each
 seek, verifies inline recovery, and exports an XCTest JSON attachment. The host
