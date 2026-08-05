@@ -94,6 +94,11 @@ struct TimebaseSoakValidationCase: View {
       try await waitUntil("Playback did not start", timeout: .seconds(30)) { player.state == .playing }
       try await waitUntil("Direct PiP did not become possible", timeout: .seconds(30)) { controller?.isPossible == true }
       guard let controller else { throw TimebaseSoakFailure("Direct PiP controller disappeared") }
+      // The decoded-frame media clock is intentionally disabled for normal
+      // clients. Enable the qualification probe before subscribing and
+      // starting PiP so the raw one-second stream can bind each decoded frame
+      // to the libVLC clock that produced it.
+      controller.enableFrameContentDiagnostics()
       let correctionStream = controller.timebaseCorrections
       correctionTask = Task {
         for await correction in correctionStream {

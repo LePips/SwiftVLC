@@ -1167,6 +1167,19 @@ class QualificationEvidenceTests(unittest.TestCase):
             )
             self.assertNotIn("hostTraceRequirements", augmented)
 
+    def test_timebase_route_enables_decoded_frame_clock_before_sampling(self):
+        source = (
+            ROOT.parent
+            / "Showcase"
+            / "iOS"
+            / "ValidationHarness"
+            / "TimebaseSoakValidationCase.swift"
+        ).read_text()
+        self.assertLess(
+            source.index("controller.enableFrameContentDiagnostics()"),
+            source.index("controller.timebaseDiagnosticSnapshot()"),
+        )
+
     def test_rejects_gap_in_raw_timebase_corrections(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
