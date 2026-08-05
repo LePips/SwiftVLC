@@ -155,8 +155,6 @@ final class PiPLiveDeviceUITests: ShowcaseIOSTestCase {
     waitForLabel(state, equals: "playing", timeout: 20)
     waitForLabel(duration, equals: "unknown", timeout: 5)
     waitForLabel(possible, equals: "yes", timeout: 15)
-    waitForLabel(linearPlayback, equals: "yes", timeout: 10)
-    waitForLabel(playbackRange, equals: "unbounded", timeout: 10)
     let displayedBeforePiP = waitForIntegerLabel(
       displayedPictures,
       greaterThan: 0,
@@ -172,7 +170,14 @@ final class PiPLiveDeviceUITests: ShowcaseIOSTestCase {
       )
     }
 
-    XCTAssertTrue(toggle.waitForExistence(timeout: 5))
+    // SwiftUI Forms materialize rows lazily on iOS 27. The linear-playback
+    // and range probes sit immediately below the initial iPhone viewport, so
+    // reveal them before asking XCUI for their values.
+    reveal(linearPlayback)
+    waitForLabel(linearPlayback, equals: "yes", timeout: 10)
+    reveal(playbackRange)
+    waitForLabel(playbackRange, equals: "unbounded", timeout: 10)
+
     reveal(toggle)
     XCTAssertTrue(toggle.isEnabled)
     for cycle in 0..<3 {
