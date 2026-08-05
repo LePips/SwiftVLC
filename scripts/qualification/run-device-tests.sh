@@ -113,7 +113,7 @@ DEVICE_ECID=$(jq -r '.selected.ecidHex' "$OUTPUT_DIR/device.json")
 RUN_MODE=$(jq -r '.mode' "$OUTPUT_DIR/device.json")
 echo "Selected $(jq -r '.selected.marketingName' "$OUTPUT_DIR/device.json") on $(jq -r '.selected.osVersion' "$OUTPUT_DIR/device.json") ($RUN_MODE)."
 
-if [[ ! -f "$FIXTURES/manifest.json" ]]; then
+if [[ ! -f "$FIXTURES/manifest.json" || ! -f "$FIXTURES/unsupported-codec.mp4" ]]; then
   "$SCRIPT_DIR/generate-fixtures.sh" "$FIXTURES"
 fi
 python3 "$SCRIPT_DIR/verify-fixtures.py" "$FIXTURES" > /dev/null
@@ -237,6 +237,7 @@ python3 "$SCRIPT_DIR/prepare-xctestrun.py" "$XCTESTRUN" "$DESTINATION_XCTESTRUN"
   --environment SWIFTVLC_PIP_DISMISSAL_DEVICE=YES \
   --environment SWIFTVLC_PIP_INTERRUPTION_DEVICE=YES \
   --environment SWIFTVLC_PIP_NATIVE_LIFECYCLE_DEVICE=YES \
+  --environment SWIFTVLC_TERMINAL_OUTCOMES_DEVICE=YES \
   --environment SWIFTVLC_PIP_DEFERRED_PAUSE_DEVICE=YES \
   --environment SWIFTVLC_PIP_DELAYED_START_FAILURE_DEVICE=YES \
   --environment SWIFTVLC_PIP_OVERLAY_DEVICE=YES \
@@ -290,7 +291,7 @@ xcrun devicectl device copy to \
   --destination Documents/streams.local.json \
   > "$OUTPUT_DIR/stage-streams.log"
 
-DEFAULT_SCENARIOS=(analyzer ui-suite harness-regressions live-media background-audio continuity capability-convergence vod-controls long-stall failed-start dismissal interruptions native-lifecycle deferred-pause-rejection accepted-start-delayed-failure hls-seek)
+DEFAULT_SCENARIOS=(analyzer ui-suite harness-regressions live-media background-audio continuity capability-convergence vod-controls long-stall failed-start dismissal interruptions native-lifecycle terminal-outcomes deferred-pause-rejection accepted-start-delayed-failure hls-seek)
 SCENARIOS_WERE_EXPLICIT=false
 if [[ ${#ONLY_SCENARIOS[@]} -eq 0 ]]; then
   ONLY_SCENARIOS=("${DEFAULT_SCENARIOS[@]}")
@@ -299,7 +300,7 @@ else
 fi
 for scenario in "${ONLY_SCENARIOS[@]}"; do
   case "$scenario" in
-    analyzer|ui-suite|native-live|direct-live|live-media|background-audio|continuity|capability-convergence|vod-controls|long-stall|failed-start|dismissal|interruptions|native-lifecycle|deferred-pause-rejection|accepted-start-delayed-failure|hls-seek|harness-regressions|ui-failures|thumbnail-preview) ;;
+    analyzer|ui-suite|native-live|direct-live|live-media|background-audio|continuity|capability-convergence|vod-controls|long-stall|failed-start|dismissal|interruptions|native-lifecycle|terminal-outcomes|deferred-pause-rejection|accepted-start-delayed-failure|hls-seek|harness-regressions|ui-failures|thumbnail-preview) ;;
     *) echo "Error: unknown scenario: $scenario" >&2; exit 2 ;;
   esac
 done
@@ -314,7 +315,7 @@ device_matches_hardware_row() {
 if ! device_matches_hardware_row "iphone-current"; then
   if [[ "$SCENARIOS_WERE_EXPLICIT" == true ]]; then
     for scenario in "${ONLY_SCENARIOS[@]}"; do
-      if [[ "$scenario" == "capability-convergence" || "$scenario" == "native-lifecycle" || "$scenario" == "deferred-pause-rejection" || "$scenario" == "accepted-start-delayed-failure" ]]; then
+      if [[ "$scenario" == "capability-convergence" || "$scenario" == "native-lifecycle" || "$scenario" == "terminal-outcomes" || "$scenario" == "deferred-pause-rejection" || "$scenario" == "accepted-start-delayed-failure" ]]; then
         echo "Error: $scenario requires the iphone-current hardware row." >&2
         exit 2
       fi
@@ -322,7 +323,7 @@ if ! device_matches_hardware_row "iphone-current"; then
   else
     FILTERED_SCENARIOS=()
     for scenario in "${ONLY_SCENARIOS[@]}"; do
-      if [[ "$scenario" != "capability-convergence" && "$scenario" != "native-lifecycle" && "$scenario" != "deferred-pause-rejection" && "$scenario" != "accepted-start-delayed-failure" ]]; then
+      if [[ "$scenario" != "capability-convergence" && "$scenario" != "native-lifecycle" && "$scenario" != "terminal-outcomes" && "$scenario" != "deferred-pause-rejection" && "$scenario" != "accepted-start-delayed-failure" ]]; then
         FILTERED_SCENARIOS+=("$scenario")
       fi
     done
@@ -448,6 +449,13 @@ run_scenario() {
       route="PiPNativeLifecycleValidation"
       selected_xctestrun="$DESTINATION_XCTESTRUN"
       ;;
+    terminal-outcomes)
+      test_identifiers=(
+        "iOSUITests/TerminalOutcomesDeviceUITests/test_terminalOutcomeMatrixIsGenerationScopedAndPreReset"
+      )
+      route="TerminalOutcomesValidation"
+      selected_xctestrun="$DESTINATION_XCTESTRUN"
+      ;;
     deferred-pause-rejection)
       test_identifiers=(
         "iOSUITests/PiPDeferredPauseDeviceUITests/test_deferredPauseRejectionAndCancellationStayTruthful"
@@ -508,6 +516,7 @@ run_scenario() {
       --environment SWIFTVLC_PIP_DISMISSAL_DEVICE=YES \
       --environment SWIFTVLC_PIP_INTERRUPTION_DEVICE=YES \
       --environment SWIFTVLC_PIP_NATIVE_LIFECYCLE_DEVICE=YES \
+      --environment SWIFTVLC_TERMINAL_OUTCOMES_DEVICE=YES \
       --environment SWIFTVLC_PIP_DEFERRED_PAUSE_DEVICE=YES \
       --environment SWIFTVLC_PIP_DELAYED_START_FAILURE_DEVICE=YES \
       --environment SWIFTVLC_PIP_OVERLAY_DEVICE=YES \
@@ -540,20 +549,33 @@ run_scenario() {
       -skip-testing:iOSUITests/PiPDismissalDeviceUITests
       -skip-testing:iOSUITests/PiPInterruptionDeviceUITests
       -skip-testing:iOSUITests/PiPNativeLifecycleDeviceUITests
+      -skip-testing:iOSUITests/TerminalOutcomesDeviceUITests
       -skip-testing:iOSUITests/PiPDeferredPauseDeviceUITests
       -skip-testing:iOSUITests/PiPDelayedStartFailureDeviceUITests
       -skip-testing:iOSUITests/PiPOverlayDeviceUITests
     )
   fi
+
   started=$(date +%s)
-  local attempt attempt_log attempt_bundle retryable_pattern
+  local attempt attempt_log attempt_bundle attempt_xctestrun final_log_prefix retryable_pattern
+  final_log_prefix="$run_id-$scenario"
   retryable_pattern='LaunchServicesDataMismatch|LaunchServices GUID and sequence number do not match|Early unexpected exit, operation never finished bootstrapping|signal kill before establishing connection|Failed to resume target process|process may have already terminated|reason: Busy|is installing or uninstalling'
   for attempt in 1 2 3; do
     attempt_log="$OUTPUT_DIR/$scenario-xcodebuild-attempt$attempt.log"
     attempt_bundle="$OUTPUT_DIR/$scenario-attempt$attempt.xcresult"
+    attempt_xctestrun="$selected_xctestrun"
+    if [[ "$scenario" != "analyzer" ]]; then
+      final_log_prefix="$run_id-$scenario-attempt$attempt"
+      attempt_xctestrun="$WORK_DIR/destination-$scenario-attempt$attempt.xctestrun"
+      python3 "$SCRIPT_DIR/prepare-xctestrun.py" \
+        "$selected_xctestrun" "$attempt_xctestrun" \
+        --environment SWIFTVLC_DEVICE_LOG_PREFIX="$final_log_prefix"
+      cp "$attempt_xctestrun" \
+        "$OUTPUT_DIR/destination-$scenario-attempt$attempt.xctestrun"
+    fi
     set +e
     xcodebuild test-without-building \
-      -xctestrun "$selected_xctestrun" \
+      -xctestrun "$attempt_xctestrun" \
       -destination "platform=iOS,id=$DEVICE_UDID" \
       -collect-test-diagnostics never \
       "${test_selection_args[@]}" \
@@ -592,7 +614,7 @@ run_scenario() {
     set -e
     if [[ "$pull_status" -eq 0 ]]; then
       set +e
-      error_count=$(python3 - "$document_capture" "$run_id-$scenario" <<'PY'
+      error_count=$(python3 - "$document_capture" "$final_log_prefix" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -638,7 +660,7 @@ PY
     set -e
     if [[ "$pull_status" -eq 0 ]]; then
       set +e
-      error_count=$(python3 - "$document_capture" "$run_id-$scenario" <<'PY'
+      error_count=$(python3 - "$document_capture" "$final_log_prefix" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -670,6 +692,15 @@ PY
     else
       log_status="missing"
     fi
+  fi
+
+  # This scenario deliberately drives six terminal engine failures. Preserve
+  # their raw error-level logs and report the count, but let the typed outcome
+  # assertions decide whether they are the expected failures. Every other
+  # scenario retains the strict zero-error gate.
+  local log_errors_acceptable=false
+  if [[ "$error_count" -eq 0 || "$scenario" == "terminal-outcomes" ]]; then
+    log_errors_acceptable=true
   fi
 
   local qualification_scenarios=()
@@ -729,6 +760,10 @@ PY
       qualification_scenarios=("native-lifecycle")
       qualification_attachments=("qualification-native-lifecycle.json")
       ;;
+    terminal-outcomes)
+      qualification_scenarios=("terminal-outcomes")
+      qualification_attachments=("qualification-terminal-outcomes.json")
+      ;;
     deferred-pause-rejection)
       qualification_scenarios=("deferred-pause-rejection")
       qualification_attachments=("qualification-deferred-pause-rejection.json")
@@ -740,7 +775,7 @@ PY
   esac
   if [[ ${#qualification_scenarios[@]} -gt 0 ]]; then
     evidence_status="missing"
-    if [[ "$test_status" -eq 0 ]] && [[ "$error_count" -eq 0 ]] \
+    if [[ "$test_status" -eq 0 ]] && [[ "$log_errors_acceptable" == true ]] \
       && [[ "$log_status" == "captured" ]] && [[ -d "$result_bundle" ]]; then
       local attachments="$OUTPUT_DIR/$scenario-attachments"
       local hardware_id evidence_file evidence_relative export_status materialize_status
@@ -820,7 +855,7 @@ PY
   fi
 
   result="pass"
-  if [[ "$test_status" -ne 0 ]] || [[ "$error_count" -ne 0 ]] || [[ "$log_status" == "missing" ]] \
+  if [[ "$test_status" -ne 0 ]] || [[ "$log_errors_acceptable" != true ]] || [[ "$log_status" == "missing" ]] \
     || [[ "$evidence_status" == "missing" ]]; then
     result="fail"
   fi

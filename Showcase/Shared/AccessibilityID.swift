@@ -296,6 +296,15 @@ enum AccessibilityID {
     static let errorLabel = "pipNativeLifecycle.error"
   }
 
+  enum TerminalOutcomesValidation {
+    static let videoView = "terminalOutcomes.videoView"
+    static let stateLabel = "terminalOutcomes.state"
+    static let actionLabel = "terminalOutcomes.action"
+    static let resultLabel = "terminalOutcomes.result"
+    static let runButton = "terminalOutcomes.run"
+    static let errorLabel = "terminalOutcomes.error"
+  }
+
   enum MatrixHValidation {
     static let stateLabel = "validation.matrixH.state"
     static let currentTimeLabel = "validation.matrixH.currentTime"

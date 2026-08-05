@@ -738,6 +738,72 @@ class QualificationEvidenceTests(unittest.TestCase):
             self.assertTrue(evidence["unsupportedBridgeVisible"])
             self.assertFalse(evidence["unsupportedRevisionExercised"])
 
+    def test_materializes_terminal_outcome_evidence(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            failure_classifications = {
+                "source": "source",
+                "demux": "demux",
+                "decoder": "decoder",
+                "renderer": "renderer",
+                "output": "output",
+            }
+            cases = {
+                "clean-eof": {"cause": "naturalEnd"},
+                "explicit-stop": {"cause": "requestedStop"},
+                "replacement": {"cause": "replacement"},
+                "server-close": {"cause": "failure:source"},
+                "malformed": {"cause": "failure:demux"},
+                "decode-failure": {"cause": "failure:decoder"},
+                "renderer-failure": {"cause": "failure:renderer"},
+                "output-failure": {"cause": "failure:output"},
+                "network-loss": {"cause": "failure:source"},
+            }
+            final_timelines = {
+                name: {
+                    "timeMilliseconds": index * 100,
+                    "durationMilliseconds": 60000,
+                    "position": index / 10,
+                    "bufferFill": 1,
+                    "activeVideoOutputs": 1,
+                }
+                for index, name in enumerate(cases)
+            }
+            self.make_export(
+                root,
+                {
+                    "formatVersion": 1,
+                    "scenario": "terminal-outcomes",
+                    "cases": cases,
+                    "finalTimelines": final_timelines,
+                    "generationIsolation": True,
+                    "failureClassifications": failure_classifications,
+                    "maximumTerminalOutcomesPerGeneration": 1,
+                    "unattributedStopNaturalEndCount": 0,
+                    "subscriberPayloadsIdentical": True,
+                    "expectedFailureLogsPreserved": True,
+                    "processIsolation": "one-launch-per-transition",
+                },
+                attachment_name="qualification-terminal-outcomes.json",
+                test_identifier="TerminalOutcomesDeviceUITests/test_terminalOutcomeMatrixIsGenerationScopedAndPreReset",
+            )
+            evidence = materialize_evidence.materialize(
+                root,
+                "qualification-terminal-outcomes.json",
+                "terminal-outcomes",
+                "iphone-current",
+                "a" * 64,
+                "b" * 64,
+            )
+            self.assertEqual(evidence["hardware"], "iphone-current")
+            self.assertEqual(len(evidence["cases"]), 9)
+            self.assertEqual(len(evidence["finalTimelines"]), 9)
+            self.assertTrue(evidence["generationIsolation"])
+            self.assertEqual(evidence["failureClassifications"], failure_classifications)
+            self.assertEqual(evidence["maximumTerminalOutcomesPerGeneration"], 1)
+            self.assertEqual(evidence["unattributedStopNaturalEndCount"], 0)
+            self.assertTrue(evidence["subscriberPayloadsIdentical"])
+
     def test_materializes_accepted_start_delayed_failure_evidence(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -1191,6 +1257,16 @@ class FixtureServerTests(unittest.TestCase):
         self.assertEqual(rejected_response.status, 503)
         rejected_response.read()
         rejected_connection.close()
+
+        retry_connection, retry_response = self.request(
+            "/fault/gated-close/source-loss-retry/sample.bin"
+        )
+        self.assertEqual(retry_response.status, 200)
+        self.assertEqual(
+            retry_response.read(512),
+            (self.root / "sample.bin").read_bytes()[:512],
+        )
+        retry_connection.close()
 
 
 if __name__ == "__main__":

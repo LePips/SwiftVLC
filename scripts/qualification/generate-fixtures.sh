@@ -64,6 +64,17 @@ for segment in "$fixture_tmp"/vod-*.ts; do
   mv "$segment" "$OUTPUT_DIR/hls/$(basename "$segment")"
 done
 
+python3 - "$OUTPUT_DIR/vod.mp4" "$OUTPUT_DIR/unsupported-codec.mp4" <<'PY'
+import sys
+from pathlib import Path
+
+source, output = map(Path, sys.argv[1:])
+payload = source.read_bytes()
+if b"avc1" not in payload:
+    raise SystemExit("generated VOD has no avc1 sample entry to invalidate")
+output.write_bytes(payload.replace(b"avc1", b"zzzz"))
+PY
+
 python3 - "$OUTPUT_DIR" "$DURATION_SECONDS" "$LIVE_DURATION_SECONDS" <<'PY'
 import hashlib
 import json
@@ -76,6 +87,7 @@ live_duration = int(sys.argv[3])
 vod = (root / "vod.mp4").read_bytes()
 (root / "truncated.mp4").write_bytes(vod[: max(1, len(vod) // 3)])
 (root / "malformed.bin").write_bytes(b"not-a-media-container\x00" * 256)
+(root / "malformed.mp4").write_bytes(b"not-a-media-container\x00" * 256)
 
 files = {}
 for path in sorted(root.rglob("*")):
