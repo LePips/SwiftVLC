@@ -269,6 +269,22 @@ enum AccessibilityID {
     static let errorLabel = "pipDismissal.error"
   }
 
+  enum PiPInterruptionValidation {
+    static let videoView = "pipInterruption.videoView"
+    static let stateLabel = "pipInterruption.state"
+    static let possibleLabel = "pipInterruption.possible"
+    static let activeLabel = "pipInterruption.active"
+    static let lifecycleEventsLabel = "pipInterruption.lifecycleEvents"
+    static let interruptionCountsLabel = "pipInterruption.interruptionCounts"
+    static let routeLossCountLabel = "pipInterruption.routeLossCount"
+    static let playedAudioBuffersLabel = "pipInterruption.playedAudioBuffers"
+    static let startButton = "pipInterruption.start"
+    static let injectRouteLossButton = "pipInterruption.injectRouteLoss"
+    static let resumeButton = "pipInterruption.resume"
+    static let stopButton = "pipInterruption.stop"
+    static let errorLabel = "pipInterruption.error"
+  }
+
   enum MatrixHValidation {
     static let stateLabel = "validation.matrixH.state"
     static let currentTimeLabel = "validation.matrixH.currentTime"

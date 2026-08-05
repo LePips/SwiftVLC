@@ -139,6 +139,21 @@ close invokes it zero times, and public lifecycle events report ordered
 launches writes a separate library log so an earlier backend/action error
 cannot be overwritten by a later cycle.
 
+The interruptions lane runs both PiP backends on every hardware row. The
+separately installed XCTest runner activates a non-mixable playback audio
+session while the candidate is backgrounded in real system PiP, then returns
+focus with `notifyOthersOnDeactivation`; the candidate must observe a balanced
+system interruption pair, recover playback, retain PiP, and render moving
+pixels. Its libVLC played-audio-buffer counter must also advance beyond the
+pre-interruption value, proving audio resumed rather than merely leaving the
+player in a nominal playing state. Route-loss behavior is a distinct, explicitly labelled deterministic
+injection: the candidate posts an `oldDeviceUnavailable` route-change
+notification through the same shared `AVAudioSession` object observed by the
+library. SwiftVLC must pause without closing PiP, accept an explicit resume,
+and finish with ordered teardown. Evidence records both sources verbatim so a
+controlled notification is never misrepresented as a physical Bluetooth
+disconnect.
+
 The iPhone-current-only deferred-pause-rejection lane drives the exact AVKit
 playback command entry point while a qualification SPI changes only libVLC's
 native pause-capability answer. It proves a permanently unpausable input
