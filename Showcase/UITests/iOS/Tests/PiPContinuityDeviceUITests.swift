@@ -187,6 +187,7 @@ final class PiPContinuityDeviceUITests: ShowcaseIOSTestCase {
       timeout: 15
     )
     waitForLabel(active, equals: "yes", timeout: 5)
+    reveal(staleSuccessorMutations, swiping: .up)
     waitForLabel(staleSuccessorMutations, equals: "0", timeout: 5)
     waitForLabel(state, equals: "playing", timeout: 10)
     _ = waitForIntegerLabel(displayedPictures, greaterThan: 0, timeout: 5)
