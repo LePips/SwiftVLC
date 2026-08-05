@@ -631,6 +631,113 @@ class QualificationEvidenceTests(unittest.TestCase):
             self.assertTrue(evidence["backends"]["native"]["audioRecovered"])
             self.assertEqual(evidence["recoveryOutcome"], "preserved")
 
+    def test_materializes_native_lifecycle_evidence(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cases = {
+                "restore": {
+                    "orderedEvents": [
+                        "willStart",
+                        "didStart",
+                        "willStop:restoreRequested",
+                        "didStop:restoreRequested",
+                    ],
+                    "restoreCallbackCount": 1,
+                },
+                "close": {
+                    "orderedEvents": [
+                        "willStart",
+                        "didStart",
+                        "willStop:userClosed",
+                        "didStop:userClosed",
+                    ],
+                    "restoreCallbackCount": 0,
+                },
+                "failed-start": {
+                    "orderedEvents": ["willStart", "failedToStart"]
+                },
+                "programmatic": {
+                    "orderedEvents": [
+                        "willStart",
+                        "didStart",
+                        "willStop:programmatic",
+                        "didStop:programmatic",
+                    ]
+                },
+                "media-end": {
+                    "orderedEvents": [
+                        "willStart",
+                        "didStart",
+                        "willStop:mediaEnded",
+                        "didStop:mediaEnded",
+                    ]
+                },
+                "failure": {
+                    "orderedEvents": [
+                        "willStart",
+                        "didStart",
+                        "willStop:failure",
+                        "didStop:failure",
+                    ]
+                },
+                "recast": {
+                    "orderedEvents": [
+                        "willStart",
+                        "didStart",
+                        "willStop:controllerReplaced",
+                        "didStop:controllerReplaced",
+                    ]
+                },
+                "replacement": {
+                    "orderedEvents": [
+                        "willStart",
+                        "didStart",
+                        "willStop:controllerReplaced",
+                        "didStop:controllerReplaced",
+                    ]
+                },
+            }
+            self.make_export(
+                root,
+                {
+                    "formatVersion": 1,
+                    "scenario": "native-lifecycle",
+                    "bridgeProbe": True,
+                    "cases": cases,
+                    "orderedEvents": {
+                        name: value["orderedEvents"] for name, value in cases.items()
+                    },
+                    "authoritativeStopReasons": True,
+                    "restoreExactlyOnce": True,
+                    "unsupportedBridgeVisible": True,
+                    "unsupportedBridgeVisibility": "typed-probe-required",
+                    "unsupportedRevisionExercised": False,
+                    "processIsolation": "one-launch-per-transition",
+                },
+                attachment_name="qualification-native-lifecycle.json",
+                test_identifier="PiPNativeLifecycleDeviceUITests/test_nativeLifecyclePublishesAuthoritativeOrderedEvents",
+            )
+            evidence = materialize_evidence.materialize(
+                root,
+                "qualification-native-lifecycle.json",
+                "native-lifecycle",
+                "iphone-current",
+                "a" * 64,
+                "b" * 64,
+            )
+            self.assertEqual(evidence["hardware"], "iphone-current")
+            self.assertTrue(evidence["bridgeProbe"])
+            self.assertEqual(len(evidence["cases"]), 8)
+            self.assertEqual(evidence["cases"]["restore"]["restoreCallbackCount"], 1)
+            self.assertEqual(
+                evidence["orderedEvents"]["failed-start"],
+                ["willStart", "failedToStart"],
+            )
+            self.assertTrue(evidence["authoritativeStopReasons"])
+            self.assertTrue(evidence["restoreExactlyOnce"])
+            self.assertTrue(evidence["unsupportedBridgeVisible"])
+            self.assertFalse(evidence["unsupportedRevisionExercised"])
+
     def test_materializes_accepted_start_delayed_failure_evidence(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -1056,6 +1163,34 @@ class FixtureServerTests(unittest.TestCase):
         self.assertEqual(len(response.read(512)), 512)
         self.assertGreaterEqual(time.monotonic() - started, 0.13)
         connection.close()
+
+    def test_gated_close_terminates_active_and_rejects_new_connections(self):
+        self.server.chunk_delay = 0.01
+        connection, response = self.request("/fault/gated-close/source-loss/sample.bin")
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.read(512), (self.root / "sample.bin").read_bytes()[:512])
+
+        trigger_connection, trigger_response = self.request(
+            "/fault/close-trigger/source-loss"
+        )
+        self.assertEqual(trigger_response.status, 200)
+        self.assertEqual(json.loads(trigger_response.read()), {"generation": 1})
+        trigger_connection.close()
+
+        buffered_after_trigger = response.read()
+        unread_remainder = (self.root / "sample.bin").stat().st_size - 512
+        self.assertLess(
+            len(buffered_after_trigger),
+            unread_remainder,
+        )
+        connection.close()
+
+        rejected_connection, rejected_response = self.request(
+            "/fault/gated-close/source-loss/sample.bin"
+        )
+        self.assertEqual(rejected_response.status, 503)
+        rejected_response.read()
+        rejected_connection.close()
 
 
 if __name__ == "__main__":

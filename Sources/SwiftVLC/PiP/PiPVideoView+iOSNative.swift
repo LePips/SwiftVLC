@@ -1296,29 +1296,53 @@ final class IOSNativePiPBackend: NSObject, @unchecked Sendable {
     let delegateSelectorNames = [
       "pictureInPictureControllerWillStartPictureInPicture:",
       "pictureInPictureControllerDidStartPictureInPicture:",
+      "pictureInPictureControllerWillStopPictureInPicture:",
       "pictureInPictureControllerDidStopPictureInPicture:",
       "pictureInPictureController:failedToStartPictureInPictureWithError:",
       "pictureInPictureController:restoreUserInterfaceForPictureInPictureStopWithCompletionHandler:"
     ]
 
-    let delegate = delegateBridge?.downstream
+    let downstreamDelegate = delegateBridge?.downstream
       ?? avPictureInPictureController?.delegate
+    let activeDelegate = avPictureInPictureController?.delegate
     var delegateResponds: [String: Bool] = [:]
-    if let delegate {
+    if let activeDelegate {
       for name in delegateSelectorNames {
-        delegateResponds[name] = delegate.responds(to: Selector((name)))
+        delegateResponds[name] = activeDelegate.responds(to: Selector((name)))
       }
     }
 
     return NativePiPProbe(
       windowControllerClassName: windowController.map { NSStringFromClass(type(of: $0)) },
       hasAVController: avPictureInPictureController != nil,
-      avDelegateClassName: delegate.flatMap { object_getClass($0) }.map { NSStringFromClass($0) },
+      avDelegateClassName: downstreamDelegate
+        .flatMap { object_getClass($0) }
+        .map { NSStringFromClass($0) },
       hasLifecycleDelegateBridge: delegateBridge != nil,
       delegateResponds: delegateResponds,
       isPossible: isPossible,
       isActive: isActive
     )
+  }
+
+  /// Sends a deterministic start failure through the installed native AVKit
+  /// delegate bridge. The qualification controller first issues the real
+  /// native start request; this helper changes no lifecycle attribution state
+  /// directly and therefore exercises the same forwarding path as AVKit.
+  func performAcceptedStartFailureQualification() -> Bool {
+    guard
+      delegateBridge != nil,
+      let controller = avPictureInPictureController,
+      let delegate = controller.delegate
+    else { return false }
+    delegate.pictureInPictureController?(
+      controller,
+      failedToStartPictureInPictureWithError: NSError(
+        domain: "SwiftVLC.Qualification.NativePiPStartFailure",
+        code: 1
+      )
+    )
+    return true
   }
 
   @discardableResult

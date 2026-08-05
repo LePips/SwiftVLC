@@ -38,6 +38,12 @@ enum LaunchArguments {
   /// `PiPController.layer`.
   static let pipRenderingPath = "-UITestPiPRenderingPath"
 
+  /// Selects one isolated action for the native-lifecycle qualification
+  /// surface. Each action launches a fresh process so an earlier terminal
+  /// transition cannot leak into the next case's evidence.
+  static let pipNativeLifecycleAction = "-UITestPiPNativeLifecycleAction"
+  static let pipNativeLifecycleToken = "-UITestPiPNativeLifecycleToken"
+
   /// Name of a showcase to deep-link to on launch (e.g. `"SimplePlayback"`).
   /// When unset, the showcase opens its normal navigation tree.
   static let route = "-UITestRoute"
@@ -85,6 +91,14 @@ enum LaunchArguments {
 
   static var pipRenderingPathValue: String? {
     UserDefaults.standard.string(forKey: key(pipRenderingPath))
+  }
+
+  static var pipNativeLifecycleActionValue: String? {
+    UserDefaults.standard.string(forKey: key(pipNativeLifecycleAction))
+  }
+
+  static var pipNativeLifecycleTokenValue: String? {
+    UserDefaults.standard.string(forKey: key(pipNativeLifecycleToken))
   }
 
   static var routeValue: String? {
@@ -170,6 +184,7 @@ enum UITestRoute: String, CaseIterable {
   case pipLongStallValidation = "PiPLongStallValidation"
   case pipDismissalValidation = "PiPDismissalValidation"
   case pipInterruptionValidation = "PiPInterruptionValidation"
+  case pipNativeLifecycleValidation = "PiPNativeLifecycleValidation"
 
   static var current: UITestRoute? {
     LaunchArguments.routeValue.flatMap(UITestRoute.init(rawValue:))

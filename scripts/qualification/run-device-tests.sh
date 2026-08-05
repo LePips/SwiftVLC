@@ -236,6 +236,7 @@ python3 "$SCRIPT_DIR/prepare-xctestrun.py" "$XCTESTRUN" "$DESTINATION_XCTESTRUN"
   --environment SWIFTVLC_PIP_LONG_STALL_URL_BASE64="$PIP_LONG_STALL_URL_BASE64" \
   --environment SWIFTVLC_PIP_DISMISSAL_DEVICE=YES \
   --environment SWIFTVLC_PIP_INTERRUPTION_DEVICE=YES \
+  --environment SWIFTVLC_PIP_NATIVE_LIFECYCLE_DEVICE=YES \
   --environment SWIFTVLC_PIP_DEFERRED_PAUSE_DEVICE=YES \
   --environment SWIFTVLC_PIP_DELAYED_START_FAILURE_DEVICE=YES \
   --environment SWIFTVLC_PIP_OVERLAY_DEVICE=YES \
@@ -289,7 +290,7 @@ xcrun devicectl device copy to \
   --destination Documents/streams.local.json \
   > "$OUTPUT_DIR/stage-streams.log"
 
-DEFAULT_SCENARIOS=(analyzer ui-suite harness-regressions live-media background-audio continuity capability-convergence vod-controls long-stall failed-start dismissal interruptions deferred-pause-rejection accepted-start-delayed-failure hls-seek)
+DEFAULT_SCENARIOS=(analyzer ui-suite harness-regressions live-media background-audio continuity capability-convergence vod-controls long-stall failed-start dismissal interruptions native-lifecycle deferred-pause-rejection accepted-start-delayed-failure hls-seek)
 SCENARIOS_WERE_EXPLICIT=false
 if [[ ${#ONLY_SCENARIOS[@]} -eq 0 ]]; then
   ONLY_SCENARIOS=("${DEFAULT_SCENARIOS[@]}")
@@ -298,7 +299,7 @@ else
 fi
 for scenario in "${ONLY_SCENARIOS[@]}"; do
   case "$scenario" in
-    analyzer|ui-suite|native-live|direct-live|live-media|background-audio|continuity|capability-convergence|vod-controls|long-stall|failed-start|dismissal|interruptions|deferred-pause-rejection|accepted-start-delayed-failure|hls-seek|harness-regressions|ui-failures|thumbnail-preview) ;;
+    analyzer|ui-suite|native-live|direct-live|live-media|background-audio|continuity|capability-convergence|vod-controls|long-stall|failed-start|dismissal|interruptions|native-lifecycle|deferred-pause-rejection|accepted-start-delayed-failure|hls-seek|harness-regressions|ui-failures|thumbnail-preview) ;;
     *) echo "Error: unknown scenario: $scenario" >&2; exit 2 ;;
   esac
 done
@@ -313,7 +314,7 @@ device_matches_hardware_row() {
 if ! device_matches_hardware_row "iphone-current"; then
   if [[ "$SCENARIOS_WERE_EXPLICIT" == true ]]; then
     for scenario in "${ONLY_SCENARIOS[@]}"; do
-      if [[ "$scenario" == "capability-convergence" || "$scenario" == "deferred-pause-rejection" || "$scenario" == "accepted-start-delayed-failure" ]]; then
+      if [[ "$scenario" == "capability-convergence" || "$scenario" == "native-lifecycle" || "$scenario" == "deferred-pause-rejection" || "$scenario" == "accepted-start-delayed-failure" ]]; then
         echo "Error: $scenario requires the iphone-current hardware row." >&2
         exit 2
       fi
@@ -321,7 +322,7 @@ if ! device_matches_hardware_row "iphone-current"; then
   else
     FILTERED_SCENARIOS=()
     for scenario in "${ONLY_SCENARIOS[@]}"; do
-      if [[ "$scenario" != "capability-convergence" && "$scenario" != "deferred-pause-rejection" && "$scenario" != "accepted-start-delayed-failure" ]]; then
+      if [[ "$scenario" != "capability-convergence" && "$scenario" != "native-lifecycle" && "$scenario" != "deferred-pause-rejection" && "$scenario" != "accepted-start-delayed-failure" ]]; then
         FILTERED_SCENARIOS+=("$scenario")
       fi
     done
@@ -440,6 +441,13 @@ run_scenario() {
       route="PiPInterruptionValidation"
       selected_xctestrun="$DESTINATION_XCTESTRUN"
       ;;
+    native-lifecycle)
+      test_identifiers=(
+        "iOSUITests/PiPNativeLifecycleDeviceUITests/test_nativeLifecyclePublishesAuthoritativeOrderedEvents"
+      )
+      route="PiPNativeLifecycleValidation"
+      selected_xctestrun="$DESTINATION_XCTESTRUN"
+      ;;
     deferred-pause-rejection)
       test_identifiers=(
         "iOSUITests/PiPDeferredPauseDeviceUITests/test_deferredPauseRejectionAndCancellationStayTruthful"
@@ -499,6 +507,7 @@ run_scenario() {
       --environment SWIFTVLC_PIP_LONG_STALL_URL_BASE64="$PIP_LONG_STALL_URL_BASE64" \
       --environment SWIFTVLC_PIP_DISMISSAL_DEVICE=YES \
       --environment SWIFTVLC_PIP_INTERRUPTION_DEVICE=YES \
+      --environment SWIFTVLC_PIP_NATIVE_LIFECYCLE_DEVICE=YES \
       --environment SWIFTVLC_PIP_DEFERRED_PAUSE_DEVICE=YES \
       --environment SWIFTVLC_PIP_DELAYED_START_FAILURE_DEVICE=YES \
       --environment SWIFTVLC_PIP_OVERLAY_DEVICE=YES \
@@ -530,6 +539,7 @@ run_scenario() {
       -skip-testing:iOSUITests/PiPLongStallDeviceUITests
       -skip-testing:iOSUITests/PiPDismissalDeviceUITests
       -skip-testing:iOSUITests/PiPInterruptionDeviceUITests
+      -skip-testing:iOSUITests/PiPNativeLifecycleDeviceUITests
       -skip-testing:iOSUITests/PiPDeferredPauseDeviceUITests
       -skip-testing:iOSUITests/PiPDelayedStartFailureDeviceUITests
       -skip-testing:iOSUITests/PiPOverlayDeviceUITests
@@ -714,6 +724,10 @@ PY
     interruptions)
       qualification_scenarios=("interruptions")
       qualification_attachments=("qualification-interruptions.json")
+      ;;
+    native-lifecycle)
+      qualification_scenarios=("native-lifecycle")
+      qualification_attachments=("qualification-native-lifecycle.json")
       ;;
     deferred-pause-rejection)
       qualification_scenarios=("deferred-pause-rejection")

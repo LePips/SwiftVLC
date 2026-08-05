@@ -229,6 +229,21 @@ extension PiPController {
     return result
   }
 
+  /// Issues a real native-backend start request, then routes a deterministic
+  /// asynchronous failure through the installed libVLC/AVKit delegate bridge.
+  /// This is candidate-only integration proof that native failed-start events
+  /// are surfaced with their accepted request attribution intact.
+  @_spi(Qualification)
+  public func performNativeAcceptedStartFailureQualification() -> PiPStartResult {
+    guard let nativeBackend else { return .backendUnavailable }
+    let result = start()
+    guard result == .accepted else { return result }
+    guard nativeBackend.performAcceptedStartFailureQualification() else {
+      return .backendUnavailable
+    }
+    return result
+  }
+
   /// Exercises the same controller command entry point used by AVKit's
   /// sample-buffer playback delegate.
   @_spi(Qualification)
