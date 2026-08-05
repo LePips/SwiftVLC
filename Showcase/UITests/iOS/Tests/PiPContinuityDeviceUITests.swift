@@ -209,6 +209,10 @@ final class PiPContinuityDeviceUITests: ShowcaseIOSTestCase {
     XCTAssertTrue(stop.waitForExistence(timeout: 5))
     stop.tap()
     waitForLabel(active, equals: "no", timeout: 10)
+    // Stopping lives near the top of the Form, while lifecycle evidence lives
+    // in the lazily materialized measured-state section below it. Bring that
+    // row back into the hierarchy before querying it on iOS 27.
+    reveal(lifecycleEvents, swiping: .up)
     waitForOccurrence("didStop:programmatic", count: 1, in: lifecycleEvents, timeout: 10)
     XCTAssertTrue(
       lifecycleEvents.label.hasPrefix(
@@ -216,6 +220,7 @@ final class PiPContinuityDeviceUITests: ShowcaseIOSTestCase {
       ),
       "PiP lifecycle was not ordered: \(lifecycleEvents.label)"
     )
+    reveal(staleSuccessorMutations, swiping: .up)
     waitForLabel(staleSuccessorMutations, equals: "0", timeout: 5)
   }
 
