@@ -339,6 +339,18 @@ enum AccessibilityID {
     static let errorLabel = "pipCadence.error"
   }
 
+  enum NativeSubtitleMatrixValidation {
+    static let videoView = "nativeSubtitleMatrix.videoView"
+    static let stateLabel = "nativeSubtitleMatrix.state"
+    static let possibleLabel = "nativeSubtitleMatrix.possible"
+    static let activeLabel = "nativeSubtitleMatrix.active"
+    static let progressLabel = "nativeSubtitleMatrix.progress"
+    static let profileLabel = "nativeSubtitleMatrix.profile"
+    static let resultLabel = "nativeSubtitleMatrix.result"
+    static let runButton = "nativeSubtitleMatrix.run"
+    static let errorLabel = "nativeSubtitleMatrix.error"
+  }
+
   enum MatrixHValidation {
     static let stateLabel = "validation.matrixH.state"
     static let currentTimeLabel = "validation.matrixH.currentTime"

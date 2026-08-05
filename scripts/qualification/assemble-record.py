@@ -156,6 +156,10 @@ def retained_trace_artifacts(
         raise AssemblyError(
             f"evidence {evidence_path} has malformed {description} provenance"
         )
+    if trace.get("treeDigestAlgorithm") != "swiftvlc-tree-v1":
+        raise AssemblyError(
+            f"evidence {evidence_path} {description} has unsupported digest algorithm"
+        )
     trace_source, trace_relative = safe_evidence_artifact_path(
         evidence_path,
         trace.get("runArtifact"),
@@ -301,6 +305,28 @@ def assemble(
                     artifacts.extend(
                         retained_trace_artifacts(
                             evidence_path, performance_trace, description
+                        )
+                    )
+            if key[0] == "native-subtitle-matrix":
+                metrics = evidence.get("metrics")
+                if not isinstance(metrics, dict):
+                    raise AssemblyError(
+                        f"evidence {evidence_path} has no native subtitle metrics"
+                    )
+                cpu = metrics.get("cpu")
+                color = metrics.get("colorHDRImpact")
+                if not isinstance(cpu, dict) or not isinstance(color, dict):
+                    raise AssemblyError(
+                        f"evidence {evidence_path} has malformed native subtitle metrics"
+                    )
+                for subtitle_trace, description in (
+                    (cpu.get("hostTrace"), "Time Profiler trace"),
+                    (metrics.get("gpu"), "Game Performance trace"),
+                    (color.get("hostTrace"), "Metal System Trace"),
+                ):
+                    artifacts.extend(
+                        retained_trace_artifacts(
+                            evidence_path, subtitle_trace, description
                         )
                     )
             rows[key] = (row, evidence_path, artifacts)

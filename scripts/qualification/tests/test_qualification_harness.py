@@ -34,6 +34,7 @@ candidate_metadata = load_script("candidate-metadata.py")
 materialize_evidence = load_script("materialize-evidence.py")
 augment_allocation_trace = load_script("augment-allocation-trace.py")
 augment_performance_traces = load_script("augment-performance-traces.py")
+augment_native_subtitle_traces = load_script("augment-native-subtitle-traces.py")
 assemble_record = load_script("assemble-record.py")
 
 
@@ -995,6 +996,83 @@ class QualificationEvidenceTests(unittest.TestCase):
             with self.assertRaises(augment_performance_traces.PerformanceTraceError):
                 augment_performance_traces.augment(evidence, traces, digest_script)
 
+    def test_materializes_and_augments_native_subtitle_matrix(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            support = {
+                key: "supported"
+                for key in ("text", "styled", "bitmap", "forced", "live", "osd")
+            }
+            payload = {
+                "formatVersion": 1,
+                "scenario": "native-subtitle-matrix",
+                "supportMatrix": support,
+                "timingTransitions": [{"profile": "text", "pauseResume": "pass"}],
+                "metrics": {
+                    "cpu": {"value": 10, "hostTraceStatus": "required-host-augmentation"},
+                    "gpu": {"status": "required-host-augmentation"},
+                    "colorHDRImpact": {
+                        "sourcePixelFormat": "yuv420p10le",
+                        "screenshotMeasurements": {"baseline": {}, "hdrWithSubtitle": {}},
+                        "hostTraceStatus": "required-host-augmentation",
+                    },
+                },
+                "hostTraceRequirements": {},
+            }
+            self.make_export(
+                root,
+                payload,
+                attachment_name="qualification-native-subtitle-matrix.json",
+                test_identifier="NativeSubtitleMatrixDeviceUITests/test_nativeSubtitleMatrixIsVisibleAndBounded",
+            )
+            evidence = materialize_evidence.materialize(
+                root,
+                "qualification-native-subtitle-matrix.json",
+                "native-subtitle-matrix",
+                "iphone-current",
+                "a" * 64,
+                "b" * 64,
+            )
+            evidence_path = root / "evidence.json"
+            evidence_path.write_text(json.dumps(evidence))
+            traces = {}
+            for key in ("time", "game", "metal"):
+                trace = root / f"{key}.trace"
+                trace.mkdir()
+                (trace / "data.bin").write_bytes(f"{key} trace".encode())
+                toc = root / f"{key}-toc.xml"
+                toc.write_text('<trace-toc><table schema="samples"/></trace-toc>')
+                traces[key] = (trace, toc)
+            digest_script = Path(__file__).resolve().parents[2] / "artifact-tree-digest.py"
+            augmented = augment_native_subtitle_traces.augment(
+                evidence_path, traces, digest_script
+            )
+            self.assertEqual(augmented["supportMatrix"], support)
+            self.assertNotIn("hostTraceRequirements", augmented)
+            self.assertEqual(
+                augmented["metrics"]["cpu"]["hostTrace"]["template"],
+                "Time Profiler",
+            )
+            self.assertEqual(augmented["metrics"]["gpu"]["template"], "Game Performance")
+            self.assertEqual(
+                augmented["metrics"]["colorHDRImpact"]["hostTrace"]["template"],
+                "Metal System Trace",
+            )
+            records = (
+                augmented["metrics"]["cpu"]["hostTrace"],
+                augmented["metrics"]["gpu"],
+                augmented["metrics"]["colorHDRImpact"]["hostTrace"],
+            )
+            for record in records:
+                self.assertEqual(record["treeDigestAlgorithm"], "swiftvlc-tree-v1")
+                self.assertFalse(Path(record["runArtifact"]).is_absolute())
+                self.assertFalse(Path(record["tableOfContents"]).is_absolute())
+                staged_trace = evidence_path.parent / record["runArtifact"]
+                staged_toc = evidence_path.parent / record["tableOfContents"]
+                self.assertTrue(staged_trace.is_dir())
+                self.assertTrue((staged_trace / "data.bin").is_file())
+                self.assertTrue(staged_toc.is_file())
+
     def test_materializes_accepted_start_delayed_failure_evidence(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -1251,6 +1329,7 @@ class QualificationRecordAssemblyTests(unittest.TestCase):
             "instrumentsTrace": {
                 "runArtifact": "artifacts/seek/allocations.trace",
                 "tableOfContents": "artifacts/seek/allocations-toc.xml",
+                "treeDigestAlgorithm": "swiftvlc-tree-v1",
                 "treeDigest": assemble_record.tree_digest(trace),
             }
         }
@@ -1298,6 +1377,7 @@ class QualificationRecordAssemblyTests(unittest.TestCase):
             trace_records[name] = {
                 "runArtifact": f"artifacts/performance/{name}.trace",
                 "tableOfContents": f"artifacts/performance/{name}-toc.xml",
+                "treeDigestAlgorithm": "swiftvlc-tree-v1",
                 "treeDigest": assemble_record.tree_digest(trace),
             }
         evidence["metrics"] = {
@@ -1318,6 +1398,65 @@ class QualificationRecordAssemblyTests(unittest.TestCase):
             self.assertTrue((retained / f"{name}-toc.xml").is_file())
 
         (retained / "game.trace" / "data.bin").write_bytes(b"tampered")
+        with self.assertRaises(assemble_record.AssemblyError):
+            assemble_record.assemble(
+                "1.1.0", self.candidate, self.matrix, [report_path], output
+            )
+
+    def test_assembles_digest_verified_native_subtitle_trace_artifacts(self):
+        scenario = "native-subtitle-matrix"
+        self.matrix.write_text(
+            json.dumps(
+                {
+                    "scenarios": [{"id": scenario, "hardware": ["iphone"]}],
+                    "hardware": [
+                        {"id": "iphone", "deviceFamily": "iPhone", "osMajor": 26},
+                        {"id": "ipad", "deviceFamily": "iPad", "osMajor": 26},
+                    ],
+                }
+            )
+        )
+        self.matrix_checksum = hashlib.sha256(self.matrix.read_bytes()).hexdigest()
+        report_path = self.make_report("iphone")
+        report = json.loads(report_path.read_text())
+        report["qualificationRows"][0]["scenario"] = scenario
+        report_path.write_text(json.dumps(report))
+
+        evidence_path = report_path.parent / "evidence" / "seek.json"
+        evidence = json.loads(evidence_path.read_text())
+        evidence["scenario"] = scenario
+        artifact_directory = evidence_path.parent / "artifacts" / "subtitles"
+        trace_records = {}
+        for name in ("time", "game", "metal"):
+            trace = artifact_directory / f"{name}.trace"
+            trace.mkdir(parents=True)
+            (trace / "data.bin").write_bytes(f"{name} samples".encode())
+            toc = artifact_directory / f"{name}-toc.xml"
+            toc.write_text('<trace-toc><table schema="samples"/></trace-toc>')
+            trace_records[name] = {
+                "runArtifact": f"artifacts/subtitles/{name}.trace",
+                "tableOfContents": f"artifacts/subtitles/{name}-toc.xml",
+                "treeDigestAlgorithm": "swiftvlc-tree-v1",
+                "treeDigest": assemble_record.tree_digest(trace),
+            }
+        evidence["metrics"] = {
+            "cpu": {"hostTrace": trace_records["time"]},
+            "gpu": trace_records["game"],
+            "colorHDRImpact": {"hostTrace": trace_records["metal"]},
+        }
+        evidence_path.write_text(json.dumps(evidence))
+
+        output = self.root / "qualification" / "1.1.0.json"
+        assemble_record.assemble(
+            "1.1.0", self.candidate, self.matrix, [report_path], output
+        )
+
+        retained = output.parent / "evidence" / "1.1.0" / "artifacts" / "subtitles"
+        for name in ("time", "game", "metal"):
+            self.assertTrue((retained / f"{name}.trace" / "data.bin").is_file())
+            self.assertTrue((retained / f"{name}-toc.xml").is_file())
+
+        (retained / "metal.trace" / "data.bin").write_bytes(b"tampered")
         with self.assertRaises(assemble_record.AssemblyError):
             assemble_record.assemble(
                 "1.1.0", self.candidate, self.matrix, [report_path], output
@@ -1581,6 +1720,16 @@ class FixtureServerTests(unittest.TestCase):
         self.assertIn("#EXT-X-MEDIA-SEQUENCE:0", first_live)
         self.assertIn("#EXT-X-MEDIA-SEQUENCE:2", second_live)
 
+        connection, response = self.request(
+            "/adaptive/run/abr-low-ts/low.m3u8"
+        )
+        subtitle_vod = response.read().decode()
+        connection.close()
+        self.assertEqual(subtitle_vod.count("#EXTINF:2.000,"), 60)
+        self.assertIn("#EXT-X-PLAYLIST-TYPE:VOD", subtitle_vod)
+        self.assertIn("#EXT-X-DISCONTINUITY", subtitle_vod)
+        self.assertTrue(subtitle_vod.rstrip().endswith("#EXT-X-ENDLIST"))
+
         connection, response = self.request("/adaptive/run/metrics")
         metrics = json.loads(response.read())
         connection.close()
@@ -1625,7 +1774,12 @@ class FixtureServerTests(unittest.TestCase):
             connection.close()
 
         connection, response = self.request("/adaptive/transitions/metrics")
-        self.assertEqual(json.loads(response.read())["variantTransitions"], 0)
+        forced_metrics = json.loads(response.read())
+        self.assertEqual(forced_metrics["variantTransitions"], 0)
+        self.assertEqual(
+            forced_metrics["successfulSegmentsByVariant"],
+            {"low": 1, "high": 1},
+        )
         connection.close()
 
         for variant in ("low", "high"):

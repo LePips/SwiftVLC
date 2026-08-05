@@ -138,6 +138,7 @@ extension UITestRoute {
     case .adaptiveHLSSoakValidation: AdaptiveHLSSoakValidationCase()
     case .pipRenderPerformanceValidation: PiPRenderPerformanceValidationCase()
     case .pipCadenceValidation: PiPCadenceValidationCase()
+    case .nativeSubtitleMatrixValidation: NativeSubtitleMatrixValidationCase()
     }
   }
 }

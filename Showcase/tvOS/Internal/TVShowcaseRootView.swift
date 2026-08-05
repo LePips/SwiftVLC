@@ -526,7 +526,8 @@ extension TVShowcase {
          .terminalOutcomesValidation,
          .adaptiveHLSSoakValidation,
          .pipRenderPerformanceValidation,
-         .pipCadenceValidation:
+         .pipCadenceValidation,
+         .nativeSubtitleMatrixValidation:
       return nil
     }
   }

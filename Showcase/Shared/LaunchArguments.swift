@@ -65,6 +65,12 @@ enum LaunchArguments {
   static let pipCadenceBaseURLBase64 = "-UITestPiPCadenceBaseURLBase64"
   static let pipCadenceDuration = "-UITestPiPCadenceDuration"
 
+  /// Local origin, duration, and adaptive namespace for native subtitle/OSD
+  /// physical qualification.
+  static let nativeSubtitleBaseURLBase64 = "-UITestNativeSubtitleBaseURLBase64"
+  static let nativeSubtitleDuration = "-UITestNativeSubtitleDuration"
+  static let nativeSubtitleToken = "-UITestNativeSubtitleToken"
+
   /// Name of a showcase to deep-link to on launch (e.g. `"SimplePlayback"`).
   /// When unset, the showcase opens its normal navigation tree.
   static let route = "-UITestRoute"
@@ -158,6 +164,18 @@ enum LaunchArguments {
     UserDefaults.standard.string(forKey: key(pipCadenceDuration)).flatMap(Int.init)
   }
 
+  static var nativeSubtitleBaseURLValue: URL? {
+    encodedArgumentURL(named: nativeSubtitleBaseURLBase64)
+  }
+
+  static var nativeSubtitleDurationValue: Int? {
+    UserDefaults.standard.string(forKey: key(nativeSubtitleDuration)).flatMap(Int.init)
+  }
+
+  static var nativeSubtitleTokenValue: String? {
+    UserDefaults.standard.string(forKey: key(nativeSubtitleToken))
+  }
+
   static var routeValue: String? {
     UserDefaults.standard.string(forKey: key(route))
   }
@@ -246,6 +264,7 @@ enum UITestRoute: String, CaseIterable {
   case adaptiveHLSSoakValidation = "AdaptiveHLSSoakValidation"
   case pipRenderPerformanceValidation = "PiPRenderPerformanceValidation"
   case pipCadenceValidation = "PiPCadenceValidation"
+  case nativeSubtitleMatrixValidation = "NativeSubtitleMatrixValidation"
 
   static var current: UITestRoute? {
     LaunchArguments.routeValue.flatMap(UITestRoute.init(rawValue:))

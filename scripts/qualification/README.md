@@ -253,6 +253,23 @@ so phase completion does not depend on media options unsupported by the pinned
 media-player API. `SWIFTVLC_CADENCE_SECONDS` may shorten exploratory runs, but the matrix
 rejects release evidence shorter than 600 seconds.
 
+The `native-subtitle-matrix` lane runs for at least 900 seconds on
+`iphone-current`. Deterministic grayscale fixtures exercise text, styled ASS,
+forced, DVB bitmap, repeated live DVB, adaptive-resolution text, 10-bit
+BT.2020/PQ HDR text, and marquee OSD composition. The bitmap stream is the
+exact SHA-256-pinned FFmpeg FATE filtered VideoLAN sample, so fixture drift
+fails generation. Every finite subtitle phase has a real 120-second seekable
+timeline; adaptive VOD reuses deterministic segments across explicit HLS
+discontinuities instead of relying on unsupported media repeat options. Native
+PiP remains active across media replacements,
+pause/resume, seek, and adaptive low/high transitions. XCTest measures the
+actual SpringBoard PiP pixels against the grayscale baseline and requires each
+supported overlay at both real PiP sizes. Host augmentation must also bind
+non-empty Time Profiler, Game Performance, and Metal System Trace recordings
+to the same candidate run. A missing subtitle track, absent overlay pixels,
+failed resize, more than 10% lost pictures, incomplete transition, wrong HDR
+metadata, shortened duration, or missing trace rejects the row.
+
 Use `--require-stable` for release evidence. It fails before testing if the
 device is a simulator, runs beta or unknown software, or does not match a
 hardware row in `matrix.json`. Without that option, the same command is useful
@@ -260,11 +277,11 @@ for exploratory beta-OS testing, but its report remains ineligible for release.
 
 This lane is intentionally fail-closed: its current automated scenarios are a
 candidate qualification subset, not a claim that all 53 qualification rows
-passed. `report.json` therefore keeps `releaseGateSatisfied` false until a
-matrix runner has produced the complete candidate-bound records described
-below. Remaining subtitle-format coverage, timebase soaks, and
-every required hardware/OS row must still be represented by
-automated evidence before the stable gate can open.
+passed. The harness has prepared automated coverage for 51 rows;
+`timebase-vod-soak` and `timebase-live-soak` remain to be automated.
+`report.json` therefore keeps `releaseGateSatisfied` false until a matrix
+runner has produced complete candidate-bound evidence for every required
+hardware/OS row described below.
 
 Qualification is bound to both halves of the shipped package. The
 XCFramework tree digest identifies the native engine and headers, while the
