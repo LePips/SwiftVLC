@@ -140,10 +140,10 @@ if [[ ! -s "$READY_FILE" ]]; then
 fi
 cp "$READY_FILE" "$OUTPUT_DIR/fixture-server.json"
 BASE_URL=$(jq -r '.baseURL' "$READY_FILE")
-PIP_LIVE_URL_BASE64=$(printf '%s' "$BASE_URL/live/live.ts" | base64)
+PIP_LIVE_URL_BASE64=$(printf '%s' "$BASE_URL/live/live.ts" | base64 | tr -d '\r\n')
 PIP_LONG_STALL_URL_BASE64=$(printf '%s' \
-  "$BASE_URL/fault/gated-stall/long-stall/12/live.ts" | base64)
-VOD_URL_BASE64=$(printf '%s' "$BASE_URL/files/vod.mp4" | base64)
+  "$BASE_URL/fault/gated-stall/long-stall/12/live.ts" | base64 | tr -d '\r\n')
+VOD_URL_BASE64=$(printf '%s' "$BASE_URL/files/vod.mp4" | base64 | tr -d '\r\n')
 
 if [[ "$SKIP_BUILD" == false ]]; then
   if [[ ! -d "$ROOT_DIR/Vendor/libvlc.xcframework" ]]; then
