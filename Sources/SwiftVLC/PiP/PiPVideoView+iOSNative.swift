@@ -438,6 +438,17 @@ final class IOSNativePiPDrawableAttachment: UIView, IOSNativePiPDrawable {
     autoresizingMask = [.flexibleWidth, .flexibleHeight]
   }
 
+  /// Announces an active same-player replacement before the old native
+  /// handle begins asynchronous teardown. The native close remains the only
+  /// operation allowed to preserve the controller; this merely lets a faster
+  /// successor output wait for it.
+  func expectPictureInPictureHandoff(
+    for mediaGeneration: PlaybackGeneration
+  ) {
+    guard nativePiPBackend.isActive else { return }
+    continuityCoordinator.expectHandoff(for: mediaGeneration)
+  }
+
   @available(*, unavailable)
   required init?(coder _: NSCoder) {
     fatalError()

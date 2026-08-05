@@ -740,7 +740,8 @@ public final class Player {
       try replaceNativePlayerForDrawablePlayback(
         target: drawable,
         media: media,
-        resumeBeforeRelease: resumeBeforeRelease
+        resumeBeforeRelease: resumeBeforeRelease,
+        successorPlaybackGeneration: PlaybackGeneration(sessionGeneration &+ 1)
       )
       // Same supersession bump as `load(_:)`: this branch replaces the media
       // without going through it.
