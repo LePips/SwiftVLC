@@ -55,6 +55,38 @@ extension Integration {
     }
 
     @Test
+    func `native playback state bypasses the asynchronous mirror`() {
+      let player = Player(instance: TestInstance.shared)
+      player._setStateForTesting(state: .playing)
+      player._nativePlaybackStateOverrideForTesting = .stopped
+
+      #expect(player.state == .playing)
+      #expect(player.nativePlaybackState == .stopped)
+    }
+
+    @Test
+    func `renderer rejection has a dedicated typed error`() throws {
+      let player = Player(instance: TestInstance.shared)
+      player._nativeSetRendererOverrideForTesting = { _ in -1 }
+
+      #expect(throws: VLCError.rendererFailed) {
+        try player.setRenderer(nil)
+      }
+    }
+
+    @Test
+    func `replacement player renderer rejection has a dedicated typed error`() throws {
+      let player = Player(instance: TestInstance.shared)
+      let originalPointer = player.pointer
+      player._nativeSetRendererOverrideForTesting = { _ in -1 }
+
+      #expect(throws: VLCError.rendererFailed) {
+        try player.replaceNativePlayerForDrawablePlayback(target: nil)
+      }
+      #expect(player.pointer == originalPointer)
+    }
+
+    @Test
     func `togglePlayPause can cancel a pending resume while native state is still paused`() {
       let player = Player(instance: TestInstance.shared)
       player._setStateForTesting(state: .paused, isPlaybackRequestedActive: true)

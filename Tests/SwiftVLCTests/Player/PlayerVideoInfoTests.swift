@@ -50,6 +50,41 @@ extension Integration {
     }
 
     @Test
+    func `voutChanged refreshes observable track snapshots`() {
+      let player = Player(instance: TestInstance.shared)
+      player.videoTracks = [
+        Track(
+          id: "stale-video",
+          type: .video,
+          name: "Stale video",
+          codec: 0,
+          language: nil,
+          trackDescription: nil,
+          isSelected: true,
+          bitrate: 0,
+          channels: nil,
+          sampleRate: nil,
+          width: 0,
+          height: 0,
+          frameRate: nil,
+          frameRateRatio: nil,
+          encoding: nil
+        )
+      ]
+      let fired = Mutex(false)
+      withObservationTracking {
+        _ = player.videoTracks
+      } onChange: {
+        fired.withLock { $0 = true }
+      }
+
+      player._handleEventForTesting(.voutChanged(1))
+
+      #expect(fired.withLock { $0 })
+      #expect(player.videoTracks.isEmpty)
+    }
+
+    @Test
     func `tracksChanged invalidates videoSize observation`() {
       let player = Player(instance: TestInstance.shared)
       let fired = Mutex(false)

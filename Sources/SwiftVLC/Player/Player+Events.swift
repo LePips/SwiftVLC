@@ -16,8 +16,13 @@ extension Player {
   // MARK: - Native state probes
 
   /// libVLC's view of the player state — read directly from the
-  /// underlying handle, not the cached `state` property.
-  var nativePlaybackState: PlayerState {
+  /// underlying handle, not the asynchronously updated ``state`` mirror.
+  ///
+  /// Use this for transport decisions that must account for a native stop,
+  /// pause, or resume before its event reaches the main actor. Prefer
+  /// ``state`` for observation-driven UI because this synchronous snapshot is
+  /// not itself observable.
+  public var nativePlaybackState: PlayerState {
     #if DEBUG
     if let _nativePlaybackStateOverrideForTesting {
       return _nativePlaybackStateOverrideForTesting
@@ -303,6 +308,7 @@ extension Player {
 
     case .voutChanged(let count):
       activeVideoOutputs = count
+      refreshTracks()
       withMutation(keyPath: \.videoSize) {}
       withMutation(keyPath: \.hasVideoOutput) {}
 

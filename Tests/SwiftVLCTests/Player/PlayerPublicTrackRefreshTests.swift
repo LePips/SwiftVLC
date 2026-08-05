@@ -13,4 +13,12 @@ import Testing
     #expect(player.videoTracks.isEmpty)
     #expect(player.subtitleTracks.isEmpty)
   }
+
+  @Test
+  func `native playback state is publicly readable`() {
+    let player = Player()
+    let state: PlayerState = player.nativePlaybackState
+
+    #expect(state == .idle || state == .stopped)
+  }
 }

@@ -70,6 +70,37 @@ extension Integration {
       #expect(userAgent.contains("SwiftVLC"))
     }
 
+    @Test(.tags(.async, .media), .timeLimit(.minutes(1)))
+    @MainActor
+    func `Per-media HTTP identity reaches the wire`() async throws {
+      let server = try UserAgentProbeServer()
+      defer { server.stop() }
+
+      let instance = try VLCInstance(arguments: Self.quietArguments)
+      let player = Player(instance: instance)
+      defer { player.stop() }
+      let media = try Media(
+        url: server.url,
+        httpUserAgent: "PerMedia/2.0",
+        httpReferrer: "https://example.com/catalog"
+      )
+
+      do {
+        try player.play(media)
+      } catch {
+        // The payload is intentionally not valid media; only the request
+        // headers produced while opening it are under test.
+      }
+
+      try #require(await poll(every: .milliseconds(50), timeout: .seconds(10)) {
+        server.capturedUserAgent != nil && server.capturedReferrer != nil
+      }, "Waiting for: libVLC to send per-media HTTP identity headers")
+
+      let userAgent = try #require(server.capturedUserAgent)
+      #expect(userAgent.hasPrefix("PerMedia/2.0"))
+      #expect(server.capturedReferrer == "https://example.com/catalog")
+    }
+
     @Test
     func `Set user agent after init does not crash`() throws {
       let instance = try VLCInstance(arguments: Self.quietArguments)
@@ -106,6 +137,10 @@ private final class UserAgentProbeServer: @unchecked Sendable {
 
   var capturedUserAgent: String? {
     state.capturedUserAgent
+  }
+
+  var capturedReferrer: String? {
+    state.capturedReferrer
   }
 
   init() throws {
@@ -186,8 +221,11 @@ private final class UserAgentProbeServer: @unchecked Sendable {
 
   private static func handle(client: Int32, state: StateBox) {
     let request = readRequest(from: client)
-    if let userAgent = userAgentHeader(in: request) {
-      state.mutex.withLock { $0.capturedUserAgent = userAgent }
+    let userAgent = header(named: "user-agent", in: request)
+    let referrer = header(named: "referer", in: request)
+    state.mutex.withLock {
+      $0.capturedUserAgent = userAgent
+      $0.capturedReferrer = referrer
     }
 
     let body = "not a transport stream"
@@ -202,9 +240,9 @@ private final class UserAgentProbeServer: @unchecked Sendable {
     }
   }
 
-  private static func userAgentHeader(in request: String) -> String? {
+  private static func header(named name: String, in request: String) -> String? {
     for line in request.components(separatedBy: "\r\n") {
-      let prefix = "user-agent:"
+      let prefix = "\(name):"
       guard line.lowercased().hasPrefix(prefix) else { continue }
       return line.dropFirst(prefix.count).trimmingCharacters(in: .whitespaces)
     }
@@ -230,6 +268,7 @@ private final class UserAgentProbeServer: @unchecked Sendable {
   private struct State: @unchecked Sendable {
     var isStopped = false
     var capturedUserAgent: String?
+    var capturedReferrer: String?
   }
 
   private final class StateBox: @unchecked Sendable {
@@ -237,6 +276,10 @@ private final class UserAgentProbeServer: @unchecked Sendable {
 
     var capturedUserAgent: String? {
       mutex.withLock { $0.capturedUserAgent }
+    }
+
+    var capturedReferrer: String? {
+      mutex.withLock { $0.capturedReferrer }
     }
   }
 }

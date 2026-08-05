@@ -102,7 +102,7 @@ Foundation types shared across all modules.
 | File | Type | Purpose |
 |---|---|---|
 | `VLCInstance.swift` | `final class VLCInstance: Sendable` | Manages `libvlc_instance_t*` lifecycle. Singleton `shared` or custom with arguments. Owns the per-instance `dialogRegistration` Mutex. |
-| `VLCError.swift` | `enum VLCError: Error, Sendable, Equatable, Hashable, LocalizedError, CustomStringConvertible` | Typed errors with hand-rolled per-case accessors (`error.parseTimeout`, `error.mediaCreationFailed`, …). Auto-synthesized `Equatable`/`Hashable` over `String` payloads. |
+| `VLCError.swift` | `enum VLCError: Error, Sendable, Equatable, Hashable, LocalizedError, CustomStringConvertible` | Typed errors with hand-rolled per-case accessors (`error.parseTimeout`, `error.mediaCreationFailed`, …) and synthesized `Equatable`/`Hashable`. |
 | `Broadcaster.swift` | `final class Broadcaster<Element: Sendable>` | Internal multi-consumer fan-out used by the dialog, renderer, log, player-event, and playback-intent streams. Exposes `subscribe`, `broadcast`, `finishAll` (allows resubscribe) and `terminate` (permanent — future `subscribe` calls return immediately-finished streams) inside the module. Lifecycle reconciliation runs on a private serial queue. |
 | `DialogHandler.swift` | `final class DialogHandler: Sendable` | Bridges libVLC's dialog callbacks (`login`, `question`, `progress`, `error`) onto a `Broadcaster<DialogEvent>`. `DialogID` carries the dialog handle through `DialogIDStorage` for safe `dismiss()` + post calls. |
 | `Logging.swift` | `AsyncStream<LogEntry>` via `LogBroadcaster` | Filterable log stream backed by `Broadcaster<LogEntry>`. C shim formats `va_list` before Swift callback. `LogNoiseFilter` demotes known-noisy libVLC errors to warnings. |
@@ -687,6 +687,7 @@ failure and propagate an error thrown by the caller's closure unchanged.
 | `parseFailed` | Media parsing reports failure status |
 | `parseTimeout` | Parsing exceeds specified timeout |
 | `trackNotFound` | Track selection fails (invalid track ID) |
+| `rendererFailed` | libVLC synchronously rejects applying a renderer |
 | `invalidState` | Operation attempted in wrong state |
 | `invalidInput` | Public API argument is outside its documented range |
 | `operationFailed` | Generic libVLC operation failure |

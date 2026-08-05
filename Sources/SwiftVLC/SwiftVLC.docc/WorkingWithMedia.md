@@ -92,13 +92,20 @@ media.addOption(":start-time=30")
 
 Options only affect media that has not yet started playing.
 
-For HTTP and HTTPS streams, libVLC's supported request options can be
-passed the same way:
+For HTTP and HTTPS streams, use the typed initializer when the request needs
+a per-media identity:
 
 ```swift
-media.addOption(":http-user-agent=CustomApp/1.0")
-media.addOption(":http-referrer=https://example.com")
+let media = try Media(
+    url: streamURL,
+    httpUserAgent: "CustomApp/1.0",
+    httpReferrer: "https://example.com/catalog"
+)
 ```
+
+The ``Media/setHTTPUserAgent(_:)`` and ``Media/setHTTPReferrer(_:)`` helpers
+provide the same options for an existing media created through another
+initializer. Apply them before parsing or playback begins.
 
 Cookie forwarding is handled by libVLC's internal cookie jar and is
 enabled by default. The bundled libVLC build does not expose a string
@@ -126,6 +133,7 @@ timer to display rates over time.
 
 ### Creating media
 - ``Media/init(url:)``
+- ``Media/init(url:httpUserAgent:httpReferrer:)``
 - ``Media/init(path:)``
 - ``Media/init(fileDescriptor:)``
 
@@ -149,5 +157,7 @@ timer to display rates over time.
 
 ### Options and statistics
 - ``Media/addOption(_:)``
+- ``Media/setHTTPUserAgent(_:)``
+- ``Media/setHTTPReferrer(_:)``
 - ``MediaStatistics``
 - ``Player/statistics``

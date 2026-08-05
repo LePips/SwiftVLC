@@ -31,6 +31,8 @@ do {
     print("Parsing timed out")
 } catch .trackNotFound(let id) {
     print("No track matched: \(id)")
+} catch .rendererFailed {
+    print("The selected renderer could not be applied")
 } catch .invalidState(let message) {
     print("Player wasn't ready: \(message)")
 } catch .invalidInput(let message) {
@@ -60,6 +62,7 @@ closure, including application-defined error types.
 | ``VLCError/parseFailed(reason:)`` | ``Media/parse(timeout:instance:)`` ended with a non-success status |
 | ``VLCError/parseTimeout-enum.case`` | ``Media/parse(timeout:instance:)`` hit the requested timeout |
 | ``VLCError/trackNotFound(id:)`` | No track matches the requested identifier |
+| ``VLCError/rendererFailed`` | libVLC synchronously rejected applying a selected renderer |
 | ``VLCError/invalidState(_:)`` | Operation is valid but the player isn't in the right state |
 | ``VLCError/invalidInput(_:)`` | A public API argument is outside its documented range |
 | ``VLCError/operationFailed(_:)`` | A libVLC call returned non-zero; the string names the attempted op |
