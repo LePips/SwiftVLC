@@ -580,6 +580,57 @@ class QualificationEvidenceTests(unittest.TestCase):
                 else:
                     self.assertEqual(evidence["stopReason"], "userClosed")
 
+    def test_materializes_interruption_evidence(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.make_export(
+                root,
+                {
+                    "formatVersion": 1,
+                    "scenario": "interruptions",
+                    "events": {
+                        "started": True,
+                        "unexpectedStopCount": 0,
+                        "order": "pass",
+                    },
+                    "interruptionRecovery": "pass",
+                    "routeChangeRecovery": "pass",
+                    "interruptionSource": "exclusive-XCTest-runner-audio-session",
+                    "routeLossSource": "deterministic-oldDeviceUnavailable-notification",
+                    "backends": {
+                        "native": {
+                            "interruptionBeganCount": 1,
+                            "routeLossCount": 1,
+                            "audioRecovered": True,
+                        },
+                        "direct": {
+                            "interruptionBeganCount": 1,
+                            "routeLossCount": 1,
+                            "audioRecovered": True,
+                        },
+                    },
+                    "recoveryOutcome": "preserved",
+                    "systemPiPMotionAfterRecovery": "pass",
+                },
+                attachment_name="qualification-interruptions.json",
+                test_identifier="PiPInterruptionDeviceUITests/test_audioInterruptionAndRouteLossAcrossNativeAndDirectBackends",
+            )
+            evidence = materialize_evidence.materialize(
+                root,
+                "qualification-interruptions.json",
+                "interruptions",
+                "iphone-current",
+                "a" * 64,
+                "b" * 64,
+            )
+            self.assertEqual(evidence["hardware"], "iphone-current")
+            self.assertEqual(evidence["events"]["unexpectedStopCount"], 0)
+            self.assertEqual(evidence["interruptionRecovery"], "pass")
+            self.assertEqual(evidence["routeChangeRecovery"], "pass")
+            self.assertEqual(evidence["backends"]["direct"]["routeLossCount"], 1)
+            self.assertTrue(evidence["backends"]["native"]["audioRecovered"])
+            self.assertEqual(evidence["recoveryOutcome"], "preserved")
+
     def test_materializes_accepted_start_delayed_failure_evidence(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

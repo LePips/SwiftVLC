@@ -520,7 +520,8 @@ extension TVShowcase {
          .pipDelayedStartFailureValidation,
          .pipVODControlsValidation,
          .pipLongStallValidation,
-         .pipDismissalValidation:
+         .pipDismissalValidation,
+         .pipInterruptionValidation:
       return nil
     }
   }
