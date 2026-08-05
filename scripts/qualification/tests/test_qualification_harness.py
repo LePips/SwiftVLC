@@ -556,6 +556,40 @@ class QualificationEvidenceTests(unittest.TestCase):
             self.assertEqual(evidence["mediaGeneration"], 7)
             self.assertTrue(evidence["orderedAttribution"])
 
+    def test_materializes_failed_start_evidence(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.make_export(
+                root,
+                {
+                    "formatVersion": 1,
+                    "scenario": "failed-start",
+                    "events": {
+                        "failedToStartCount": 1,
+                        "didStartCount": 0,
+                        "order": "pass",
+                    },
+                    "failureSurfaced": True,
+                    "orderedEvents": ["willStart", "failedToStart"],
+                    "failureDomain": "SwiftVLC.Qualification.DelayedPiPStartFailure",
+                    "failureCode": 1,
+                },
+                attachment_name="qualification-failed-start.json",
+                test_identifier="PiPDelayedStartFailureDeviceUITests/test_acceptedStartRetainsAttributionThroughDelayedFailure",
+            )
+            evidence = materialize_evidence.materialize(
+                root,
+                "qualification-failed-start.json",
+                "failed-start",
+                "ipad-current",
+                "a" * 64,
+                "b" * 64,
+            )
+            self.assertEqual(evidence["hardware"], "ipad-current")
+            self.assertEqual(evidence["events"]["failedToStartCount"], 1)
+            self.assertEqual(evidence["events"]["didStartCount"], 0)
+            self.assertTrue(evidence["failureSurfaced"])
+
     def test_materializes_focused_replacement_evidence(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

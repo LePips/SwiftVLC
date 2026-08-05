@@ -49,13 +49,31 @@ final class PiPDelayedStartFailureDeviceUITests: ShowcaseIOSTestCase {
       evidence["expectedMediaGeneration"] as? Int
     )
     let events = try XCTUnwrap(evidence["orderedEvents"] as? [String])
-    XCTAssertTrue(events.contains("failedToStart"))
-    XCTAssertFalse(events.contains("didStart"))
+    let failedToStartCount = events.filter { $0 == "failedToStart" }.count
+    let didStartCount = events.filter { $0 == "didStart" }.count
+    XCTAssertEqual(failedToStartCount, 1)
+    XCTAssertEqual(didStartCount, 0)
     XCTAssertEqual(evidence["quiescenceMilliseconds"] as? Int, 3000)
     XCTAssertEqual(evidence["controllerActiveAfterCleanup"] as? Bool, false)
     XCTAssertEqual(
       evidence["failureDomain"] as? String,
       "SwiftVLC.Qualification.DelayedPiPStartFailure"
+    )
+    try attachQualificationEvidence(
+      [
+        "formatVersion": 1,
+        "scenario": "failed-start",
+        "events": [
+          "failedToStartCount": failedToStartCount,
+          "didStartCount": didStartCount,
+          "order": "pass"
+        ],
+        "failureSurfaced": true,
+        "orderedEvents": events,
+        "failureDomain": XCTUnwrap(evidence["failureDomain"] as? String),
+        "failureCode": XCTUnwrap(evidence["failureCode"] as? Int)
+      ],
+      scenario: "failed-start"
     )
     attachQualificationEvidence(evidence, scenario: "accepted-start-delayed-failure")
     assertNoLibraryErrors()

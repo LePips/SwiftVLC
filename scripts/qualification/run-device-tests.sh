@@ -34,7 +34,7 @@ Options:
   --only SCENARIO         Repeat to select: analyzer, ui-suite, native-live,
                           direct-live, live-media, background-audio,
                           continuity, capability-convergence,
-                          vod-controls, long-stall,
+                          vod-controls, long-stall, failed-start,
                           deferred-pause-rejection,
                           accepted-start-delayed-failure, hls-seek,
                           harness-regressions, ui-failures, thumbnail-preview
@@ -286,7 +286,7 @@ xcrun devicectl device copy to \
   --destination Documents/streams.local.json \
   > "$OUTPUT_DIR/stage-streams.log"
 
-DEFAULT_SCENARIOS=(analyzer ui-suite harness-regressions live-media background-audio continuity capability-convergence vod-controls long-stall deferred-pause-rejection accepted-start-delayed-failure hls-seek)
+DEFAULT_SCENARIOS=(analyzer ui-suite harness-regressions live-media background-audio continuity capability-convergence vod-controls long-stall failed-start deferred-pause-rejection accepted-start-delayed-failure hls-seek)
 SCENARIOS_WERE_EXPLICIT=false
 if [[ ${#ONLY_SCENARIOS[@]} -eq 0 ]]; then
   ONLY_SCENARIOS=("${DEFAULT_SCENARIOS[@]}")
@@ -295,7 +295,7 @@ else
 fi
 for scenario in "${ONLY_SCENARIOS[@]}"; do
   case "$scenario" in
-    analyzer|ui-suite|native-live|direct-live|live-media|background-audio|continuity|capability-convergence|vod-controls|long-stall|deferred-pause-rejection|accepted-start-delayed-failure|hls-seek|harness-regressions|ui-failures|thumbnail-preview) ;;
+    analyzer|ui-suite|native-live|direct-live|live-media|background-audio|continuity|capability-convergence|vod-controls|long-stall|failed-start|deferred-pause-rejection|accepted-start-delayed-failure|hls-seek|harness-regressions|ui-failures|thumbnail-preview) ;;
     *) echo "Error: unknown scenario: $scenario" >&2; exit 2 ;;
   esac
 done
@@ -325,6 +325,14 @@ if ! device_matches_hardware_row "iphone-current"; then
     ONLY_SCENARIOS=("${FILTERED_SCENARIOS[@]}")
     echo "Skipping iphone-current-only qualification scenarios: selected device does not match iphone-current."
   fi
+elif [[ "$SCENARIOS_WERE_EXPLICIT" == false ]]; then
+  FILTERED_SCENARIOS=()
+  for scenario in "${ONLY_SCENARIOS[@]}"; do
+    if [[ "$scenario" != "accepted-start-delayed-failure" ]]; then
+      FILTERED_SCENARIOS+=("$scenario")
+    fi
+  done
+  ONLY_SCENARIOS=("${FILTERED_SCENARIOS[@]}")
 fi
 
 RESULTS_TSV="$WORK_DIR/results.tsv"
@@ -406,6 +414,13 @@ run_scenario() {
         "iOSUITests/PiPLongStallDeviceUITests/test_longStallRecoversAcrossNativeAndDirectBackends"
       )
       route="PiPLongStallValidation"
+      selected_xctestrun="$DESTINATION_XCTESTRUN"
+      ;;
+    failed-start)
+      test_identifiers=(
+        "iOSUITests/PiPDelayedStartFailureDeviceUITests/test_acceptedStartRetainsAttributionThroughDelayedFailure"
+      )
+      route="PiPDelayedStartFailureValidation"
       selected_xctestrun="$DESTINATION_XCTESTRUN"
       ;;
     deferred-pause-rejection)
@@ -661,6 +676,15 @@ PY
     long-stall)
       qualification_scenarios=("long-stall")
       qualification_attachments=("qualification-long-stall.json")
+      ;;
+    failed-start)
+      qualification_scenarios=("failed-start")
+      qualification_attachments=("qualification-failed-start.json")
+      if [[ "$SCENARIOS_WERE_EXPLICIT" == false ]] \
+        && device_matches_hardware_row "iphone-current"; then
+        qualification_scenarios+=("accepted-start-delayed-failure")
+        qualification_attachments+=("qualification-accepted-start-delayed-failure.json")
+      fi
       ;;
     deferred-pause-rejection)
       qualification_scenarios=("deferred-pause-rejection")

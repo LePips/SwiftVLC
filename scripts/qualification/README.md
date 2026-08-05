@@ -149,6 +149,17 @@ attached evidence records those identities, ordered events, and injected error
 domain. The default run omits this lane on other hardware rows, and an explicit
 unsupported request fails before testing.
 
+The same deterministic delegate-failure exercise also emits the matrix-wide
+`failed-start` attachment on every hardware row. That narrower record requires
+exactly one surfaced failure, no successful start, and ordered events; the
+additional controller/media attribution fields remain reserved for the
+iPhone-current `accepted-start-delayed-failure` row. The all-hardware lane
+therefore closes the original functional matrix gap without weakening the
+focused issue-104 qualification.
+On the default `iphone-current` run, the harness materializes both attachments
+from this single execution; either scenario remains independently selectable
+with `--only`.
+
 The HLS seek lane is another complete machine-readable matrix slice. It
 executes forward, backward, and absolute seeks, measures the return of decoded
 video, checks ordered PiP continuity, samples real system-PiP motion after each
