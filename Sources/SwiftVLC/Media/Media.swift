@@ -132,7 +132,8 @@ public final class Media: Sendable {
     url: URL,
     httpUserAgent: String?,
     httpReferrer: String?
-  ) throws(VLCError) {
+  )
+    throws(VLCError) {
     try self.init(url: url)
     if let httpUserAgent {
       setHTTPUserAgent(httpUserAgent)
