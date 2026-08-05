@@ -324,6 +324,40 @@ class VolunteerReportTests(unittest.TestCase):
             self.assertIn("Report state: **COMPLETE**", summary)
             self.assertIn("Result: **PASS**", summary)
 
+    def test_failure_summary_extracts_a_concise_reason(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run = root / "run"
+            run.mkdir()
+            (run / "report.json").write_text(
+                json.dumps(
+                    {
+                        "result": "fail",
+                        "scenarios": [
+                            {
+                                "scenario": "analyzer",
+                                "result": "fail",
+                                "durationSeconds": 60,
+                                "libraryErrorCount": 0,
+                                "qualificationEvidence": "not-applicable",
+                            }
+                        ],
+                    }
+                )
+            )
+            (run / "analyzer-xcodebuild.log").write_text(
+                "Runner encountered an error (Timed out while enabling automation mode.)\n"
+            )
+            output = root / "share.zip"
+            package_volunteer_report.package(run, output)
+            with zipfile.ZipFile(output) as archive:
+                summary = archive.read("SwiftVLC-Device-Report/SUMMARY.md").decode()
+                reasons = json.loads(
+                    archive.read("SwiftVLC-Device-Report/failure-reasons.json")
+                )
+            self.assertIn("Timed out while enabling automation mode", summary)
+            self.assertEqual(reasons[0]["scenario"], "analyzer")
+
 
 class CandidateMetadataTests(unittest.TestCase):
     def test_metadata_is_bound_to_the_exact_candidate_digest(self):

@@ -65,6 +65,9 @@ For scripted use, the same entry point is available as:
 
 Use `--team TEAM` only when more than one Apple Development team is installed,
 and `--device ID` only when more than one eligible physical device is attached.
+Maintainers may also request a focused diagnostic with repeatable
+`--only SCENARIO` arguments; omitting them always selects the complete
+applicable suite.
 The report explicitly labels beta/unknown OS runs as exploratory; collecting a
 report does not by itself claim that an uncovered hardware row passed.
 

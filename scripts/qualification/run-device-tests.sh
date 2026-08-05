@@ -923,7 +923,7 @@ run_scenario() {
   started=$(date +%s)
   local attempt attempt_log attempt_bundle attempt_xctestrun final_log_prefix retryable_pattern
   final_log_prefix="$run_id-$scenario"
-  retryable_pattern='LaunchServicesDataMismatch|LaunchServices GUID and sequence number do not match|Early unexpected exit, operation never finished bootstrapping|signal kill before establishing connection|Failed to resume target process|process may have already terminated|reason: Busy|is installing or uninstalling'
+  retryable_pattern='LaunchServicesDataMismatch|LaunchServices GUID and sequence number do not match|Early unexpected exit, operation never finished bootstrapping|signal kill before establishing connection|Failed to resume target process|process may have already terminated|Timed out while enabling automation mode|reason: Busy|is installing or uninstalling'
   for attempt in 1 2 3; do
     attempt_log="$OUTPUT_DIR/$scenario-xcodebuild-attempt$attempt.log"
     attempt_bundle="$OUTPUT_DIR/$scenario-attempt$attempt.xcresult"

@@ -7,6 +7,7 @@ OUTPUT_ROOT="${SWIFTVLC_VOLUNTEER_RESULTS:-$ROOT_DIR/SwiftVLC Device Reports}"
 DEVELOPMENT_TEAM="${SWIFTVLC_DEVELOPMENT_TEAM:-}"
 DEVICE_SELECTOR=""
 ASSUME_YES=false
+ONLY_SCENARIOS=()
 
 usage() {
   cat <<'EOF'
@@ -20,6 +21,7 @@ Options:
   --team TEAM        Apple Development team identifier (normally auto-detected)
   --device ID        Device id, UDID, ECID, or exact device name
   --output PATH      Report directory
+  --only SCENARIO    Advanced: repeat to run only named scenario drivers
   --yes              Start without the final confirmation prompt
   -h, --help         Show this help
 EOF
@@ -30,6 +32,7 @@ while [[ $# -gt 0 ]]; do
     --team) DEVELOPMENT_TEAM="$2"; shift 2 ;;
     --device) DEVICE_SELECTOR="$2"; shift 2 ;;
     --output) OUTPUT_ROOT="$2"; shift 2 ;;
+    --only) ONLY_SCENARIOS+=("$2"); shift 2 ;;
     --yes) ASSUME_YES=true; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Error: unknown option $1" >&2; usage >&2; exit 2 ;;
@@ -211,6 +214,9 @@ runner_args=(
   --output "$RUNS_ROOT"
 )
 [[ -n "$DEVICE_SELECTOR" ]] && runner_args+=(--device "$DEVICE_SELECTOR")
+for scenario in "${ONLY_SCENARIOS[@]}"; do
+  runner_args+=(--only "$scenario")
+done
 
 if jq -e --slurpfile matrix "$SCRIPT_DIR/matrix.json" '
   .mode == "exploratory"

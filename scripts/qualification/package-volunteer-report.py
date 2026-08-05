@@ -143,6 +143,33 @@ def device_summary(run_dir: Path) -> dict[str, Any]:
     return {key: value[key] for key in allowed if key in value}
 
 
+def failure_reasons(run_dir: Path, scenarios: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    results = []
+    pattern = re.compile(
+        r"(?:error:|failed -|encountered an error|Testing failed:|TEST EXECUTE FAILED)",
+        re.IGNORECASE,
+    )
+    for row in scenarios:
+        if row.get("result") == "pass":
+            continue
+        scenario = str(row.get("scenario", "unknown"))
+        log_path = run_dir / f"{scenario}-xcodebuild.log"
+        reasons = []
+        if log_path.is_file():
+            for line in log_path.read_text(errors="replace").splitlines():
+                candidate = line.strip()
+                if pattern.search(candidate) and candidate not in reasons:
+                    reasons.append(candidate[:500])
+            reasons = reasons[-3:]
+        results.append(
+            {
+                "scenario": scenario,
+                "reasons": reasons or ["No concise failure line was found; see the included log."],
+            }
+        )
+    return results
+
+
 def summary_markdown(
     run_dir: Path, scenarios: list[dict[str, Any]], complete: bool
 ) -> str:
@@ -199,6 +226,16 @@ def summary_markdown(
         )
     if not scenarios:
         lines.append("| _No scenario completed_ | INCOMPLETE | 0s | — | — |")
+    failures = failure_reasons(run_dir, scenarios)
+    if failures:
+        lines.extend(["", "## Failure excerpts", ""])
+        for failure in failures:
+            lines.append(f"### {failure['scenario']}")
+            lines.append("")
+            for reason in failure["reasons"]:
+                safe_reason = reason.replace("`", "'")
+                lines.append(f"- `{safe_reason}`")
+            lines.append("")
     lines.extend(
         [
             "",
@@ -268,6 +305,10 @@ def package(run_dir: Path, output: Path) -> Path:
         staging = Path(temporary) / "SwiftVLC-Device-Report"
         staging.mkdir()
         collect_files(run_dir, staging, secrets)
+        failures = sanitize_json(failure_reasons(run_dir, scenarios), secrets)
+        (staging / "failure-reasons.json").write_text(
+            json.dumps(failures, indent=2, sort_keys=True) + "\n"
+        )
         (staging / "SUMMARY.md").write_text(
             scrub_text(summary_markdown(run_dir, scenarios, complete), secrets)
         )
