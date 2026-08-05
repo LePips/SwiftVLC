@@ -258,6 +258,17 @@ enum AccessibilityID {
     static let errorLabel = "pipLongStall.error"
   }
 
+  enum PiPDismissalValidation {
+    static let videoView = "pipDismissal.videoView"
+    static let stateLabel = "pipDismissal.state"
+    static let possibleLabel = "pipDismissal.possible"
+    static let activeLabel = "pipDismissal.active"
+    static let lifecycleEventsLabel = "pipDismissal.lifecycleEvents"
+    static let restoreCountLabel = "pipDismissal.restoreCount"
+    static let startButton = "pipDismissal.start"
+    static let errorLabel = "pipDismissal.error"
+  }
+
   enum MatrixHValidation {
     static let stateLabel = "validation.matrixH.state"
     static let currentTimeLabel = "validation.matrixH.currentTime"

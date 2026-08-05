@@ -411,7 +411,8 @@ extension MacShowcase {
          .pipDeferredPauseValidation,
          .pipDelayedStartFailureValidation,
          .pipVODControlsValidation,
-         .pipLongStallValidation:
+         .pipLongStallValidation,
+         .pipDismissalValidation:
       return nil
     }
   }

@@ -6,6 +6,23 @@ final class PiPMotionRegionAnalyzerTests: XCTestCase {
   private let screenHeight = 240
   private let expectedPiP = PiPMotionRegion(x: 64, y: 156, width: 80, height: 45)
 
+  func testNormalizedSystemPiPControlPointUsesDetectedBounds() {
+    let region = SystemPictureInPictureWindowRegion(
+      normalizedX: 0.4,
+      normalizedY: 0.65,
+      normalizedWidth: 0.5,
+      normalizedHeight: 0.1875
+    )
+
+    let close = region.normalizedPoint(x: 0.12, y: 0.18)
+    let restore = region.normalizedPoint(x: 0.88, y: 0.18)
+
+    XCTAssertEqual(close.dx, 0.46, accuracy: 0.0001)
+    XCTAssertEqual(close.dy, 0.68375, accuracy: 0.0001)
+    XCTAssertEqual(restore.dx, 0.84, accuracy: 0.0001)
+    XCTAssertEqual(restore.dy, close.dy, accuracy: 0.0001)
+  }
+
   func testMovingVideoInsideFixedSixteenByNinePiPRegionPasses() throws {
     let frames = syntheticFrames { _, _, _, frameIndex in
       .animated(region: self.expectedPiP, frameIndex: frameIndex)

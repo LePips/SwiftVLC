@@ -1,6 +1,28 @@
 import UIKit
 import XCTest
 
+struct SystemPictureInPictureWindowRegion: Equatable {
+  let normalizedX: Double
+  let normalizedY: Double
+  let normalizedWidth: Double
+  let normalizedHeight: Double
+
+  func normalizedPoint(x: Double, y: Double) -> CGVector {
+    CGVector(
+      dx: normalizedX + normalizedWidth * x,
+      dy: normalizedY + normalizedHeight * y
+    )
+  }
+}
+
+private struct SystemPictureInPictureInspectionFailure: Error, CustomStringConvertible {
+  let description: String
+
+  init(_ description: String) {
+    self.description = description
+  }
+}
+
 /// Base class for every iOS showcase UI test.
 ///
 /// Owns the `XCUIApplication` instance, configures the launch-arg contract
@@ -331,6 +353,32 @@ class ShowcaseIOSTestCase: XCTestCase {
     samples: Int = 6,
     interval: TimeInterval = 0.75
   ) -> String? {
+    inspectSystemPictureInPictureMotion(samples: samples, interval: interval).failure
+  }
+
+  /// Returns the stable system-PiP bounds proven by the same moving-pixel
+  /// oracle used for visual qualification. Coordinates are normalized to the
+  /// full screen so UI tests can exercise the real restore and close controls
+  /// without depending on localized SpringBoard accessibility labels.
+  func locateSystemPictureInPictureWindow(
+    samples: Int = 6,
+    interval: TimeInterval = 0.75
+  )
+    throws -> SystemPictureInPictureWindowRegion {
+    let inspection = inspectSystemPictureInPictureMotion(samples: samples, interval: interval)
+    if let failure = inspection.failure {
+      throw SystemPictureInPictureInspectionFailure(failure)
+    }
+    guard let region = inspection.region else {
+      throw SystemPictureInPictureInspectionFailure("System PiP bounds were not detected")
+    }
+    return region
+  }
+
+  private func inspectSystemPictureInPictureMotion(
+    samples: Int,
+    interval: TimeInterval
+  ) -> (region: SystemPictureInPictureWindowRegion?, failure: String?) {
     precondition(samples >= 5)
 
     var screenshots: [XCUIScreenshot] = []
@@ -358,7 +406,7 @@ class ShowcaseIOSTestCase: XCTestCase {
       attachment.name = "system-pip-motion-diagnostics"
       attachment.lifetime = .keepAlways
       add(attachment)
-      return "Could not rasterize system PiP screenshots"
+      return (nil, "Could not rasterize system PiP screenshots")
     }
 
     let analysis = PiPMotionRegionAnalyzer().analyze(frames)
@@ -388,8 +436,19 @@ class ShowcaseIOSTestCase: XCTestCase {
       }
     }
 
-    guard let failure = analysis.failure else { return nil }
-    return "System PiP image oracle failed: \(failure.rawValue). \(diagnostics)"
+    let normalizedRegion = analysis.region.map {
+      SystemPictureInPictureWindowRegion(
+        normalizedX: Double($0.x) / Double(analysis.frameWidth),
+        normalizedY: Double($0.y) / Double(analysis.frameHeight),
+        normalizedWidth: Double($0.width) / Double(analysis.frameWidth),
+        normalizedHeight: Double($0.height) / Double(analysis.frameHeight)
+      )
+    }
+    guard let failure = analysis.failure else { return (normalizedRegion, nil) }
+    return (
+      normalizedRegion,
+      "System PiP image oracle failed: \(failure.rawValue). \(diagnostics)"
+    )
   }
 
   // MARK: - Fixtures

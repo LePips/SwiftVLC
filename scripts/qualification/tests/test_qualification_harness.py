@@ -519,6 +519,67 @@ class QualificationEvidenceTests(unittest.TestCase):
             self.assertTrue(evidence["boundedMemory"])
             self.assertEqual(evidence["backendResults"]["direct"]["memory"]["growthBytes"], 2048)
 
+    def test_materializes_restore_and_close_evidence(self):
+        for scenario, restore_count, reason in (
+            ("restore", 1, "restoreRequested"),
+            ("close", 0, "userClosed"),
+        ):
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                self.make_export(
+                    root,
+                    {
+                        "formatVersion": 1,
+                        "scenario": scenario,
+                        "events": {
+                            "didStartCount": 1,
+                            "willStopReason": reason,
+                            "didStopReason": reason,
+                            "order": "pass",
+                        },
+                        "backends": {
+                            "native": {
+                                "reason": reason,
+                                "restoreCallbackCount": restore_count,
+                                "systemPiPMotion": "pass",
+                            },
+                            "direct": {
+                                "reason": reason,
+                                "restoreCallbackCount": restore_count,
+                                "systemPiPMotion": "pass",
+                            },
+                        },
+                        **(
+                            {"restoreResult": "pass", "completionCount": 1}
+                            if scenario == "restore"
+                            else {"stopReason": "userClosed"}
+                        ),
+                        "aggregationBasis": "per-backend invariant",
+                        "systemAffordance": "pass",
+                    },
+                    attachment_name=f"qualification-{scenario}.json",
+                    test_identifier="PiPDismissalDeviceUITests/test_systemRestoreAndCloseAcrossNativeAndDirectBackends",
+                )
+                evidence = materialize_evidence.materialize(
+                    root,
+                    f"qualification-{scenario}.json",
+                    scenario,
+                    "ipad-current",
+                    "a" * 64,
+                    "b" * 64,
+                )
+                self.assertEqual(evidence["hardware"], "ipad-current")
+                self.assertEqual(evidence["events"]["didStartCount"], 1)
+                self.assertEqual(evidence["events"]["willStopReason"], reason)
+                self.assertEqual(evidence["events"]["didStopReason"], reason)
+                self.assertEqual(evidence["backends"]["native"]["reason"], reason)
+                self.assertEqual(evidence["systemAffordance"], "pass")
+                if scenario == "restore":
+                    self.assertEqual(evidence["restoreResult"], "pass")
+                    self.assertEqual(evidence["completionCount"], 1)
+                else:
+                    self.assertEqual(evidence["stopReason"], "userClosed")
+
     def test_materializes_accepted_start_delayed_failure_evidence(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

@@ -34,7 +34,7 @@ Options:
   --only SCENARIO         Repeat to select: analyzer, ui-suite, native-live,
                           direct-live, live-media, background-audio,
                           continuity, capability-convergence,
-                          vod-controls, long-stall, failed-start,
+                          vod-controls, long-stall, failed-start, dismissal,
                           deferred-pause-rejection,
                           accepted-start-delayed-failure, hls-seek,
                           harness-regressions, ui-failures, thumbnail-preview
@@ -233,6 +233,7 @@ python3 "$SCRIPT_DIR/prepare-xctestrun.py" "$XCTESTRUN" "$DESTINATION_XCTESTRUN"
   --environment SWIFTVLC_PIP_VOD_CONTROLS_DEVICE=YES \
   --environment SWIFTVLC_PIP_LONG_STALL_DEVICE=YES \
   --environment SWIFTVLC_PIP_LONG_STALL_URL_BASE64="$PIP_LONG_STALL_URL_BASE64" \
+  --environment SWIFTVLC_PIP_DISMISSAL_DEVICE=YES \
   --environment SWIFTVLC_PIP_DEFERRED_PAUSE_DEVICE=YES \
   --environment SWIFTVLC_PIP_DELAYED_START_FAILURE_DEVICE=YES \
   --environment SWIFTVLC_PIP_OVERLAY_DEVICE=YES \
@@ -286,7 +287,7 @@ xcrun devicectl device copy to \
   --destination Documents/streams.local.json \
   > "$OUTPUT_DIR/stage-streams.log"
 
-DEFAULT_SCENARIOS=(analyzer ui-suite harness-regressions live-media background-audio continuity capability-convergence vod-controls long-stall failed-start deferred-pause-rejection accepted-start-delayed-failure hls-seek)
+DEFAULT_SCENARIOS=(analyzer ui-suite harness-regressions live-media background-audio continuity capability-convergence vod-controls long-stall failed-start dismissal deferred-pause-rejection accepted-start-delayed-failure hls-seek)
 SCENARIOS_WERE_EXPLICIT=false
 if [[ ${#ONLY_SCENARIOS[@]} -eq 0 ]]; then
   ONLY_SCENARIOS=("${DEFAULT_SCENARIOS[@]}")
@@ -295,7 +296,7 @@ else
 fi
 for scenario in "${ONLY_SCENARIOS[@]}"; do
   case "$scenario" in
-    analyzer|ui-suite|native-live|direct-live|live-media|background-audio|continuity|capability-convergence|vod-controls|long-stall|failed-start|deferred-pause-rejection|accepted-start-delayed-failure|hls-seek|harness-regressions|ui-failures|thumbnail-preview) ;;
+    analyzer|ui-suite|native-live|direct-live|live-media|background-audio|continuity|capability-convergence|vod-controls|long-stall|failed-start|dismissal|deferred-pause-rejection|accepted-start-delayed-failure|hls-seek|harness-regressions|ui-failures|thumbnail-preview) ;;
     *) echo "Error: unknown scenario: $scenario" >&2; exit 2 ;;
   esac
 done
@@ -423,6 +424,13 @@ run_scenario() {
       route="PiPDelayedStartFailureValidation"
       selected_xctestrun="$DESTINATION_XCTESTRUN"
       ;;
+    dismissal)
+      test_identifiers=(
+        "iOSUITests/PiPDismissalDeviceUITests/test_systemRestoreAndCloseAcrossNativeAndDirectBackends"
+      )
+      route="PiPDismissalValidation"
+      selected_xctestrun="$DESTINATION_XCTESTRUN"
+      ;;
     deferred-pause-rejection)
       test_identifiers=(
         "iOSUITests/PiPDeferredPauseDeviceUITests/test_deferredPauseRejectionAndCancellationStayTruthful"
@@ -480,6 +488,7 @@ run_scenario() {
       --environment SWIFTVLC_PIP_VOD_CONTROLS_DEVICE=YES \
       --environment SWIFTVLC_PIP_LONG_STALL_DEVICE=YES \
       --environment SWIFTVLC_PIP_LONG_STALL_URL_BASE64="$PIP_LONG_STALL_URL_BASE64" \
+      --environment SWIFTVLC_PIP_DISMISSAL_DEVICE=YES \
       --environment SWIFTVLC_PIP_DEFERRED_PAUSE_DEVICE=YES \
       --environment SWIFTVLC_PIP_DELAYED_START_FAILURE_DEVICE=YES \
       --environment SWIFTVLC_PIP_OVERLAY_DEVICE=YES \
@@ -509,6 +518,7 @@ run_scenario() {
       -skip-testing:iOSUITests/PiPCapabilityDeviceUITests
       -skip-testing:iOSUITests/PiPVODControlsDeviceUITests
       -skip-testing:iOSUITests/PiPLongStallDeviceUITests
+      -skip-testing:iOSUITests/PiPDismissalDeviceUITests
       -skip-testing:iOSUITests/PiPDeferredPauseDeviceUITests
       -skip-testing:iOSUITests/PiPDelayedStartFailureDeviceUITests
       -skip-testing:iOSUITests/PiPOverlayDeviceUITests
@@ -685,6 +695,10 @@ PY
         qualification_scenarios+=("accepted-start-delayed-failure")
         qualification_attachments+=("qualification-accepted-start-delayed-failure.json")
       fi
+      ;;
+    dismissal)
+      qualification_scenarios=("restore" "close")
+      qualification_attachments=("qualification-restore.json" "qualification-close.json")
       ;;
     deferred-pause-rejection)
       qualification_scenarios=("deferred-pause-rejection")
