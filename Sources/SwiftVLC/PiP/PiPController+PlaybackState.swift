@@ -152,6 +152,27 @@ extension PiPController {
     }
   }
 
+  /// Whether a sourced event can still describe the player the PiP controller
+  /// currently owns.
+  ///
+  /// A native media change can reach this controller before `Player`'s own
+  /// main-actor consumer publishes the successor generation, so that one event
+  /// may legitimately be newer. Every other event must match exactly. Native
+  /// handle identity is always exact: callbacks from a retired handle cannot
+  /// describe the installed player even when the event bridge has already
+  /// stamped them with the successor playback generation.
+  static func shouldObservePlaybackStateEnvelope(
+    _ envelope: PlayerEventEnvelope,
+    nativeGeneration: NativePlayerGeneration,
+    playbackGeneration: PlaybackGeneration
+  ) -> Bool {
+    guard envelope.nativeGeneration == nativeGeneration else { return false }
+    if case .mediaChanged = envelope.event {
+      return envelope.playbackGeneration >= playbackGeneration
+    }
+    return envelope.playbackGeneration == playbackGeneration
+  }
+
   static func applyPlaybackStateUpdate(
     _ update: PlaybackStateUpdate,
     setRequiresLinearPlayback: (Bool) -> Void,

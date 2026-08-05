@@ -406,6 +406,57 @@ import Testing
     )
   }
 
+  @Test
+  func `Retired native handle cannot restore outgoing media capability`() {
+    let envelope = PlayerEventEnvelope(
+      event: .seekableChanged(true),
+      nativeGeneration: NativePlayerGeneration(1),
+      playbackGeneration: PlaybackGeneration(2)
+    )
+
+    #expect(
+      !PiPController.shouldObservePlaybackStateEnvelope(
+        envelope,
+        nativeGeneration: NativePlayerGeneration(2),
+        playbackGeneration: PlaybackGeneration(2)
+      )
+    )
+  }
+
+  @Test
+  func `Successor media change can precede Player generation publication`() {
+    let envelope = PlayerEventEnvelope(
+      event: .mediaChanged,
+      nativeGeneration: NativePlayerGeneration(2),
+      playbackGeneration: PlaybackGeneration(2)
+    )
+
+    #expect(
+      PiPController.shouldObservePlaybackStateEnvelope(
+        envelope,
+        nativeGeneration: NativePlayerGeneration(2),
+        playbackGeneration: PlaybackGeneration(1)
+      )
+    )
+  }
+
+  @Test
+  func `Superseded media event on current handle is rejected`() {
+    let envelope = PlayerEventEnvelope(
+      event: .lengthChanged(.seconds(120)),
+      nativeGeneration: NativePlayerGeneration(2),
+      playbackGeneration: PlaybackGeneration(1)
+    )
+
+    #expect(
+      !PiPController.shouldObservePlaybackStateEnvelope(
+        envelope,
+        nativeGeneration: NativePlayerGeneration(2),
+        playbackGeneration: PlaybackGeneration(2)
+      )
+    )
+  }
+
   /// A poll that has not learned the length must not undo a length event that
   /// already arrived, or the two sources fight each other.
   @Test
