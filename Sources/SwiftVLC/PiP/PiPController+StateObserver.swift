@@ -60,7 +60,8 @@ extension PiPController {
     lastObservedRate = 1.0
     playbackStateObservation = PlaybackStateObservationState(
       duration: player.duration,
-      isSeekable: player.isSeekable
+      isSeekable: player.isSeekable,
+      playbackGeneration: player.generation
     )
 
     stateObserverTask = Task { @MainActor [weak self] in
@@ -95,6 +96,21 @@ extension PiPController {
         playbackGeneration: player.generation
       )
     else { return }
+
+    let capability = player.capabilitySnapshot.withLock { $0 }
+    if
+      let update = playbackStateObservation.adoptPlaybackGeneration(
+        envelope.playbackGeneration,
+        capability: capability
+      ) {
+      applyObservedPlaybackStateUpdate(update)
+      // The generation adoption performed the exact conservative work of a
+      // media-change event. Avoid publishing the same reset twice when the
+      // successor did emit that callback.
+      if case .mediaChanged = envelope.event {
+        return
+      }
+    }
     handleStateObserverEvent(envelope.event)
   }
 
