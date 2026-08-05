@@ -164,6 +164,10 @@ final class PiPContinuityDeviceUITests: ShowcaseIOSTestCase {
     button.tap()
 
     waitForLabelChange(generation, from: previousGeneration, timeout: 5)
+    // Re-materialize the policy row after the load. An off-screen Form row can
+    // retain its previous accessibility snapshot even though the controller
+    // and the on-screen generation have advanced.
+    reveal(playbackSnapshot, swiping: .up)
     waitForLabel(playbackSnapshot, equals: expectedSnapshot, timeout: 15)
     waitForOccurrence(
       "restored",
