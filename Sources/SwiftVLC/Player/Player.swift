@@ -18,7 +18,12 @@ import Synchronization
 public final class Player {
   // MARK: - Observable State
 
-  /// Current playback state.
+  /// The latest playback state delivered by libVLC's asynchronous event
+  /// stream.
+  ///
+  /// This observable mirror can briefly lag the underlying player after a
+  /// transport command. Read ``nativePlaybackState`` when transport logic
+  /// requires a synchronous native-state snapshot instead of UI observation.
   public internal(set) var state: PlayerState = .idle
 
   /// Whether playback controls should currently present the media as
@@ -466,6 +471,8 @@ public final class Player {
   @ObservationIgnored
   var _nativePauseSafetyOverrideForTesting: Bool?
   @ObservationIgnored
+  var _nativeSetRendererOverrideForTesting: ((RendererItem?) -> Int32)?
+  @ObservationIgnored
   var _seekOverridesForTesting = PlayerSeekTestOverrides()
   #endif
 
@@ -721,7 +728,7 @@ public final class Player {
 
   /// Loads media and starts playback in one step.
   /// - Throws: ``VLCError/playbackFailed(reason:)`` if playback cannot
-  ///   start, or ``VLCError/operationFailed(_:)`` if a selected renderer
+  ///   start, or ``VLCError/rendererFailed`` if a selected renderer
   ///   cannot be applied to a replacement native player.
   public func play(_ media: sending Media) throws(VLCError) {
     // Guarded here as well as in `play()`: the replacement branch below
@@ -772,7 +779,7 @@ public final class Player {
   /// they are streaming manifests.
   /// - Throws: ``VLCError/mediaCreationFailed(source:)``,
   ///   ``VLCError/playbackFailed(reason:)``, or
-  ///   ``VLCError/operationFailed(_:)`` if a selected renderer cannot be
+  ///   ``VLCError/rendererFailed`` if a selected renderer cannot be
   ///   applied to a replacement native player.
   public func play(url: URL) throws(VLCError) {
     try play(Media(url: url))
@@ -780,7 +787,7 @@ public final class Player {
 
   /// Starts playback.
   /// - Throws: ``VLCError/playbackFailed(reason:)`` if playback cannot
-  ///   start, or ``VLCError/operationFailed(_:)`` if a selected renderer
+  ///   start, or ``VLCError/rendererFailed`` if a selected renderer
   ///   cannot be applied to a replacement native player.
   public func play() throws(VLCError) {
     guard !isShutdown else {

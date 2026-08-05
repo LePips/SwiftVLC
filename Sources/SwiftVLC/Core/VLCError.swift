@@ -30,6 +30,11 @@ public enum VLCError: Error, Sendable, Equatable, Hashable, LocalizedError, Cust
   /// The requested track identifier does not match any track on the
   /// current media.
   case trackNotFound(id: String)
+  /// libVLC rejected applying the selected renderer to a native player.
+  ///
+  /// This is a synchronous renderer-selection failure. A renderer session
+  /// that starts and fails later is reported through playback events instead.
+  case rendererFailed
   /// The operation is valid in principle but not in the player's
   /// current state (e.g. setting an A-B loop before any media is
   /// loaded). The associated string names the constraint that failed.
@@ -57,6 +62,8 @@ public enum VLCError: Error, Sendable, Equatable, Hashable, LocalizedError, Cust
       "Media parsing timed out"
     case .trackNotFound(let id):
       "Track not found: \(id)"
+    case .rendererFailed:
+      "Failed to apply renderer"
     case .invalidState(let message):
       "Invalid state: \(message)"
     case .invalidInput(let message):
@@ -123,6 +130,15 @@ extension VLCError {
   public var trackNotFound: String? {
     if case .trackNotFound(let value) = self {
       value
+    } else {
+      nil
+    }
+  }
+
+  /// `Void` if this error is `.rendererFailed`, otherwise `nil`.
+  public var rendererFailed: Void? {
+    if case .rendererFailed = self {
+      ()
     } else {
       nil
     }

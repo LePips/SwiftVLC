@@ -120,6 +120,29 @@ public final class Media: Sendable {
     pointer = media
   }
 
+  /// Creates media from a URL with per-media HTTP identity headers.
+  ///
+  /// - Parameters:
+  ///   - url: The media source URL.
+  ///   - httpUserAgent: Per-media HTTP `User-Agent`, or `nil` to use the
+  ///     ``VLCInstance`` default.
+  ///   - httpReferrer: Per-media HTTP `Referer`, or `nil` to omit it.
+  /// - Throws: `VLCError.mediaCreationFailed` if the URL is invalid.
+  public convenience init(
+    url: URL,
+    httpUserAgent: String?,
+    httpReferrer: String?
+  )
+    throws(VLCError) {
+    try self.init(url: url)
+    if let httpUserAgent {
+      setHTTPUserAgent(httpUserAgent)
+    }
+    if let httpReferrer {
+      setHTTPReferrer(httpReferrer)
+    }
+  }
+
   /// Creates media from a file path.
   /// - Parameter path: Absolute file path to the media file.
   /// - Throws: `VLCError.mediaCreationFailed` if the path is invalid.
@@ -354,6 +377,23 @@ public final class Media: Sendable {
   /// options. Options have no effect once the media has begun playing.
   public func addOption(_ option: String) {
     libvlc_media_add_option(pointer, option)
+  }
+
+  /// Sets the `User-Agent` header for HTTP requests made for this media.
+  ///
+  /// Call before playback or parsing begins. Whether the option is honored
+  /// depends on the HTTP access module in the bundled libVLC build.
+  public func setHTTPUserAgent(_ value: String) {
+    addOption(":http-user-agent=\(value)")
+  }
+
+  /// Sets the `Referer` header for HTTP requests made for this media.
+  ///
+  /// The libVLC option is spelled `http-referrer` even though the wire header
+  /// uses the historical HTTP spelling `Referer`. Call before playback or
+  /// parsing begins.
+  public func setHTTPReferrer(_ value: String) {
+    addOption(":http-referrer=\(value)")
   }
 
   // MARK: - Metadata Editing

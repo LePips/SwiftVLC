@@ -279,9 +279,9 @@ extension Player {
     if let incoming = media ?? currentMedia {
       libvlc_media_player_set_media(newPointer, incoming.pointer)
     }
-    guard libvlc_media_player_set_renderer(newPointer, selectedRenderer?.pointer) == 0 else {
+    guard setNativeRenderer(selectedRenderer, on: newPointer) == 0 else {
       libvlc_media_player_release(newPointer)
-      throw .operationFailed("Set renderer")
+      throw .rendererFailed
     }
     let newLifetime = NativePlayerHandleLifetime(pointer: newPointer)
     _ = libvlc_audio_set_volume(newPointer, Int32(_volume * 100))

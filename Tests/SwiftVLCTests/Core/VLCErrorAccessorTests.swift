@@ -12,6 +12,7 @@ extension Logic {
       expectNoDifference(VLCError.parseFailed(reason: "bad input").parseFailed, "bad input")
       #expect(VLCError.parseTimeout.parseTimeout != nil)
       expectNoDifference(VLCError.trackNotFound(id: "audio-1").trackNotFound, "audio-1")
+      #expect(VLCError.rendererFailed.rendererFailed != nil)
       expectNoDifference(VLCError.invalidState("not loaded").invalidState, "not loaded")
       expectNoDifference(VLCError.invalidInput("width").invalidInput, "width")
       expectNoDifference(VLCError.operationFailed("Snapshot").operationFailed, "Snapshot")
@@ -26,6 +27,7 @@ extension Logic {
         VLCError.parseTimeout.parseFailed == nil,
         VLCError.instanceCreationFailed.parseTimeout == nil,
         VLCError.parseTimeout.trackNotFound == nil,
+        VLCError.parseTimeout.rendererFailed == nil,
         VLCError.parseTimeout.invalidState == nil,
         VLCError.parseTimeout.invalidInput == nil,
         VLCError.parseTimeout.operationFailed == nil

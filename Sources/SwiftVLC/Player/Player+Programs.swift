@@ -52,7 +52,7 @@ extension Player {
   /// > reach — applying a renderer there does not produce remote output.
   ///
   /// - Parameter renderer: A ``RendererItem`` discovered by ``RendererDiscoverer``, or `nil`.
-  /// - Throws: `VLCError.operationFailed` if the renderer cannot be set,
+  /// - Throws: ``VLCError/rendererFailed`` if the renderer cannot be set,
   ///   or ``VLCError/invalidState(_:)`` if the player has already started
   ///   playback or isn't in an idle-like state.
   public func setRenderer(_ renderer: RendererItem?) throws(VLCError) {
@@ -65,9 +65,19 @@ extension Player {
     guard !nativePlayerHasStartedPlayback else {
       throw .invalidState("setRenderer must be called before the first play() on this Player")
     }
-    let result = libvlc_media_player_set_renderer(pointer, renderer?.pointer)
-    guard result == 0 else { throw .operationFailed("Set renderer") }
+    guard setNativeRenderer(renderer, on: pointer) == 0 else { throw .rendererFailed }
     selectedRenderer = renderer
+  }
+
+  /// Applies a renderer through one testable boundary so both initial
+  /// selection and replacement-player selection surface the same typed error.
+  func setNativeRenderer(_ renderer: RendererItem?, on player: OpaquePointer) -> Int32 {
+    #if DEBUG
+    if let _nativeSetRendererOverrideForTesting {
+      return _nativeSetRendererOverrideForTesting(renderer)
+    }
+    #endif
+    return libvlc_media_player_set_renderer(player, renderer?.pointer)
   }
 
   /// Switches the active renderer mid-playback on this same `Player` —
@@ -98,7 +108,7 @@ extension Player {
   /// > Note: On tvOS the bundled libVLC ships no renderer output
   /// > backends — see ``setRenderer(_:)``.
   ///
-  /// - Throws: ``VLCError/operationFailed(_:)`` if the renderer is
+  /// - Throws: ``VLCError/rendererFailed`` if the renderer is
   ///   rejected (prior renderer and local playback left intact),
   ///   ``VLCError/playbackFailed(reason:)`` if the replacement session
   ///   cannot be started (the renderer is applied at that point — the
