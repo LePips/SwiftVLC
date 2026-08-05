@@ -95,6 +95,12 @@ class ExploratoryDevicePolicyTests(unittest.TestCase):
                 self.record(osReleaseType="beta"), self.matrix
             )
         )
+        self.assertEqual(
+            exploratory_device_policy.evidence_hardware_id(
+                self.record(osReleaseType="beta"), self.matrix
+            ),
+            "exploratory-future-ios",
+        )
 
     def test_matching_or_older_os_cannot_bypass_matrix_selection(self):
         self.assertFalse(

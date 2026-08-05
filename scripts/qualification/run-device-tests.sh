@@ -13,6 +13,7 @@ FIXTURES="${SWIFTVLC_DEVICE_FIXTURES:-$ROOT_DIR/.qualification-fixtures}"
 OUTPUT_ROOT="${SWIFTVLC_DEVICE_RESULTS:-$ROOT_DIR/.qualification-results}"
 REQUIRE_STABLE=false
 EXPLORATORY_CURRENT_ONLY=false
+EXPLORATORY_HARDWARE_ID=""
 SKIP_BUILD=false
 ONLY_SCENARIOS=()
 ADAPTIVE_SOAK_SECONDS="${SWIFTVLC_ADAPTIVE_SOAK_SECONDS:-7200}"
@@ -414,6 +415,11 @@ device_matches_hardware_row() {
     "$OUTPUT_DIR/device.json" > /dev/null
 }
 
+can_run_iphone_current_lanes() {
+  device_matches_hardware_row "iphone-current" \
+    || [[ -n "$EXPLORATORY_HARDWARE_ID" ]]
+}
+
 exclude_opt_in_current_scenarios() {
   FILTERED_SCENARIOS=()
   for scenario in "${ONLY_SCENARIOS[@]}"; do
@@ -424,15 +430,19 @@ exclude_opt_in_current_scenarios() {
   ONLY_SCENARIOS=("${FILTERED_SCENARIOS[@]}")
 }
 
+if [[ "$EXPLORATORY_CURRENT_ONLY" == true ]]; then
+  if ! EXPLORATORY_HARDWARE_ID=$(python3 \
+    "$SCRIPT_DIR/exploratory-device-policy.py" \
+    --device-info "$OUTPUT_DIR/device.json" \
+    --matrix "$SCRIPT_DIR/matrix.json"); then
+    echo "Error: --exploratory-current-only requires an exploratory iPhone" >&2
+    echo "  on an OS newer than the matrix's iphone-current row." >&2
+    exit 2
+  fi
+fi
+
 if ! device_matches_hardware_row "iphone-current"; then
-  if [[ "$EXPLORATORY_CURRENT_ONLY" == true ]]; then
-    if ! python3 "$SCRIPT_DIR/exploratory-device-policy.py" \
-      --device-info "$OUTPUT_DIR/device.json" \
-      --matrix "$SCRIPT_DIR/matrix.json"; then
-      echo "Error: --exploratory-current-only requires an exploratory iPhone" >&2
-      echo "  on an OS newer than the matrix's iphone-current row." >&2
-      exit 2
-    fi
+  if [[ -n "$EXPLORATORY_HARDWARE_ID" ]]; then
     echo "Including iphone-current-only scenarios as exploratory evidence."
     echo "These results cannot qualify or close any stable matrix row."
     if [[ "$SCENARIOS_WERE_EXPLICIT" == false ]]; then
@@ -572,8 +582,7 @@ run_scenario() {
       ;;
     continuity)
       test_identifiers=("iOSUITests/PiPContinuityDeviceUITests/test_nativePiPSurvivesSamePlayerReplacement")
-      if jq -e '.selected.matchingHardwareRows | index("iphone-current") != null' \
-          "$OUTPUT_DIR/device.json" >/dev/null; then
+      if can_run_iphone_current_lanes; then
         test_identifiers+=("iOSUITests/PiPContinuityDeviceUITests/test_nativePiPReplacementContinuityAcrossVODAndLive")
       fi
       route="HarnessHome"
@@ -1337,8 +1346,7 @@ PY
     continuity)
       qualification_scenarios=("replacement")
       qualification_attachments=("qualification-replacement.json")
-      if jq -e '.selected.matchingHardwareRows | index("iphone-current") != null' \
-          "$OUTPUT_DIR/device.json" >/dev/null; then
+      if can_run_iphone_current_lanes; then
         qualification_scenarios+=("replacement-continuity")
         qualification_attachments+=("qualification-replacement-continuity.json")
       fi
@@ -1359,7 +1367,7 @@ PY
       qualification_scenarios=("failed-start")
       qualification_attachments=("qualification-failed-start.json")
       if [[ "$SCENARIOS_WERE_EXPLICIT" == false ]] \
-        && device_matches_hardware_row "iphone-current"; then
+        && can_run_iphone_current_lanes; then
         qualification_scenarios+=("accepted-start-delayed-failure")
         qualification_attachments+=("qualification-accepted-start-delayed-failure.json")
       fi
@@ -1432,6 +1440,9 @@ PY
       set -e
       hardware_id=$(jq -r '.selected.matchingHardwareRows | if length == 1 then .[0] else "" end' \
         "$OUTPUT_DIR/device.json")
+      if [[ -z "$hardware_id" ]] && [[ -n "$EXPLORATORY_HARDWARE_ID" ]]; then
+        hardware_id="$EXPLORATORY_HARDWARE_ID"
+      fi
       if [[ "$export_status" -eq 0 ]] && [[ -n "$hardware_id" ]]; then
         for evidence_index in "${!qualification_scenarios[@]}"; do
           qualification_scenario="${qualification_scenarios[$evidence_index]}"
@@ -1523,17 +1534,18 @@ PY
         done
         if [[ "$materialized_count" -eq "${#qualification_scenarios[@]}" ]]; then
           evidence_status="captured"
-          for evidence_index in "${!materialized_scenarios[@]}"; do
-            local qualification_duration="$((ended - started))"
-            if [[ "${materialized_scenarios[$evidence_index]}" == "adaptive-hls-soak" ]]; then
-              qualification_duration=$(jq -r '.durationSeconds' \
-                "$OUTPUT_DIR/${materialized_evidence[$evidence_index]}")
-            fi
-            python3 - \
-                "$OUTPUT_DIR/device.json" "$QUALIFICATION_ROWS" \
-                "${materialized_evidence[$evidence_index]}" \
-                "$FIXTURE_MANIFEST_CHECKSUM" "$qualification_duration" \
-                "${materialized_scenarios[$evidence_index]}" <<'PY'
+          if [[ -z "$EXPLORATORY_HARDWARE_ID" ]]; then
+            for evidence_index in "${!materialized_scenarios[@]}"; do
+              local qualification_duration="$((ended - started))"
+              if [[ "${materialized_scenarios[$evidence_index]}" == "adaptive-hls-soak" ]]; then
+                qualification_duration=$(jq -r '.durationSeconds' \
+                  "$OUTPUT_DIR/${materialized_evidence[$evidence_index]}")
+              fi
+              python3 - \
+                  "$OUTPUT_DIR/device.json" "$QUALIFICATION_ROWS" \
+                  "${materialized_evidence[$evidence_index]}" \
+                  "$FIXTURE_MANIFEST_CHECKSUM" "$qualification_duration" \
+                  "${materialized_scenarios[$evidence_index]}" <<'PY'
 import json
 import sys
 
@@ -1557,7 +1569,8 @@ row = {
 with open(rows_path, "a") as output:
     output.write(json.dumps(row, sort_keys=True) + "\n")
 PY
-          done
+            done
+          fi
         fi
       fi
     fi

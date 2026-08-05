@@ -5,13 +5,15 @@ import argparse
 import json
 from pathlib import Path
 
+EXPLORATORY_HARDWARE_ID = "exploratory-future-ios"
 
-def permits_current_only(device_info: dict, matrix: dict) -> bool:
+
+def evidence_hardware_id(device_info: dict, matrix: dict) -> str | None:
     selected = device_info.get("selected")
     if device_info.get("mode") != "exploratory" or not isinstance(selected, dict):
-        return False
+        return None
     if selected.get("deviceFamily") != "iPhone":
-        return False
+        return None
 
     current_rows = [
         row
@@ -19,15 +21,20 @@ def permits_current_only(device_info: dict, matrix: dict) -> bool:
         if row.get("id") == "iphone-current"
     ]
     if len(current_rows) != 1:
-        return False
+        return None
 
     selected_major = selected.get("osMajor")
     current_major = current_rows[0].get("osMajor")
-    return (
+    permitted = (
         isinstance(selected_major, int)
         and isinstance(current_major, int)
         and selected_major > current_major
     )
+    return EXPLORATORY_HARDWARE_ID if permitted else None
+
+
+def permits_current_only(device_info: dict, matrix: dict) -> bool:
+    return evidence_hardware_id(device_info, matrix) is not None
 
 
 def main() -> int:
@@ -38,7 +45,11 @@ def main() -> int:
 
     device_info = json.loads(arguments.device_info.read_text())
     matrix = json.loads(arguments.matrix.read_text())
-    return 0 if permits_current_only(device_info, matrix) else 1
+    hardware_id = evidence_hardware_id(device_info, matrix)
+    if hardware_id is None:
+        return 1
+    print(hardware_id)
+    return 0
 
 
 if __name__ == "__main__":
