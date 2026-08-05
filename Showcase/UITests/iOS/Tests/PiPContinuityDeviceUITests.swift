@@ -187,8 +187,6 @@ final class PiPContinuityDeviceUITests: ShowcaseIOSTestCase {
       timeout: 15
     )
     waitForLabel(active, equals: "yes", timeout: 5)
-    reveal(staleSuccessorMutations, swiping: .up)
-    waitForLabel(staleSuccessorMutations, equals: "0", timeout: 5)
     waitForLabel(state, equals: "playing", timeout: 10)
     _ = waitForIntegerLabel(displayedPictures, greaterThan: 0, timeout: 5)
     _ = waitForIntegerLabel(playedAudioBuffers, greaterThan: 0, timeout: 5)
@@ -200,6 +198,11 @@ final class PiPContinuityDeviceUITests: ShowcaseIOSTestCase {
     app.activate()
     waitForLabel(active, equals: "yes", timeout: 10)
     waitForLabel(state, equals: "playing", timeout: 10)
+    _ = waitForReplacementMeasurement(
+      stream: expectedStream,
+      generation: generation.label,
+      timeout: 5
+    )
     return measurement
   }
 
@@ -221,8 +224,6 @@ final class PiPContinuityDeviceUITests: ShowcaseIOSTestCase {
       ),
       "PiP lifecycle was not ordered: \(lifecycleEvents.label)"
     )
-    reveal(staleSuccessorMutations, swiping: .up)
-    waitForLabel(staleSuccessorMutations, equals: "0", timeout: 5)
   }
 
   private func waitForLabelChange(
@@ -271,13 +272,19 @@ final class PiPContinuityDeviceUITests: ShowcaseIOSTestCase {
     )
     let components = replacementMeasurement.label.split(separator: ":")
     guard
-      components.count == 5,
+      components.count == 6,
       let video = Int(components[3]),
-      let audio = Int(components[4])
+      let audio = Int(components[4]),
+      let staleMutations = Int(components[5])
     else {
       XCTFail("Malformed replacement measurement: \(replacementMeasurement.label)")
       return ReplacementMeasurement(videoGapMilliseconds: Int.max, audioGapMilliseconds: Int.max)
     }
+    XCTAssertEqual(
+      staleMutations,
+      0,
+      "Retired playback generations mutated successor state"
+    )
     return ReplacementMeasurement(videoGapMilliseconds: video, audioGapMilliseconds: audio)
   }
 
@@ -392,12 +399,6 @@ final class PiPContinuityDeviceUITests: ShowcaseIOSTestCase {
   private var replacementMeasurement: XCUIElement {
     app.descendants(matching: .any)[
       AccessibilityID.PiPContinuityValidation.replacementMeasurementLabel
-    ]
-  }
-
-  private var staleSuccessorMutations: XCUIElement {
-    app.descendants(matching: .any)[
-      AccessibilityID.PiPContinuityValidation.staleSuccessorMutationsLabel
     ]
   }
 

@@ -128,7 +128,7 @@ struct MatrixScreenA: View {
         )
         valueRow(
           "Replacement measurement",
-          value: replacementMeasurement,
+          value: "\(replacementMeasurement):\(staleSuccessorMutations)",
           identifier: AccessibilityID.PiPContinuityValidation.replacementMeasurementLabel
         )
         valueRow(
