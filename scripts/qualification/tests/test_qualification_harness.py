@@ -315,7 +315,16 @@ class VolunteerReportTests(unittest.TestCase):
             )
             (run / "ui-suite-xcodebuild.log").write_text(
                 "Person's iPhone /Users/alice/project http://192.168.1.4:8000/file "
-                "http://[fd7d:5ea1:e53f::2]:9000/file\n"
+                "http://[fd7d:5ea1:e53f::2]:9000/file "
+                "org.swiftvlc.validation.wnwacjnfdx.app\n"
+            )
+            (run / "configure-signing.log").write_text(
+                "appBundleIdentifier=org.swiftvlc.validation.wnwacjnfdx.app\n"
+                "uiTestBundleIdentifier=org.swiftvlc.validation.wnwacjnfdx.uitests\n"
+            )
+            (run / "build.log").write_text(
+                "DEVELOPMENT_TEAM = WNWACJNFDX\n"
+                "bundle org.swiftvlc.validation.wnwacjnfdx.uitests.xctrunner\n"
             )
             evidence = run / "evidence"
             evidence.mkdir()
@@ -334,6 +343,12 @@ class VolunteerReportTests(unittest.TestCase):
                 log = archive.read(
                     "SwiftVLC-Device-Report/logs/ui-suite-xcodebuild.log"
                 ).decode()
+                build_log = archive.read(
+                    "SwiftVLC-Device-Report/logs/build.log"
+                ).decode()
+                signing_log = archive.read(
+                    "SwiftVLC-Device-Report/logs/configure-signing.log"
+                ).decode()
                 saved_evidence = json.loads(
                     archive.read("SwiftVLC-Device-Report/evidence/probe.json")
                 )
@@ -346,6 +361,9 @@ class VolunteerReportTests(unittest.TestCase):
             self.assertNotIn("alice", log)
             self.assertNotIn("192.168.1.4", log)
             self.assertNotIn("fd7d:5ea1:e53f", log)
+            self.assertNotIn("WNWACJNFDX", build_log)
+            self.assertNotIn("wnwacjnfdx", log)
+            self.assertNotIn("wnwacjnfdx", signing_log)
             self.assertEqual(saved_evidence["id"], "measurement-id")
             self.assertEqual(saved_evidence["name"], "continuity probe")
 

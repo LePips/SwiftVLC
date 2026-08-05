@@ -67,7 +67,7 @@ def sanitize_json(value: Any, secrets: set[str] | None = None) -> Any:
 def scrub_text(value: str, secrets: set[str] | None = None) -> str:
     for secret in sorted(secrets or set(), key=len, reverse=True):
         if secret:
-            value = value.replace(secret, "<redacted>")
+            value = re.sub(re.escape(secret), "<redacted>", value, flags=re.IGNORECASE)
     value = re.sub(r"/Users/[^/\s]+", "/Users/<redacted>", value)
     value = re.sub(r"file:///Users/[^/\s]+", "file:///Users/<redacted>", value)
     value = re.sub(r"/Volumes/[^/\s]+", "/Volumes/<redacted>", value)
@@ -100,6 +100,26 @@ def sensitive_values(device: Any) -> set[str]:
     elif isinstance(device, list):
         for value in device:
             values.update(sensitive_values(value))
+    return values
+
+
+def signing_values(run_dir: Path) -> set[str]:
+    """Collect developer-team and disposable bundle identifiers from build logs."""
+    values: set[str] = set()
+    for name in ("configure-signing.log", "build.log"):
+        path = run_dir / name
+        if not path.is_file():
+            continue
+        text = path.read_text(errors="replace")
+        values.update(
+            re.findall(r"DEVELOPMENT_TEAM(?:\s*=|=)\s*([A-Za-z0-9]{10})", text)
+        )
+        for identifier in re.findall(
+            r"^(?:appBundleIdentifier|uiTestBundleIdentifier)=([^\s]+)$",
+            text,
+            flags=re.MULTILINE,
+        ):
+            values.add(identifier)
     return values
 
 
@@ -304,7 +324,7 @@ def package(run_dir: Path, output: Path) -> Path:
         raise ValueError(f"run directory does not exist: {run_dir}")
     device_path = run_dir / "device.json"
     device = json.loads(device_path.read_text()) if device_path.is_file() else {}
-    secrets = sensitive_values(device)
+    secrets = sensitive_values(device) | signing_values(run_dir)
     scenarios, complete = read_scenarios(run_dir)
 
     output.parent.mkdir(parents=True, exist_ok=True)
