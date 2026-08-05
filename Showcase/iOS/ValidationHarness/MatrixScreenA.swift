@@ -151,6 +151,17 @@ struct MatrixScreenA: View {
       ResultRecorderSection(screenID: "matrix-a")
     }
     .showcaseFormStyle()
+    .overlay(alignment: .topLeading) {
+      Text("Automation snapshot")
+        .frame(width: 1, height: 1)
+        .clipped()
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(automationSnapshot)
+        .accessibilityIdentifier(
+          AccessibilityID.PiPContinuityValidation.automationSnapshot
+        )
+        .allowsHitTesting(false)
+    }
     .navigationTitle("(a) PiP survival")
     .toolbar {
       if LaunchArguments.isUITestMode {
@@ -284,6 +295,25 @@ struct MatrixScreenA: View {
     let seekable = snapshot.isSeekable ? "seekable" : "unseekable"
     let controls = snapshot.requiresLinearPlayback ? "linear" : "interactive"
     return "\(duration):\(seekable):\(controls)"
+  }
+
+  /// A fixed accessibility probe for device automation. SwiftUI Forms lazily
+  /// remove off-screen rows from the accessibility hierarchy, so qualification
+  /// must not use those rows as its state transport.
+  private var automationSnapshot: String {
+    [
+      "state=\(String(describing: player.state))",
+      "generation=\(player.playbackQualificationGeneration.description)",
+      "displayedPictures=\(player.statistics?.displayedPictures ?? 0)",
+      "playedAudioBuffers=\(player.statistics?.playedAudioBuffers ?? 0)",
+      "playbackSnapshot=\(playbackSnapshot)",
+      "nativePlaybackSnapshot=\(nativePlaybackSnapshot)",
+      "possible=\(pip?.isPossible == true ? "yes" : "no")",
+      "active=\(pip?.isActive == true ? "yes" : "no")",
+      "continuityEvents=\(continuityEvents.isEmpty ? "none" : continuityEvents.joined(separator: "|"))",
+      "lifecycleEvents=\(lifecycleEvents.isEmpty ? "none" : lifecycleEvents.joined(separator: "|"))",
+      "replacementMeasurement=\(replacementMeasurement):\(staleSuccessorMutations)"
+    ].joined(separator: "\n")
   }
 
   private var nativePlaybackSnapshot: String {

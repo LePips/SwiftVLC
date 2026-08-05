@@ -124,31 +124,33 @@ final class PiPContinuityDeviceUITests: ShowcaseIOSTestCase {
     let matrix = app.buttons["(a) PiP survival across load()"]
     XCTAssertTrue(matrix.waitForExistence(timeout: 5))
     matrix.tap()
+    XCTAssertTrue(automationSnapshot.waitForExistence(timeout: 5))
   }
 
   private func loadInitialVODAndStartPictureInPicture() {
     app.buttons[AccessibilityID.PiPContinuityValidation.loadVODButton].tap()
-    waitForLabel(state, equals: "playing", timeout: 20)
-    // iOS 27 lazily materializes Form rows below the initial phone viewport.
-    reveal(playbackSnapshot, swiping: .up)
-    waitForLabel(playbackSnapshot, equals: "finite:seekable:interactive", timeout: 15)
-    reveal(nativePlaybackSnapshot, swiping: .up)
+    waitForSnapshotValue("state", equals: "playing", timeout: 20)
+    waitForSnapshotValue(
+      "playbackSnapshot",
+      equals: "finite:seekable:interactive",
+      timeout: 15
+    )
     _ = waitForNativePlaybackSnapshot(
-      generation: generation.label,
+      generation: snapshotValue("generation"),
       expectsFiniteDuration: true,
       expectsSeekable: true,
       timeout: 15
     )
-    _ = waitForIntegerLabel(displayedPictures, greaterThan: 0, timeout: 10)
-    _ = waitForIntegerLabel(playedAudioBuffers, greaterThan: 0, timeout: 10)
-    waitForLabel(possible, equals: "yes", timeout: 15)
+    _ = waitForSnapshotInteger("displayedPictures", greaterThan: 0, timeout: 10)
+    _ = waitForSnapshotInteger("playedAudioBuffers", greaterThan: 0, timeout: 10)
+    waitForSnapshotValue("possible", equals: "yes", timeout: 15)
 
     let start = app.buttons["Start PiP"]
     reveal(start, swiping: .down)
     waitUntilEnabled(start, timeout: 20)
     start.tap()
-    waitForLabel(active, equals: "yes", timeout: 10)
-    waitForOccurrence("didStart", count: 1, in: lifecycleEvents, timeout: 10)
+    waitForSnapshotValue("active", equals: "yes", timeout: 10)
+    waitForSnapshotOccurrence("didStart", count: 1, in: "lifecycleEvents", timeout: 10)
   }
 
   private func transition(
@@ -157,50 +159,46 @@ final class PiPContinuityDeviceUITests: ShowcaseIOSTestCase {
     expectedSnapshot: String,
     expectedRestoredCount: Int
   ) -> ReplacementMeasurement {
-    let previousGeneration = generation.label
+    let previousGeneration = snapshotValue("generation")
     let button = app.buttons[buttonIdentifier]
-    reveal(button, swiping: .up)
     XCTAssertTrue(button.waitForExistence(timeout: 5))
     button.tap()
 
-    waitForLabelChange(generation, from: previousGeneration, timeout: 5)
-    // Re-materialize the policy row after the load. An off-screen Form row can
-    // retain its previous accessibility snapshot even though the controller
-    // and the on-screen generation have advanced.
-    reveal(playbackSnapshot, swiping: .up)
-    waitForLabel(playbackSnapshot, equals: expectedSnapshot, timeout: 15)
-    waitForOccurrence(
+    waitForSnapshotValueChange("generation", from: previousGeneration, timeout: 5)
+    waitForSnapshotValue("playbackSnapshot", equals: expectedSnapshot, timeout: 15)
+    waitForSnapshotOccurrence(
       "restored",
       count: expectedRestoredCount,
-      in: continuityEvents,
+      in: "continuityEvents",
       timeout: 15
     )
+    let generation = snapshotValue("generation")
     _ = waitForNativePlaybackSnapshot(
-      generation: generation.label,
+      generation: generation,
       expectsFiniteDuration: expectedSnapshot.hasPrefix("finite:"),
       expectsSeekable: expectedSnapshot.contains(":seekable:"),
       timeout: 15
     )
     let measurement = waitForReplacementMeasurement(
       stream: expectedStream,
-      generation: generation.label,
+      generation: generation,
       timeout: 15
     )
-    waitForLabel(active, equals: "yes", timeout: 5)
-    waitForLabel(state, equals: "playing", timeout: 10)
-    _ = waitForIntegerLabel(displayedPictures, greaterThan: 0, timeout: 5)
-    _ = waitForIntegerLabel(playedAudioBuffers, greaterThan: 0, timeout: 5)
+    waitForSnapshotValue("active", equals: "yes", timeout: 5)
+    waitForSnapshotValue("state", equals: "playing", timeout: 10)
+    _ = waitForSnapshotInteger("displayedPictures", greaterThan: 0, timeout: 5)
+    _ = waitForSnapshotInteger("playedAudioBuffers", greaterThan: 0, timeout: 5)
 
     XCUIDevice.shared.press(.home)
     if let failure = captureSystemPictureInPictureMotion() {
       XCTFail("\(expectedStream) replacement PiP motion failed: \(failure)")
     }
     app.activate()
-    waitForLabel(active, equals: "yes", timeout: 10)
-    waitForLabel(state, equals: "playing", timeout: 10)
+    waitForSnapshotValue("active", equals: "yes", timeout: 10)
+    waitForSnapshotValue("state", equals: "playing", timeout: 10)
     _ = waitForReplacementMeasurement(
       stream: expectedStream,
-      generation: generation.label,
+      generation: generation,
       timeout: 5
     )
     return measurement
@@ -212,47 +210,81 @@ final class PiPContinuityDeviceUITests: ShowcaseIOSTestCase {
     reveal(stop, swiping: .down)
     XCTAssertTrue(stop.waitForExistence(timeout: 5))
     stop.tap()
-    waitForLabel(active, equals: "no", timeout: 10)
-    // Stopping lives near the top of the Form, while lifecycle evidence lives
-    // in the lazily materialized measured-state section below it. Bring that
-    // row back into the hierarchy before querying it on iOS 27.
-    reveal(lifecycleEvents, swiping: .up)
-    waitForOccurrence("didStop:programmatic", count: 1, in: lifecycleEvents, timeout: 10)
+    waitForSnapshotValue("active", equals: "no", timeout: 10)
+    waitForSnapshotOccurrence(
+      "didStop:programmatic",
+      count: 1,
+      in: "lifecycleEvents",
+      timeout: 10
+    )
+    let lifecycleEvents = snapshotValue("lifecycleEvents")
     XCTAssertTrue(
-      lifecycleEvents.label.hasPrefix(
+      lifecycleEvents.hasPrefix(
         "willStart|didStart|willStop:programmatic|didStop:programmatic"
       ),
-      "PiP lifecycle was not ordered: \(lifecycleEvents.label)"
+      "PiP lifecycle was not ordered: \(lifecycleEvents)"
     )
   }
 
-  private func waitForLabelChange(
-    _ element: XCUIElement,
+  private func waitForSnapshotValueChange(
+    _ key: String,
     from previous: String,
     timeout: TimeInterval
   ) {
     let predicate = NSPredicate { _, _ in
-      element.exists && element.label != previous
+      self.snapshotValue(key) != previous
     }
     let expectation = expectation(for: predicate, evaluatedWith: NSObject())
     XCTAssertEqual(XCTWaiter.wait(for: [expectation], timeout: timeout), .completed)
   }
 
-  private func waitForOccurrence(
+  private func waitForSnapshotOccurrence(
     _ value: String,
     count: Int,
-    in element: XCUIElement,
+    in key: String,
     timeout: TimeInterval
   ) {
     let predicate = NSPredicate { _, _ in
-      element.label.split(separator: "|").filter { $0.contains(value) }.count >= count
+      self.snapshotValue(key).split(separator: "|").filter { $0.contains(value) }.count >= count
     }
     let expectation = expectation(for: predicate, evaluatedWith: NSObject())
     XCTAssertEqual(
       XCTWaiter.wait(for: [expectation], timeout: timeout),
       .completed,
-      "Expected \(count) \(value) event(s), got: \(element.label)"
+      "Expected \(count) \(value) event(s), got: \(snapshotValue(key))"
     )
+  }
+
+  private func waitForSnapshotValue(
+    _ key: String,
+    equals expected: String,
+    timeout: TimeInterval
+  ) {
+    let predicate = NSPredicate { _, _ in self.snapshotValue(key) == expected }
+    let expectation = expectation(for: predicate, evaluatedWith: NSObject())
+    XCTAssertEqual(
+      XCTWaiter.wait(for: [expectation], timeout: timeout),
+      .completed,
+      "Expected \(key)=\(expected), got: \(snapshotValue(key))"
+    )
+  }
+
+  @discardableResult
+  private func waitForSnapshotInteger(
+    _ key: String,
+    greaterThan minimum: Int,
+    timeout: TimeInterval
+  ) -> Int {
+    let predicate = NSPredicate { _, _ in
+      Int(self.snapshotValue(key)).map { $0 > minimum } ?? false
+    }
+    let expectation = expectation(for: predicate, evaluatedWith: NSObject())
+    XCTAssertEqual(
+      XCTWaiter.wait(for: [expectation], timeout: timeout),
+      .completed,
+      "Expected \(key) > \(minimum), got: \(snapshotValue(key))"
+    )
+    return Int(snapshotValue(key)) ?? Int.min
   }
 
   private func waitForReplacementMeasurement(
@@ -262,22 +294,23 @@ final class PiPContinuityDeviceUITests: ShowcaseIOSTestCase {
   ) -> ReplacementMeasurement {
     let prefix = "complete:\(stream):\(generation):"
     let predicate = NSPredicate { _, _ in
-      self.replacementMeasurement.label.hasPrefix(prefix)
+      self.snapshotValue("replacementMeasurement").hasPrefix(prefix)
     }
     let expectation = expectation(for: predicate, evaluatedWith: NSObject())
     XCTAssertEqual(
       XCTWaiter.wait(for: [expectation], timeout: timeout),
       .completed,
-      "No successor A/V measurement arrived: \(replacementMeasurement.label)"
+      "No successor A/V measurement arrived: \(snapshotValue("replacementMeasurement"))"
     )
-    let components = replacementMeasurement.label.split(separator: ":")
+    let value = snapshotValue("replacementMeasurement")
+    let components = value.split(separator: ":")
     guard
       components.count == 6,
       let video = Int(components[3]),
       let audio = Int(components[4]),
       let staleMutations = Int(components[5])
     else {
-      XCTFail("Malformed replacement measurement: \(replacementMeasurement.label)")
+      XCTFail("Malformed replacement measurement: \(value)")
       return ReplacementMeasurement(videoGapMilliseconds: Int.max, audioGapMilliseconds: Int.max)
     }
     XCTAssertEqual(
@@ -298,7 +331,9 @@ final class PiPContinuityDeviceUITests: ShowcaseIOSTestCase {
     let predicate = NSPredicate { _, _ in
       guard
         let expectedGeneration,
-        let snapshot = self.parseNativePlaybackSnapshot(self.nativePlaybackSnapshot.label)
+        let snapshot = self.parseNativePlaybackSnapshot(
+          self.snapshotValue("nativePlaybackSnapshot")
+        )
       else { return false }
       let durationMatches = expectsFiniteDuration
         ? snapshot.durationMilliseconds > 0
@@ -312,10 +347,11 @@ final class PiPContinuityDeviceUITests: ShowcaseIOSTestCase {
     XCTAssertEqual(
       XCTWaiter.wait(for: [expectation], timeout: timeout),
       .completed,
-      "Native playback snapshot did not converge: \(nativePlaybackSnapshot.label)"
+      "Native playback snapshot did not converge: \(snapshotValue("nativePlaybackSnapshot"))"
     )
-    guard let snapshot = parseNativePlaybackSnapshot(nativePlaybackSnapshot.label) else {
-      XCTFail("Malformed native playback snapshot: \(nativePlaybackSnapshot.label)")
+    let value = snapshotValue("nativePlaybackSnapshot")
+    guard let snapshot = parseNativePlaybackSnapshot(value) else {
+      XCTFail("Malformed native playback snapshot: \(value)")
       return NativePlaybackSnapshot(
         generation: -1,
         durationMilliseconds: -1,
@@ -344,66 +380,26 @@ final class PiPContinuityDeviceUITests: ShowcaseIOSTestCase {
     )
   }
 
-  private var state: XCUIElement {
-    app.descendants(matching: .any)[AccessibilityID.PiPContinuityValidation.stateLabel]
-  }
-
-  private var generation: XCUIElement {
-    app.descendants(matching: .any)[AccessibilityID.PiPContinuityValidation.generationLabel]
-  }
-
-  private var displayedPictures: XCUIElement {
+  private var automationSnapshot: XCUIElement {
     app.descendants(matching: .any)[
-      AccessibilityID.PiPContinuityValidation.displayedPicturesLabel
+      AccessibilityID.PiPContinuityValidation.automationSnapshot
     ]
   }
 
-  private var playedAudioBuffers: XCUIElement {
-    app.descendants(matching: .any)[
-      AccessibilityID.PiPContinuityValidation.playedAudioBuffersLabel
-    ]
-  }
-
-  private var possible: XCUIElement {
-    app.descendants(matching: .any)[AccessibilityID.PiPContinuityValidation.possibleLabel]
-  }
-
-  private var active: XCUIElement {
-    app.descendants(matching: .any)[AccessibilityID.PiPContinuityValidation.activeLabel]
-  }
-
-  private var playbackSnapshot: XCUIElement {
-    app.descendants(matching: .any)[
-      AccessibilityID.PiPContinuityValidation.playbackSnapshotLabel
-    ]
-  }
-
-  private var continuityEvents: XCUIElement {
-    app.descendants(matching: .any)[
-      AccessibilityID.PiPContinuityValidation.continuityEventsLabel
-    ]
-  }
-
-  private var nativePlaybackSnapshot: XCUIElement {
-    app.descendants(matching: .any)[
-      AccessibilityID.PiPContinuityValidation.nativePlaybackSnapshotLabel
-    ]
-  }
-
-  private var lifecycleEvents: XCUIElement {
-    app.descendants(matching: .any)[
-      AccessibilityID.PiPContinuityValidation.lifecycleEventsLabel
-    ]
-  }
-
-  private var replacementMeasurement: XCUIElement {
-    app.descendants(matching: .any)[
-      AccessibilityID.PiPContinuityValidation.replacementMeasurementLabel
-    ]
+  private func snapshotValue(_ key: String) -> String {
+    let prefix = "\(key)="
+    guard
+      let line = automationSnapshot.label.split(separator: "\n").first(where: {
+        $0.hasPrefix(prefix)
+      })
+    else { return "" }
+    return String(line.dropFirst(prefix.count))
   }
 
   private var restoredEventCount: Int {
-    continuityEvents.label.split(separator: "|").filter { $0.contains("restored") }.count
+    snapshotValue("continuityEvents").split(separator: "|").filter {
+      $0.contains("restored")
+    }.count
   }
 
   private enum ScrollDirection {
