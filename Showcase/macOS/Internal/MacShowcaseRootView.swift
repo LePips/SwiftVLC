@@ -414,7 +414,8 @@ extension MacShowcase {
          .pipLongStallValidation,
          .pipDismissalValidation,
          .pipInterruptionValidation,
-         .pipNativeLifecycleValidation:
+         .pipNativeLifecycleValidation,
+         .terminalOutcomesValidation:
       return nil
     }
   }

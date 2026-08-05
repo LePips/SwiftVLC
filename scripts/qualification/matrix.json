@@ -230,7 +230,7 @@
       "id": "terminal-outcomes",
       "issues": [85],
       "hardware": ["iphone-current"],
-      "summary": "EOF, stop, replacement, server close, malformed input, decode, renderer, and network failures produce one generation-scoped terminal outcome",
+      "summary": "EOF, stop, replacement, server close, malformed input, decode, renderer, output, and network failures produce one generation-scoped terminal outcome",
       "requiredEvidenceFields": [
         "cases",
         "finalTimelines",
@@ -241,7 +241,10 @@
         "failureClassifications.renderer",
         "failureClassifications.output",
         "maximumTerminalOutcomesPerGeneration",
-        "unattributedStopNaturalEndCount"
+        "unattributedStopNaturalEndCount",
+        "subscriberPayloadsIdentical",
+        "expectedFailureLogsPreserved",
+        "processIsolation"
       ],
       "expectedEvidenceValues": {
         "generationIsolation": true,
@@ -251,7 +254,10 @@
         "failureClassifications.renderer": "renderer",
         "failureClassifications.output": "output",
         "maximumTerminalOutcomesPerGeneration": 1,
-        "unattributedStopNaturalEndCount": 0
+        "unattributedStopNaturalEndCount": 0,
+        "subscriberPayloadsIdentical": true,
+        "expectedFailureLogsPreserved": true,
+        "processIsolation": "one-launch-per-transition"
       }
     },
     {

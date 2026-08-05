@@ -44,6 +44,12 @@ enum LaunchArguments {
   static let pipNativeLifecycleAction = "-UITestPiPNativeLifecycleAction"
   static let pipNativeLifecycleToken = "-UITestPiPNativeLifecycleToken"
 
+  /// Selects one isolated playback terminal transition. The physical-device
+  /// test launches a fresh process for every action so one terminal generation
+  /// cannot contaminate another case's evidence.
+  static let terminalOutcomeAction = "-UITestTerminalOutcomeAction"
+  static let terminalOutcomeToken = "-UITestTerminalOutcomeToken"
+
   /// Name of a showcase to deep-link to on launch (e.g. `"SimplePlayback"`).
   /// When unset, the showcase opens its normal navigation tree.
   static let route = "-UITestRoute"
@@ -99,6 +105,14 @@ enum LaunchArguments {
 
   static var pipNativeLifecycleTokenValue: String? {
     UserDefaults.standard.string(forKey: key(pipNativeLifecycleToken))
+  }
+
+  static var terminalOutcomeActionValue: String? {
+    UserDefaults.standard.string(forKey: key(terminalOutcomeAction))
+  }
+
+  static var terminalOutcomeTokenValue: String? {
+    UserDefaults.standard.string(forKey: key(terminalOutcomeToken))
   }
 
   static var routeValue: String? {
@@ -185,6 +199,7 @@ enum UITestRoute: String, CaseIterable {
   case pipDismissalValidation = "PiPDismissalValidation"
   case pipInterruptionValidation = "PiPInterruptionValidation"
   case pipNativeLifecycleValidation = "PiPNativeLifecycleValidation"
+  case terminalOutcomesValidation = "TerminalOutcomesValidation"
 
   static var current: UITestRoute? {
     LaunchArguments.routeValue.flatMap(UITestRoute.init(rawValue:))
