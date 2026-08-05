@@ -35,6 +35,7 @@ materialize_evidence = load_script("materialize-evidence.py")
 augment_allocation_trace = load_script("augment-allocation-trace.py")
 augment_performance_traces = load_script("augment-performance-traces.py")
 augment_native_subtitle_traces = load_script("augment-native-subtitle-traces.py")
+augment_timebase_evidence = load_script("augment-timebase-evidence.py")
 assemble_record = load_script("assemble-record.py")
 
 
@@ -1073,6 +1074,201 @@ class QualificationEvidenceTests(unittest.TestCase):
                 self.assertTrue((staged_trace / "data.bin").is_file())
                 self.assertTrue(staged_toc.is_file())
 
+    def test_augments_timebase_raw_capture_and_audio_trace(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            raw = root / "swiftvlc-timebase-attempt-vod.jsonl"
+            with raw.open("w") as output:
+                for index in range(7200):
+                    sample = {
+                        "kind": "sample",
+                        "clock": {
+                            "elapsedSeconds": index,
+                            "driftSeconds": 0.01,
+                            "requestedRate": (0.5, 1.0, 2.0)[index % 3],
+                        },
+                        "audio": {"playedBuffers": index},
+                        "frame": {
+                            "deliveredFrames": index,
+                            "playbackGeneration": 1,
+                            "presentedSeconds": index / 30,
+                            "decodedFrameMediaTimeSeconds": index / 30,
+                        },
+                    }
+                    output.write(json.dumps(sample) + "\n")
+                output.write(
+                    json.dumps(
+                        {
+                            "kind": "correction",
+                            "correction": {
+                                "sequence": 8,
+                                "reason": "steadyStateDrift",
+                                "driftSeconds": 0.02,
+                            },
+                        }
+                    )
+                    + "\n"
+                )
+                output.write(
+                    json.dumps(
+                        {
+                            "kind": "correction",
+                            "correction": {
+                                "sequence": 9,
+                                "reason": "playbackRateTransition",
+                                "driftSeconds": 0,
+                            },
+                        }
+                    )
+                    + "\n"
+                )
+            evidence_path = root / "evidence.json"
+            evidence_path.write_text(
+                json.dumps(
+                    {
+                        "scenario": "timebase-vod-soak",
+                        "durationSeconds": 7200,
+                        "corrections": [{"sequence": 8}, {"sequence": 9}],
+                        "driftBudget": {"maximumSeconds": 2.1},
+                        "correctionBudget": {"maximumSeconds": 2.1},
+                        "audioPresentationSeries": {
+                            "hostTraceStatus": "required-host-augmentation"
+                        },
+                        "rawCapture": {
+                            "fileName": raw.name,
+                            "sampleIntervalSeconds": 1,
+                        },
+                        "hostTraceRequirements": {},
+                    }
+                )
+            )
+            trace = root / "audio.trace"
+            trace.mkdir()
+            (trace / "data.bin").write_bytes(b"audio trace")
+            toc = root / "audio-toc.xml"
+            toc.write_text('<trace-toc><table schema="audio-io"/></trace-toc>')
+            digest_script = Path(__file__).resolve().parents[2] / "artifact-tree-digest.py"
+            augmented = augment_timebase_evidence.augment(
+                evidence_path, root, trace, toc, digest_script
+            )
+            self.assertEqual(augmented["rawCapture"]["sampleCount"], 7200)
+            self.assertEqual(augmented["rawCapture"]["firstCorrectionSequence"], 8)
+            self.assertEqual(
+                augmented["audioPresentationSeries"]["hostTrace"]["template"],
+                "Audio System Trace",
+            )
+            raw_record = augmented["rawCapture"]
+            trace_record = augmented["audioPresentationSeries"]["hostTrace"]
+            self.assertEqual(raw_record["digestAlgorithm"], "sha256")
+            self.assertTrue((evidence_path.parent / raw_record["runArtifact"]).is_file())
+            self.assertTrue((evidence_path.parent / trace_record["runArtifact"]).is_dir())
+            self.assertTrue(
+                (evidence_path.parent / trace_record["tableOfContents"]).is_file()
+            )
+            self.assertNotIn("hostTraceRequirements", augmented)
+
+    def test_timebase_route_enables_decoded_frame_clock_before_sampling(self):
+        source = (
+            ROOT.parent
+            / "Showcase"
+            / "iOS"
+            / "ValidationHarness"
+            / "TimebaseSoakValidationCase.swift"
+        ).read_text()
+        self.assertLess(
+            source.index("controller.enableFrameContentDiagnostics()"),
+            source.index("controller.timebaseDiagnosticSnapshot()"),
+        )
+
+    def test_rejects_gap_in_raw_timebase_corrections(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            raw = root / "capture.jsonl"
+            lines = [
+                {
+                    "kind": "sample",
+                    "clock": {
+                        "elapsedSeconds": 0,
+                        "requestedRate": 1,
+                        "driftSeconds": 0,
+                    },
+                    "audio": {"playedBuffers": 1},
+                    "frame": {"playbackGeneration": 1, "presentedSeconds": 1},
+                },
+                {"kind": "correction", "correction": {"sequence": 4}},
+                {"kind": "correction", "correction": {"sequence": 6}},
+            ]
+            raw.write_text("".join(json.dumps(line) + "\n" for line in lines))
+            with self.assertRaises(augment_timebase_evidence.TimebaseEvidenceError):
+                augment_timebase_evidence.raw_record(
+                    root,
+                    {"fileName": raw.name, "sampleIntervalSeconds": 1},
+                    1,
+                )
+
+    def test_rejects_raw_timebase_capture_without_drift_samples(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            raw = root / "capture.jsonl"
+            raw.write_text(
+                json.dumps(
+                    {
+                        "kind": "sample",
+                        "clock": {"elapsedSeconds": 0, "requestedRate": 1},
+                        "audio": {"playedBuffers": 1},
+                        "frame": {
+                            "playbackGeneration": 1,
+                            "presentedSeconds": 1,
+                        },
+                    }
+                )
+                + "\n"
+            )
+            with self.assertRaisesRegex(
+                augment_timebase_evidence.TimebaseEvidenceError,
+                "missing clock-drift samples",
+            ):
+                augment_timebase_evidence.raw_record(
+                    root,
+                    {"fileName": raw.name, "sampleIntervalSeconds": 1},
+                    1,
+                )
+
+    def test_rejects_duplicate_raw_timebase_timeline_samples(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            raw = root / "capture.jsonl"
+            sample = {
+                "kind": "sample",
+                "clock": {
+                    "elapsedSeconds": 0,
+                    "requestedRate": 1,
+                    "driftSeconds": 0,
+                },
+                "audio": {"playedBuffers": 1},
+                "frame": {"playbackGeneration": 1, "presentedSeconds": 1},
+            }
+            raw.write_text(json.dumps(sample) + "\n" + json.dumps(sample) + "\n")
+            with self.assertRaisesRegex(
+                augment_timebase_evidence.TimebaseEvidenceError,
+                "timeline is not strictly increasing",
+            ):
+                augment_timebase_evidence.raw_record(
+                    root,
+                    {"fileName": raw.name, "sampleIntervalSeconds": 1},
+                    2,
+                )
+
+    def test_rejects_mismatched_compact_timebase_correction_sequences(self):
+        with self.assertRaisesRegex(
+            augment_timebase_evidence.TimebaseEvidenceError,
+            "compact and raw correction sequences differ",
+        ):
+            augment_timebase_evidence.require_matching_correction_sequences(
+                [{"sequence": 8}, {"sequence": 10}],
+                [8, 9],
+            )
+
     def test_materializes_accepted_start_delayed_failure_evidence(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -1462,6 +1658,67 @@ class QualificationRecordAssemblyTests(unittest.TestCase):
                 "1.1.0", self.candidate, self.matrix, [report_path], output
             )
 
+    def test_assembles_digest_verified_timebase_trace_and_raw_capture(self):
+        scenario = "timebase-vod-soak"
+        self.matrix.write_text(
+            json.dumps(
+                {
+                    "scenarios": [{"id": scenario, "hardware": ["iphone"]}],
+                    "hardware": [
+                        {"id": "iphone", "deviceFamily": "iPhone", "osMajor": 26},
+                        {"id": "ipad", "deviceFamily": "iPad", "osMajor": 26},
+                    ],
+                }
+            )
+        )
+        self.matrix_checksum = hashlib.sha256(self.matrix.read_bytes()).hexdigest()
+        report_path = self.make_report("iphone")
+        report = json.loads(report_path.read_text())
+        report["qualificationRows"][0]["scenario"] = scenario
+        report_path.write_text(json.dumps(report))
+
+        evidence_path = report_path.parent / "evidence" / "seek.json"
+        evidence = json.loads(evidence_path.read_text())
+        evidence["scenario"] = scenario
+        artifact_directory = evidence_path.parent / "artifacts" / "timebase"
+        trace = artifact_directory / "audio.trace"
+        trace.mkdir(parents=True)
+        (trace / "data.bin").write_bytes(b"audio samples")
+        toc = artifact_directory / "audio-toc.xml"
+        toc.write_text('<trace-toc><table schema="audio"/></trace-toc>')
+        raw = artifact_directory / "capture.jsonl"
+        raw.write_text('{"kind":"sample"}\n')
+        evidence["audioPresentationSeries"] = {
+            "hostTrace": {
+                "runArtifact": "artifacts/timebase/audio.trace",
+                "tableOfContents": "artifacts/timebase/audio-toc.xml",
+                "treeDigestAlgorithm": "swiftvlc-tree-v1",
+                "treeDigest": assemble_record.tree_digest(trace),
+            }
+        }
+        evidence["rawCapture"] = {
+            "runArtifact": "artifacts/timebase/capture.jsonl",
+            "digestAlgorithm": "sha256",
+            "sha256": hashlib.sha256(raw.read_bytes()).hexdigest(),
+        }
+        evidence_path.write_text(json.dumps(evidence))
+
+        output = self.root / "qualification" / "1.1.0.json"
+        assemble_record.assemble(
+            "1.1.0", self.candidate, self.matrix, [report_path], output
+        )
+
+        retained = output.parent / "evidence" / "1.1.0" / "artifacts" / "timebase"
+        self.assertTrue((retained / "audio.trace" / "data.bin").is_file())
+        self.assertTrue((retained / "audio-toc.xml").is_file())
+        self.assertEqual((retained / "capture.jsonl").read_bytes(), raw.read_bytes())
+
+        raw.write_text("tampered\n")
+        with self.assertRaises(assemble_record.AssemblyError):
+            assemble_record.assemble(
+                "1.1.0", self.candidate, self.matrix, [report_path], output
+            )
+
     def test_rejects_exploratory_and_duplicate_rows(self):
         output = self.root / "qualification" / "1.1.0.json"
         with self.assertRaises(assemble_record.AssemblyError):
@@ -1762,6 +2019,32 @@ class FixtureServerTests(unittest.TestCase):
         connection.close()
         self.assertEqual(metrics["retryFailures"], 1)
         self.assertEqual(metrics["retryRecoveries"], 1)
+
+    def test_timebase_vod_is_four_hour_seekable_high_variant_timeline(self):
+        connection, response = self.request(
+            "/adaptive/timebase/timebase-vod-ts/master.m3u8"
+        )
+        master = response.read().decode()
+        connection.close()
+        self.assertEqual(master.count("#EXT-X-STREAM-INF:"), 1)
+        self.assertIn("RESOLUTION=640x360", master)
+        self.assertNotIn("RESOLUTION=320x180", master)
+
+        connection, response = self.request(
+            "/adaptive/timebase/timebase-vod-ts/high.m3u8"
+        )
+        playlist = response.read().decode()
+        connection.close()
+        segment_count = fixture_server.TIMEBASE_VOD_SECONDS // 2
+        self.assertEqual(playlist.count("#EXTINF:2.000,"), segment_count)
+        self.assertEqual(playlist.count("?sequence="), segment_count)
+        self.assertEqual(
+            playlist.count("#EXT-X-DISCONTINUITY\n"),
+            segment_count // 4 - 1,
+        )
+        self.assertIn("#EXT-X-PLAYLIST-TYPE:VOD", playlist)
+        self.assertIn("?sequence=7199", playlist)
+        self.assertTrue(playlist.rstrip().endswith("#EXT-X-ENDLIST"))
 
     def test_adaptive_variant_transitions_require_one_multivariant_master(self):
         for path in (

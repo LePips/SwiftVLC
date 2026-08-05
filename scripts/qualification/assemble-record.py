@@ -180,6 +180,27 @@ def retained_trace_artifacts(
     ]
 
 
+def retained_file_artifact(
+    evidence_path: Path, record: object, description: str
+) -> list[tuple[Path, Path, bool]]:
+    if not isinstance(record, dict):
+        raise AssemblyError(f"evidence {evidence_path} has malformed {description}")
+    if record.get("digestAlgorithm") != "sha256":
+        raise AssemblyError(
+            f"evidence {evidence_path} {description} has unsupported digest algorithm"
+        )
+    source, relative = safe_evidence_artifact_path(
+        evidence_path,
+        record.get("runArtifact"),
+        description,
+        directory=False,
+    )
+    digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    if digest != record.get("sha256"):
+        raise AssemblyError(f"evidence {evidence_path} {description} digest mismatch")
+    return [(source, relative, False)]
+
+
 def assemble(
     version: str,
     candidate_path: Path,
@@ -329,6 +350,26 @@ def assemble(
                             evidence_path, subtitle_trace, description
                         )
                     )
+            if key[0] in {"timebase-vod-soak", "timebase-live-soak"}:
+                audio = evidence.get("audioPresentationSeries")
+                if not isinstance(audio, dict):
+                    raise AssemblyError(
+                        f"evidence {evidence_path} has no timebase audio series"
+                    )
+                artifacts.extend(
+                    retained_trace_artifacts(
+                        evidence_path,
+                        audio.get("hostTrace"),
+                        "Audio System Trace",
+                    )
+                )
+                artifacts.extend(
+                    retained_file_artifact(
+                        evidence_path,
+                        evidence.get("rawCapture"),
+                        "raw timebase capture",
+                    )
+                )
             rows[key] = (row, evidence_path, artifacts)
 
     evidence_directory = output_path.parent / "evidence" / version

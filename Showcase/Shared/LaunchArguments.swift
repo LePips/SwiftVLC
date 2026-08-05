@@ -71,6 +71,13 @@ enum LaunchArguments {
   static let nativeSubtitleDuration = "-UITestNativeSubtitleDuration"
   static let nativeSubtitleToken = "-UITestNativeSubtitleToken"
 
+  /// Direct-PiP VOD/live clock soak configuration. The token binds fixture
+  /// requests and host traces to one candidate attempt.
+  static let timebaseSoakBaseURLBase64 = "-UITestTimebaseSoakBaseURLBase64"
+  static let timebaseSoakDuration = "-UITestTimebaseSoakDuration"
+  static let timebaseSoakMode = "-UITestTimebaseSoakMode"
+  static let timebaseSoakToken = "-UITestTimebaseSoakToken"
+
   /// Name of a showcase to deep-link to on launch (e.g. `"SimplePlayback"`).
   /// When unset, the showcase opens its normal navigation tree.
   static let route = "-UITestRoute"
@@ -176,6 +183,22 @@ enum LaunchArguments {
     UserDefaults.standard.string(forKey: key(nativeSubtitleToken))
   }
 
+  static var timebaseSoakBaseURLValue: URL? {
+    encodedArgumentURL(named: timebaseSoakBaseURLBase64)
+  }
+
+  static var timebaseSoakDurationValue: Int? {
+    UserDefaults.standard.string(forKey: key(timebaseSoakDuration)).flatMap(Int.init)
+  }
+
+  static var timebaseSoakModeValue: String? {
+    UserDefaults.standard.string(forKey: key(timebaseSoakMode))
+  }
+
+  static var timebaseSoakTokenValue: String? {
+    UserDefaults.standard.string(forKey: key(timebaseSoakToken))
+  }
+
   static var routeValue: String? {
     UserDefaults.standard.string(forKey: key(route))
   }
@@ -265,6 +288,7 @@ enum UITestRoute: String, CaseIterable {
   case pipRenderPerformanceValidation = "PiPRenderPerformanceValidation"
   case pipCadenceValidation = "PiPCadenceValidation"
   case nativeSubtitleMatrixValidation = "NativeSubtitleMatrixValidation"
+  case timebaseSoakValidation = "TimebaseSoakValidation"
 
   static var current: UITestRoute? {
     LaunchArguments.routeValue.flatMap(UITestRoute.init(rawValue:))

@@ -385,12 +385,14 @@
         "transitions",
         "avPlayerBaseline",
         "visibleSnapCount",
-        "monotonicityViolations"
+        "monotonicityViolations",
+        "postInterruptionAudioRecovery"
       ],
       "expectedEvidenceValues": {
         "rates": [0.5, 1, 2],
         "visibleSnapCount": 0,
-        "monotonicityViolations": 0
+        "monotonicityViolations": 0,
+        "postInterruptionAudioRecovery": "pass"
       }
     },
     {
@@ -410,12 +412,14 @@
         "transitions",
         "avPlayerBaseline",
         "visibleSnapCount",
-        "monotonicityViolations"
+        "monotonicityViolations",
+        "postInterruptionAudioRecovery"
       ],
       "expectedEvidenceValues": {
         "rates": [0.5, 1, 2],
         "visibleSnapCount": 0,
-        "monotonicityViolations": 0
+        "monotonicityViolations": 0,
+        "postInterruptionAudioRecovery": "pass"
       }
     },
     {

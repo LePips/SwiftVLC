@@ -664,6 +664,30 @@ extension Integration {
     }
 
     @Test
+    @MainActor
+    func `Decoded frame media clock is sampled only after qualification opts in`() async {
+      let player = Player(instance: TestInstance.makeAudioOnly())
+      let renderer = PixelBufferRenderer(displayLayer: AVSampleBufferDisplayLayer())
+      let context = PixelBufferRendererCallbackContext(
+        renderer: renderer,
+        nativePlayer: player.pointer
+      )
+      let retained = Unmanaged.passRetained(context)
+
+      #expect(context.qualificationMediaTimeSeconds == nil)
+      context.setQualificationTelemetryEnabled(true)
+      #expect(context.isQualificationTelemetryEnabled)
+      // libVLC initializes a fresh media-player clock at zero. Reaching that
+      // value proves the opted-in handle path samples the native player.
+      #expect(context.qualificationMediaTimeSeconds == 0)
+      context.nativePlayerHandleDidRelease(opaque: retained.toOpaque())
+      #expect(context.nativePlayerHandleReleasedForTesting)
+      #expect(context.qualificationMediaTimeSeconds == nil)
+
+      await player.shutdown()
+    }
+
+    @Test
     func `Retiring callback context releases opaque only after native handle ends`() throws {
       weak var weakContext: PixelBufferRendererCallbackContext?
       weak var weakRenderer: PixelBufferRenderer?

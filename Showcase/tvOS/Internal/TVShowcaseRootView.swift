@@ -527,7 +527,8 @@ extension TVShowcase {
          .adaptiveHLSSoakValidation,
          .pipRenderPerformanceValidation,
          .pipCadenceValidation,
-         .nativeSubtitleMatrixValidation:
+         .nativeSubtitleMatrixValidation,
+         .timebaseSoakValidation:
       return nil
     }
   }

@@ -79,6 +79,7 @@ final class DirectPiPVideoCallbackSlot {
     self.api = api
     let context = PixelBufferRendererCallbackContext(
       renderer: decodeRenderer,
+      nativePlayer: lifetime.pointer,
       playbackGeneration: playbackGeneration,
       voutGenerationCounter: voutGenerationCounter
     )
@@ -263,11 +264,16 @@ final class PixelBufferRendererCallbackContext: Sendable {
   private let state: Mutex<State>
   private let presentationCopyRequired: Atomic<Bool>
   private let qualificationTelemetryEnabled: Atomic<Bool>
+  /// Stored as bits because `OpaquePointer` is not `Sendable`. The enclosing
+  /// callback context is retained only until this exact native handle joins
+  /// vout teardown, so reconstructing it during an in-flight callback is safe.
+  private let nativePlayerAddress: UInt
   private let playbackGeneration: Mutex<UInt64>
   private let voutGenerationCounter: PixelBufferVoutGenerationCounter
 
   init(
     renderer: PixelBufferRenderer,
+    nativePlayer: OpaquePointer? = nil,
     playbackGeneration: UInt64 = 0,
     voutGenerationCounter: PixelBufferVoutGenerationCounter = PixelBufferVoutGenerationCounter()
   ) {
@@ -278,6 +284,7 @@ final class PixelBufferRendererCallbackContext: Sendable {
     qualificationTelemetryEnabled = Atomic(
       renderer.contentDiagnosticsEnabled.load(ordering: .acquiring)
     )
+    nativePlayerAddress = nativePlayer.map(UInt.init(bitPattern:)) ?? 0
     self.playbackGeneration = Mutex(playbackGeneration)
     self.voutGenerationCounter = voutGenerationCounter
   }
@@ -329,6 +336,17 @@ final class PixelBufferRendererCallbackContext: Sendable {
 
   var isQualificationTelemetryEnabled: Bool {
     qualificationTelemetryEnabled.load(ordering: .acquiring)
+  }
+
+  var qualificationMediaTimeSeconds: Double? {
+    guard
+      isQualificationTelemetryEnabled,
+      !state.withLock({ $0.nativePlayerHandleReleased }),
+      nativePlayerAddress != 0,
+      let nativePlayer = OpaquePointer(bitPattern: nativePlayerAddress)
+    else { return nil }
+    let milliseconds = libvlc_media_player_get_time(nativePlayer)
+    return milliseconds >= 0 ? Double(milliseconds) / 1000 : nil
   }
 
   func setPresentationCopyRequired(_ required: Bool) {
@@ -529,6 +547,10 @@ final class PixelBufferRendererVoutCallbackContext: @unchecked Sendable {
 
   var isPresentationCopyRequired: Bool {
     handleContext.isPresentationCopyRequired
+  }
+
+  var qualificationMediaTimeSeconds: Double? {
+    handleContext.qualificationMediaTimeSeconds
   }
 
   /// Pins one callback picture until display consumes it, a later lock
@@ -736,9 +758,15 @@ func pixelBufferDisplayCallback(
       $0.playbackGeneration == playbackGeneration
     }
     guard acceptsPlaybackGeneration else { return }
+    let decodedMediaTimeSeconds = context.qualificationMediaTimeSeconds
     renderer.state.withLock {
       $0.decodedFrameCount &+= 1
       $0.lastDecodedAt = .now
+    }
+    if let decodedMediaTimeSeconds {
+      renderer.state.withLock {
+        $0.lastDecodedFrameMediaTimeSeconds = decodedMediaTimeSeconds
+      }
     }
     guard let output = renderer.outputPixelBuffer(from: pb) else { return }
     let outputBuffer = output.buffer

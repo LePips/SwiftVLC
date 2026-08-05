@@ -139,6 +139,7 @@ extension UITestRoute {
     case .pipRenderPerformanceValidation: PiPRenderPerformanceValidationCase()
     case .pipCadenceValidation: PiPCadenceValidationCase()
     case .nativeSubtitleMatrixValidation: NativeSubtitleMatrixValidationCase()
+    case .timebaseSoakValidation: TimebaseSoakValidationCase()
     }
   }
 }
