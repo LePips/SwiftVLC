@@ -8,6 +8,8 @@
 #   ./scripts/setup-dev.sh                  # install release declared by Package.swift
 #   ./scripts/setup-dev.sh v0.3.0           # pin to a specific release tag
 #   ./scripts/setup-dev.sh --force          # always re-download, even if Vendor/ exists
+#   ./scripts/setup-dev.sh --artifact-only  # install/verify Vendor without editing sources
+#   ./scripts/setup-dev.sh --manifest-only  # use this checkout's pinned URL/checksum
 #   ./scripts/setup-dev.sh --skip-download  # only flip local references
 #                                             (useful after ./scripts/build-libvlc.sh)
 #
@@ -28,10 +30,14 @@ cd "$ROOT_DIR"
 VERSION=""
 FORCE=false
 SKIP_DOWNLOAD=false
+ARTIFACT_ONLY=false
+MANIFEST_ONLY=false
 
 for arg in "$@"; do
   case "$arg" in
     --force)         FORCE=true ;;
+    --artifact-only) ARTIFACT_ONLY=true ;;
+    --manifest-only) MANIFEST_ONLY=true ;;
     --skip-download) SKIP_DOWNLOAD=true ;;
     --help|-h)
       sed -n 's/^# \{0,1\}//p' "$0" | sed -n '/^Usage:/,/^$/p'
@@ -178,7 +184,13 @@ if [[ "$SKIP_DOWNLOAD" == true ]]; then
   fi
   echo "Keeping existing xcframework at $XCFW_DIR (--skip-download)."
 else
-  if [[ -n "$VERSION" ]]; then
+  if [[ "$MANIFEST_ONLY" == true ]]; then
+    if [[ -n "$VERSION" ]]; then
+      echo "Error: --manifest-only cannot be combined with an explicit version." >&2
+      exit 2
+    fi
+    artifact_info=$(python3 "$SCRIPT_DIR/release-artifact-info.py" Package.swift)
+  elif [[ -n "$VERSION" ]]; then
     artifact_info=$("$SCRIPT_DIR/resolve-release-artifact.sh" --tag "$VERSION")
   else
     artifact_info=$("$SCRIPT_DIR/resolve-release-artifact.sh")
@@ -230,13 +242,17 @@ PYEOF
   fi
 
   if [[ "$NEED_DOWNLOAD" == true ]]; then
-    require_gh
     mkdir -p Vendor
 
     echo "Downloading $ZIP_NAME from $RESOLVED_TAG..."
     rm -f "Vendor/$ZIP_NAME"
-    gh release download "$RESOLVED_TAG" \
-      --repo "$REPO" --pattern "$ZIP_NAME" --dir Vendor/
+    if [[ "$MANIFEST_ONLY" == true ]]; then
+      curl --fail --location --retry 3 --output "Vendor/$ZIP_NAME" "$RESOLVED_URL"
+    else
+      require_gh
+      gh release download "$RESOLVED_TAG" \
+        --repo "$REPO" --pattern "$ZIP_NAME" --dir Vendor/
+    fi
 
     downloaded_checksum=$(swift package compute-checksum "Vendor/$ZIP_NAME")
     if [[ "$downloaded_checksum" != "$RESOLVED_CHECKSUM" ]]; then
@@ -281,6 +297,11 @@ PYEOF
 fi
 
 # ── Flip Package.swift to local path ──────────────────────────────────────────
+
+if [[ "$ARTIFACT_ONLY" == true ]]; then
+  echo "Artifact is ready at $XCFW_DIR."
+  exit 0
+fi
 
 echo "Pointing Package.swift at $XCFW_DIR..."
 switch_package_to_local_path

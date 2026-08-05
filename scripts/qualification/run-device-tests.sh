@@ -15,6 +15,10 @@ REQUIRE_STABLE=false
 EXPLORATORY_CURRENT_ONLY=false
 EXPLORATORY_HARDWARE_ID=""
 SKIP_BUILD=false
+DEVELOPMENT_TEAM=""
+BUNDLE_ID_PREFIX=""
+APP_BUNDLE_ID="com.swiftvlc.showcase.ios"
+UI_TEST_BUNDLE_ID="com.swiftvlc.showcase.ios.uitests"
 ONLY_SCENARIOS=()
 ADAPTIVE_SOAK_SECONDS="${SWIFTVLC_ADAPTIVE_SOAK_SECONDS:-7200}"
 PIP_PERFORMANCE_SECONDS="${SWIFTVLC_PIP_PERFORMANCE_SECONDS:-900}"
@@ -58,6 +62,8 @@ Options:
                           Allow iphone-current-only lanes on a newer iPhone OS;
                           evidence remains exploratory and cannot qualify rows
   --skip-build            Reuse an existing signed runner in derived data
+  --development-team ID   Sign a disposable build with this Apple team
+  --bundle-id-prefix ID   Reverse-DNS prefix for disposable app identifiers
   -h, --help              Show this help
 
 Connecting, unlocking, trusting, and enabling Developer Mode are the only
@@ -130,10 +136,31 @@ while [[ $# -gt 0 ]]; do
     --require-stable) REQUIRE_STABLE=true; shift ;;
     --exploratory-current-only) EXPLORATORY_CURRENT_ONLY=true; shift ;;
     --skip-build) SKIP_BUILD=true; shift ;;
+    --development-team) DEVELOPMENT_TEAM="$2"; shift 2 ;;
+    --bundle-id-prefix) BUNDLE_ID_PREFIX="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Error: unknown option $1" >&2; usage >&2; exit 2 ;;
   esac
 done
+
+if [[ -n "$BUNDLE_ID_PREFIX" && -z "$DEVELOPMENT_TEAM" ]]; then
+  echo "Error: --bundle-id-prefix requires --development-team." >&2
+  exit 2
+fi
+if [[ -n "$DEVELOPMENT_TEAM" ]]; then
+  if [[ ! "$DEVELOPMENT_TEAM" =~ ^[A-Z0-9]{10}$ ]]; then
+    echo "Error: --development-team must be a 10-character Apple team identifier." >&2
+    exit 2
+  fi
+  if [[ -z "$BUNDLE_ID_PREFIX" ]]; then
+    normalized_team=$(printf '%s' "$DEVELOPMENT_TEAM" | tr '[:upper:]' '[:lower:]')
+    BUNDLE_ID_PREFIX="org.swiftvlc.validation.$normalized_team"
+  fi
+  APP_BUNDLE_ID="$BUNDLE_ID_PREFIX.app"
+  UI_TEST_BUNDLE_ID="$BUNDLE_ID_PREFIX.uitests"
+fi
+export SWIFTVLC_UI_TARGET_BUNDLE_ID="$APP_BUNDLE_ID"
+export SWIFTVLC_TEST_HOST_BUNDLE_ID="$UI_TEST_BUNDLE_ID.xctrunner"
 
 for command in curl git jq python3 shasum tar xcodebuild xcrun; do
   if ! command -v "$command" >/dev/null 2>&1; then
@@ -261,17 +288,29 @@ if [[ "$SKIP_BUILD" == false ]]; then
   ln -s "$ROOT_DIR/Vendor" "$BUILD_SOURCE_ROOT/Vendor"
   "$BUILD_SOURCE_ROOT/scripts/setup-dev.sh" --skip-download \
     > "$OUTPUT_DIR/setup-local-source.log"
-  xcodebuild build-for-testing \
-    -project "$BUILD_SOURCE_ROOT/Showcase/SwiftVLCShowcase.xcodeproj" \
-    -scheme iOS \
-    -configuration Release \
-    -destination 'generic/platform=iOS' \
-    -derivedDataPath "$DERIVED_DATA" \
-    SWIFTVLC_SOURCE_COMMIT="$BUILD_SOURCE_COMMIT" \
-    SWIFTVLC_RELEASE_SOURCE_DIGEST="$BUILD_SOURCE_DIGEST" \
-    SWIFTVLC_ARTIFACT_DIGEST="$BUILD_ARTIFACT_DIGEST" \
-    CODE_SIGNING_ALLOWED=YES \
-    > "$OUTPUT_DIR/build.log"
+  if [[ -n "$DEVELOPMENT_TEAM" ]]; then
+    python3 "$SCRIPT_DIR/configure-signing.py" \
+      "$BUILD_SOURCE_ROOT/Showcase/SwiftVLCShowcase.xcodeproj/project.pbxproj" \
+      --team "$DEVELOPMENT_TEAM" \
+      --bundle-prefix "$BUNDLE_ID_PREFIX" \
+      > "$OUTPUT_DIR/configure-signing.log"
+  fi
+  build_args=(
+    build-for-testing
+    -project "$BUILD_SOURCE_ROOT/Showcase/SwiftVLCShowcase.xcodeproj"
+    -scheme iOS
+    -configuration Release
+    -destination 'generic/platform=iOS'
+    -derivedDataPath "$DERIVED_DATA"
+    SWIFTVLC_SOURCE_COMMIT="$BUILD_SOURCE_COMMIT"
+    SWIFTVLC_RELEASE_SOURCE_DIGEST="$BUILD_SOURCE_DIGEST"
+    SWIFTVLC_ARTIFACT_DIGEST="$BUILD_ARTIFACT_DIGEST"
+    CODE_SIGNING_ALLOWED=YES
+  )
+  if [[ -n "$DEVELOPMENT_TEAM" ]]; then
+    build_args+=(DEVELOPMENT_TEAM="$DEVELOPMENT_TEAM" -allowProvisioningUpdates)
+  fi
+  xcodebuild "${build_args[@]}" > "$OUTPUT_DIR/build.log"
 fi
 
 RUNNER_APP="$DERIVED_DATA/Build/Products/Release-iphoneos/iOSUITests-Runner.app"
@@ -385,7 +424,7 @@ cp "$STREAMS_FILE" "$OUTPUT_DIR/streams.local.json"
 xcrun devicectl device copy to \
   --device "$DEVICE_UDID" \
   --domain-type appDataContainer \
-  --domain-identifier com.swiftvlc.showcase.ios \
+  --domain-identifier "$APP_BUNDLE_ID" \
   --source "$STREAMS_FILE" \
   --destination Documents/streams.local.json \
   > "$OUTPUT_DIR/stage-streams.log"
@@ -407,6 +446,7 @@ for scenario in "${ONLY_SCENARIOS[@]}"; do
     *) echo "Error: unknown scenario: $scenario" >&2; exit 2 ;;
   esac
 done
+REQUESTED_SCENARIOS=("${ONLY_SCENARIOS[@]}")
 
 device_matches_hardware_row() {
   local hardware_row="$1"
@@ -469,9 +509,57 @@ elif [[ "$SCENARIOS_WERE_EXPLICIT" == false ]]; then
   exclude_opt_in_current_scenarios
 fi
 
-RESULTS_TSV="$WORK_DIR/results.tsv"
+requested_scenarios_file="$WORK_DIR/requested-scenarios.txt"
+selected_scenarios_file="$WORK_DIR/selected-scenarios.txt"
+printf '%s\n' "${REQUESTED_SCENARIOS[@]}" > "$requested_scenarios_file"
+printf '%s\n' "${ONLY_SCENARIOS[@]}" > "$selected_scenarios_file"
+EXPLORATORY_HARDWARE_ID="$EXPLORATORY_HARDWARE_ID" python3 - \
+  "$OUTPUT_DIR/device.json" "$SCRIPT_DIR/matrix.json" \
+  "$requested_scenarios_file" "$selected_scenarios_file" \
+  "$OUTPUT_DIR/validation-plan.json" <<'PY'
+import json
+import os
+import sys
+
+device_path, matrix_path, requested_path, selected_path, output_path = sys.argv[1:]
+device_info = json.load(open(device_path))
+matrix = json.load(open(matrix_path))
+requested = [line.strip() for line in open(requested_path) if line.strip()]
+selected = [line.strip() for line in open(selected_path) if line.strip()]
+selected_set = set(selected)
+device = device_info["selected"]
+hardware = list(device.get("matchingHardwareRows", []))
+projected_hardware = os.environ.get("EXPLORATORY_HARDWARE_ID")
+matrix_hardware = hardware or (["iphone-current"] if projected_hardware else [])
+represented_rows = [
+    scenario["id"]
+    for scenario in matrix.get("scenarios", [])
+    if not scenario.get("hardware")
+    or set(scenario["hardware"]).intersection(matrix_hardware)
+]
+value = {
+    "formatVersion": 1,
+    "mode": device_info["mode"],
+    "qualificationEligibleEnvironment": device["qualificationEligible"],
+    "matrixHardwareRows": hardware,
+    "projectedHardwareRow": "iphone-current" if projected_hardware else None,
+    "matrixRowsRepresented": represented_rows,
+    "requestedScenarioDrivers": requested,
+    "selectedScenarioDrivers": selected,
+    "skippedScenarioDrivers": [
+        {"scenario": scenario, "reason": "not applicable to the selected hardware row"}
+        for scenario in requested
+        if scenario not in selected_set
+    ],
+}
+with open(output_path, "w") as output:
+    json.dump(value, output, indent=2, sort_keys=True)
+    output.write("\n")
+PY
+
+RESULTS_TSV="$OUTPUT_DIR/scenario-results.tsv"
 : > "$RESULTS_TSV"
-QUALIFICATION_ROWS="$WORK_DIR/qualification-rows.jsonl"
+QUALIFICATION_ROWS="$OUTPUT_DIR/qualification-rows.jsonl"
 : > "$QUALIFICATION_ROWS"
 
 export_trace_toc() {
@@ -1230,7 +1318,7 @@ PY
     xcrun devicectl device copy from \
       --device "$DEVICE_UDID" \
       --domain-type appDataContainer \
-      --domain-identifier com.swiftvlc.showcase.ios \
+      --domain-identifier "$APP_BUNDLE_ID" \
       --source Documents \
       --destination "$document_capture" \
       > "$OUTPUT_DIR/$scenario-pull-log.log" 2>&1
@@ -1276,7 +1364,7 @@ PY
     xcrun devicectl device copy from \
       --device "$DEVICE_UDID" \
       --domain-type appDataContainer \
-      --domain-identifier com.swiftvlc.showcase.ios \
+      --domain-identifier "$APP_BUNDLE_ID" \
       --source Documents \
       --destination "$document_capture" \
       > "$OUTPUT_DIR/$scenario-pull-log.log" 2>&1

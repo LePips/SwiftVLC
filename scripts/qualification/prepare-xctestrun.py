@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import plistlib
 from pathlib import Path
 
@@ -21,6 +22,8 @@ def transform(
     environment: dict[str, str],
     *,
     use_destination_artifacts: bool = True,
+    target_app_bundle_id: str = "com.swiftvlc.showcase.ios",
+    test_host_bundle_id: str = "com.swiftvlc.showcase.ios.uitests.xctrunner",
 ) -> dict:
     configurations = value.get("TestConfigurations", [])
     targets = [target for config in configurations for target in config.get("TestTargets", [])]
@@ -36,9 +39,9 @@ def transform(
             target.update(
                 {
                     "UseDestinationArtifacts": True,
-                    "TestHostBundleIdentifier": "com.swiftvlc.showcase.ios.uitests.xctrunner",
+                    "TestHostBundleIdentifier": test_host_bundle_id,
                     "TestBundleDestinationRelativePath": "__TESTHOST__/PlugIns/iOSUITests.xctest",
-                    "UITargetAppBundleIdentifier": "com.swiftvlc.showcase.ios",
+                    "UITargetAppBundleIdentifier": target_app_bundle_id,
                 }
             )
         testing_environment = target.setdefault("TestingEnvironmentVariables", {})
@@ -51,6 +54,19 @@ def main() -> None:
     parser.add_argument("input", type=Path)
     parser.add_argument("output", type=Path)
     parser.add_argument("--environment", action="append", default=[], metavar="KEY=VALUE")
+    parser.add_argument(
+        "--target-app-bundle-id",
+        default=os.environ.get(
+            "SWIFTVLC_UI_TARGET_BUNDLE_ID", "com.swiftvlc.showcase.ios"
+        ),
+    )
+    parser.add_argument(
+        "--test-host-bundle-id",
+        default=os.environ.get(
+            "SWIFTVLC_TEST_HOST_BUNDLE_ID",
+            "com.swiftvlc.showcase.ios.uitests.xctrunner",
+        ),
+    )
     parser.add_argument(
         "--preserve-product-paths",
         action="store_true",
@@ -80,6 +96,8 @@ def main() -> None:
         value,
         environment,
         use_destination_artifacts=not args.preserve_product_paths,
+        target_app_bundle_id=args.target_app_bundle_id,
+        test_host_bundle_id=args.test_host_bundle_id,
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with args.output.open("wb") as output:

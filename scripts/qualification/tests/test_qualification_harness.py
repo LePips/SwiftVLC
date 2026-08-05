@@ -11,6 +11,7 @@ import tempfile
 import threading
 import time
 import unittest
+import zipfile
 from pathlib import Path
 
 
@@ -30,6 +31,8 @@ device_info = load_script("device-info.py")
 exploratory_device_policy = load_script("exploratory-device-policy.py")
 fixture_server = load_script("fixture-server.py")
 prepare_xctestrun = load_script("prepare-xctestrun.py")
+configure_signing = load_script("configure-signing.py")
+package_volunteer_report = load_script("package-volunteer-report.py")
 verify_fixtures = load_script("verify-fixtures.py")
 candidate_metadata = load_script("candidate-metadata.py")
 materialize_evidence = load_script("materialize-evidence.py")
@@ -168,6 +171,159 @@ class XCTestrunTests(unittest.TestCase):
             "http://127.0.0.1/media.mp4",
         )
 
+    def test_destination_artifact_transform_accepts_disposable_bundle_ids(self):
+        transformed = prepare_xctestrun.transform(
+            self.ui_test_plan(),
+            {},
+            target_app_bundle_id="org.swiftvlc.validation.team.app",
+            test_host_bundle_id="org.swiftvlc.validation.team.uitests.xctrunner",
+        )
+        target = transformed["TestConfigurations"][0]["TestTargets"][0]
+        self.assertEqual(
+            target["UITargetAppBundleIdentifier"],
+            "org.swiftvlc.validation.team.app",
+        )
+        self.assertEqual(
+            target["TestHostBundleIdentifier"],
+            "org.swiftvlc.validation.team.uitests.xctrunner",
+        )
+
+
+class ConfigureSigningTests(unittest.TestCase):
+    project_text = """
+DEVELOPMENT_TEAM = MTAQ5K5D6P;
+DEVELOPMENT_TEAM = MTAQ5K5D6P;
+PRODUCT_BUNDLE_IDENTIFIER = com.swiftvlc.showcase.ios;
+PRODUCT_BUNDLE_IDENTIFIER = com.swiftvlc.showcase.ios;
+PRODUCT_BUNDLE_IDENTIFIER = com.swiftvlc.showcase.ios.uitests;
+PRODUCT_BUNDLE_IDENTIFIER = com.swiftvlc.showcase.ios.uitests;
+PRODUCT_BUNDLE_IDENTIFIER = com.swiftvlc.showcase.macos;
+"""
+
+    def test_configures_only_ios_signing_in_disposable_project(self):
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory) / "project.pbxproj"
+            project.write_text(self.project_text)
+            app_id, tests_id = configure_signing.configure(
+                project, "WNWACJNFDX", "org.swiftvlc.validation.wnwacjnfdx"
+            )
+            value = project.read_text()
+            self.assertEqual(app_id, "org.swiftvlc.validation.wnwacjnfdx.app")
+            self.assertEqual(tests_id, "org.swiftvlc.validation.wnwacjnfdx.uitests")
+            self.assertEqual(value.count("DEVELOPMENT_TEAM = WNWACJNFDX;"), 2)
+            self.assertIn("PRODUCT_BUNDLE_IDENTIFIER = com.swiftvlc.showcase.macos;", value)
+
+    def test_refuses_an_unexpected_project_shape(self):
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory) / "project.pbxproj"
+            project.write_text(self.project_text.replace("DEVELOPMENT_TEAM", "", 1))
+            with self.assertRaisesRegex(ValueError, "expected 2"):
+                configure_signing.configure(
+                    project, "WNWACJNFDX", "org.swiftvlc.validation.wnwacjnfdx"
+                )
+
+
+class VolunteerReportTests(unittest.TestCase):
+    def test_packages_incomplete_progress_and_scrubs_private_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run = root / "run"
+            run.mkdir()
+            (run / "device.json").write_text(
+                json.dumps(
+                    {
+                        "selected": {
+                            "id": "private-core-id",
+                            "udid": "private-udid",
+                            "ecid": 42,
+                            "name": "Person's iPhone",
+                            "marketingName": "iPhone 15 Pro",
+                            "productType": "iPhone16,1",
+                            "deviceFamily": "iPhone",
+                            "osVersion": "27.0",
+                            "osBuild": "24A5390f",
+                            "osReleaseType": "beta",
+                            "transport": "wired",
+                        }
+                    }
+                )
+            )
+            (run / "scenario-results.tsv").write_text(
+                "ui-suite\tpass\t0\t0\tcaptured\tnot-applicable\t30\n"
+            )
+            (run / "validation-plan.json").write_text(
+                json.dumps(
+                    {
+                        "selectedScenarioDrivers": [
+                            "ui-suite",
+                            "live-media",
+                            "hls-seek",
+                        ]
+                    }
+                )
+            )
+            (run / "ui-suite-xcodebuild.log").write_text(
+                "Person's iPhone /Users/alice/project http://192.168.1.4:8000/file\n"
+            )
+            evidence = run / "evidence"
+            evidence.mkdir()
+            (evidence / "probe.json").write_text(
+                json.dumps({"id": "measurement-id", "name": "continuity probe"})
+            )
+            output = root / "share.zip"
+
+            package_volunteer_report.package(run, output)
+
+            with zipfile.ZipFile(output) as archive:
+                summary = archive.read("SwiftVLC-Device-Report/SUMMARY.md").decode()
+                device = json.loads(
+                    archive.read("SwiftVLC-Device-Report/device.json")
+                )["selected"]
+                log = archive.read(
+                    "SwiftVLC-Device-Report/logs/ui-suite-xcodebuild.log"
+                ).decode()
+                saved_evidence = json.loads(
+                    archive.read("SwiftVLC-Device-Report/evidence/probe.json")
+                )
+            self.assertIn("INCOMPLETE / INTERRUPTED", summary)
+            self.assertIn("Unfinished scenario drivers: **2**", summary)
+            self.assertEqual(device["name"], "<redacted>")
+            self.assertEqual(device["id"], "<redacted>")
+            self.assertNotIn("udid", device)
+            self.assertNotIn("ecid", device)
+            self.assertNotIn("alice", log)
+            self.assertNotIn("192.168.1.4", log)
+            self.assertEqual(saved_evidence["id"], "measurement-id")
+            self.assertEqual(saved_evidence["name"], "continuity probe")
+
+    def test_complete_report_is_labelled_pass(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run = root / "run"
+            run.mkdir()
+            (run / "report.json").write_text(
+                json.dumps(
+                    {
+                        "result": "pass",
+                        "scenarios": [
+                            {
+                                "scenario": "analyzer",
+                                "result": "pass",
+                                "durationSeconds": 1,
+                                "libraryErrorCount": 0,
+                                "qualificationEvidence": "not-applicable",
+                            }
+                        ],
+                    }
+                )
+            )
+            output = root / "share.zip"
+            package_volunteer_report.package(run, output)
+            with zipfile.ZipFile(output) as archive:
+                summary = archive.read("SwiftVLC-Device-Report/SUMMARY.md").decode()
+            self.assertIn("Report state: **COMPLETE**", summary)
+            self.assertIn("Result: **PASS**", summary)
+
 
 class CandidateMetadataTests(unittest.TestCase):
     def test_metadata_is_bound_to_the_exact_candidate_digest(self):
@@ -293,6 +449,45 @@ class QualificationEvidenceTests(unittest.TestCase):
             self.assertEqual(evidence["releaseSourceDigest"], "b" * 64)
             self.assertEqual(evidence["hardware"], "iphone-current")
             self.assertEqual(evidence["seekResults"]["forward"], "pass")
+
+    def test_accepts_xcode_export_suffix_on_exact_attachment_stem(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.make_export(
+                root,
+                {"formatVersion": 1, "scenario": "long-stall"},
+                attachment_name=(
+                    "qualification-long-stall_0_"
+                    "90D1B11D-44AD-4F9A-832F-DC95D85F314B.json"
+                ),
+            )
+            evidence = materialize_evidence.materialize(
+                root,
+                "qualification-long-stall.json",
+                "long-stall",
+                "iphone-current",
+                "a" * 64,
+                "b" * 64,
+            )
+            self.assertEqual(evidence["scenario"], "long-stall")
+
+    def test_rejects_arbitrary_attachment_suffixes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.make_export(
+                root,
+                {"formatVersion": 1, "scenario": "long-stall"},
+                attachment_name="qualification-long-stall-copy.json",
+            )
+            with self.assertRaises(materialize_evidence.EvidenceError):
+                materialize_evidence.materialize(
+                    root,
+                    "qualification-long-stall.json",
+                    "long-stall",
+                    "iphone-current",
+                    "a" * 64,
+                    "b" * 64,
+                )
 
     def test_materializes_combined_live_media_backend_evidence(self):
         with tempfile.TemporaryDirectory() as temporary:

@@ -31,6 +31,43 @@ The original cross-device PiP rows apply the same rule to each control,
 lifecycle order, recovery path, and stop reason; a top-level `result: "pass"`
 cannot mask a failed pause, missing restoration, or unsuccessful recovery.
 
+### Community device validation: connect, run, upload
+
+Issue reporters do not need to inspect logs or manually record observations.
+Clone the requested SwiftVLC tag on a Mac with the current Xcode, connect one
+unlocked and trusted iPhone or iPad with Developer Mode enabled, then
+double-click **Validate SwiftVLC.command** at the repository root. A free Apple
+Personal Team is sufficient; the launcher detects the installed Apple
+Development identity and uses unique disposable bundle identifiers.
+
+The launcher preflights Xcode, signing, the physical device, its OS/build, and
+the pinned libVLC release artifact. After one confirmation it builds, installs,
+and runs every scenario applicable to that matrix row without further manual
+testing. This includes the broad UI suite, playback and PiP lifecycle, seeking,
+live/HLS, background audio, interruptions, failure/recovery, subtitles,
+cadence, performance, and long-duration soak coverage. A current-iPhone run can
+take roughly 8–10 hours; keep the Mac and device powered and connected.
+
+Whether the run passes, fails, or is interrupted, the launcher opens Finder on
+a single `SwiftVLC-Device-Report-*.zip`. Attach that ZIP to the issue. It
+contains a Markdown summary, machine-readable report and evidence JSON,
+candidate/source/artifact identity, fixture identity, relevant bounded logs,
+and SHA-256 checksums. The share archive removes device identifiers and names,
+local usernames, and fixture-server addresses and is capped below GitHub's
+25 MiB attachment limit. Full xcresults, traces, screenshots, and unabridged
+logs remain only in the adjacent `raw` directory on the tester's Mac.
+
+For scripted use, the same entry point is available as:
+
+```bash
+./Validate\ SwiftVLC.command --yes
+```
+
+Use `--team TEAM` only when more than one Apple Development team is installed,
+and `--device ID` only when more than one eligible physical device is attached.
+The report explicitly labels beta/unknown OS runs as exploratory; collecting a
+report does not by itself claim that an uncovered hardware row passed.
+
 ### Unattended physical-device lane
 
 Once a device is connected, unlocked, trusted, and has Developer Mode enabled,
