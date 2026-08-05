@@ -33,6 +33,7 @@ fixture_server = load_script("fixture-server.py")
 prepare_xctestrun = load_script("prepare-xctestrun.py")
 configure_signing = load_script("configure-signing.py")
 package_volunteer_report = load_script("package-volunteer-report.py")
+tunnel_host = load_script("tunnel-host.py")
 verify_fixtures = load_script("verify-fixtures.py")
 candidate_metadata = load_script("candidate-metadata.py")
 materialize_evidence = load_script("materialize-evidence.py")
@@ -77,6 +78,56 @@ class DeviceInfoTests(unittest.TestCase):
         self.assertTrue(normalized["connected"])
         self.assertTrue(normalized["qualificationEligible"])
         self.assertEqual(normalized["matchingHardwareRows"], ["iphone-current"])
+
+    def test_preserves_the_wired_coredevice_tunnel_address(self):
+        device = {
+            "identifier": "core-id",
+            "connectionProperties": {
+                "tunnelState": "connected",
+                "transportType": "wired",
+                "tunnelIPAddress": "fd7d:5ea1:e53f::1",
+            },
+            "deviceProperties": {
+                "ddiServicesAvailable": True,
+                "developerModeStatus": "enabled",
+                "osVersionNumber": "26.6",
+                "osBuildUpdate": "23G80",
+            },
+            "hardwareProperties": {
+                "reality": "physical",
+                "platform": "iOS",
+                "deviceType": "iPhone",
+            },
+        }
+        normalized = device_info.normalize(device, [])
+        self.assertEqual(normalized["tunnelIPAddress"], "fd7d:5ea1:e53f::1")
+
+
+class TunnelHostTests(unittest.TestCase):
+    def test_finds_the_mac_peer_in_the_device_tunnel_prefix(self):
+        value = tunnel_host.matching_host_address(
+            "fd7d:5ea1:e53f::1",
+            """
+utun4: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST>
+    inet6 fe80::d211:e5ff:fe08:e097%utun4 prefixlen 64
+    inet6 fd7d:5ea1:e53f::2 prefixlen 64
+en0: flags=8863<UP,BROADCAST,RUNNING>
+    inet6 fd00:dead:beef::2 prefixlen 64
+""",
+        )
+        self.assertEqual(value, "fd7d:5ea1:e53f::2")
+
+    def test_rejects_an_ambiguous_or_missing_peer(self):
+        with self.assertRaisesRegex(ValueError, "expected one"):
+            tunnel_host.matching_host_address("fd7d:5ea1:e53f::1", "")
+
+
+class FixtureServerAddressTests(unittest.TestCase):
+    def test_brackets_ipv6_hosts_in_fixture_urls(self):
+        self.assertEqual(
+            fixture_server.advertised_url("fd7d:5ea1:e53f::2", 8080),
+            "http://[fd7d:5ea1:e53f::2]:8080",
+        )
 
 
 class ExploratoryDevicePolicyTests(unittest.TestCase):
@@ -263,7 +314,8 @@ class VolunteerReportTests(unittest.TestCase):
                 )
             )
             (run / "ui-suite-xcodebuild.log").write_text(
-                "Person's iPhone /Users/alice/project http://192.168.1.4:8000/file\n"
+                "Person's iPhone /Users/alice/project http://192.168.1.4:8000/file "
+                "http://[fd7d:5ea1:e53f::2]:9000/file\n"
             )
             evidence = run / "evidence"
             evidence.mkdir()
@@ -293,6 +345,7 @@ class VolunteerReportTests(unittest.TestCase):
             self.assertNotIn("ecid", device)
             self.assertNotIn("alice", log)
             self.assertNotIn("192.168.1.4", log)
+            self.assertNotIn("fd7d:5ea1:e53f", log)
             self.assertEqual(saved_evidence["id"], "measurement-id")
             self.assertEqual(saved_evidence["name"], "continuity probe")
 

@@ -47,6 +47,9 @@ testing. This includes the broad UI suite, playback and PiP lifecycle, seeking,
 live/HLS, background audio, interruptions, failure/recovery, subtitles,
 cadence, performance, and long-duration soak coverage. A current-iPhone run can
 take roughly 8–10 hours; keep the Mac and device powered and connected.
+Fixture media is served over the paired CoreDevice IPv6 tunnel when available,
+so the Mac and device do not need to share Wi-Fi; the LAN path is only a
+fallback for older Xcode/device combinations.
 
 Whether the run passes, fails, or is interrupted, the launcher opens Finder on
 a single `SwiftVLC-Device-Report-*.zip`. Attach that ZIP to the issue. It

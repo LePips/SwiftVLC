@@ -88,6 +88,7 @@ def normalize(device: dict, hardware_rows: list[dict]) -> dict:
         "osBuild": properties.get("osBuildUpdate"),
         "osReleaseType": os_release_type,
         "transport": connection.get("transportType"),
+        "tunnelIPAddress": connection.get("tunnelIPAddress"),
         "connected": connected,
         "matchingHardwareRows": matching_rows,
         "qualificationEligible": connected and os_release_type == "stable" and bool(matching_rows),

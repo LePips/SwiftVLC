@@ -22,6 +22,7 @@ SENSITIVE_VALUE_KEYS = {
     "name",
     "serialnumber",
     "udid",
+    "tunnelipaddress",
 }
 REMOVED_KEYS = {
     "coredeviceidentifier",
@@ -29,6 +30,7 @@ REMOVED_KEYS = {
     "ecidhex",
     "serialnumber",
     "udid",
+    "tunnelipaddress",
 }
 JSON_FILES = (
     "report.json",
@@ -75,11 +77,16 @@ def scrub_text(value: str, secrets: set[str] | None = None) -> str:
         value,
     )
     value = re.sub(
-        r"https?://(?:127\.0\.0\.1|localhost|(?:\d{1,3}\.){3}\d{1,3})(?::\d+)?",
+        r"https?://(?:\[[0-9A-Fa-f:]+\]|127\.0\.0\.1|localhost|(?:\d{1,3}\.){3}\d{1,3})(?::\d+)?",
         "http://<fixture-server>",
         value,
     )
     value = re.sub(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", "<redacted-ip>", value)
+    value = re.sub(
+        r"(?<![0-9A-Fa-f:])(?:[0-9A-Fa-f]{1,4}:){2,}[0-9A-Fa-f:]{0,4}(?![0-9A-Fa-f:])",
+        "<redacted-ip>",
+        value,
+    )
     return value
 
 

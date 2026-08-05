@@ -225,6 +225,7 @@ fi
 
 DEVICE_UDID=$(jq -r '.selected.udid' "$OUTPUT_DIR/device.json")
 DEVICE_ECID=$(jq -r '.selected.ecidHex' "$OUTPUT_DIR/device.json")
+DEVICE_TUNNEL_IP=$(jq -r '.selected.tunnelIPAddress // empty' "$OUTPUT_DIR/device.json")
 RUN_MODE=$(jq -r '.mode' "$OUTPUT_DIR/device.json")
 echo "Selected $(jq -r '.selected.marketingName' "$OUTPUT_DIR/device.json") on $(jq -r '.selected.osVersion' "$OUTPUT_DIR/device.json") ($RUN_MODE)."
 
@@ -245,10 +246,25 @@ cp "$FIXTURES/manifest.json" "$OUTPUT_DIR/fixture-manifest.json"
 FIXTURE_MANIFEST_CHECKSUM=$(shasum -a 256 "$FIXTURES/manifest.json" | cut -d' ' -f1)
 
 READY_FILE="$WORK_DIR/server-ready.json"
-python3 "$SCRIPT_DIR/fixture-server.py" \
-  --root "$FIXTURES" \
-  --ready-file "$READY_FILE" \
-  --request-log "$OUTPUT_DIR/fixture-requests.jsonl" \
+fixture_server_args=(
+  --root "$FIXTURES"
+  --ready-file "$READY_FILE"
+  --request-log "$OUTPUT_DIR/fixture-requests.jsonl"
+)
+if [[ -n "$DEVICE_TUNNEL_IP" ]]; then
+  set +e
+  TUNNEL_HOST=$(python3 "$SCRIPT_DIR/tunnel-host.py" \
+    --device-address "$DEVICE_TUNNEL_IP" 2> "$OUTPUT_DIR/tunnel-host.log")
+  tunnel_status=$?
+  set -e
+  if [[ "$tunnel_status" -eq 0 ]]; then
+    fixture_server_args+=(--host :: --advertise-host "$TUNNEL_HOST")
+    echo "Using the wired CoreDevice tunnel for fixture delivery ($TUNNEL_HOST)."
+  else
+    echo "CoreDevice tunnel discovery failed; falling back to the LAN fixture address."
+  fi
+fi
+python3 "$SCRIPT_DIR/fixture-server.py" "${fixture_server_args[@]}" \
   > "$OUTPUT_DIR/fixture-server.log" 2>&1 &
 SERVER_PID=$!
 for _ in {1..100}; do
@@ -400,6 +416,29 @@ install_app() {
 
 install_app "$CANDIDATE_APP" > "$OUTPUT_DIR/install-candidate.log"
 install_app "$RUNNER_APP" > "$OUTPUT_DIR/install-runner.log"
+
+# A freshly installed xctrunner has no data container until its first launch.
+# Xcode 27 tries to place runtime profiles in that container before launching
+# the process, which otherwise fails with ContainerLookupErrorDomain or times
+# out enabling automation. Prime the exact signed runner without presenting UI,
+# then terminate the suspended process before XCTest owns it.
+RUNNER_PRIME_JSON="$WORK_DIR/runner-prime.json"
+xcrun devicectl device process launch \
+  --device "$DEVICE_UDID" \
+  --start-stopped \
+  --no-activate \
+  --json-output "$RUNNER_PRIME_JSON" \
+  "$UI_TEST_BUNDLE_ID.xctrunner" \
+  > "$OUTPUT_DIR/prime-runner.log"
+RUNNER_PRIME_PID=$(jq -r '.result.process.processIdentifier // empty' "$RUNNER_PRIME_JSON")
+if [[ -z "$RUNNER_PRIME_PID" ]]; then
+  echo "Error: the installed UI-test runner did not return a process identifier." >&2
+  exit 1
+fi
+xcrun devicectl device process terminate \
+  --device "$DEVICE_UDID" \
+  --pid "$RUNNER_PRIME_PID" \
+  >> "$OUTPUT_DIR/prime-runner.log"
 
 STREAMS_FILE="$WORK_DIR/streams.local.json"
 python3 - "$BASE_URL" "$STREAMS_FILE" <<'PY'
