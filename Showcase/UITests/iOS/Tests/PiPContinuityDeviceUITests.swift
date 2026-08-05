@@ -410,7 +410,13 @@ final class PiPContinuityDeviceUITests: ShowcaseIOSTestCase {
   }
 
   private func reveal(_ element: XCUIElement, swiping direction: ScrollDirection) {
-    for _ in 0..<8 where !element.isHittable {
+    for _ in 0..<8 {
+      // `isHittable` is not a safe existence probe: XCTest records a lookup
+      // failure when a lazy SwiftUI Form row has not been materialized yet.
+      // Scroll first until the query exists, then ask whether it is hittable.
+      if element.exists, element.isHittable {
+        return
+      }
       switch direction {
       case .up:
         app.swipeUp()
