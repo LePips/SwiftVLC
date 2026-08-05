@@ -107,6 +107,16 @@ library errors before emitting the combined `capability-convergence` row. The
 default run omits this lane on other hardware rows, and an explicit unsupported
 request fails before testing rather than producing evidence for an unknown row.
 
+The VOD-controls lane runs on every hardware row and exercises both native
+drawable and direct sample-buffer PiP with the real system window active.
+Play and pause enter through the backend-specific control bridge, forward and
+backward skips wait for their native landed outcome, and an absolute scrub
+must settle on the public timeline without stopping PiP. Each backend is then
+backgrounded and must show sustained system-PiP motion before a programmatic
+stop completes the ordered lifecycle. One combined `vod-controls` attachment
+is emitted only when every control passes on both backends with zero library
+errors or unexpected stops.
+
 The iPhone-current-only deferred-pause-rejection lane drives the exact AVKit
 playback command entry point while a qualification SPI changes only libVLC's
 native pause-capability answer. It proves a permanently unpausable input

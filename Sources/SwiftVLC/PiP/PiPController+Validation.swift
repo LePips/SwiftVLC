@@ -169,11 +169,39 @@ extension PiPController {
   /// locale-dependent system PiP control by its accessibility label.
   @_spi(Qualification)
   public func performQualificationSkip(bySeconds seconds: Double) async -> Bool {
+    let interval = CMTime(seconds: seconds, preferredTimescale: 1000)
+    if let nativeBackend {
+      guard let offset = Self.skipOffsetMilliseconds(interval) else { return false }
+      return await nativeBackend.mediaController.qualificationSeek(by: offset) == .settled
+    }
     let request = Self.performSkip(
       on: player,
-      by: CMTime(seconds: seconds, preferredTimescale: 1000)
+      by: interval
     )
     return await request.outcome == .settled
+  }
+
+  /// Exercises the backend-specific play/pause entry used by system PiP.
+  /// Native drawable PiP enters through libVLC's media-controller bridge;
+  /// direct sample-buffer PiP enters through AVKit's playback delegate.
+  @_spi(Qualification)
+  public func performQualificationSetPlaying(_ playing: Bool) -> Bool {
+    if let nativeBackend {
+      if playing {
+        nativeBackend.mediaController.play()
+      } else {
+        nativeBackend.mediaController.pause()
+      }
+      return true
+    } else {
+      guard
+        let avController = pipController,
+        let delegate = avController.contentSource?.sampleBufferPlaybackDelegate,
+        (delegate as AnyObject) === playbackDelegateProxy
+      else { return false }
+      delegate.pictureInPictureController(avController, setPlaying: playing)
+      return true
+    }
   }
 
   /// Issues a real direct-backend AVKit start request, then delivers a

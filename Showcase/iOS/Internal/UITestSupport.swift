@@ -129,6 +129,7 @@ extension UITestRoute {
     case .pipCapabilityValidation: PiPCapabilityValidationCase()
     case .pipDeferredPauseValidation: PiPDeferredPauseValidationCase()
     case .pipDelayedStartFailureValidation: PiPDelayedStartFailureValidationCase()
+    case .pipVODControlsValidation: PiPVODControlsValidationCase()
     }
   }
 }
