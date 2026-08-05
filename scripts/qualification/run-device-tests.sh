@@ -14,6 +14,7 @@ OUTPUT_ROOT="${SWIFTVLC_DEVICE_RESULTS:-$ROOT_DIR/.qualification-results}"
 REQUIRE_STABLE=false
 SKIP_BUILD=false
 ONLY_SCENARIOS=()
+ADAPTIVE_SOAK_SECONDS="${SWIFTVLC_ADAPTIVE_SOAK_SECONDS:-7200}"
 
 usage() {
   cat <<'EOF'
@@ -36,6 +37,8 @@ Options:
                           continuity, capability-convergence,
                           vod-controls, long-stall, failed-start, dismissal,
                           interruptions,
+                          native-lifecycle, terminal-outcomes,
+                          adaptive-hls-soak,
                           deferred-pause-rejection,
                           accepted-start-delayed-failure, hls-seek,
                           harness-regressions, ui-failures, thumbnail-preview
@@ -48,6 +51,17 @@ operator steps. A beta OS can run exploratory tests, but never qualifies a
 release row.
 EOF
 }
+
+case "$ADAPTIVE_SOAK_SECONDS" in
+  ''|*[!0-9]*)
+    echo "Error: SWIFTVLC_ADAPTIVE_SOAK_SECONDS must be a positive integer." >&2
+    exit 2
+    ;;
+esac
+if [[ "$ADAPTIVE_SOAK_SECONDS" -le 0 ]]; then
+  echo "Error: SWIFTVLC_ADAPTIVE_SOAK_SECONDS must be positive." >&2
+  exit 2
+fi
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -66,7 +80,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-for command in git jq python3 shasum tar xcodebuild xcrun; do
+for command in curl git jq python3 shasum tar xcodebuild xcrun; do
   if ! command -v "$command" >/dev/null 2>&1; then
     echo "Error: required command is unavailable: $command" >&2
     exit 1
@@ -78,8 +92,27 @@ OUTPUT_DIR="$OUTPUT_ROOT/$run_id"
 mkdir -p "$OUTPUT_DIR"
 WORK_DIR=$(mktemp -d "${TMPDIR:-/tmp}/swiftvlc-device-tests.XXXXXX")
 SERVER_PID=""
+ACTIVE_XCODEBUILD_PID=""
+ACTIVE_XCTRACE_PID=""
 
 cleanup() {
+  if [[ -n "$ACTIVE_XCTRACE_PID" ]] && kill -0 "$ACTIVE_XCTRACE_PID" 2>/dev/null; then
+    kill -INT "$ACTIVE_XCTRACE_PID" 2>/dev/null || true
+    for _ in {1..20}; do
+      if ! kill -0 "$ACTIVE_XCTRACE_PID" 2>/dev/null; then
+        break
+      fi
+      sleep 0.1
+    done
+    if kill -0 "$ACTIVE_XCTRACE_PID" 2>/dev/null; then
+      kill -KILL "$ACTIVE_XCTRACE_PID" 2>/dev/null || true
+    fi
+    wait "$ACTIVE_XCTRACE_PID" 2>/dev/null || true
+  fi
+  if [[ -n "$ACTIVE_XCODEBUILD_PID" ]] && kill -0 "$ACTIVE_XCODEBUILD_PID" 2>/dev/null; then
+    kill -TERM "$ACTIVE_XCODEBUILD_PID" 2>/dev/null || true
+    wait "$ACTIVE_XCODEBUILD_PID" 2>/dev/null || true
+  fi
   if [[ -n "$SERVER_PID" ]] && kill -0 "$SERVER_PID" 2>/dev/null; then
     kill "$SERVER_PID" 2>/dev/null || true
     wait "$SERVER_PID" 2>/dev/null || true
@@ -113,7 +146,10 @@ DEVICE_ECID=$(jq -r '.selected.ecidHex' "$OUTPUT_DIR/device.json")
 RUN_MODE=$(jq -r '.mode' "$OUTPUT_DIR/device.json")
 echo "Selected $(jq -r '.selected.marketingName' "$OUTPUT_DIR/device.json") on $(jq -r '.selected.osVersion' "$OUTPUT_DIR/device.json") ($RUN_MODE)."
 
-if [[ ! -f "$FIXTURES/manifest.json" || ! -f "$FIXTURES/unsupported-codec.mp4" ]]; then
+if [[ ! -f "$FIXTURES/manifest.json" \
+  || ! -f "$FIXTURES/unsupported-codec.mp4" \
+  || ! -f "$FIXTURES/hls/soak/ts/low/segment-000.ts" \
+  || ! -f "$FIXTURES/hls/soak/fmp4/high/init.mp4" ]]; then
   "$SCRIPT_DIR/generate-fixtures.sh" "$FIXTURES"
 fi
 python3 "$SCRIPT_DIR/verify-fixtures.py" "$FIXTURES" > /dev/null
@@ -238,6 +274,8 @@ python3 "$SCRIPT_DIR/prepare-xctestrun.py" "$XCTESTRUN" "$DESTINATION_XCTESTRUN"
   --environment SWIFTVLC_PIP_INTERRUPTION_DEVICE=YES \
   --environment SWIFTVLC_PIP_NATIVE_LIFECYCLE_DEVICE=YES \
   --environment SWIFTVLC_TERMINAL_OUTCOMES_DEVICE=YES \
+  --environment SWIFTVLC_ADAPTIVE_HLS_SOAK_DEVICE=YES \
+  --environment SWIFTVLC_ADAPTIVE_SOAK_SECONDS="$ADAPTIVE_SOAK_SECONDS" \
   --environment SWIFTVLC_PIP_DEFERRED_PAUSE_DEVICE=YES \
   --environment SWIFTVLC_PIP_DELAYED_START_FAILURE_DEVICE=YES \
   --environment SWIFTVLC_PIP_OVERLAY_DEVICE=YES \
@@ -291,7 +329,7 @@ xcrun devicectl device copy to \
   --destination Documents/streams.local.json \
   > "$OUTPUT_DIR/stage-streams.log"
 
-DEFAULT_SCENARIOS=(analyzer ui-suite harness-regressions live-media background-audio continuity capability-convergence vod-controls long-stall failed-start dismissal interruptions native-lifecycle terminal-outcomes deferred-pause-rejection accepted-start-delayed-failure hls-seek)
+DEFAULT_SCENARIOS=(analyzer ui-suite harness-regressions live-media background-audio continuity capability-convergence vod-controls long-stall failed-start dismissal interruptions native-lifecycle terminal-outcomes adaptive-hls-soak deferred-pause-rejection accepted-start-delayed-failure hls-seek)
 SCENARIOS_WERE_EXPLICIT=false
 if [[ ${#ONLY_SCENARIOS[@]} -eq 0 ]]; then
   ONLY_SCENARIOS=("${DEFAULT_SCENARIOS[@]}")
@@ -300,7 +338,7 @@ else
 fi
 for scenario in "${ONLY_SCENARIOS[@]}"; do
   case "$scenario" in
-    analyzer|ui-suite|native-live|direct-live|live-media|background-audio|continuity|capability-convergence|vod-controls|long-stall|failed-start|dismissal|interruptions|native-lifecycle|terminal-outcomes|deferred-pause-rejection|accepted-start-delayed-failure|hls-seek|harness-regressions|ui-failures|thumbnail-preview) ;;
+    analyzer|ui-suite|native-live|direct-live|live-media|background-audio|continuity|capability-convergence|vod-controls|long-stall|failed-start|dismissal|interruptions|native-lifecycle|terminal-outcomes|adaptive-hls-soak|deferred-pause-rejection|accepted-start-delayed-failure|hls-seek|harness-regressions|ui-failures|thumbnail-preview) ;;
     *) echo "Error: unknown scenario: $scenario" >&2; exit 2 ;;
   esac
 done
@@ -315,7 +353,7 @@ device_matches_hardware_row() {
 if ! device_matches_hardware_row "iphone-current"; then
   if [[ "$SCENARIOS_WERE_EXPLICIT" == true ]]; then
     for scenario in "${ONLY_SCENARIOS[@]}"; do
-      if [[ "$scenario" == "capability-convergence" || "$scenario" == "native-lifecycle" || "$scenario" == "terminal-outcomes" || "$scenario" == "deferred-pause-rejection" || "$scenario" == "accepted-start-delayed-failure" ]]; then
+      if [[ "$scenario" == "capability-convergence" || "$scenario" == "native-lifecycle" || "$scenario" == "terminal-outcomes" || "$scenario" == "adaptive-hls-soak" || "$scenario" == "deferred-pause-rejection" || "$scenario" == "accepted-start-delayed-failure" ]]; then
         echo "Error: $scenario requires the iphone-current hardware row." >&2
         exit 2
       fi
@@ -323,7 +361,7 @@ if ! device_matches_hardware_row "iphone-current"; then
   else
     FILTERED_SCENARIOS=()
     for scenario in "${ONLY_SCENARIOS[@]}"; do
-      if [[ "$scenario" != "capability-convergence" && "$scenario" != "native-lifecycle" && "$scenario" != "terminal-outcomes" && "$scenario" != "deferred-pause-rejection" && "$scenario" != "accepted-start-delayed-failure" ]]; then
+      if [[ "$scenario" != "capability-convergence" && "$scenario" != "native-lifecycle" && "$scenario" != "terminal-outcomes" && "$scenario" != "adaptive-hls-soak" && "$scenario" != "deferred-pause-rejection" && "$scenario" != "accepted-start-delayed-failure" ]]; then
         FILTERED_SCENARIOS+=("$scenario")
       fi
     done
@@ -456,6 +494,13 @@ run_scenario() {
       route="TerminalOutcomesValidation"
       selected_xctestrun="$DESTINATION_XCTESTRUN"
       ;;
+    adaptive-hls-soak)
+      test_identifiers=(
+        "iOSUITests/AdaptiveHLSSoakDeviceUITests/test_adaptiveHLSMatrixSoakRemainsBounded"
+      )
+      route="AdaptiveHLSSoakValidation"
+      selected_xctestrun="$DESTINATION_XCTESTRUN"
+      ;;
     deferred-pause-rejection)
       test_identifiers=(
         "iOSUITests/PiPDeferredPauseDeviceUITests/test_deferredPauseRejectionAndCancellationStayTruthful"
@@ -517,6 +562,8 @@ run_scenario() {
       --environment SWIFTVLC_PIP_INTERRUPTION_DEVICE=YES \
       --environment SWIFTVLC_PIP_NATIVE_LIFECYCLE_DEVICE=YES \
       --environment SWIFTVLC_TERMINAL_OUTCOMES_DEVICE=YES \
+      --environment SWIFTVLC_ADAPTIVE_HLS_SOAK_DEVICE=YES \
+      --environment SWIFTVLC_ADAPTIVE_SOAK_SECONDS="$ADAPTIVE_SOAK_SECONDS" \
       --environment SWIFTVLC_PIP_DEFERRED_PAUSE_DEVICE=YES \
       --environment SWIFTVLC_PIP_DELAYED_START_FAILURE_DEVICE=YES \
       --environment SWIFTVLC_PIP_OVERLAY_DEVICE=YES \
@@ -532,6 +579,9 @@ run_scenario() {
   fi
 
   local started ended test_status result error_count log_status evidence_status
+  local allocation_trace_status="not-applicable"
+  local allocation_trace=""
+  local allocation_trace_toc=""
   local xcodebuild_log="$OUTPUT_DIR/$scenario-xcodebuild.log"
   local result_bundle="$OUTPUT_DIR/$scenario.xcresult"
   local test_selection_args=()
@@ -550,6 +600,7 @@ run_scenario() {
       -skip-testing:iOSUITests/PiPInterruptionDeviceUITests
       -skip-testing:iOSUITests/PiPNativeLifecycleDeviceUITests
       -skip-testing:iOSUITests/TerminalOutcomesDeviceUITests
+      -skip-testing:iOSUITests/AdaptiveHLSSoakDeviceUITests
       -skip-testing:iOSUITests/PiPDeferredPauseDeviceUITests
       -skip-testing:iOSUITests/PiPDelayedStartFailureDeviceUITests
       -skip-testing:iOSUITests/PiPOverlayDeviceUITests
@@ -564,26 +615,149 @@ run_scenario() {
     attempt_log="$OUTPUT_DIR/$scenario-xcodebuild-attempt$attempt.log"
     attempt_bundle="$OUTPUT_DIR/$scenario-attempt$attempt.xcresult"
     attempt_xctestrun="$selected_xctestrun"
+    local attempt_token=""
     if [[ "$scenario" != "analyzer" ]]; then
       final_log_prefix="$run_id-$scenario-attempt$attempt"
       attempt_xctestrun="$WORK_DIR/destination-$scenario-attempt$attempt.xctestrun"
-      python3 "$SCRIPT_DIR/prepare-xctestrun.py" \
-        "$selected_xctestrun" "$attempt_xctestrun" \
-        --environment SWIFTVLC_DEVICE_LOG_PREFIX="$final_log_prefix"
+      if [[ "$scenario" == "adaptive-hls-soak" ]]; then
+        attempt_token="$run_id-adaptive-$attempt"
+        python3 "$SCRIPT_DIR/prepare-xctestrun.py" \
+          "$selected_xctestrun" "$attempt_xctestrun" \
+          --environment SWIFTVLC_DEVICE_LOG_PREFIX="$final_log_prefix" \
+          --environment SWIFTVLC_ADAPTIVE_SOAK_TOKEN="$attempt_token"
+      else
+        python3 "$SCRIPT_DIR/prepare-xctestrun.py" \
+          "$selected_xctestrun" "$attempt_xctestrun" \
+          --environment SWIFTVLC_DEVICE_LOG_PREFIX="$final_log_prefix"
+      fi
       cp "$attempt_xctestrun" \
         "$OUTPUT_DIR/destination-$scenario-attempt$attempt.xctestrun"
     fi
+    if [[ "$scenario" == "adaptive-hls-soak" ]]; then
+      allocation_trace_status="missing"
+      allocation_trace="$OUTPUT_DIR/$scenario-allocations-attempt$attempt.trace"
+      allocation_trace_toc="$OUTPUT_DIR/$scenario-allocations-attempt$attempt-toc.xml"
+    fi
     set +e
-    xcodebuild test-without-building \
-      -xctestrun "$attempt_xctestrun" \
-      -destination "platform=iOS,id=$DEVICE_UDID" \
-      -collect-test-diagnostics never \
-      "${test_selection_args[@]}" \
-      -resultBundlePath "$attempt_bundle" \
-      > "$attempt_log" 2>&1
-    test_status=$?
+    if [[ "$scenario" == "adaptive-hls-soak" ]]; then
+      xcodebuild test-without-building \
+        -xctestrun "$attempt_xctestrun" \
+        -destination "platform=iOS,id=$DEVICE_UDID" \
+        -collect-test-diagnostics never \
+        -test-timeouts-enabled YES \
+        -default-test-execution-time-allowance "$((ADAPTIVE_SOAK_SECONDS + 300))" \
+        -maximum-test-execution-time-allowance "$((ADAPTIVE_SOAK_SECONDS + 300))" \
+        "${test_selection_args[@]}" \
+        -resultBundlePath "$attempt_bundle" \
+        > "$attempt_log" 2>&1 &
+      local xcodebuild_pid=$!
+      ACTIVE_XCODEBUILD_PID="$xcodebuild_pid"
+      local xctrace_pid=""
+      local trace_exited_early=false
+      for _ in {1..300}; do
+        if ! kill -0 "$xcodebuild_pid" 2>/dev/null; then
+          break
+        fi
+        if curl -fsS "$BASE_URL/adaptive/$attempt_token/metrics" 2>/dev/null \
+            | jq -e '.masterRequests > 0' >/dev/null 2>&1; then
+          xcrun xctrace record --quiet \
+            --template Allocations \
+            --device "$DEVICE_UDID" \
+            --attach iOS \
+            --time-limit "$((ADAPTIVE_SOAK_SECONDS + 300))s" \
+            --window 15m \
+            --output "$allocation_trace" \
+            --no-prompt \
+            > "$OUTPUT_DIR/$scenario-xctrace-attempt$attempt.log" 2>&1 &
+          xctrace_pid=$!
+          ACTIVE_XCTRACE_PID="$xctrace_pid"
+          break
+        fi
+        sleep 0.2
+      done
+      if [[ -n "$xctrace_pid" ]]; then
+        while kill -0 "$xcodebuild_pid" 2>/dev/null; do
+          if ! kill -0 "$xctrace_pid" 2>/dev/null; then
+            if curl -fsS "$BASE_URL/adaptive/$attempt_token/metrics" 2>/dev/null \
+                | jq -e '.clientCompleted == true' >/dev/null 2>&1; then
+              break
+            fi
+            trace_exited_early=true
+            echo "Error: allocation trace exited before the soak completed." >> "$attempt_log"
+            kill -TERM "$xcodebuild_pid" 2>/dev/null
+            break
+          fi
+          sleep 1
+        done
+      fi
+      wait "$xcodebuild_pid"
+      test_status=$?
+      ACTIVE_XCODEBUILD_PID=""
+      if [[ -n "$xctrace_pid" ]]; then
+        if kill -0 "$xctrace_pid" 2>/dev/null; then
+          kill -INT "$xctrace_pid" 2>/dev/null
+        fi
+        for _ in {1..100}; do
+          if ! kill -0 "$xctrace_pid" 2>/dev/null; then
+            break
+          fi
+          sleep 0.1
+        done
+        if kill -0 "$xctrace_pid" 2>/dev/null; then
+          kill -TERM "$xctrace_pid" 2>/dev/null
+        fi
+        for _ in {1..50}; do
+          if ! kill -0 "$xctrace_pid" 2>/dev/null; then
+            break
+          fi
+          sleep 0.1
+        done
+        if kill -0 "$xctrace_pid" 2>/dev/null; then
+          kill -KILL "$xctrace_pid" 2>/dev/null
+        fi
+        wait "$xctrace_pid" 2>/dev/null
+        ACTIVE_XCTRACE_PID=""
+      fi
+      if [[ "$trace_exited_early" == false ]] && [[ -d "$allocation_trace" ]]; then
+        python3 - "$allocation_trace" "$allocation_trace_toc" \
+            > "$OUTPUT_DIR/$scenario-xctrace-export-attempt$attempt.log" 2>&1 <<'PY'
+import subprocess
+import sys
+
+try:
+    result = subprocess.run(
+        [
+            "xcrun", "xctrace", "export", "--quiet",
+            "--input", sys.argv[1], "--toc", "--output", sys.argv[2],
+        ],
+        timeout=120,
+    )
+except subprocess.TimeoutExpired:
+    raise SystemExit(124)
+raise SystemExit(result.returncode)
+PY
+        local trace_export_status=$?
+        if [[ "$trace_export_status" -eq 0 ]] \
+          && [[ -s "$allocation_trace_toc" ]] \
+          && grep -qiE 'allocation|vm-tracker' "$allocation_trace_toc"; then
+          allocation_trace_status="captured"
+        fi
+      fi
+    else
+      xcodebuild test-without-building \
+        -xctestrun "$attempt_xctestrun" \
+        -destination "platform=iOS,id=$DEVICE_UDID" \
+        -collect-test-diagnostics never \
+        "${test_selection_args[@]}" \
+        -resultBundlePath "$attempt_bundle" \
+        > "$attempt_log" 2>&1
+      test_status=$?
+    fi
     set -e
     if [[ "$test_status" -eq 0 ]]; then
+      break
+    fi
+    if [[ "$scenario" == "adaptive-hls-soak" ]] && [[ "$trace_exited_early" == true ]]; then
       break
     fi
     if [[ "$attempt" -eq 3 ]] || ! grep -qE "$retryable_pattern" "$attempt_log"; then
@@ -694,12 +868,13 @@ PY
     fi
   fi
 
-  # This scenario deliberately drives six terminal engine failures. Preserve
-  # their raw error-level logs and report the count, but let the typed outcome
-  # assertions decide whether they are the expected failures. Every other
-  # scenario retains the strict zero-error gate.
+  # Terminal outcomes deliberately drives engine failures, while the adaptive
+  # soak deliberately injects recoverable HTTP failures. Preserve their raw
+  # logs, but let their typed assertions reject sanitizer signatures,
+  # unbounded recovery, or incorrect attribution. Other scenarios retain the
+  # strict zero-error gate.
   local log_errors_acceptable=false
-  if [[ "$error_count" -eq 0 || "$scenario" == "terminal-outcomes" ]]; then
+  if [[ "$error_count" -eq 0 || "$scenario" == "terminal-outcomes" || "$scenario" == "adaptive-hls-soak" ]]; then
     log_errors_acceptable=true
   fi
 
@@ -764,6 +939,10 @@ PY
       qualification_scenarios=("terminal-outcomes")
       qualification_attachments=("qualification-terminal-outcomes.json")
       ;;
+    adaptive-hls-soak)
+      qualification_scenarios=("adaptive-hls-soak")
+      qualification_attachments=("qualification-adaptive-hls-soak.json")
+      ;;
     deferred-pause-rejection)
       qualification_scenarios=("deferred-pause-rejection")
       qualification_attachments=("qualification-deferred-pause-rejection.json")
@@ -776,6 +955,7 @@ PY
   if [[ ${#qualification_scenarios[@]} -gt 0 ]]; then
     evidence_status="missing"
     if [[ "$test_status" -eq 0 ]] && [[ "$log_errors_acceptable" == true ]] \
+      && [[ "$allocation_trace_status" != "missing" ]] \
       && [[ "$log_status" == "captured" ]] && [[ -d "$result_bundle" ]]; then
       local attachments="$OUTPUT_DIR/$scenario-attachments"
       local hardware_id evidence_file evidence_relative export_status materialize_status
@@ -813,6 +993,25 @@ PY
           if [[ "$materialize_status" -ne 0 ]]; then
             continue
           fi
+          if [[ "$scenario" == "adaptive-hls-soak" ]]; then
+            set +e
+            python3 "$SCRIPT_DIR/augment-allocation-trace.py" \
+              --evidence "$evidence_file" \
+              --trace "$allocation_trace" \
+              --toc "$allocation_trace_toc" \
+              --digest-script "$ROOT_DIR/scripts/artifact-tree-digest.py"
+            local augment_trace_status=$?
+            set -e
+            if [[ "$augment_trace_status" -ne 0 ]]; then
+              continue
+            fi
+            if ! jq -e '
+                .durationSeconds
+                | type == "number" and . > 0 and floor == .
+              ' "$evidence_file" >/dev/null; then
+              continue
+            fi
+          fi
           materialized_count=$((materialized_count + 1))
           materialized_scenarios+=("$qualification_scenario")
           materialized_evidence+=("$evidence_relative")
@@ -820,10 +1019,15 @@ PY
         if [[ "$materialized_count" -eq "${#qualification_scenarios[@]}" ]]; then
           evidence_status="captured"
           for evidence_index in "${!materialized_scenarios[@]}"; do
+            local qualification_duration="$((ended - started))"
+            if [[ "${materialized_scenarios[$evidence_index]}" == "adaptive-hls-soak" ]]; then
+              qualification_duration=$(jq -r '.durationSeconds' \
+                "$OUTPUT_DIR/${materialized_evidence[$evidence_index]}")
+            fi
             python3 - \
                 "$OUTPUT_DIR/device.json" "$QUALIFICATION_ROWS" \
                 "${materialized_evidence[$evidence_index]}" \
-                "$FIXTURE_MANIFEST_CHECKSUM" "$((ended - started))" \
+                "$FIXTURE_MANIFEST_CHECKSUM" "$qualification_duration" \
                 "${materialized_scenarios[$evidence_index]}" <<'PY'
 import json
 import sys
@@ -856,6 +1060,7 @@ PY
 
   result="pass"
   if [[ "$test_status" -ne 0 ]] || [[ "$log_errors_acceptable" != true ]] || [[ "$log_status" == "missing" ]] \
+    || [[ "$allocation_trace_status" == "missing" ]] \
     || [[ "$evidence_status" == "missing" ]]; then
     result="fail"
   fi

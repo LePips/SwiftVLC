@@ -62,7 +62,8 @@ engine artifact.
 The command identifies the physical device and OS release type, generates and
 serves deterministic local media, installs the exact signed candidate and UI
 test runner, executes the analyzer, general UI stress suite, native/direct live
-PiP, same-player continuity, capability convergence, and HLS seek lanes, then
+PiP, same-player continuity, capability convergence, terminal outcomes, the
+adaptive HLS soak, and HLS seek lanes, then
 pulls app logs and writes a machine-readable `report.json`. It retains every
 attempt log and xcresult,
 records and verifies candidate metadata that binds the app tree digest to its
@@ -195,18 +196,36 @@ hardware identity fields that the test process is forbidden to provide. The
 matching row appears under `qualificationRows` in `report.json`; beta-OS rows
 remain exploratory and are rejected by `check-qualification.sh`.
 
+The `adaptive-hls-soak` lane defaults to 7,200 seconds and runs only on the
+`iphone-current` row. Its local origin constructs VOD, event, and sliding-live
+playlists from deterministic low/high TS and fragmented-MP4 representations.
+It injects discontinuities and one-shot HTTP failures, advances live windows,
+and records successful retry, representation-transition, segment, and playlist
+telemetry under a unique run token. The candidate cycles every mode without an
+operator, samples Mach resident memory and Darwin malloc-zone totals every 30
+seconds, and the host attaches Instruments' Allocations template with a rolling
+15-minute stack-provenance window once the unique run token proves the exact
+candidate has begun playback. The trace tree digest and table of contents are
+added by the host to the candidate-bound evidence; inability to capture or
+export that trace fails the row. The app scans native diagnostics for sanitizer signatures and fails on a
+20-second unbounded recovery or more than 128 MiB final resident growth. The
+attachment explicitly records whether ASan instrumentation was present; a zero
+finding never pretends that a normal signed device build was ASan-instrumented.
+`SWIFTVLC_ADAPTIVE_SOAK_SECONDS` may shorten an exploratory harness run, but
+the matrix rejects any row shorter than 7,200 seconds.
+
 Use `--require-stable` for release evidence. It fails before testing if the
 device is a simulator, runs beta or unknown software, or does not match a
 hardware row in `matrix.json`. Without that option, the same command is useful
 for exploratory beta-OS testing, but its report remains ineligible for release.
 
 This lane is intentionally fail-closed: its current automated scenarios are a
-candidate smoke/regression subset, not a claim that all 53 qualification rows
+candidate qualification subset, not a claim that all 53 qualification rows
 passed. `report.json` therefore keeps `releaseGateSatisfied` false until a
 matrix runner has produced the complete candidate-bound records described
-below. Long soaks, performance captures, interruption/route-change coverage,
-subtitle-format coverage, and every required hardware/OS row must still be
-represented by automated evidence before the stable gate can open.
+below. Remaining performance captures, subtitle-format coverage, timebase and
+cadence soaks, and every required hardware/OS row must still be represented by
+automated evidence before the stable gate can open.
 
 Qualification is bound to both halves of the shipped package. The
 XCFramework tree digest identifies the native engine and headers, while the

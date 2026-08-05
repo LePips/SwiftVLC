@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Deterministic HTTP media server with loop, stall, and disconnect endpoints."""
+"""Deterministic HTTP media server with media faults and adaptive HLS telemetry."""
 
 from __future__ import annotations
 
@@ -96,6 +96,71 @@ class FixtureHandler(BaseHTTPRequestHandler):
                 )
                 return
 
+            match = re.fullmatch(r"/adaptive/([A-Za-z0-9._-]+)/metrics", route)
+            if match:
+                payload = json.dumps(
+                    self.server.adaptive_metrics(match.group(1)), sort_keys=True
+                ).encode()
+                transferred = self._serve_bytes(payload, "application/json")
+                return
+
+            match = re.fullmatch(r"/adaptive/([A-Za-z0-9._-]+)/complete", route)
+            if match:
+                payload = json.dumps(
+                    self.server.complete_adaptive_run(match.group(1)), sort_keys=True
+                ).encode()
+                transferred = self._serve_bytes(payload, "application/json")
+                return
+
+            match = re.fullmatch(
+                r"/adaptive/([A-Za-z0-9._-]+)/([a-z0-9-]+)/master\.m3u8",
+                route,
+            )
+            if match:
+                payload = self.server.adaptive_master(
+                    match.group(1), match.group(2)
+                ).encode()
+                transferred = self._serve_bytes(
+                    payload, "application/vnd.apple.mpegurl"
+                )
+                return
+
+            match = re.fullmatch(
+                r"/adaptive/([A-Za-z0-9._-]+)/([a-z0-9-]+)/(low|high)\.m3u8",
+                route,
+            )
+            if match:
+                payload = self.server.adaptive_media_playlist(
+                    match.group(1), match.group(2), match.group(3)
+                ).encode()
+                transferred = self._serve_bytes(
+                    payload, "application/vnd.apple.mpegurl"
+                )
+                return
+
+            match = re.fullmatch(
+                r"/adaptive/([A-Za-z0-9._-]+)/([a-z0-9-]+)/(low|high)/([A-Za-z0-9._-]+)",
+                route,
+            )
+            if match:
+                token, mode, variant, filename = match.groups()
+                container = self.server.adaptive_container(mode)
+                if self.server.should_fail_adaptive_asset(
+                    token, mode, variant, filename
+                ):
+                    status = HTTPStatus.SERVICE_UNAVAILABLE
+                    self.response_status = status
+                    self.send_error(status, "deterministic adaptive retry")
+                    return
+                path = self._safe_path(
+                    f"hls/soak/{container}/{variant}/{filename}"
+                )
+                transferred = self._serve_file(path)
+                self.server.record_adaptive_asset(
+                    token, mode, variant, filename, recovered=True
+                )
+                return
+
             match = re.fullmatch(r"/live/(.+)", route)
             if match:
                 transferred = self._serve_loop(self._safe_path(match.group(1)))
@@ -164,6 +229,16 @@ class FixtureHandler(BaseHTTPRequestHandler):
         if not candidate.is_file():
             raise FileNotFoundError(candidate)
         return candidate
+
+    def _serve_bytes(self, payload: bytes, content_type: str) -> int:
+        self.response_status = HTTPStatus.OK
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+        return len(payload)
 
     def _serve_loop(
         self,
@@ -301,6 +376,218 @@ class FixtureHTTPServer(ThreadingHTTPServer):
         self._stall_triggered_at: dict[str, float] = {}
         self._close_lock = threading.Lock()
         self._close_generations: dict[str, int] = {}
+        self._adaptive_lock = threading.Lock()
+        self._adaptive_runs: dict[str, dict] = {}
+        self._adaptive_started_at: dict[tuple[str, str, str], float] = {}
+        self._adaptive_retry_failures: set[tuple[str, str, str, str]] = set()
+
+    @staticmethod
+    def adaptive_container(mode: str) -> str:
+        if mode in {"event-fmp4", "live-fmp4", "abr-high-fmp4"}:
+            return "fmp4"
+        if mode in {
+            "vod-ts",
+            "live-ts",
+            "retry-ts",
+            "abr-ts",
+            "abr-low-ts",
+        }:
+            return "ts"
+        raise ValueError(f"unsupported adaptive mode: {mode}")
+
+    @staticmethod
+    def adaptive_playlist_type(mode: str) -> str:
+        if mode == "event-fmp4":
+            return "event"
+        if mode in {"live-ts", "live-fmp4", "retry-ts", "abr-ts"}:
+            return "live"
+        return "vod"
+
+    def _adaptive_state(self, token: str) -> dict:
+        return self._adaptive_runs.setdefault(
+            token,
+            {
+                "masterRequests": 0,
+                "mediaPlaylistRequests": 0,
+                "segmentRequests": 0,
+                "successfulSegments": 0,
+                "retryFailures": 0,
+                "retryRecoveries": 0,
+                "expiredWindows": 0,
+                "discontinuityManifests": 0,
+                "variantTransitions": 0,
+                "lastVariantByMode": {},
+                "clientCompleted": False,
+                "playlistTypes": set(),
+                "containers": set(),
+                "variants": set(),
+                "modes": set(),
+                "maxMediaSequenceByMode": {},
+            },
+        )
+
+    def adaptive_master(self, token: str, mode: str) -> str:
+        container = self.adaptive_container(mode)
+        playlist_type = self.adaptive_playlist_type(mode)
+        variants = ["low", "high"]
+        if mode == "abr-low-ts":
+            variants = ["low"]
+        elif mode == "abr-high-fmp4":
+            variants = ["high"]
+        with self._adaptive_lock:
+            state = self._adaptive_state(token)
+            state["masterRequests"] += 1
+            state["playlistTypes"].add(playlist_type)
+            state["containers"].add(container)
+            state["modes"].add(mode)
+        lines = ["#EXTM3U", "#EXT-X-VERSION:7"]
+        records = {
+            "low": (300_000, "320x180"),
+            "high": (1_200_000, "640x360"),
+        }
+        for variant in variants:
+            bandwidth, resolution = records[variant]
+            lines.extend(
+                [
+                    f'#EXT-X-STREAM-INF:BANDWIDTH={bandwidth},AVERAGE-BANDWIDTH={bandwidth},RESOLUTION={resolution},CODECS="avc1.42c01e,mp4a.40.2"',
+                    f"{variant}.m3u8",
+                ]
+            )
+        return "\n".join(lines) + "\n"
+
+    def adaptive_media_playlist(self, token: str, mode: str, variant: str) -> str:
+        container = self.adaptive_container(mode)
+        playlist_type = self.adaptive_playlist_type(mode)
+        directory = self.root / "hls" / "soak" / container / variant
+        suffix = ".ts" if container == "ts" else ".m4s"
+        segments = sorted(directory.glob(f"segment-*{suffix}"))
+        if len(segments) < 4:
+            raise FileNotFoundError(f"insufficient adaptive segments in {directory}")
+
+        key = (token, mode, variant)
+        now = time.monotonic()
+        with self._adaptive_lock:
+            started = self._adaptive_started_at.setdefault(key, now)
+            state = self._adaptive_state(token)
+            state["mediaPlaylistRequests"] += 1
+            state["playlistTypes"].add(playlist_type)
+            state["containers"].add(container)
+            state["variants"].add(variant)
+            state["modes"].add(mode)
+
+        is_live = playlist_type == "live"
+        media_sequence = int((now - started) / 2) if is_live else 0
+        if is_live:
+            window_count = min(6, len(segments))
+            indices = range(media_sequence, media_sequence + window_count)
+        else:
+            indices = range(len(segments))
+
+        discontinuity = playlist_type == "event" or is_live
+        lines = [
+            "#EXTM3U",
+            "#EXT-X-VERSION:7" if container == "fmp4" else "#EXT-X-VERSION:3",
+            "#EXT-X-TARGETDURATION:2",
+            f"#EXT-X-MEDIA-SEQUENCE:{media_sequence}",
+        ]
+        if playlist_type == "vod":
+            lines.append("#EXT-X-PLAYLIST-TYPE:VOD")
+        elif playlist_type == "event":
+            lines.append("#EXT-X-PLAYLIST-TYPE:EVENT")
+        if container == "fmp4":
+            lines.append(f'#EXT-X-MAP:URI="{variant}/init.mp4"')
+
+        midpoint = max(1, len(segments) // 2)
+        if is_live:
+            discontinuities_before_window = 0
+            if media_sequence > midpoint:
+                discontinuities_before_window = (
+                    1 + (media_sequence - 1 - midpoint) // len(segments)
+                )
+            lines.append(
+                f"#EXT-X-DISCONTINUITY-SEQUENCE:{discontinuities_before_window}"
+            )
+        for offset, sequence in enumerate(indices):
+            should_discontinue = (
+                playlist_type == "event" and offset == midpoint
+            ) or (is_live and sequence % len(segments) == midpoint)
+            if should_discontinue:
+                lines.append("#EXT-X-DISCONTINUITY")
+            segment = segments[sequence % len(segments)]
+            uri = f"{variant}/{segment.name}"
+            if is_live:
+                uri += f"?sequence={sequence}"
+            lines.extend(["#EXTINF:2.000,", uri])
+        if not is_live:
+            lines.append("#EXT-X-ENDLIST")
+
+        with self._adaptive_lock:
+            state = self._adaptive_state(token)
+            previous = state["maxMediaSequenceByMode"].get(mode, -1)
+            if media_sequence > previous:
+                if previous >= 0:
+                    state["expiredWindows"] += media_sequence - previous
+                state["maxMediaSequenceByMode"][mode] = media_sequence
+            if discontinuity:
+                state["discontinuityManifests"] += 1
+        return "\n".join(lines) + "\n"
+
+    def should_fail_adaptive_asset(
+        self, token: str, mode: str, variant: str, filename: str
+    ) -> bool:
+        if mode != "retry-ts" or filename == "init.mp4":
+            return False
+        key = (token, mode, variant, filename)
+        with self._adaptive_lock:
+            state = self._adaptive_state(token)
+            state["segmentRequests"] += 1
+            state["variants"].add(variant)
+            self._record_adaptive_variant(state, mode, variant)
+            if key not in self._adaptive_retry_failures:
+                self._adaptive_retry_failures.add(key)
+                state["retryFailures"] += 1
+                return True
+        return False
+
+    def record_adaptive_asset(
+        self, token: str, mode: str, variant: str, filename: str, recovered: bool
+    ) -> None:
+        with self._adaptive_lock:
+            state = self._adaptive_state(token)
+            if mode != "retry-ts" or (token, mode, variant, filename) not in self._adaptive_retry_failures:
+                state["segmentRequests"] += 1
+            state["successfulSegments"] += 1
+            state["variants"].add(variant)
+            self._record_adaptive_variant(state, mode, variant)
+            if recovered and (token, mode, variant, filename) in self._adaptive_retry_failures:
+                state["retryRecoveries"] += 1
+
+    def adaptive_metrics(self, token: str) -> dict:
+        with self._adaptive_lock:
+            state = self._adaptive_state(token)
+            return {
+                key: sorted(value) if isinstance(value, set) else value
+                for key, value in state.items()
+                if key != "lastVariantByMode"
+            }
+
+    @staticmethod
+    def _record_adaptive_variant(state: dict, mode: str, variant: str) -> None:
+        # Only abr-ts advertises both representations in one master. Moving
+        # between separate one-variant URLs is a test phase change, not an ABR
+        # switch performed by the player.
+        if mode != "abr-ts":
+            return
+        previous = state["lastVariantByMode"].get(mode)
+        if previous not in {None, variant}:
+            state["variantTransitions"] += 1
+        state["lastVariantByMode"][mode] = variant
+
+    def complete_adaptive_run(self, token: str) -> dict:
+        with self._adaptive_lock:
+            state = self._adaptive_state(token)
+            state["clientCompleted"] = True
+            return {"clientCompleted": True}
 
     def trigger_stall(self, token: str) -> int:
         with self._stall_lock:

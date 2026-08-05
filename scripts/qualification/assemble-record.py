@@ -9,6 +9,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import sys
 import tempfile
 from pathlib import Path
@@ -91,6 +92,63 @@ def safe_evidence_path(report_path: Path, relative: object) -> Path:
     return resolved
 
 
+def safe_evidence_artifact_path(
+    evidence_path: Path, relative: object, description: str, *, directory: bool
+) -> tuple[Path, Path]:
+    if not isinstance(relative, str) or not relative:
+        raise AssemblyError(f"evidence {evidence_path} has no {description} path")
+    candidate = Path(relative)
+    if candidate.is_absolute() or ".." in candidate.parts:
+        raise AssemblyError(
+            f"evidence {evidence_path} has unsafe {description} path {relative!r}"
+        )
+    resolved = (evidence_path.parent / candidate).resolve()
+    try:
+        resolved.relative_to(evidence_path.parent.resolve())
+    except ValueError as error:
+        raise AssemblyError(
+            f"evidence {evidence_path} {description} escapes its directory"
+        ) from error
+    valid = resolved.is_dir() if directory else resolved.is_file()
+    if not valid:
+        kind = "directory" if directory else "file"
+        raise AssemblyError(
+            f"evidence {evidence_path} {description} {kind} is missing: {relative}"
+        )
+    return resolved, candidate
+
+
+def tree_digest(root: Path) -> str:
+    digest = hashlib.sha256(b"SwiftVLC artifact tree digest v1\0")
+    entries = sorted(root.rglob("*"), key=lambda path: path.relative_to(root).as_posix())
+    if not entries:
+        raise AssemblyError(f"allocation trace is empty: {root}")
+
+    def update(value: bytes) -> None:
+        digest.update(len(value).to_bytes(8, "big"))
+        digest.update(value)
+
+    for path in entries:
+        metadata = path.lstat()
+        if stat.S_ISDIR(metadata.st_mode):
+            kind, payload = b"directory", b""
+        elif stat.S_ISREG(metadata.st_mode):
+            content = hashlib.sha256()
+            with path.open("rb") as source:
+                while chunk := source.read(1024 * 1024):
+                    content.update(chunk)
+            kind, payload = b"file", content.digest()
+        elif stat.S_ISLNK(metadata.st_mode):
+            kind, payload = b"symlink", os.readlink(path).encode()
+        else:
+            raise AssemblyError(f"unsupported allocation trace entry: {path}")
+        update(kind)
+        update(path.relative_to(root).as_posix().encode())
+        update(stat.S_IMODE(metadata.st_mode).to_bytes(4, "big"))
+        update(payload)
+    return digest.hexdigest()
+
+
 def assemble(
     version: str,
     candidate_path: Path,
@@ -135,7 +193,7 @@ def assemble(
                 f"{candidate.get(field)!r} != {expected!r}"
             )
 
-    rows: dict[tuple[str, str], tuple[dict, Path]] = {}
+    rows: dict[tuple[str, str], tuple[dict, Path, list[tuple[Path, Path, bool]]]] = {}
     for report_path in report_paths:
         report = load_object(report_path, "device report")
         if report.get("result") != "pass":
@@ -187,12 +245,40 @@ def assemble(
                         f"evidence {evidence_path} {field} mismatch: "
                         f"{evidence.get(field)!r} != {expected!r}"
                     )
-            rows[key] = (row, evidence_path)
+            artifacts: list[tuple[Path, Path, bool]] = []
+            provenance = evidence.get("allocationProvenance")
+            trace = provenance.get("instrumentsTrace") if isinstance(provenance, dict) else None
+            if trace is not None:
+                if not isinstance(trace, dict):
+                    raise AssemblyError(f"evidence {evidence_path} has malformed trace provenance")
+                trace_source, trace_relative = safe_evidence_artifact_path(
+                    evidence_path,
+                    trace.get("runArtifact"),
+                    "allocation trace",
+                    directory=True,
+                )
+                toc_source, toc_relative = safe_evidence_artifact_path(
+                    evidence_path,
+                    trace.get("tableOfContents"),
+                    "allocation trace table of contents",
+                    directory=False,
+                )
+                if tree_digest(trace_source) != trace.get("treeDigest"):
+                    raise AssemblyError(
+                        f"evidence {evidence_path} allocation trace digest mismatch"
+                    )
+                artifacts.extend(
+                    [
+                        (trace_source, trace_relative, True),
+                        (toc_source, toc_relative, False),
+                    ]
+                )
+            rows[key] = (row, evidence_path, artifacts)
 
     evidence_directory = output_path.parent / "evidence" / version
     staged_rows = []
     for key in sorted(rows):
-        row, source = rows[key]
+        row, source, _ = rows[key]
         filename = f"{key[0]}-{key[1]}.json"
         relative = Path("evidence") / version / filename
         staged = dict(row, evidence=str(relative))
@@ -200,7 +286,7 @@ def assemble(
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     evidence_directory.mkdir(parents=True, exist_ok=True)
-    for key, (_, source) in sorted(rows.items()):
+    for key, (_, source, artifacts) in sorted(rows.items()):
         destination = evidence_directory / f"{key[0]}-{key[1]}.json"
         with tempfile.NamedTemporaryFile(
             dir=evidence_directory, prefix=f".{destination.name}.", delete=False
@@ -211,6 +297,28 @@ def assemble(
             os.replace(temporary_path, destination)
         finally:
             temporary_path.unlink(missing_ok=True)
+        for artifact_source, artifact_relative, is_directory in artifacts:
+            artifact_destination = evidence_directory / artifact_relative
+            artifact_destination.parent.mkdir(parents=True, exist_ok=True)
+            if artifact_destination.exists():
+                identical = (
+                    is_directory
+                    and artifact_destination.is_dir()
+                    and tree_digest(artifact_destination) == tree_digest(artifact_source)
+                ) or (
+                    not is_directory
+                    and artifact_destination.is_file()
+                    and artifact_destination.read_bytes() == artifact_source.read_bytes()
+                )
+                if not identical:
+                    raise AssemblyError(
+                        f"retained evidence artifact collision: {artifact_relative}"
+                    )
+                continue
+            if is_directory:
+                shutil.copytree(artifact_source, artifact_destination, symlinks=True)
+            else:
+                shutil.copyfile(artifact_source, artifact_destination)
 
     record = {**identity, "rows": staged_rows}
     with tempfile.NamedTemporaryFile(
