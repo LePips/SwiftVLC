@@ -14,6 +14,10 @@ if ! command -v ffprobe >/dev/null 2>&1; then
   echo "Error: ffprobe is required to verify qualification fixtures." >&2
   exit 1
 fi
+if ! command -v curl >/dev/null 2>&1; then
+  echo "Error: curl is required to fetch the pinned FFmpeg bitmap-subtitle sample." >&2
+  exit 1
+fi
 
 case "$DURATION_SECONDS" in
   ''|*[!0-9]*)
@@ -35,13 +39,153 @@ mkdir -p \
   "$fixture_tmp/hls/soak/fmp4/low" \
   "$fixture_tmp/hls/soak/fmp4/high" \
   "$fixture_tmp/performance" \
-  "$fixture_tmp/cadence"
+  "$fixture_tmp/cadence" \
+  "$fixture_tmp/subtitles"
 LIVE_DURATION_SECONDS="$DURATION_SECONDS"
 if [[ "$LIVE_DURATION_SECONDS" -lt 120 ]]; then
   LIVE_DURATION_SECONDS=120
 fi
 
 ffmpeg_quiet=(ffmpeg -hide_banner -loglevel error -nostdin -y)
+
+# A deliberately grayscale moving source makes the subtitle/OSD pixels
+# measurable in SpringBoard screenshots. No saturated source color can be
+# mistaken for a composited overlay.
+"${ffmpeg_quiet[@]}" \
+  -f lavfi -i "testsrc2=size=640x360:rate=30" \
+  -f lavfi -i "sine=frequency=700:sample_rate=48000" \
+  -vf "hue=s=0,eq=contrast=0.55:brightness=-0.15,format=yuv420p" \
+  -t "$LIVE_DURATION_SECONDS" -shortest \
+  -c:v libx264 -preset ultrafast -crf 28 -g 60 -keyint_min 60 -sc_threshold 0 \
+  -c:a aac -b:a 96k -movflags +faststart \
+  "$fixture_tmp/subtitles/base.mp4"
+
+python3 - "$fixture_tmp/subtitles" "$LIVE_DURATION_SECONDS" <<'PY'
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+duration = int(sys.argv[2])
+
+def stamp(seconds: int, separator: str = ",") -> str:
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}{separator}000"
+
+cues = []
+events = []
+for index, start in enumerate(range(0, duration, 8), 1):
+    end = min(duration, start + 6)
+    cues.append(
+        f'{index}\n{stamp(start)} --> {stamp(end)}\n'
+        f'<font color="#FFFFFF">SWIFTVLC TEXT {index:02d}</font>\n'
+    )
+    events.append(
+        f'Dialogue: 0,{stamp(start, ".")[:-1]},{stamp(end, ".")[:-1]},Matrix,,0,0,0,,'
+        f'{{\\an2\\bord3\\c&H0000FFFF&}}STYLED MATRIX {index:02d}'
+    )
+(root / "text.srt").write_text("\n".join(cues))
+(root / "forced.srt").write_text("\n".join(cue.replace("TEXT", "FORCED") for cue in cues))
+(root / "styled.ass").write_text(
+    "[Script Info]\nScriptType: v4.00+\nPlayResX: 640\nPlayResY: 360\n\n"
+    "[V4+ Styles]\n"
+    "Format: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,"
+    "Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,"
+    "Alignment,MarginL,MarginR,MarginV,Encoding\n"
+    "Style: Matrix,Helvetica,38,&H0000FFFF,&H000000FF,&H00000000,&H80000000,"
+    "-1,0,0,0,100,100,0,0,1,3,1,2,20,20,28,1\n\n"
+    "[Events]\n"
+    "Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text\n"
+    + "\n".join(events)
+    + "\n"
+)
+PY
+
+for subtitle_profile in text styled forced; do
+  subtitle_input="$fixture_tmp/subtitles/$subtitle_profile.srt"
+  subtitle_codec="srt"
+  if [[ "$subtitle_profile" == "styled" ]]; then
+    subtitle_input="$fixture_tmp/subtitles/styled.ass"
+    subtitle_codec="ass"
+  fi
+  subtitle_disposition="default"
+  if [[ "$subtitle_profile" == "forced" ]]; then
+    subtitle_disposition="forced+default"
+  fi
+  "${ffmpeg_quiet[@]}" \
+    -i "$fixture_tmp/subtitles/base.mp4" -i "$subtitle_input" \
+    -map 0:v -map 0:a -map 1:0 -c:v copy -c:a copy -c:s "$subtitle_codec" \
+    -metadata:s:s:0 language=eng -metadata:s:s:0 title="$subtitle_profile" \
+    -disposition:s:0 "$subtitle_disposition" \
+    "$fixture_tmp/subtitles/$subtitle_profile.mkv"
+done
+
+# FFmpeg's 77 KiB FATE sample is a filtered VideoLAN DVB-subtitle stream. Pin
+# the exact bytes: an upstream change, redirect, or unavailable source fails
+# fixture generation instead of silently changing release evidence.
+bitmap_source="$fixture_tmp/subtitles/dvbsubtest_filter.ts"
+curl -fsSL https://fate-suite.ffmpeg.org/sub/dvbsubtest_filter.ts -o "$bitmap_source"
+bitmap_digest=$(shasum -a 256 "$bitmap_source" | cut -d' ' -f1)
+if [[ "$bitmap_digest" != "93ad6d0be649bb29697275ff522a983d475a1e58ab070271f912b86799e04a86" ]]; then
+  echo "Error: pinned FFmpeg DVB-subtitle fixture digest changed: $bitmap_digest" >&2
+  exit 1
+fi
+"${ffmpeg_quiet[@]}" -copyts -start_at_zero -i "$bitmap_source" \
+  -map 0:s:0 -c copy "$fixture_tmp/subtitles/bitmap-only.mkv"
+"${ffmpeg_quiet[@]}" \
+  -i "$fixture_tmp/subtitles/base.mp4" \
+  -stream_loop -1 -i "$fixture_tmp/subtitles/bitmap-only.mkv" \
+  -map 0:v -map 0:a -map 1:s:0 -c copy -metadata:s:s:0 title=bitmap \
+  -disposition:s:0 default -t "$LIVE_DURATION_SECONDS" \
+  "$fixture_tmp/subtitles/bitmap.mkv"
+"${ffmpeg_quiet[@]}" \
+  -stream_loop -1 -i "$fixture_tmp/subtitles/bitmap.mkv" \
+  -t "$LIVE_DURATION_SECONDS" -map 0:v -map 0:a -map 0:s:0 -c copy -f mpegts \
+  "$fixture_tmp/subtitles/live.ts"
+
+# A real 10-bit BT.2020/PQ source measures HDR/color impact with and without
+# native PiP composition. The expensive HEVC source is encoded once, then
+# remuxed into a real continuous timeline long enough for the physical phase.
+"${ffmpeg_quiet[@]}" \
+  -f lavfi -i "testsrc2=size=640x360:rate=30" \
+  -f lavfi -i "sine=frequency=740:sample_rate=48000" \
+  -t 6 -shortest \
+  -vf "hue=s=0,eq=contrast=0.55:brightness=-0.15,format=yuv420p10le" \
+  -c:v libx265 -preset ultrafast \
+  -x265-params "hdr10=1:repeat-headers=1:colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc" \
+  -tag:v hvc1 -c:a aac -b:a 96k -movflags +faststart \
+  "$fixture_tmp/subtitles/hdr-base.mp4"
+"${ffmpeg_quiet[@]}" \
+  -stream_loop -1 -i "$fixture_tmp/subtitles/hdr-base.mp4" \
+  -i "$fixture_tmp/subtitles/text.srt" \
+  -map 0:v -map 0:a -map 1:0 -c:v copy -c:a copy -c:s srt \
+  -metadata:s:s:0 title=hdr-text -disposition:s:0 default \
+  -t "$LIVE_DURATION_SECONDS" "$fixture_tmp/subtitles/hdr-text.mkv"
+ffprobe -v error -select_streams v:0 \
+  -show_entries stream=codec_name,pix_fmt,color_space,color_transfer,color_primaries \
+  -of json "$fixture_tmp/subtitles/hdr-text.mkv" \
+  > "$fixture_tmp/subtitles/hdr-probe.json"
+python3 - "$fixture_tmp/subtitles/hdr-probe.json" <<'PY'
+import json
+import sys
+
+streams = json.load(open(sys.argv[1])).get("streams", [])
+expected = {
+    "codec_name": "hevc",
+    "pix_fmt": "yuv420p10le",
+    "color_space": "bt2020nc",
+    "color_transfer": "smpte2084",
+    "color_primaries": "bt2020",
+}
+if len(streams) != 1 or any(streams[0].get(key) != value for key, value in expected.items()):
+    raise SystemExit(
+        f"generated HDR subtitle fixture metadata mismatch: {streams!r} != {expected!r}"
+    )
+PY
+rm "$fixture_tmp/subtitles/bitmap-only.mkv" \
+  "$fixture_tmp/subtitles/dvbsubtest_filter.ts" \
+  "$fixture_tmp/subtitles/hdr-base.mp4" \
+  "$fixture_tmp/subtitles/hdr-probe.json"
 
 "${ffmpeg_quiet[@]}" \
   -f lavfi -i "testsrc2=size=640x360:rate=30" \
@@ -193,6 +337,8 @@ rm -rf "$OUTPUT_DIR/performance"
 mv "$fixture_tmp/performance" "$OUTPUT_DIR/performance"
 rm -rf "$OUTPUT_DIR/cadence"
 mv "$fixture_tmp/cadence" "$OUTPUT_DIR/cadence"
+rm -rf "$OUTPUT_DIR/subtitles"
+mv "$fixture_tmp/subtitles" "$OUTPUT_DIR/subtitles"
 mv "$fixture_tmp/vod.m3u8" "$OUTPUT_DIR/hls/vod.m3u8"
 for segment in "$fixture_tmp"/vod-*.ts; do
   mv "$segment" "$OUTPUT_DIR/hls/$(basename "$segment")"
@@ -247,6 +393,21 @@ manifest = {
         "rates": [23.976, 24, 25, 29.97, 30, 50, 59.94, 60],
         "vfr": True,
         "durationSeconds": live_duration,
+    },
+    "subtitles": {
+        "profiles": ["text", "styled", "bitmap", "forced", "live", "adaptive", "hdr", "osd"],
+        "bitmapSource": {
+            "origin": "FFmpeg FATE filtered VideoLAN DVB subtitle sample",
+            "sha256": "93ad6d0be649bb29697275ff522a983d475a1e58ab070271f912b86799e04a86",
+        },
+        "hdr": {
+            "codec": "hevc",
+            "pixelFormat": "yuv420p10le",
+            "colorPrimaries": "bt2020",
+            "transfer": "smpte2084",
+            "colorSpace": "bt2020nc",
+            "durationSeconds": live_duration,
+        },
     },
     "files": files,
 }

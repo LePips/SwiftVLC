@@ -418,7 +418,8 @@ extension MacShowcase {
          .terminalOutcomesValidation,
          .adaptiveHLSSoakValidation,
          .pipRenderPerformanceValidation,
-         .pipCadenceValidation:
+         .pipCadenceValidation,
+         .nativeSubtitleMatrixValidation:
       return nil
     }
   }

@@ -411,6 +411,7 @@ class FixtureHTTPServer(ThreadingHTTPServer):
                 "mediaPlaylistRequests": 0,
                 "segmentRequests": 0,
                 "successfulSegments": 0,
+                "successfulSegmentsByVariant": {"low": 0, "high": 0},
                 "retryFailures": 0,
                 "retryRecoveries": 0,
                 "expiredWindows": 0,
@@ -476,14 +477,22 @@ class FixtureHTTPServer(ThreadingHTTPServer):
             state["modes"].add(mode)
 
         is_live = playlist_type == "live"
+        is_subtitle_vod = mode in {"abr-low-ts", "abr-high-fmp4"}
         media_sequence = int((now - started) / 2) if is_live else 0
         if is_live:
             window_count = min(6, len(segments))
             indices = range(media_sequence, media_sequence + window_count)
+        elif is_subtitle_vod:
+            # The subtitle matrix owns each ABR profile for about 84 seconds.
+            # Reuse the deterministic two-second media segments to publish a
+            # real 120-second seekable timeline without duplicating fixture
+            # bytes. A discontinuity at every wrap resets segment timestamps
+            # while the playlist timeline remains monotonic.
+            indices = range(max(len(segments), 60))
         else:
             indices = range(len(segments))
 
-        discontinuity = playlist_type == "event" or is_live
+        discontinuity = playlist_type == "event" or is_live or is_subtitle_vod
         lines = [
             "#EXTM3U",
             "#EXT-X-VERSION:7" if container == "fmp4" else "#EXT-X-VERSION:3",
@@ -510,7 +519,9 @@ class FixtureHTTPServer(ThreadingHTTPServer):
         for offset, sequence in enumerate(indices):
             should_discontinue = (
                 playlist_type == "event" and offset == midpoint
-            ) or (is_live and sequence % len(segments) == midpoint)
+            ) or (is_live and sequence % len(segments) == midpoint) or (
+                is_subtitle_vod and offset > 0 and sequence % len(segments) == 0
+            )
             if should_discontinue:
                 lines.append("#EXT-X-DISCONTINUITY")
             segment = segments[sequence % len(segments)]
@@ -557,6 +568,7 @@ class FixtureHTTPServer(ThreadingHTTPServer):
             if mode != "retry-ts" or (token, mode, variant, filename) not in self._adaptive_retry_failures:
                 state["segmentRequests"] += 1
             state["successfulSegments"] += 1
+            state["successfulSegmentsByVariant"][variant] += 1
             state["variants"].add(variant)
             self._record_adaptive_variant(state, mode, variant)
             if recovered and (token, mode, variant, filename) in self._adaptive_retry_failures:

@@ -15,6 +15,18 @@ struct SystemPictureInPictureWindowRegion: Equatable {
   }
 }
 
+struct SystemPictureInPicturePixelSummary: Codable, Equatable {
+  let sampledPixels: Int
+  let brightPixelRatio: Double
+  let saturatedPixelRatio: Double
+  let yellowPixelRatio: Double
+  let greenPixelRatio: Double
+  let nonGrayPixelRatio: Double
+  let meanRed: Double
+  let meanGreen: Double
+  let meanBlue: Double
+}
+
 private struct SystemPictureInPictureInspectionFailure: Error, CustomStringConvertible {
   let description: String
 
@@ -375,6 +387,29 @@ class ShowcaseIOSTestCase: XCTestCase {
     return region
   }
 
+  /// Captures the detected system PiP window and reduces its pixels to stable,
+  /// numeric overlay/color evidence. Qualification tests compare these values
+  /// against the grayscale no-overlay phase instead of relying on a person to
+  /// inspect screenshots.
+  func captureSystemPictureInPicturePixelSummary(
+    in region: SystemPictureInPictureWindowRegion,
+    attachmentName: String
+  )
+    throws -> SystemPictureInPicturePixelSummary {
+    let screenshot = XCUIScreen.main.screenshot()
+    guard let crop = croppedSystemPictureInPictureRegion(screenshot.image, region: region) else {
+      throw SystemPictureInPictureInspectionFailure("Could not crop the system PiP window")
+    }
+    let attachment = XCTAttachment(image: crop)
+    attachment.name = attachmentName
+    attachment.lifetime = .keepAlways
+    add(attachment)
+    guard let summary = pictureInPicturePixelSummary(crop) else {
+      throw SystemPictureInPictureInspectionFailure("Could not rasterize the system PiP window")
+    }
+    return summary
+  }
+
   private func inspectSystemPictureInPictureMotion(
     samples: Int,
     interval: TimeInterval
@@ -623,6 +658,77 @@ private func croppedPiPMotionRegion(
   guard pixelRegion.width > 0, pixelRegion.height > 0 else { return nil }
   guard let cropped = cgImage.cropping(to: pixelRegion) else { return nil }
   return UIImage(cgImage: cropped, scale: image.scale, orientation: image.imageOrientation)
+}
+
+private func croppedSystemPictureInPictureRegion(
+  _ image: UIImage,
+  region: SystemPictureInPictureWindowRegion
+) -> UIImage? {
+  guard let cgImage = image.cgImage else { return nil }
+  let bounds = CGRect(x: 0, y: 0, width: cgImage.width, height: cgImage.height)
+  let crop = CGRect(
+    x: Double(cgImage.width) * region.normalizedX,
+    y: Double(cgImage.height) * region.normalizedY,
+    width: Double(cgImage.width) * region.normalizedWidth,
+    height: Double(cgImage.height) * region.normalizedHeight
+  ).integral.intersection(bounds)
+  guard crop.width > 0, crop.height > 0, let cropped = cgImage.cropping(to: crop) else {
+    return nil
+  }
+  return UIImage(cgImage: cropped, scale: image.scale, orientation: image.imageOrientation)
+}
+
+private func pictureInPicturePixelSummary(
+  _ image: UIImage
+) -> SystemPictureInPicturePixelSummary? {
+  guard let frame = makePiPMotionFrame(from: image) else { return nil }
+  let pixels = frame.pixels
+  guard !pixels.isEmpty else { return nil }
+  var bright = 0
+  var saturated = 0
+  var yellow = 0
+  var green = 0
+  var nonGray = 0
+  var redTotal: UInt64 = 0
+  var greenTotal: UInt64 = 0
+  var blueTotal: UInt64 = 0
+  for pixel in pixels {
+    let red = Int(pixel.red)
+    let greenValue = Int(pixel.green)
+    let blue = Int(pixel.blue)
+    let maximum = max(red, greenValue, blue)
+    let minimum = min(red, greenValue, blue)
+    if minimum >= 220 {
+      bright += 1
+    }
+    if maximum >= 150, maximum - minimum >= 80 {
+      saturated += 1
+    }
+    if red >= 180, greenValue >= 160, blue <= 140 {
+      yellow += 1
+    }
+    if greenValue >= 140, greenValue >= red + 35, greenValue >= blue + 20 {
+      green += 1
+    }
+    if maximum - minimum >= 30 {
+      nonGray += 1
+    }
+    redTotal += UInt64(pixel.red)
+    greenTotal += UInt64(pixel.green)
+    blueTotal += UInt64(pixel.blue)
+  }
+  let count = Double(pixels.count)
+  return SystemPictureInPicturePixelSummary(
+    sampledPixels: pixels.count,
+    brightPixelRatio: Double(bright) / count,
+    saturatedPixelRatio: Double(saturated) / count,
+    yellowPixelRatio: Double(yellow) / count,
+    greenPixelRatio: Double(green) / count,
+    nonGrayPixelRatio: Double(nonGray) / count,
+    meanRed: Double(redTotal) / count,
+    meanGreen: Double(greenTotal) / count,
+    meanBlue: Double(blueTotal) / count
+  )
 }
 
 private func systemPiPMotionDiagnostics(_ analysis: PiPMotionRegionAnalysis) -> String {

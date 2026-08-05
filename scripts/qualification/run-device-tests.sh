@@ -17,6 +17,7 @@ ONLY_SCENARIOS=()
 ADAPTIVE_SOAK_SECONDS="${SWIFTVLC_ADAPTIVE_SOAK_SECONDS:-7200}"
 PIP_PERFORMANCE_SECONDS="${SWIFTVLC_PIP_PERFORMANCE_SECONDS:-900}"
 CADENCE_SECONDS="${SWIFTVLC_CADENCE_SECONDS:-600}"
+NATIVE_SUBTITLE_SECONDS="${SWIFTVLC_NATIVE_SUBTITLE_SECONDS:-900}"
 
 usage() {
   cat <<'EOF'
@@ -44,6 +45,7 @@ Options:
                           pip-render-performance-1080p60,
                           pip-render-performance-4k60,
                           cadence-matrix,
+                          native-subtitle-matrix,
                           deferred-pause-rejection,
                           accepted-start-delayed-failure, hls-seek,
                           harness-regressions, ui-failures, thumbnail-preview
@@ -85,6 +87,16 @@ case "$CADENCE_SECONDS" in
 esac
 if [[ "$CADENCE_SECONDS" -le 0 ]]; then
   echo "Error: SWIFTVLC_CADENCE_SECONDS must be positive." >&2
+  exit 2
+fi
+case "$NATIVE_SUBTITLE_SECONDS" in
+  ''|*[!0-9]*)
+    echo "Error: SWIFTVLC_NATIVE_SUBTITLE_SECONDS must be a positive integer." >&2
+    exit 2
+    ;;
+esac
+if [[ "$NATIVE_SUBTITLE_SECONDS" -lt 900 ]]; then
+  echo "Error: SWIFTVLC_NATIVE_SUBTITLE_SECONDS must be at least 900." >&2
   exit 2
 fi
 
@@ -178,7 +190,9 @@ if [[ ! -f "$FIXTURES/manifest.json" \
   || ! -f "$FIXTURES/performance/1080p60.mp4" \
   || ! -f "$FIXTURES/performance/4k60.mp4" \
   || ! -f "$FIXTURES/cadence/23_976.mp4" \
-  || ! -f "$FIXTURES/cadence/vfr.mp4" ]]; then
+  || ! -f "$FIXTURES/cadence/vfr.mp4" \
+  || ! -f "$FIXTURES/subtitles/bitmap.mkv" \
+  || ! -f "$FIXTURES/subtitles/hdr-text.mkv" ]]; then
   "$SCRIPT_DIR/generate-fixtures.sh" "$FIXTURES"
 fi
 python3 "$SCRIPT_DIR/verify-fixtures.py" "$FIXTURES" > /dev/null
@@ -361,6 +375,7 @@ xcrun devicectl device copy to \
 DEFAULT_SCENARIOS=(analyzer ui-suite harness-regressions live-media background-audio continuity capability-convergence vod-controls long-stall failed-start dismissal interruptions native-lifecycle terminal-outcomes adaptive-hls-soak deferred-pause-rejection accepted-start-delayed-failure hls-seek)
 DEFAULT_SCENARIOS+=(pip-render-performance-1080p60 pip-render-performance-4k60)
 DEFAULT_SCENARIOS+=(cadence-matrix)
+DEFAULT_SCENARIOS+=(native-subtitle-matrix)
 SCENARIOS_WERE_EXPLICIT=false
 if [[ ${#ONLY_SCENARIOS[@]} -eq 0 ]]; then
   ONLY_SCENARIOS=("${DEFAULT_SCENARIOS[@]}")
@@ -369,7 +384,7 @@ else
 fi
 for scenario in "${ONLY_SCENARIOS[@]}"; do
   case "$scenario" in
-    analyzer|ui-suite|native-live|direct-live|live-media|background-audio|continuity|capability-convergence|vod-controls|long-stall|failed-start|dismissal|interruptions|native-lifecycle|terminal-outcomes|adaptive-hls-soak|pip-render-performance-1080p60|pip-render-performance-4k60|cadence-matrix|deferred-pause-rejection|accepted-start-delayed-failure|hls-seek|harness-regressions|ui-failures|thumbnail-preview) ;;
+    analyzer|ui-suite|native-live|direct-live|live-media|background-audio|continuity|capability-convergence|vod-controls|long-stall|failed-start|dismissal|interruptions|native-lifecycle|terminal-outcomes|adaptive-hls-soak|pip-render-performance-1080p60|pip-render-performance-4k60|cadence-matrix|native-subtitle-matrix|deferred-pause-rejection|accepted-start-delayed-failure|hls-seek|harness-regressions|ui-failures|thumbnail-preview) ;;
     *) echo "Error: unknown scenario: $scenario" >&2; exit 2 ;;
   esac
 done
@@ -384,7 +399,7 @@ device_matches_hardware_row() {
 if ! device_matches_hardware_row "iphone-current"; then
   if [[ "$SCENARIOS_WERE_EXPLICIT" == true ]]; then
     for scenario in "${ONLY_SCENARIOS[@]}"; do
-      if [[ "$scenario" == "capability-convergence" || "$scenario" == "native-lifecycle" || "$scenario" == "terminal-outcomes" || "$scenario" == "adaptive-hls-soak" || "$scenario" == pip-render-performance-* || "$scenario" == "cadence-matrix" || "$scenario" == "deferred-pause-rejection" || "$scenario" == "accepted-start-delayed-failure" ]]; then
+      if [[ "$scenario" == "capability-convergence" || "$scenario" == "native-lifecycle" || "$scenario" == "terminal-outcomes" || "$scenario" == "adaptive-hls-soak" || "$scenario" == pip-render-performance-* || "$scenario" == "cadence-matrix" || "$scenario" == "native-subtitle-matrix" || "$scenario" == "deferred-pause-rejection" || "$scenario" == "accepted-start-delayed-failure" ]]; then
         echo "Error: $scenario requires the iphone-current hardware row." >&2
         exit 2
       fi
@@ -392,7 +407,7 @@ if ! device_matches_hardware_row "iphone-current"; then
   else
     FILTERED_SCENARIOS=()
     for scenario in "${ONLY_SCENARIOS[@]}"; do
-      if [[ "$scenario" != "capability-convergence" && "$scenario" != "native-lifecycle" && "$scenario" != "terminal-outcomes" && "$scenario" != "adaptive-hls-soak" && "$scenario" != pip-render-performance-* && "$scenario" != "cadence-matrix" && "$scenario" != "deferred-pause-rejection" && "$scenario" != "accepted-start-delayed-failure" ]]; then
+      if [[ "$scenario" != "capability-convergence" && "$scenario" != "native-lifecycle" && "$scenario" != "terminal-outcomes" && "$scenario" != "adaptive-hls-soak" && "$scenario" != pip-render-performance-* && "$scenario" != "cadence-matrix" && "$scenario" != "native-subtitle-matrix" && "$scenario" != "deferred-pause-rejection" && "$scenario" != "accepted-start-delayed-failure" ]]; then
         FILTERED_SCENARIOS+=("$scenario")
       fi
     done
@@ -616,6 +631,13 @@ run_scenario() {
       route="PiPCadenceValidation"
       selected_xctestrun="$DESTINATION_XCTESTRUN"
       ;;
+    native-subtitle-matrix)
+      test_identifiers=(
+        "iOSUITests/NativeSubtitleMatrixDeviceUITests/test_nativeSubtitleMatrixIsVisibleAndBounded"
+      )
+      route="NativeSubtitleMatrixValidation"
+      selected_xctestrun="$DESTINATION_XCTESTRUN"
+      ;;
     deferred-pause-rejection)
       test_identifiers=(
         "iOSUITests/PiPDeferredPauseDeviceUITests/test_deferredPauseRejectionAndCancellationStayTruthful"
@@ -686,6 +708,9 @@ run_scenario() {
       --environment SWIFTVLC_PIP_CADENCE_DEVICE=YES \
       --environment SWIFTVLC_PIP_CADENCE_BASE_URL_BASE64="$(printf '%s/' "$BASE_URL" | base64 | tr -d '\r\n')" \
       --environment SWIFTVLC_CADENCE_SECONDS="$CADENCE_SECONDS" \
+      --environment SWIFTVLC_NATIVE_SUBTITLE_DEVICE=YES \
+      --environment SWIFTVLC_NATIVE_SUBTITLE_BASE_URL_BASE64="$(printf '%s/' "$BASE_URL" | base64 | tr -d '\r\n')" \
+      --environment SWIFTVLC_NATIVE_SUBTITLE_SECONDS="$NATIVE_SUBTITLE_SECONDS" \
       --environment SWIFTVLC_PIP_DEFERRED_PAUSE_DEVICE=YES \
       --environment SWIFTVLC_PIP_DELAYED_START_FAILURE_DEVICE=YES \
       --environment SWIFTVLC_PIP_OVERLAY_DEVICE=YES \
@@ -711,6 +736,13 @@ run_scenario() {
   local perf_power_toc=""
   local perf_time_trace=""
   local perf_time_toc=""
+  local subtitle_trace_status="not-applicable"
+  local subtitle_game_trace=""
+  local subtitle_game_toc=""
+  local subtitle_time_trace=""
+  local subtitle_time_toc=""
+  local subtitle_metal_trace=""
+  local subtitle_metal_toc=""
   local xcodebuild_log="$OUTPUT_DIR/$scenario-xcodebuild.log"
   local result_bundle="$OUTPUT_DIR/$scenario.xcresult"
   local test_selection_args=()
@@ -732,6 +764,7 @@ run_scenario() {
       -skip-testing:iOSUITests/AdaptiveHLSSoakDeviceUITests
       -skip-testing:iOSUITests/PiPRenderPerformanceDeviceUITests
       -skip-testing:iOSUITests/PiPCadenceDeviceUITests
+      -skip-testing:iOSUITests/NativeSubtitleMatrixDeviceUITests
       -skip-testing:iOSUITests/PiPDeferredPauseDeviceUITests
       -skip-testing:iOSUITests/PiPDelayedStartFailureDeviceUITests
       -skip-testing:iOSUITests/PiPOverlayDeviceUITests
@@ -786,6 +819,21 @@ run_scenario() {
       perf_power_toc="$OUTPUT_DIR/$scenario-power-attempt$attempt-toc.xml"
       perf_time_trace="$OUTPUT_DIR/$scenario-time-attempt$attempt.trace"
       perf_time_toc="$OUTPUT_DIR/$scenario-time-attempt$attempt-toc.xml"
+    elif [[ "$scenario" == "native-subtitle-matrix" ]]; then
+      attempt_token="$run_id-subtitle-$attempt"
+      attempt_xctestrun="$WORK_DIR/destination-$scenario-attempt$attempt.xctestrun"
+      python3 "$SCRIPT_DIR/prepare-xctestrun.py" \
+        "$selected_xctestrun" "$attempt_xctestrun" \
+        --environment SWIFTVLC_DEVICE_LOG_PREFIX="$final_log_prefix" \
+        --environment SWIFTVLC_NATIVE_SUBTITLE_TOKEN="$attempt_token"
+      cp "$attempt_xctestrun" "$OUTPUT_DIR/destination-$scenario-attempt$attempt.xctestrun"
+      subtitle_trace_status="missing"
+      subtitle_game_trace="$OUTPUT_DIR/$scenario-game-attempt$attempt.trace"
+      subtitle_game_toc="$OUTPUT_DIR/$scenario-game-attempt$attempt-toc.xml"
+      subtitle_time_trace="$OUTPUT_DIR/$scenario-time-attempt$attempt.trace"
+      subtitle_time_toc="$OUTPUT_DIR/$scenario-time-attempt$attempt-toc.xml"
+      subtitle_metal_trace="$OUTPUT_DIR/$scenario-metal-attempt$attempt.trace"
+      subtitle_metal_toc="$OUTPUT_DIR/$scenario-metal-attempt$attempt-toc.xml"
     fi
     set +e
     if [[ "$scenario" == "adaptive-hls-soak" ]]; then
@@ -965,6 +1013,67 @@ PY
         -resultBundlePath "$attempt_bundle" \
         > "$attempt_log" 2>&1
       test_status=$?
+    elif [[ "$scenario" == "native-subtitle-matrix" ]]; then
+      xcodebuild test-without-building \
+        -xctestrun "$attempt_xctestrun" \
+        -destination "platform=iOS,id=$DEVICE_UDID" \
+        -collect-test-diagnostics never \
+        -test-timeouts-enabled YES \
+        -default-test-execution-time-allowance "$((NATIVE_SUBTITLE_SECONDS + 300))" \
+        -maximum-test-execution-time-allowance "$((NATIVE_SUBTITLE_SECONDS + 300))" \
+        "${test_selection_args[@]}" \
+        -resultBundlePath "$attempt_bundle" \
+        > "$attempt_log" 2>&1 &
+      local subtitle_xcodebuild_pid=$!
+      ACTIVE_XCODEBUILD_PID="$subtitle_xcodebuild_pid"
+      local subtitle_started=false
+      for _ in {1..600}; do
+        if ! kill -0 "$subtitle_xcodebuild_pid" 2>/dev/null; then
+          break
+        fi
+        if grep -q "$attempt_token" "$OUTPUT_DIR/fixture-requests.jsonl" 2>/dev/null; then
+          subtitle_started=true
+          break
+        fi
+        sleep 0.1
+      done
+      local subtitle_trace_failed=false
+      local subtitle_phase_seconds=$(((NATIVE_SUBTITLE_SECONDS - 120) / 3))
+      if [[ "$subtitle_phase_seconds" -lt 60 ]]; then
+        subtitle_phase_seconds=60
+      fi
+      if [[ "$subtitle_started" == false ]]; then
+        subtitle_trace_failed=true
+        echo "Error: subtitle fixture did not start before trace capture." >> "$attempt_log"
+      else
+        local subtitle_spec subtitle_key subtitle_template subtitle_trace subtitle_toc
+        for subtitle_spec in \
+          "time|Time Profiler|$subtitle_time_trace|$subtitle_time_toc" \
+          "game|Game Performance|$subtitle_game_trace|$subtitle_game_toc" \
+          "metal|Metal System Trace|$subtitle_metal_trace|$subtitle_metal_toc"; do
+          IFS='|' read -r subtitle_key subtitle_template subtitle_trace subtitle_toc \
+            <<< "$subtitle_spec"
+          if ! record_performance_trace \
+              "$subtitle_template" "$subtitle_trace" "$subtitle_toc" \
+              "$subtitle_phase_seconds" "$subtitle_xcodebuild_pid" \
+              "$OUTPUT_DIR/$scenario-$subtitle_key-xctrace-attempt$attempt.log"; then
+            subtitle_trace_failed=true
+            echo "Error: $subtitle_template trace capture failed." >> "$attempt_log"
+            break
+          fi
+        done
+      fi
+      if [[ "$subtitle_trace_failed" == true ]]; then
+        kill -TERM "$subtitle_xcodebuild_pid" 2>/dev/null
+      fi
+      wait "$subtitle_xcodebuild_pid"
+      test_status=$?
+      ACTIVE_XCODEBUILD_PID=""
+      if [[ "$subtitle_trace_failed" == true ]]; then
+        test_status=1
+      elif [[ "$test_status" -eq 0 ]]; then
+        subtitle_trace_status="captured"
+      fi
     else
       xcodebuild test-without-building \
         -xctestrun "$attempt_xctestrun" \
@@ -1173,6 +1282,10 @@ PY
       qualification_scenarios=("cadence-matrix")
       qualification_attachments=("qualification-cadence-matrix.json")
       ;;
+    native-subtitle-matrix)
+      qualification_scenarios=("native-subtitle-matrix")
+      qualification_attachments=("qualification-native-subtitle-matrix.json")
+      ;;
     deferred-pause-rejection)
       qualification_scenarios=("deferred-pause-rejection")
       qualification_attachments=("qualification-deferred-pause-rejection.json")
@@ -1187,6 +1300,7 @@ PY
     if [[ "$test_status" -eq 0 ]] && [[ "$log_errors_acceptable" == true ]] \
       && [[ "$allocation_trace_status" != "missing" ]] \
       && [[ "$performance_trace_status" != "missing" ]] \
+      && [[ "$subtitle_trace_status" != "missing" ]] \
       && [[ "$log_status" == "captured" ]] && [[ -d "$result_bundle" ]]; then
       local attachments="$OUTPUT_DIR/$scenario-attachments"
       local hardware_id evidence_file evidence_relative export_status materialize_status
@@ -1258,6 +1372,22 @@ PY
             if [[ "$augment_performance_status" -ne 0 ]]; then
               continue
             fi
+          elif [[ "$scenario" == "native-subtitle-matrix" ]]; then
+            set +e
+            python3 "$SCRIPT_DIR/augment-native-subtitle-traces.py" \
+              --evidence "$evidence_file" \
+              --time-trace "$subtitle_time_trace" \
+              --time-toc "$subtitle_time_toc" \
+              --game-trace "$subtitle_game_trace" \
+              --game-toc "$subtitle_game_toc" \
+              --metal-trace "$subtitle_metal_trace" \
+              --metal-toc "$subtitle_metal_toc" \
+              --digest-script "$ROOT_DIR/scripts/artifact-tree-digest.py"
+            local augment_subtitle_status=$?
+            set -e
+            if [[ "$augment_subtitle_status" -ne 0 ]]; then
+              continue
+            fi
           fi
           materialized_count=$((materialized_count + 1))
           materialized_scenarios+=("$qualification_scenario")
@@ -1309,6 +1439,7 @@ PY
   if [[ "$test_status" -ne 0 ]] || [[ "$log_errors_acceptable" != true ]] || [[ "$log_status" == "missing" ]] \
     || [[ "$allocation_trace_status" == "missing" ]] \
     || [[ "$performance_trace_status" == "missing" ]] \
+    || [[ "$subtitle_trace_status" == "missing" ]] \
     || [[ "$evidence_status" == "missing" ]]; then
     result="fail"
   fi
