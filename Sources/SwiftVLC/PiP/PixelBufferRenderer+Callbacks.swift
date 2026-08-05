@@ -341,6 +341,7 @@ final class PixelBufferRendererCallbackContext: Sendable {
   var qualificationMediaTimeSeconds: Double? {
     guard
       isQualificationTelemetryEnabled,
+      !state.withLock({ $0.nativePlayerHandleReleased }),
       nativePlayerAddress != 0,
       let nativePlayer = OpaquePointer(bitPattern: nativePlayerAddress)
     else { return nil }

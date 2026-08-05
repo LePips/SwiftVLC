@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import re
 import shutil
 import subprocess
@@ -73,7 +74,9 @@ def raw_record(root: Path, reference: dict, duration: int) -> dict:
     path = matches[0]
     samples = 0
     correction_sequences: list[int] = []
+    elapsed_seconds: list[int] = []
     maximum_drift = 0.0
+    drift_samples = 0
     maximum_correction = 0.0
     observed_rates: set[float] = set()
     monotonicity_violations = 0
@@ -92,13 +95,20 @@ def raw_record(root: Path, reference: dict, duration: int) -> dict:
             clock, audio, frame = value["clock"], value["audio"], value["frame"]
             drift = clock.get("driftSeconds")
             rate = clock.get("requestedRate")
+            elapsed = clock.get("elapsedSeconds")
             generation = frame.get("playbackGeneration")
             presented = frame.get("presentedSeconds")
             played = audio.get("playedBuffers")
             decoded_media = frame.get("decodedFrameMediaTimeSeconds")
-            if isinstance(drift, (int, float)):
+            if type(drift) in (int, float) and math.isfinite(float(drift)):
                 maximum_drift = max(maximum_drift, abs(float(drift)))
-            if isinstance(rate, (int, float)):
+                drift_samples += 1
+            if type(elapsed) is not int:
+                raise TimebaseEvidenceError(
+                    f"raw sample line {number} has no integer elapsedSeconds"
+                )
+            elapsed_seconds.append(elapsed)
+            if type(rate) in (int, float) and math.isfinite(float(rate)):
                 observed_rates.add(float(rate))
             if isinstance(generation, int) and isinstance(presented, (int, float)):
                 previous = previous_presented.get(generation)
@@ -125,7 +135,25 @@ def raw_record(root: Path, reference: dict, duration: int) -> dict:
         raise TimebaseEvidenceError(
             f"raw capture has {samples} samples for a {duration}-second run"
         )
-    if any(b != a + 1 for a, b in zip(correction_sequences, correction_sequences[1:])):
+    if drift_samples < max(1, samples - 120):
+        raise TimebaseEvidenceError("raw capture is missing clock-drift samples")
+    if any(current <= previous for previous, current in zip(elapsed_seconds, elapsed_seconds[1:])):
+        raise TimebaseEvidenceError("raw sample timeline is not strictly increasing")
+    if elapsed_seconds[0] > 5 or elapsed_seconds[-1] < max(0, duration - 5):
+        raise TimebaseEvidenceError("raw sample timeline does not cover the soak duration")
+    maximum_sample_gap = max(
+        (current - previous for previous, current in zip(elapsed_seconds, elapsed_seconds[1:])),
+        default=1,
+    )
+    missing_timeline_seconds = (
+        elapsed_seconds[-1] - elapsed_seconds[0] + 1 - len(elapsed_seconds)
+    )
+    if maximum_sample_gap > 5 or missing_timeline_seconds > 120:
+        raise TimebaseEvidenceError("raw sample timeline has excessive gaps")
+    if any(
+        current != previous + 1
+        for previous, current in zip(correction_sequences, correction_sequences[1:])
+    ):
         raise TimebaseEvidenceError("raw correction sequence has a gap")
     return {
         "status": "captured",
@@ -138,6 +166,11 @@ def raw_record(root: Path, reference: dict, duration: int) -> dict:
         "firstCorrectionSequence": correction_sequences[0] if correction_sequences else None,
         "lastCorrectionSequence": correction_sequences[-1] if correction_sequences else None,
         "maximumObservedDriftSeconds": maximum_drift,
+        "driftSampleCount": drift_samples,
+        "timelineStartSeconds": elapsed_seconds[0],
+        "timelineEndSeconds": elapsed_seconds[-1],
+        "maximumSampleGapSeconds": maximum_sample_gap,
+        "missingTimelineSeconds": missing_timeline_seconds,
         "maximumSteadyCorrectionSeconds": maximum_correction,
         "observedRates": sorted(observed_rates),
         "monotonicityViolations": monotonicity_violations,
@@ -147,7 +180,25 @@ def raw_record(root: Path, reference: dict, duration: int) -> dict:
             and last_played_buffers > first_played_buffers
         ),
         "decodedFrameMediaClockSampleCount": decoded_media_samples,
+        "_correctionSequences": correction_sequences,
     }
+
+
+def require_matching_correction_sequences(
+    corrections: object, raw_sequences: list[int]
+) -> None:
+    if not isinstance(corrections, list):
+        raise TimebaseEvidenceError("compact timebase corrections are malformed")
+    compact_sequences: list[int] = []
+    for correction in corrections:
+        if (
+            not isinstance(correction, dict)
+            or type(correction.get("sequence")) is not int
+        ):
+            raise TimebaseEvidenceError("compact timebase correction has no sequence")
+        compact_sequences.append(correction["sequence"])
+    if compact_sequences != raw_sequences:
+        raise TimebaseEvidenceError("compact and raw correction sequences differ")
 
 
 def augment(
@@ -172,8 +223,9 @@ def augment(
         raise TimebaseEvidenceError("timebase audio/raw evidence is malformed")
     raw = raw_record(raw_root, reference, duration)
     corrections = payload.get("corrections")
-    if not isinstance(corrections, list) or len(corrections) != raw["correctionCount"]:
-        raise TimebaseEvidenceError("compact and raw correction counts differ")
+    require_matching_correction_sequences(
+        corrections, raw.pop("_correctionSequences")
+    )
     drift_budget = payload.get("driftBudget")
     correction_budget = payload.get("correctionBudget")
     if not isinstance(drift_budget, dict) or not isinstance(correction_budget, dict):

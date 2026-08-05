@@ -672,6 +672,7 @@ extension Integration {
         renderer: renderer,
         nativePlayer: player.pointer
       )
+      let retained = Unmanaged.passRetained(context)
 
       #expect(context.qualificationMediaTimeSeconds == nil)
       context.setQualificationTelemetryEnabled(true)
@@ -679,6 +680,9 @@ extension Integration {
       // libVLC initializes a fresh media-player clock at zero. Reaching that
       // value proves the opted-in handle path samples the native player.
       #expect(context.qualificationMediaTimeSeconds == 0)
+      context.nativePlayerHandleDidRelease(opaque: retained.toOpaque())
+      #expect(context.nativePlayerHandleReleasedForTesting)
+      #expect(context.qualificationMediaTimeSeconds == nil)
 
       await player.shutdown()
     }

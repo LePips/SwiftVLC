@@ -1079,7 +1079,7 @@ class QualificationEvidenceTests(unittest.TestCase):
             root = Path(temporary)
             raw = root / "swiftvlc-timebase-attempt-vod.jsonl"
             with raw.open("w") as output:
-                for index in range(7080):
+                for index in range(7200):
                     sample = {
                         "kind": "sample",
                         "clock": {
@@ -1151,7 +1151,7 @@ class QualificationEvidenceTests(unittest.TestCase):
             augmented = augment_timebase_evidence.augment(
                 evidence_path, root, trace, toc, digest_script
             )
-            self.assertEqual(augmented["rawCapture"]["sampleCount"], 7080)
+            self.assertEqual(augmented["rawCapture"]["sampleCount"], 7200)
             self.assertEqual(augmented["rawCapture"]["firstCorrectionSequence"], 8)
             self.assertEqual(
                 augmented["audioPresentationSeries"]["hostTrace"]["template"],
@@ -1187,7 +1187,11 @@ class QualificationEvidenceTests(unittest.TestCase):
             lines = [
                 {
                     "kind": "sample",
-                    "clock": {"requestedRate": 1, "driftSeconds": 0},
+                    "clock": {
+                        "elapsedSeconds": 0,
+                        "requestedRate": 1,
+                        "driftSeconds": 0,
+                    },
                     "audio": {"playedBuffers": 1},
                     "frame": {"playbackGeneration": 1, "presentedSeconds": 1},
                 },
@@ -1201,6 +1205,69 @@ class QualificationEvidenceTests(unittest.TestCase):
                     {"fileName": raw.name, "sampleIntervalSeconds": 1},
                     1,
                 )
+
+    def test_rejects_raw_timebase_capture_without_drift_samples(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            raw = root / "capture.jsonl"
+            raw.write_text(
+                json.dumps(
+                    {
+                        "kind": "sample",
+                        "clock": {"elapsedSeconds": 0, "requestedRate": 1},
+                        "audio": {"playedBuffers": 1},
+                        "frame": {
+                            "playbackGeneration": 1,
+                            "presentedSeconds": 1,
+                        },
+                    }
+                )
+                + "\n"
+            )
+            with self.assertRaisesRegex(
+                augment_timebase_evidence.TimebaseEvidenceError,
+                "missing clock-drift samples",
+            ):
+                augment_timebase_evidence.raw_record(
+                    root,
+                    {"fileName": raw.name, "sampleIntervalSeconds": 1},
+                    1,
+                )
+
+    def test_rejects_duplicate_raw_timebase_timeline_samples(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            raw = root / "capture.jsonl"
+            sample = {
+                "kind": "sample",
+                "clock": {
+                    "elapsedSeconds": 0,
+                    "requestedRate": 1,
+                    "driftSeconds": 0,
+                },
+                "audio": {"playedBuffers": 1},
+                "frame": {"playbackGeneration": 1, "presentedSeconds": 1},
+            }
+            raw.write_text(json.dumps(sample) + "\n" + json.dumps(sample) + "\n")
+            with self.assertRaisesRegex(
+                augment_timebase_evidence.TimebaseEvidenceError,
+                "timeline is not strictly increasing",
+            ):
+                augment_timebase_evidence.raw_record(
+                    root,
+                    {"fileName": raw.name, "sampleIntervalSeconds": 1},
+                    2,
+                )
+
+    def test_rejects_mismatched_compact_timebase_correction_sequences(self):
+        with self.assertRaisesRegex(
+            augment_timebase_evidence.TimebaseEvidenceError,
+            "compact and raw correction sequences differ",
+        ):
+            augment_timebase_evidence.require_matching_correction_sequences(
+                [{"sequence": 8}, {"sequence": 10}],
+                [8, 9],
+            )
 
     def test_materializes_accepted_start_delayed_failure_evidence(self):
         with tempfile.TemporaryDirectory() as temporary:

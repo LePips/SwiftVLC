@@ -612,9 +612,19 @@ private enum AVPlayerTimebaseBaseline {
       try await Task.sleep(for: .seconds(2))
     }
     player.pause()
-    let maximum = samples.compactMap(\.videoClockDriftSeconds).map(abs).max() ?? 0
     guard samples.count >= durationSeconds / 3 else { throw TimebaseSoakFailure("AVPlayer baseline produced too few samples") }
+    let videoClockDrifts = samples.compactMap(\.videoClockDriftSeconds)
+    guard !videoClockDrifts.isEmpty else {
+      throw TimebaseSoakFailure("AVPlayer baseline produced no video-clock comparison")
+    }
     let observedRates = Array(Set(samples.map(\.actualRate))).sorted()
+    guard
+      [Float(0.5), 1, 2].allSatisfy({ expected in
+        observedRates.contains { abs($0 - expected) < 0.01 }
+      }) else {
+      throw TimebaseSoakFailure("AVPlayer baseline did not apply every requested rate")
+    }
+    let maximum = videoClockDrifts.map(abs).max() ?? 0
     return .init(
       durationSeconds: durationSeconds,
       requestedRates: [0.5, 1, 2],
