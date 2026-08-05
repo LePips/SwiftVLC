@@ -245,6 +245,19 @@ enum AccessibilityID {
     static let errorLabel = "pipVODControls.error"
   }
 
+  enum PiPLongStallValidation {
+    static let videoView = "pipLongStall.videoView"
+    static let stateLabel = "pipLongStall.state"
+    static let possibleLabel = "pipLongStall.possible"
+    static let activeLabel = "pipLongStall.active"
+    static let healthLabel = "pipLongStall.health"
+    static let resultLabel = "pipLongStall.result"
+    static let runButton = "pipLongStall.run"
+    static let triggerButton = "pipLongStall.trigger"
+    static let stopButton = "pipLongStall.stop"
+    static let errorLabel = "pipLongStall.error"
+  }
+
   enum MatrixHValidation {
     static let stateLabel = "validation.matrixH.state"
     static let currentTimeLabel = "validation.matrixH.currentTime"

@@ -117,6 +117,17 @@ stop completes the ordered lifecycle. One combined `vod-controls` attachment
 is emitted only when every control passes on both backends with zero library
 errors or unexpected stops.
 
+The long-stall lane also runs on every hardware row. Its local fixture keeps a
+continuous MPEG-TS connection flowing until the candidate has entered real
+system PiP, then an explicit in-app trigger stalls every active connection for
+twelve seconds. Both native and direct backends must publish either the public
+stalled/recovered pair or the expected buffering/healthy transition, remain in
+PiP, resume moving system-PiP pixels, and complete ordered teardown without
+library errors. The app samples its own
+resident memory throughout the fault and rejects growth beyond a 96 MiB bound;
+the combined attachment records the raw per-backend timings and memory values
+as well as the matrix-required recovery and bounded-memory outcomes.
+
 The iPhone-current-only deferred-pause-rejection lane drives the exact AVKit
 playback command entry point while a qualification SPI changes only libVLC's
 native pause-capability answer. It proves a permanently unpausable input

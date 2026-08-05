@@ -10,6 +10,7 @@ import os
 import re
 import socket
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from http import HTTPStatus
@@ -42,6 +43,30 @@ class FixtureHandler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(payload)
                 transferred = len(payload)
+                return
+
+            match = re.fullmatch(r"/fault/trigger/([A-Za-z0-9._-]+)", route)
+            if match:
+                generation = self.server.trigger_stall(match.group(1))
+                payload = json.dumps({"generation": generation}).encode()
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+                transferred = len(payload)
+                return
+
+            match = re.fullmatch(
+                r"/fault/gated-stall/([A-Za-z0-9._-]+)/([0-9]+(?:\.[0-9]+)?)/(.+)",
+                route,
+            )
+            if match:
+                transferred = self._serve_loop(
+                    self._safe_path(match.group(3)),
+                    stall_token=match.group(1),
+                    stall_seconds=float(match.group(2)),
+                )
                 return
 
             match = re.fullmatch(r"/live/(.+)", route)
@@ -113,7 +138,13 @@ class FixtureHandler(BaseHTTPRequestHandler):
             raise FileNotFoundError(candidate)
         return candidate
 
-    def _serve_loop(self, path: Path) -> int:
+    def _serve_loop(
+        self,
+        path: Path,
+        *,
+        stall_token: str | None = None,
+        stall_seconds: float = 0,
+    ) -> int:
         content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", content_type)
@@ -121,12 +152,25 @@ class FixtureHandler(BaseHTTPRequestHandler):
         self.send_header("Connection", "close")
         self.end_headers()
         transferred = 0
+        observed_stall_generation = 0
+        if stall_token:
+            observed_stall_generation, triggered_at = self.server.stall_state(stall_token)
+            remaining = triggered_at + stall_seconds - time.monotonic()
+            if observed_stall_generation > 0 and remaining > 0:
+                time.sleep(remaining)
         while True:
             with path.open("rb") as source:
                 while chunk := source.read(self.server.chunk_size):
                     self.wfile.write(chunk)
                     self.wfile.flush()
                     transferred += len(chunk)
+                    if stall_token:
+                        generation, triggered_at = self.server.stall_state(stall_token)
+                        if generation > observed_stall_generation:
+                            observed_stall_generation = generation
+                            remaining = triggered_at + stall_seconds - time.monotonic()
+                            if remaining > 0:
+                                time.sleep(remaining)
                     if self.server.chunk_delay:
                         time.sleep(self.server.chunk_delay)
 
@@ -221,6 +265,23 @@ class FixtureHTTPServer(ThreadingHTTPServer):
         self.chunk_size = chunk_size
         self.chunk_delay = chunk_delay
         self.verbose = verbose
+        self._stall_lock = threading.Lock()
+        self._stall_generations: dict[str, int] = {}
+        self._stall_triggered_at: dict[str, float] = {}
+
+    def trigger_stall(self, token: str) -> int:
+        with self._stall_lock:
+            generation = self._stall_generations.get(token, 0) + 1
+            self._stall_generations[token] = generation
+            self._stall_triggered_at[token] = time.monotonic()
+            return generation
+
+    def stall_state(self, token: str) -> tuple[int, float]:
+        with self._stall_lock:
+            return (
+                self._stall_generations.get(token, 0),
+                self._stall_triggered_at.get(token, 0),
+            )
 
     def handle_error(self, request: object, client_address: tuple[str, int]) -> None:
         # Media clients commonly abandon a keep-alive connection after a seek

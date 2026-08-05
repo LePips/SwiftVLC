@@ -479,6 +479,46 @@ class QualificationEvidenceTests(unittest.TestCase):
             self.assertEqual(evidence["controls"]["scrub"], "pass")
             self.assertEqual(evidence["systemPiPMotion"]["native"], "pass")
 
+    def test_materializes_long_stall_evidence(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.make_export(
+                root,
+                {
+                    "formatVersion": 1,
+                    "scenario": "long-stall",
+                    "events": {
+                        "started": True,
+                        "unexpectedStopCount": 0,
+                        "order": "pass",
+                    },
+                    "recoveryOutcome": "recovered",
+                    "boundedMemory": True,
+                    "backendResults": {
+                        "native": {"memory": {"growthBytes": 1024}},
+                        "direct": {"memory": {"growthBytes": 2048}},
+                    },
+                    "systemPiPMotionAfterRecovery": {
+                        "native": "pass",
+                        "direct": "pass",
+                    },
+                },
+                attachment_name="qualification-long-stall.json",
+                test_identifier="PiPLongStallDeviceUITests/test_longStallRecoversAcrossNativeAndDirectBackends",
+            )
+            evidence = materialize_evidence.materialize(
+                root,
+                "qualification-long-stall.json",
+                "long-stall",
+                "iphone-minimum",
+                "a" * 64,
+                "b" * 64,
+            )
+            self.assertEqual(evidence["hardware"], "iphone-minimum")
+            self.assertEqual(evidence["recoveryOutcome"], "recovered")
+            self.assertTrue(evidence["boundedMemory"])
+            self.assertEqual(evidence["backendResults"]["direct"]["memory"]["growthBytes"], 2048)
+
     def test_materializes_accepted_start_delayed_failure_evidence(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -841,6 +881,34 @@ class FixtureServerTests(unittest.TestCase):
         connection, response = self.request("/live/sample.bin")
         sample = (self.root / "sample.bin").read_bytes()
         self.assertEqual(response.read(len(sample) + 32), sample + sample[:32])
+        connection.close()
+
+    def test_gated_stall_waits_only_after_trigger(self):
+        self.server.chunk_delay = 0.01
+        connection, response = self.request("/fault/gated-stall/test/0.15/sample.bin")
+        self.assertEqual(response.read(512), (self.root / "sample.bin").read_bytes()[:512])
+
+        trigger_connection, trigger_response = self.request("/fault/trigger/test")
+        self.assertEqual(trigger_response.status, 200)
+        self.assertEqual(json.loads(trigger_response.read()), {"generation": 1})
+        trigger_connection.close()
+
+        started = time.monotonic()
+        self.assertEqual(len(response.read(4096)), 4096)
+        self.assertGreaterEqual(time.monotonic() - started, 0.14)
+        connection.close()
+
+    def test_gated_stall_also_holds_connections_opened_after_trigger(self):
+        trigger_connection, trigger_response = self.request("/fault/trigger/new-client")
+        self.assertEqual(json.loads(trigger_response.read()), {"generation": 1})
+        trigger_connection.close()
+
+        connection, response = self.request(
+            "/fault/gated-stall/new-client/0.15/sample.bin"
+        )
+        started = time.monotonic()
+        self.assertEqual(len(response.read(512)), 512)
+        self.assertGreaterEqual(time.monotonic() - started, 0.13)
         connection.close()
 
 
