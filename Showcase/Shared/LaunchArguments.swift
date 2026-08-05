@@ -50,6 +50,12 @@ enum LaunchArguments {
   static let terminalOutcomeAction = "-UITestTerminalOutcomeAction"
   static let terminalOutcomeToken = "-UITestTerminalOutcomeToken"
 
+  /// Duration and server namespace for the candidate-bound adaptive HLS soak.
+  /// The physical runner supplies 7,200 seconds; shorter values are useful
+  /// only while developing the harness and cannot satisfy the matrix gate.
+  static let adaptiveSoakDuration = "-UITestAdaptiveSoakDuration"
+  static let adaptiveSoakToken = "-UITestAdaptiveSoakToken"
+
   /// Name of a showcase to deep-link to on launch (e.g. `"SimplePlayback"`).
   /// When unset, the showcase opens its normal navigation tree.
   static let route = "-UITestRoute"
@@ -113,6 +119,14 @@ enum LaunchArguments {
 
   static var terminalOutcomeTokenValue: String? {
     UserDefaults.standard.string(forKey: key(terminalOutcomeToken))
+  }
+
+  static var adaptiveSoakDurationValue: Int? {
+    UserDefaults.standard.string(forKey: key(adaptiveSoakDuration)).flatMap(Int.init)
+  }
+
+  static var adaptiveSoakTokenValue: String? {
+    UserDefaults.standard.string(forKey: key(adaptiveSoakToken))
   }
 
   static var routeValue: String? {
@@ -200,6 +214,7 @@ enum UITestRoute: String, CaseIterable {
   case pipInterruptionValidation = "PiPInterruptionValidation"
   case pipNativeLifecycleValidation = "PiPNativeLifecycleValidation"
   case terminalOutcomesValidation = "TerminalOutcomesValidation"
+  case adaptiveHLSSoakValidation = "AdaptiveHLSSoakValidation"
 
   static var current: UITestRoute? {
     LaunchArguments.routeValue.flatMap(UITestRoute.init(rawValue:))

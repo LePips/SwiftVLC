@@ -305,6 +305,16 @@ enum AccessibilityID {
     static let errorLabel = "terminalOutcomes.error"
   }
 
+  enum AdaptiveHLSSoakValidation {
+    static let videoView = "adaptiveHLSSoak.videoView"
+    static let stateLabel = "adaptiveHLSSoak.state"
+    static let progressLabel = "adaptiveHLSSoak.progress"
+    static let phaseLabel = "adaptiveHLSSoak.phase"
+    static let resultLabel = "adaptiveHLSSoak.result"
+    static let runButton = "adaptiveHLSSoak.run"
+    static let errorLabel = "adaptiveHLSSoak.error"
+  }
+
   enum MatrixHValidation {
     static let stateLabel = "validation.matrixH.state"
     static let currentTimeLabel = "validation.matrixH.currentTime"

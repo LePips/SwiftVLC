@@ -25,6 +25,11 @@ fi
 mkdir -p "$OUTPUT_DIR/hls"
 fixture_tmp=$(mktemp -d "${TMPDIR:-/tmp}/swiftvlc-fixtures.XXXXXX")
 trap 'rm -rf "$fixture_tmp"' EXIT
+mkdir -p \
+  "$fixture_tmp/hls/soak/ts/low" \
+  "$fixture_tmp/hls/soak/ts/high" \
+  "$fixture_tmp/hls/soak/fmp4/low" \
+  "$fixture_tmp/hls/soak/fmp4/high"
 LIVE_DURATION_SECONDS="$DURATION_SECONDS"
 if [[ "$LIVE_DURATION_SECONDS" -lt 120 ]]; then
   LIVE_DURATION_SECONDS=120
@@ -51,6 +56,40 @@ ffmpeg_quiet=(ffmpeg -hide_banner -loglevel error -nostdin -y)
   -hls_segment_filename "$fixture_tmp/vod-%03d.ts" \
   "$fixture_tmp/vod.m3u8"
 
+# Two real representations and both HLS segment containers back the adaptive
+# soak origin. The server builds VOD, event, and sliding-live manifests from
+# these deterministic files at request time, so a long run never depends on a
+# third-party CDN or an expiring public stream.
+"${ffmpeg_quiet[@]}" \
+  -i "$fixture_tmp/vod.mp4" \
+  -vf "scale=320:180" -c:v libx264 -preset veryfast -pix_fmt yuv420p \
+  -g 60 -keyint_min 60 -sc_threshold 0 \
+  -c:a copy -movflags +faststart \
+  "$fixture_tmp/low.mp4"
+
+for variant in low high; do
+  source="$fixture_tmp/vod.mp4"
+  if [[ "$variant" == "low" ]]; then
+    source="$fixture_tmp/low.mp4"
+  fi
+
+  "${ffmpeg_quiet[@]}" \
+    -i "$source" -c copy \
+    -hls_time 2 -hls_playlist_type vod \
+    -hls_segment_filename "$fixture_tmp/hls/soak/ts/$variant/segment-%03d.ts" \
+    "$fixture_tmp/hls/soak/ts/$variant/media.m3u8"
+
+  (
+    cd "$fixture_tmp/hls/soak/fmp4/$variant"
+    "${ffmpeg_quiet[@]}" \
+      -i "$source" -c copy \
+      -hls_time 2 -hls_playlist_type vod -hls_segment_type fmp4 \
+      -hls_fmp4_init_filename init.mp4 \
+      -hls_segment_filename "segment-%03d.m4s" \
+      media.m3u8
+  )
+done
+
 "${ffmpeg_quiet[@]}" \
   -f lavfi -i "sine=frequency=440:sample_rate=48000" \
   -t "$DURATION_SECONDS" -c:a aac -b:a 128k \
@@ -63,6 +102,8 @@ mv "$fixture_tmp/vod.m3u8" "$OUTPUT_DIR/hls/vod.m3u8"
 for segment in "$fixture_tmp"/vod-*.ts; do
   mv "$segment" "$OUTPUT_DIR/hls/$(basename "$segment")"
 done
+rm -rf "$OUTPUT_DIR/hls/soak"
+mv "$fixture_tmp/hls/soak" "$OUTPUT_DIR/hls/soak"
 
 python3 - "$OUTPUT_DIR/vod.mp4" "$OUTPUT_DIR/unsupported-codec.mp4" <<'PY'
 import sys

@@ -523,7 +523,8 @@ extension TVShowcase {
          .pipDismissalValidation,
          .pipInterruptionValidation,
          .pipNativeLifecycleValidation,
-         .terminalOutcomesValidation:
+         .terminalOutcomesValidation,
+         .adaptiveHLSSoakValidation:
       return nil
     }
   }

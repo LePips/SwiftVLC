@@ -415,7 +415,8 @@ extension MacShowcase {
          .pipDismissalValidation,
          .pipInterruptionValidation,
          .pipNativeLifecycleValidation,
-         .terminalOutcomesValidation:
+         .terminalOutcomesValidation,
+         .adaptiveHLSSoakValidation:
       return nil
     }
   }

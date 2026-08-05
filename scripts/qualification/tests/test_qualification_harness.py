@@ -32,6 +32,7 @@ prepare_xctestrun = load_script("prepare-xctestrun.py")
 verify_fixtures = load_script("verify-fixtures.py")
 candidate_metadata = load_script("candidate-metadata.py")
 materialize_evidence = load_script("materialize-evidence.py")
+augment_allocation_trace = load_script("augment-allocation-trace.py")
 assemble_record = load_script("assemble-record.py")
 
 
@@ -804,6 +805,97 @@ class QualificationEvidenceTests(unittest.TestCase):
             self.assertEqual(evidence["unattributedStopNaturalEndCount"], 0)
             self.assertTrue(evidence["subscriberPayloadsIdentical"])
 
+    def test_materializes_adaptive_hls_soak_evidence(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            payload = {
+                "formatVersion": 1,
+                "scenario": "adaptive-hls-soak",
+                "durationSeconds": 7200,
+                "playlistCoverage": {
+                    "playlistTypes": ["event", "live", "vod"],
+                    "containers": ["fmp4", "ts"],
+                    "variants": ["high", "low"],
+                    "variantTransitions": 4,
+                    "discontinuityManifests": 3,
+                    "expiredWindows": 2,
+                    "retryFailures": 1,
+                    "retryRecoveries": 1,
+                    "cancellations": 7,
+                },
+                "allocationProvenance": {
+                    "allocator": "Darwin default malloc zone",
+                    "sourceOwnershipRegression": "SegmentChunkOwnership_test",
+                    "expectedSourceReleaseCount": 1,
+                },
+                "memorySeries": [
+                    {"elapsedSeconds": 0, "residentBytes": 100},
+                    {"elapsedSeconds": 7200, "residentBytes": 101},
+                ],
+                "sanitizerFindings": 0,
+                "crashes": 0,
+                "unboundedRecoveries": 0,
+                "monotonicGrowth": False,
+                "upstreamCrossLink": "https://code.videolan.org/videolan/vlc/-/work_items/29845",
+            }
+            self.make_export(
+                root,
+                payload,
+                attachment_name="qualification-adaptive-hls-soak.json",
+                test_identifier="AdaptiveHLSSoakDeviceUITests/test_adaptiveHLSMatrixSoakRemainsBounded",
+            )
+            evidence = materialize_evidence.materialize(
+                root,
+                "qualification-adaptive-hls-soak.json",
+                "adaptive-hls-soak",
+                "iphone-current",
+                "a" * 64,
+                "b" * 64,
+            )
+            self.assertEqual(evidence["hardware"], "iphone-current")
+            self.assertEqual(evidence["sanitizerFindings"], 0)
+            self.assertFalse(evidence["monotonicGrowth"])
+            self.assertEqual(
+                evidence["allocationProvenance"]["expectedSourceReleaseCount"], 1
+            )
+
+    def test_host_binds_allocation_trace_digest_to_adaptive_evidence(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            evidence = root / "evidence.json"
+            evidence.write_text(
+                json.dumps(
+                    {
+                        "scenario": "adaptive-hls-soak",
+                        "allocationProvenance": {"allocator": "malloc"},
+                    }
+                )
+            )
+            trace = root / "adaptive.trace"
+            trace.mkdir()
+            (trace / "data.bin").write_bytes(b"candidate allocation stacks")
+            toc = root / "toc.xml"
+            toc.write_text('<table schema="allocations"/>')
+            digest_script = Path(__file__).resolve().parents[2] / "artifact-tree-digest.py"
+
+            augmented = augment_allocation_trace.augment(
+                evidence, trace, toc, digest_script
+            )
+            record = augmented["allocationProvenance"]["instrumentsTrace"]
+            self.assertRegex(record["treeDigest"], r"^[0-9a-f]{64}$")
+            self.assertEqual(record["template"], "Allocations")
+            self.assertEqual(
+                record["runArtifact"], "artifacts/evidence/adaptive.trace"
+            )
+            self.assertTrue((evidence.parent / record["runArtifact"]).is_dir())
+            self.assertTrue(
+                (evidence.parent / record["tableOfContents"]).is_file()
+            )
+
+            toc.write_text("<trace-toc/>")
+            with self.assertRaises(augment_allocation_trace.TraceEvidenceError):
+                augment_allocation_trace.augment(evidence, trace, toc, digest_script)
+
     def test_materializes_accepted_start_delayed_failure_evidence(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -1045,6 +1137,35 @@ class QualificationRecordAssemblyTests(unittest.TestCase):
         for row in record["rows"]:
             self.assertTrue((output.parent / row["evidence"]).is_file())
 
+    def test_assembles_digest_verified_allocation_trace_artifacts(self):
+        iphone = self.make_report("iphone")
+        ipad = self.make_report("ipad")
+        evidence_path = iphone.parent / "evidence" / "seek.json"
+        evidence = json.loads(evidence_path.read_text())
+        artifact_directory = evidence_path.parent / "artifacts" / "seek"
+        trace = artifact_directory / "allocations.trace"
+        trace.mkdir(parents=True)
+        (trace / "data.bin").write_bytes(b"allocation stacks")
+        toc = artifact_directory / "allocations-toc.xml"
+        toc.write_text('<table schema="allocations"/>')
+        evidence["allocationProvenance"] = {
+            "instrumentsTrace": {
+                "runArtifact": "artifacts/seek/allocations.trace",
+                "tableOfContents": "artifacts/seek/allocations-toc.xml",
+                "treeDigest": assemble_record.tree_digest(trace),
+            }
+        }
+        evidence_path.write_text(json.dumps(evidence))
+
+        output = self.root / "qualification" / "1.1.0.json"
+        assemble_record.assemble(
+            "1.1.0", self.candidate, self.matrix, [iphone, ipad], output
+        )
+
+        retained = output.parent / "evidence" / "1.1.0" / "artifacts" / "seek"
+        self.assertTrue((retained / "allocations.trace" / "data.bin").is_file())
+        self.assertTrue((retained / "allocations-toc.xml").is_file())
+
     def test_rejects_exploratory_and_duplicate_rows(self):
         output = self.root / "qualification" / "1.1.0.json"
         with self.assertRaises(assemble_record.AssemblyError):
@@ -1128,6 +1249,16 @@ class FixtureServerTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
         (self.root / "sample.bin").write_bytes(bytes(range(256)) * 64)
+        for container, suffix in (("ts", ".ts"), ("fmp4", ".m4s")):
+            for variant in ("low", "high"):
+                directory = self.root / "hls" / "soak" / container / variant
+                directory.mkdir(parents=True)
+                for index in range(4):
+                    (directory / f"segment-{index:03d}{suffix}").write_bytes(
+                        f"{container}-{variant}-{index}".encode()
+                    )
+                if container == "fmp4":
+                    (directory / "init.mp4").write_bytes(b"fixture-init")
         self.log = self.root / "requests.jsonl"
         self.server = fixture_server.FixtureHTTPServer(
             ("127.0.0.1", 0), self.root, self.log, 512, 0, False
@@ -1267,6 +1398,98 @@ class FixtureServerTests(unittest.TestCase):
             (self.root / "sample.bin").read_bytes()[:512],
         )
         retry_connection.close()
+
+    def test_adaptive_origin_serves_master_event_and_sliding_live_telemetry(self):
+        connection, response = self.request("/adaptive/run/vod-ts/master.m3u8")
+        master = response.read().decode()
+        connection.close()
+        self.assertEqual(response.status, 200)
+        self.assertIn("RESOLUTION=320x180", master)
+        self.assertIn("RESOLUTION=640x360", master)
+
+        connection, response = self.request("/adaptive/run/event-fmp4/low.m3u8")
+        event = response.read().decode()
+        connection.close()
+        self.assertIn("#EXT-X-PLAYLIST-TYPE:EVENT", event)
+        self.assertIn("#EXT-X-MAP", event)
+        self.assertIn("#EXT-X-DISCONTINUITY", event)
+
+        connection, response = self.request("/adaptive/run/live-ts/high.m3u8")
+        first_live = response.read().decode()
+        connection.close()
+        self.server._adaptive_started_at[("run", "live-ts", "high")] -= 4
+        connection, response = self.request("/adaptive/run/live-ts/high.m3u8")
+        second_live = response.read().decode()
+        connection.close()
+        self.assertIn("#EXT-X-MEDIA-SEQUENCE:0", first_live)
+        self.assertIn("#EXT-X-MEDIA-SEQUENCE:2", second_live)
+
+        connection, response = self.request("/adaptive/run/metrics")
+        metrics = json.loads(response.read())
+        connection.close()
+        self.assertEqual(metrics["playlistTypes"], ["event", "live", "vod"])
+        self.assertEqual(metrics["containers"], ["fmp4", "ts"])
+        self.assertGreater(metrics["expiredWindows"], 0)
+        self.assertGreater(metrics["discontinuityManifests"], 0)
+
+        connection, response = self.request("/adaptive/run/complete")
+        self.assertEqual(json.loads(response.read()), {"clientCompleted": True})
+        connection.close()
+        connection, response = self.request("/adaptive/run/metrics")
+        self.assertTrue(json.loads(response.read())["clientCompleted"])
+        connection.close()
+
+    def test_adaptive_retry_fails_once_then_recovers(self):
+        path = "/adaptive/retry/retry-ts/low/segment-000.ts"
+        connection, response = self.request(path)
+        self.assertEqual(response.status, 503)
+        response.read()
+        connection.close()
+
+        connection, response = self.request(path)
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.read(), b"ts-low-0")
+        connection.close()
+
+        connection, response = self.request("/adaptive/retry/metrics")
+        metrics = json.loads(response.read())
+        connection.close()
+        self.assertEqual(metrics["retryFailures"], 1)
+        self.assertEqual(metrics["retryRecoveries"], 1)
+
+    def test_adaptive_variant_transitions_require_one_multivariant_master(self):
+        for path in (
+            "/adaptive/transitions/abr-low-ts/low/segment-000.ts",
+            "/adaptive/transitions/abr-high-fmp4/high/segment-000.m4s",
+        ):
+            connection, response = self.request(path)
+            self.assertEqual(response.status, 200)
+            response.read()
+            connection.close()
+
+        connection, response = self.request("/adaptive/transitions/metrics")
+        self.assertEqual(json.loads(response.read())["variantTransitions"], 0)
+        connection.close()
+
+        for variant in ("low", "high"):
+            connection, response = self.request(
+                f"/adaptive/transitions/abr-ts/{variant}/segment-000.ts"
+            )
+            self.assertEqual(response.status, 200)
+            response.read()
+            connection.close()
+
+        connection, response = self.request("/adaptive/transitions/metrics")
+        self.assertEqual(json.loads(response.read())["variantTransitions"], 1)
+        connection.close()
+
+    def test_fmp4_generator_places_each_init_beside_its_variant(self):
+        script = (ROOT / "qualification" / "generate-fixtures.sh").read_text()
+        self.assertIn(
+            'cd "$fixture_tmp/hls/soak/fmp4/$variant"',
+            script,
+        )
+        self.assertIn("-hls_fmp4_init_filename init.mp4", script)
 
 
 if __name__ == "__main__":
