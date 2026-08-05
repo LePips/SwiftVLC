@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -14,6 +15,21 @@ class EvidenceError(ValueError):
 
 
 HOST_IDENTITY_FIELDS = {"artifactDigest", "releaseSourceDigest", "hardware"}
+
+
+def attachment_name_matches(actual: object, expected: str) -> bool:
+    if actual == expected:
+        return True
+    if not isinstance(actual, str):
+        return False
+    expected_path = Path(expected)
+    suffix_pattern = re.compile(
+        rf"^{re.escape(expected_path.stem)}_\d+_"
+        r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-"
+        r"[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}"
+        rf"{re.escape(expected_path.suffix)}$"
+    )
+    return suffix_pattern.fullmatch(actual) is not None
 
 
 def find_attachment(directory: Path, expected_name: str) -> Path:
@@ -32,7 +48,9 @@ def find_attachment(directory: Path, expected_name: str) -> Path:
         for attachment in test.get("attachments", []):
             if (
                 isinstance(attachment, dict)
-                and attachment.get("suggestedHumanReadableName") == expected_name
+                and attachment_name_matches(
+                    attachment.get("suggestedHumanReadableName"), expected_name
+                )
             ):
                 exported = attachment.get("exportedFileName")
                 if not isinstance(exported, str) or not exported:

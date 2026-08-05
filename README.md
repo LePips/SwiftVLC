@@ -261,10 +261,37 @@ Releases advance `main`, but stable releases can only consume an immutable,
 previously prepared and device-qualified candidate. `setup-dev.sh` flips a
 working checkout back to local sources for day-to-day development.
 
+### Mandatory physical-device gate
+
+Before publishing a stable release, run the connected-device validator against
+the exact source and libVLC artifact that will ship:
+
+```bash
+./Validate\ SwiftVLC.command --yes
+```
+
+Run it from the candidate tag or checkout whose `Package.swift` pins the
+candidate artifact. The command verifies and downloads that immutable artifact,
+then builds, signs, installs, and exercises every matrix scenario that
+applies to the connected iPhone or iPad, then creates one shareable
+`SwiftVLC-Device-Report-*.zip`. No manual in-app checklist is required. A full
+current-iPhone run is intentionally comprehensive and can take 8–10 hours; keep
+the Mac and device powered, unlocked, and connected. Runs on simulators or beta
+and unknown OS builds remain exploratory and cannot satisfy the stable gate.
+
+One device normally covers only one hardware/OS row. Repeat the same command on
+each device required by `scripts/qualification/matrix.json`, retain the raw
+`report.json` from each run, assemble those reports, and run the fail-closed
+qualification check before publishing stable. See
+[scripts/qualification/README.md](scripts/qualification/README.md#release-operator-checklist)
+for the exact candidate-binding, report assembly, and release commands.
+
 ```bash
 ./scripts/build-libvlc.sh --all          # produces Vendor/libvlc.xcframework
 ./scripts/release.sh X.Y.Z --dry-run     # strip + zip + checksum, no push
 ./scripts/release.sh X.Y.Z --prepare /absolute/path/to/candidate
+./Validate\ SwiftVLC.command --yes        # from the candidate tag; repeat per device row
+python3 scripts/qualification/assemble-record.py --help
 ./scripts/check-qualification.sh X.Y.Z /absolute/path/to/candidate/libvlc.xcframework
 ./scripts/release.sh X.Y.Z --candidate /absolute/path/to/candidate
 ```
@@ -274,8 +301,9 @@ What `release.sh` does:
 1. Verifies all eight platform slices are present in the xcframework.
 2. In `--prepare` mode, strips and zips once, then records complete-tree, zip,
    and provenance digests in an immutable candidate directory.
-3. Requires physical-device qualification to name that complete post-strip
-   tree; a stable run refuses to rebuild or mutate it.
+3. Requires the unattended physical-device matrix to qualify that complete
+   post-strip tree and its exact release-significant Swift source; a stable run
+   refuses to rebuild or mutate either identity.
 4. Verifies the prepared zip expands to the qualified XCFramework and that all
    candidate/provenance checksums still match.
 5. Rewrites `Package.swift` to the remote URL and checksum, pins the Showcase

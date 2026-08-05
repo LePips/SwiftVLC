@@ -406,6 +406,87 @@ import Testing
     )
   }
 
+  @Test
+  func `Retired native handle cannot restore outgoing media capability`() {
+    let envelope = PlayerEventEnvelope(
+      event: .seekableChanged(true),
+      nativeGeneration: NativePlayerGeneration(1),
+      playbackGeneration: PlaybackGeneration(2)
+    )
+
+    #expect(
+      !PiPController.shouldObservePlaybackStateEnvelope(
+        envelope,
+        nativeGeneration: NativePlayerGeneration(2),
+        playbackGeneration: PlaybackGeneration(2)
+      )
+    )
+  }
+
+  @Test
+  func `Successor media change can precede Player generation publication`() {
+    let envelope = PlayerEventEnvelope(
+      event: .mediaChanged,
+      nativeGeneration: NativePlayerGeneration(2),
+      playbackGeneration: PlaybackGeneration(2)
+    )
+
+    #expect(
+      PiPController.shouldObservePlaybackStateEnvelope(
+        envelope,
+        nativeGeneration: NativePlayerGeneration(2),
+        playbackGeneration: PlaybackGeneration(1)
+      )
+    )
+  }
+
+  @Test
+  func `Superseded media event on current handle is rejected`() {
+    let envelope = PlayerEventEnvelope(
+      event: .lengthChanged(.seconds(120)),
+      nativeGeneration: NativePlayerGeneration(2),
+      playbackGeneration: PlaybackGeneration(1)
+    )
+
+    #expect(
+      !PiPController.shouldObservePlaybackStateEnvelope(
+        envelope,
+        nativeGeneration: NativePlayerGeneration(2),
+        playbackGeneration: PlaybackGeneration(2)
+      )
+    )
+  }
+
+  /// Drawable-backed active replacement sets media before attaching the new
+  /// event manager, so there may be no native `MediaChanged` callback. The
+  /// first successor envelope must still reset the outgoing VOD policy.
+  @Test
+  func `Successor generation resets capability without media changed`() throws {
+    var state = PiPController.PlaybackStateObservationState(
+      duration: .seconds(120),
+      isSeekable: true,
+      playbackGeneration: PlaybackGeneration(1)
+    )
+
+    let generationUpdate = state.adoptPlaybackGeneration(
+      PlaybackGeneration(2),
+      capability: PlayerCapabilitySnapshot(generation: 2)
+    )
+    let update = try #require(generationUpdate)
+
+    #expect(update.invalidatesPlaybackState)
+    #expect(update.requiresLinearPlayback == true)
+    #expect(state.durationMilliseconds == nil)
+    #expect(!state.isSeekable)
+    #expect(
+      state.adoptPlaybackGeneration(
+        PlaybackGeneration(2),
+        capability: PlayerCapabilitySnapshot(generation: 2)
+      ) == nil,
+      "the same generation published a duplicate reset"
+    )
+  }
+
   /// A poll that has not learned the length must not undo a length event that
   /// already arrived, or the two sources fight each other.
   @Test

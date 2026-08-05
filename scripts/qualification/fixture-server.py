@@ -369,6 +369,8 @@ class FixtureHTTPServer(ThreadingHTTPServer):
         chunk_delay: float,
         verbose: bool,
     ) -> None:
+        if ":" in address[0]:
+            self.address_family = socket.AF_INET6
         super().__init__(address, FixtureHandler)
         self.root = root.resolve()
         self.request_log = request_log
@@ -667,6 +669,11 @@ def lan_address() -> str:
         return connection.getsockname()[0]
 
 
+def advertised_url(host: str, port: int) -> str:
+    url_host = f"[{host}]" if ":" in host else host
+    return f"http://{url_host}:{port}"
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", type=Path, required=True)
@@ -691,7 +698,11 @@ def main() -> None:
         args.verbose,
     )
     advertised = args.advertise_host or lan_address()
-    ready = {"host": advertised, "port": server.server_port, "baseURL": f"http://{advertised}:{server.server_port}"}
+    ready = {
+        "host": advertised,
+        "port": server.server_port,
+        "baseURL": advertised_url(advertised, server.server_port),
+    }
     if args.ready_file:
         args.ready_file.write_text(json.dumps(ready, indent=2, sort_keys=True) + "\n")
     print(json.dumps(ready, sort_keys=True), flush=True)

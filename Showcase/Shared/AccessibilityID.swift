@@ -193,6 +193,7 @@ enum AccessibilityID {
     static let lifecycleEventsLabel = "pipContinuity.lifecycleEvents"
     static let replacementMeasurementLabel = "pipContinuity.replacementMeasurement"
     static let staleSuccessorMutationsLabel = "pipContinuity.staleSuccessorMutations"
+    static let automationSnapshot = "pipContinuity.automationSnapshot"
   }
 
   enum PiPCapabilityValidation {

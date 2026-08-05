@@ -49,8 +49,8 @@ extension PiPController {
   /// only a weak reference in scope, so an observer never prevents the
   /// controller from deinitializing.
   func startStateObserver() {
-    let controlEvents = player.controlEvents
-    let timingEvents = player.timingEvents
+    let controlEvents = player.controlEventEnvelopes
+    let timingEvents = player.timingEventEnvelopes
     let initialActive = player.isPlaybackRequestedActive
     let initialNativeActive = player.isActive
     pipPlaybackActive = initialActive
@@ -60,21 +60,58 @@ extension PiPController {
     lastObservedRate = 1.0
     playbackStateObservation = PlaybackStateObservationState(
       duration: player.duration,
-      isSeekable: player.isSeekable
+      isSeekable: player.isSeekable,
+      playbackGeneration: player.generation
     )
 
     stateObserverTask = Task { @MainActor [weak self] in
-      for await event in controlEvents {
+      for await envelope in controlEvents {
         guard let self else { return }
-        handleStateObserverEvent(event)
+        handleStateObserverEnvelope(envelope)
       }
     }
     timingObserverTask = Task { @MainActor [weak self] in
-      for await event in timingEvents {
+      for await envelope in timingEvents {
         guard let self else { return }
-        handleStateObserverEvent(event)
+        handleStateObserverEnvelope(envelope)
       }
     }
+  }
+
+  /// Rejects callbacks that were emitted by a retired native handle or for a
+  /// superseded media session before they can mutate AVKit's policy.
+  ///
+  /// The raw event streams deliberately omit this provenance. That was unsafe
+  /// here: an active `play(_:)` can replace the native player, and its retiring
+  /// handle may still deliver a late VOD length/seekability callback after the
+  /// successor live stream is current. Applying that callback made live PiP
+  /// finite and interactive until another capability event happened to repair
+  /// it. Envelope filtering makes the session boundary explicit instead of
+  /// relying on callback order.
+  private func handleStateObserverEnvelope(_ envelope: PlayerEventEnvelope) {
+    guard
+      Self.shouldObservePlaybackStateEnvelope(
+        envelope,
+        nativeGeneration: player.nativeEventGeneration,
+        playbackGeneration: player.generation
+      )
+    else { return }
+
+    let capability = player.capabilitySnapshot.withLock { $0 }
+    if
+      let update = playbackStateObservation.adoptPlaybackGeneration(
+        envelope.playbackGeneration,
+        capability: capability
+      ) {
+      applyObservedPlaybackStateUpdate(update)
+      // The generation adoption performed the exact conservative work of a
+      // media-change event. Avoid publishing the same reset twice when the
+      // successor did emit that callback.
+      if case .mediaChanged = envelope.event {
+        return
+      }
+    }
+    handleStateObserverEvent(envelope.event)
   }
 
   /// The body both lane tasks run. Identical work either way: what differs

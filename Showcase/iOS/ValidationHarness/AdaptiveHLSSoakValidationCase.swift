@@ -260,8 +260,8 @@ struct AdaptiveHLSSoakValidationCase: View {
       Spacer()
       Text(value)
         .foregroundStyle(.secondary)
-        .accessibilityIdentifier(identifier)
     }
+    .qualificationAccessibilityValue(value, title: title, identifier: identifier)
   }
 
   private static func memorySample(elapsedSeconds: Int, player: Player) -> AdaptiveMemorySample {

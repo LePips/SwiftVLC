@@ -749,6 +749,18 @@ clock and a 3-minute idle watchdog and sends SIGKILL to the process
 group when either fires. Caches cover the libvlc xcframework, compiled
 build products, and SPM dependency checkouts.
 
+**Physical release qualification.** CI cannot exercise real system PiP,
+SpringBoard controls, device audio interruptions, native video output, or the
+thermal and timing behavior of libVLC on hardware. The repository-root
+`Validate SwiftVLC.command` is therefore part of the release architecture, not
+an optional smoke test. It signs and installs the exact candidate, runs every
+scenario applicable to the connected matrix row without manual observations,
+and emits candidate-bound evidence. A complete current-iPhone row can take
+8–10 hours because XCTest executes device UI cases serially and isolates many
+cases with a fresh app launch. Reports from all required hardware/OS rows are
+assembled into the versioned qualification record; stable publication remains
+blocked until `check-qualification.sh` accepts that record.
+
 ---
 
 ## Build & Release Infrastructure
@@ -761,6 +773,10 @@ build products, and SPM dependency checkouts.
 | `scripts/build-libvlc.sh` | Compiles libVLC from VideoLAN source (pinned via `VLC_HASH`) into `Vendor/libvlc.xcframework`. Applies the local VLC source patches described in README. |
 | `scripts/fix-duplicate-symbols.sh` | Localizes `_json_parse_error` and `_json_read` in the chromecast plugin, which two VLC plugins each emit. Called automatically by `build-libvlc.sh` and `setup-dev.sh`. |
 | `scripts/release.sh` | Cuts a versioned release, uploads the xcframework asset, pins the Showcase app to that exact Swift package version, and advances `main`. |
+| `Validate SwiftVLC.command` | One-command physical-device validator for maintainers and community testers. Preflights signing and hardware, runs the complete applicable matrix unattended, and creates a privacy-scrubbed shareable report ZIP. |
+| `scripts/qualification/run-device-tests.sh` | Lower-level candidate-bound device runner used by the launcher. Supports exact prebuilt products and focused diagnostic lanes. |
+| `scripts/qualification/assemble-record.py` | Combines eligible reports from separate devices into the versioned qualification record while rejecting stale, duplicate, exploratory, or identity-mismatched evidence. |
+| `scripts/check-qualification.sh` | Fail-closed stable-release gate. Recomputes candidate identities and requires every matrix row and scenario-specific evidence field to pass. |
 | `scripts/ci-use-released-xcframework.sh` | CI-only. Rewrites the current `Package.swift` `binaryTarget` to the url+checksum of the latest release tag. Run at CI job start so tests resolve against the same binary a downstream consumer would. |
 | `scripts/ci-run-with-timeouts.py` | CI-only. Wraps `swift test` with wall-clock and idle timeouts; SIGKILLs the process group if either fires. |
 
@@ -799,20 +815,31 @@ The Showcase apps follow the same split: published states pin `SwiftVLC` by exac
 ```mermaid
 flowchart LR
     BUILD["build-libvlc.sh --all"] --> XCF["Vendor/libvlc.xcframework<br/>(unstripped)"]
-    XCF --> RELEASE["release.sh X.Y.Z"]
-    RELEASE --> VERIFY["Verify all required slices present"]
-    VERIFY --> STRIP["strip -S"]
-    STRIP --> ZIP["ditto -c -k"]
-    ZIP --> SUM["swift package compute-checksum"]
-    SUM --> COMMIT["Commit on main:<br/>Package.swift → url+checksum<br/>Showcase → exactVersion X.Y.Z"]
+    XCF --> PREPARE["release.sh X.Y.Z --prepare candidate"]
+    PREPARE --> VERIFY["Verify slices, provenance,<br/>source, and matrix identity"]
+    VERIFY --> STRIP["Create immutable stripped tree,<br/>zip, checksum, and manifest"]
+    STRIP --> DEVICE["Validate SwiftVLC.command<br/>on each required device row"]
+    DEVICE --> ASSEMBLE["assemble-record.py<br/>candidate-bound evidence"]
+    ASSEMBLE --> GATE["check-qualification.sh"]
+    GATE -->|all rows pass| RELEASE["release.sh X.Y.Z --candidate"]
+    GATE -->|missing, stale, or failed| BLOCK["Block stable publication"]
+    RELEASE --> COMMIT["Commit on main:<br/>Package.swift → url+checksum<br/>Showcase → exactVersion X.Y.Z"]
     COMMIT --> TAG["git tag vX.Y.Z"]
-    TAG --> PUSH_TAG["git push origin vX.Y.Z"]
-    PUSH_TAG --> GH["gh release create<br/>+ attached .zip"]
-    GH --> PUSH_MAIN["git push origin HEAD:main"]
-    PUSH_MAIN --> SPM["main and consumers resolve the same release"]
+    TAG --> DRAFT["Upload immutable assets<br/>to draft GitHub release"]
+    DRAFT --> PUSH_MAIN["Advance origin/main"]
+    PUSH_MAIN --> PUBLISH["Publish GitHub release"]
+    PUBLISH --> SPM["main and consumers resolve the same release"]
 ```
 
-Preflight refuses releases from non-`main` branches, uncommitted changes in `Package.swift` or the Showcase project, pre-existing local or remote tags, and unauthenticated `gh`. If a pre-commit rewrite or post-write sanity check fails, the script restores `Package.swift` and the Showcase project before exiting. The tag is pushed before `main`, so if GitHub Release creation fails, `origin/main` still points at the previous good release; finish the release or delete the tag before retrying. A post-write regex guard verifies that the rewritten `Package.swift` still contains the `CLibVLC` target, catching a malformed replacement before the tag is cut.
+Preflight refuses releases from non-`main` branches, uncommitted changes in
+`Package.swift` or the Showcase project, pre-existing local or remote tags, and
+unauthenticated `gh`. Stable publication additionally rejects an absent,
+partial, exploratory, failed, or candidate-mismatched physical-device record.
+If a pre-commit rewrite or post-write sanity check fails, the script restores
+`Package.swift` and the Showcase project before exiting. Assets remain in a
+non-public draft until `origin/main` advances successfully. A post-write regex
+guard verifies that the rewritten `Package.swift` still contains the `CLibVLC`
+target, catching a malformed replacement before the tag is cut.
 
 After publishing a tag, verify that Swift Package Index has completed its
 asynchronous documentation build and that the unversioned documentation URL

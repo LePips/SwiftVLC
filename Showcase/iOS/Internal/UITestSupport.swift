@@ -61,6 +61,23 @@ enum UITestSupport {
 }
 
 extension View {
+  /// Exposes a validation value as one stable accessibility element.
+  ///
+  /// iOS 27 may merge a row's title and value (or hide the child carrying
+  /// the identifier). Qualification tests need the machine-readable value
+  /// to remain identical across OS releases, while VoiceOver still receives
+  /// the human-readable title as a hint.
+  func qualificationAccessibilityValue(
+    _ value: String,
+    title: String,
+    identifier: String
+  ) -> some View {
+    accessibilityElement(children: .ignore)
+      .accessibilityLabel(value)
+      .accessibilityHint(title)
+      .accessibilityIdentifier(identifier)
+  }
+
   /// Applies `.accessibilityIdentifier(_:)` only when `identifier` is
   /// non-nil. Avoids setting an empty-string identifier, which would
   /// make multiple sliders/rows share the same ambiguous ID and break

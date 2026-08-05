@@ -58,12 +58,21 @@ struct MatrixScreenA: View {
 
       Section("Picture in Picture") {
         if let pip {
-          LabeledContent("Possible", value: pip.isPossible ? "yes" : "no")
-            .accessibilityIdentifier(AccessibilityID.PiPContinuityValidation.possibleLabel)
-          LabeledContent("Active", value: pip.isActive ? "yes" : "no")
-            .accessibilityIdentifier(AccessibilityID.PiPContinuityValidation.activeLabel)
-          LabeledContent("Continuity", value: continuityStatus)
-            .accessibilityIdentifier("validation.matrixA.continuity")
+          valueRow(
+            "Possible",
+            value: pip.isPossible ? "yes" : "no",
+            identifier: AccessibilityID.PiPContinuityValidation.possibleLabel
+          )
+          valueRow(
+            "Active",
+            value: pip.isActive ? "yes" : "no",
+            identifier: AccessibilityID.PiPContinuityValidation.activeLabel
+          )
+          valueRow(
+            "Continuity",
+            value: continuityStatus,
+            identifier: "validation.matrixA.continuity"
+          )
           Button(
             pip.isActive ? "Stop PiP" : "Start PiP",
             systemImage: "pip",
@@ -77,57 +86,56 @@ struct MatrixScreenA: View {
       }
 
       Section("Measured state") {
-        LabeledContent("Playback", value: String(describing: player.state))
-          .accessibilityIdentifier(AccessibilityID.PiPContinuityValidation.stateLabel)
-        LabeledContent(
+        valueRow(
+          "Playback",
+          value: String(describing: player.state),
+          identifier: AccessibilityID.PiPContinuityValidation.stateLabel
+        )
+        valueRow(
           "Media generation",
-          value: player.playbackQualificationGeneration.description
+          value: player.playbackQualificationGeneration.description,
+          identifier: AccessibilityID.PiPContinuityValidation.generationLabel
         )
-        .accessibilityIdentifier(AccessibilityID.PiPContinuityValidation.generationLabel)
-        LabeledContent(
+        valueRow(
           "Displayed pictures",
-          value: String(player.statistics?.displayedPictures ?? 0)
+          value: String(player.statistics?.displayedPictures ?? 0),
+          identifier: AccessibilityID.PiPContinuityValidation.displayedPicturesLabel
         )
-        .accessibilityIdentifier(
-          AccessibilityID.PiPContinuityValidation.displayedPicturesLabel
-        )
-        LabeledContent(
+        valueRow(
           "Played audio buffers",
-          value: String(player.statistics?.playedAudioBuffers ?? 0)
+          value: String(player.statistics?.playedAudioBuffers ?? 0),
+          identifier: AccessibilityID.PiPContinuityValidation.playedAudioBuffersLabel
         )
-        .accessibilityIdentifier(
-          AccessibilityID.PiPContinuityValidation.playedAudioBuffersLabel
+        valueRow(
+          "Playback snapshot",
+          value: playbackSnapshot,
+          identifier: AccessibilityID.PiPContinuityValidation.playbackSnapshotLabel
         )
-        LabeledContent("Playback snapshot", value: playbackSnapshot)
-          .accessibilityIdentifier(
-            AccessibilityID.PiPContinuityValidation.playbackSnapshotLabel
-          )
-        LabeledContent("Native atomic snapshot", value: nativePlaybackSnapshot)
-          .accessibilityIdentifier(
-            AccessibilityID.PiPContinuityValidation.nativePlaybackSnapshotLabel
-          )
-        LabeledContent(
+        valueRow(
+          "Native atomic snapshot",
+          value: nativePlaybackSnapshot,
+          identifier: AccessibilityID.PiPContinuityValidation.nativePlaybackSnapshotLabel
+        )
+        valueRow(
           "Continuity events",
-          value: continuityEvents.isEmpty ? "none" : continuityEvents.joined(separator: "|")
+          value: continuityEvents.isEmpty ? "none" : continuityEvents.joined(separator: "|"),
+          identifier: AccessibilityID.PiPContinuityValidation.continuityEventsLabel
         )
-        .accessibilityIdentifier(
-          AccessibilityID.PiPContinuityValidation.continuityEventsLabel
-        )
-        LabeledContent(
+        valueRow(
           "Lifecycle events",
-          value: lifecycleEvents.isEmpty ? "none" : lifecycleEvents.joined(separator: "|")
+          value: lifecycleEvents.isEmpty ? "none" : lifecycleEvents.joined(separator: "|"),
+          identifier: AccessibilityID.PiPContinuityValidation.lifecycleEventsLabel
         )
-        .accessibilityIdentifier(
-          AccessibilityID.PiPContinuityValidation.lifecycleEventsLabel
+        valueRow(
+          "Replacement measurement",
+          value: "\(replacementMeasurement):\(staleSuccessorMutations)",
+          identifier: AccessibilityID.PiPContinuityValidation.replacementMeasurementLabel
         )
-        LabeledContent("Replacement measurement", value: replacementMeasurement)
-          .accessibilityIdentifier(
-            AccessibilityID.PiPContinuityValidation.replacementMeasurementLabel
-          )
-        LabeledContent("Stale successor mutations", value: String(staleSuccessorMutations))
-          .accessibilityIdentifier(
-            AccessibilityID.PiPContinuityValidation.staleSuccessorMutationsLabel
-          )
+        valueRow(
+          "Stale successor mutations",
+          value: String(staleSuccessorMutations),
+          identifier: AccessibilityID.PiPContinuityValidation.staleSuccessorMutationsLabel
+        )
       }
 
       Section("Channel zap") {
@@ -143,6 +151,17 @@ struct MatrixScreenA: View {
       ResultRecorderSection(screenID: "matrix-a")
     }
     .showcaseFormStyle()
+    .overlay(alignment: .topLeading) {
+      Text("Automation snapshot")
+        .frame(width: 1, height: 1)
+        .clipped()
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(automationSnapshot)
+        .accessibilityIdentifier(
+          AccessibilityID.PiPContinuityValidation.automationSnapshot
+        )
+        .allowsHitTesting(false)
+    }
     .navigationTitle("(a) PiP survival")
     .toolbar {
       if LaunchArguments.isUITestMode {
@@ -172,6 +191,11 @@ struct MatrixScreenA: View {
       replacementProbe?.cancel()
       player.stop()
     }
+  }
+
+  private func valueRow(_ title: String, value: String, identifier: String) -> some View {
+    LabeledContent(title, value: value)
+      .qualificationAccessibilityValue(value, title: title, identifier: identifier)
   }
 
   @ViewBuilder
@@ -271,6 +295,25 @@ struct MatrixScreenA: View {
     let seekable = snapshot.isSeekable ? "seekable" : "unseekable"
     let controls = snapshot.requiresLinearPlayback ? "linear" : "interactive"
     return "\(duration):\(seekable):\(controls)"
+  }
+
+  /// A fixed accessibility probe for device automation. SwiftUI Forms lazily
+  /// remove off-screen rows from the accessibility hierarchy, so qualification
+  /// must not use those rows as its state transport.
+  private var automationSnapshot: String {
+    [
+      "state=\(String(describing: player.state))",
+      "generation=\(player.playbackQualificationGeneration.description)",
+      "displayedPictures=\(player.statistics?.displayedPictures ?? 0)",
+      "playedAudioBuffers=\(player.statistics?.playedAudioBuffers ?? 0)",
+      "playbackSnapshot=\(playbackSnapshot)",
+      "nativePlaybackSnapshot=\(nativePlaybackSnapshot)",
+      "possible=\(pip?.isPossible == true ? "yes" : "no")",
+      "active=\(pip?.isActive == true ? "yes" : "no")",
+      "continuityEvents=\(continuityEvents.isEmpty ? "none" : continuityEvents.joined(separator: "|"))",
+      "lifecycleEvents=\(lifecycleEvents.isEmpty ? "none" : lifecycleEvents.joined(separator: "|"))",
+      "replacementMeasurement=\(replacementMeasurement):\(staleSuccessorMutations)"
+    ].joined(separator: "\n")
   }
 
   private var nativePlaybackSnapshot: String {

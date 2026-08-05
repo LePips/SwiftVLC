@@ -34,6 +34,8 @@ Showcase/iOS/ValidationHarness/streams.local.json
 
 # Generated deterministic media for the physical-device qualification lane
 .qualification-fixtures/
+.device-test-build/
+SwiftVLC Device Reports/
 
 # Local working documents (not part of the repo)
 CLAUDE.md

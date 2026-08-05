@@ -210,8 +210,8 @@ struct PiPCapabilityValidationCase: View {
       Spacer()
       Text(value)
         .foregroundStyle(.secondary)
-        .accessibilityIdentifier(identifier)
     }
+    .qualificationAccessibilityValue(value, title: title, identifier: identifier)
   }
 }
 

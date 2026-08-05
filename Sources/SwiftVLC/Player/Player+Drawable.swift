@@ -246,7 +246,8 @@ extension Player {
   func replaceNativePlayerForDrawablePlayback(
     target: AnyObject?,
     media: Media? = nil,
-    resumeBeforeRelease: Bool = false
+    resumeBeforeRelease: Bool = false,
+    successorPlaybackGeneration: PlaybackGeneration? = nil
   )
     throws(VLCError) {
     let oldPointer = pointer
@@ -329,6 +330,16 @@ extension Player {
     needsDrawableRebindForPlayback = false
     nativePlayerHasHostedDrawable = target != nil
     nativePlayerHasStartedPlayback = false
+
+    #if os(iOS)
+    if
+      let successorPlaybackGeneration,
+      let attachment = target as? IOSNativePiPDrawableAttachment {
+      attachment.expectPictureInPictureHandoff(
+        for: successorPlaybackGeneration
+      )
+    }
+    #endif
 
     releaseNativePlayer(
       oldPointer,
