@@ -521,7 +521,8 @@ extension TVShowcase {
          .pipVODControlsValidation,
          .pipLongStallValidation,
          .pipDismissalValidation,
-         .pipInterruptionValidation:
+         .pipInterruptionValidation,
+         .pipNativeLifecycleValidation:
       return nil
     }
   }

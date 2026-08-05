@@ -133,6 +133,7 @@ extension UITestRoute {
     case .pipLongStallValidation: PiPLongStallValidationCase()
     case .pipDismissalValidation: PiPDismissalValidationCase()
     case .pipInterruptionValidation: PiPInterruptionValidationCase()
+    case .pipNativeLifecycleValidation: PiPNativeLifecycleValidationCase()
     }
   }
 }

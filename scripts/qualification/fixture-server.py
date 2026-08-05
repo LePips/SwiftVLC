@@ -57,6 +57,33 @@ class FixtureHandler(BaseHTTPRequestHandler):
                 transferred = len(payload)
                 return
 
+            match = re.fullmatch(r"/fault/close-trigger/([A-Za-z0-9._-]+)", route)
+            if match:
+                generation = self.server.trigger_close(match.group(1))
+                payload = json.dumps({"generation": generation}).encode()
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+                transferred = len(payload)
+                return
+
+            match = re.fullmatch(
+                r"/fault/gated-close/([A-Za-z0-9._-]+)/(.+)", route
+            )
+            if match:
+                token = match.group(1)
+                if self.server.close_generation(token) > 0:
+                    status = HTTPStatus.SERVICE_UNAVAILABLE
+                    self.response_status = status
+                    self.send_error(status, "fixture connection was closed")
+                    return
+                transferred = self._serve_loop(
+                    self._safe_path(match.group(2)), close_token=token
+                )
+                return
+
             match = re.fullmatch(
                 r"/fault/gated-stall/([A-Za-z0-9._-]+)/([0-9]+(?:\.[0-9]+)?)/(.+)",
                 route,
@@ -144,6 +171,7 @@ class FixtureHandler(BaseHTTPRequestHandler):
         *,
         stall_token: str | None = None,
         stall_seconds: float = 0,
+        close_token: str | None = None,
     ) -> int:
         content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
         self.send_response(HTTPStatus.OK)
@@ -171,6 +199,9 @@ class FixtureHandler(BaseHTTPRequestHandler):
                             remaining = triggered_at + stall_seconds - time.monotonic()
                             if remaining > 0:
                                 time.sleep(remaining)
+                    if close_token and self.server.close_generation(close_token) > 0:
+                        self.close_connection = True
+                        return transferred
                     if self.server.chunk_delay:
                         time.sleep(self.server.chunk_delay)
 
@@ -268,6 +299,8 @@ class FixtureHTTPServer(ThreadingHTTPServer):
         self._stall_lock = threading.Lock()
         self._stall_generations: dict[str, int] = {}
         self._stall_triggered_at: dict[str, float] = {}
+        self._close_lock = threading.Lock()
+        self._close_generations: dict[str, int] = {}
 
     def trigger_stall(self, token: str) -> int:
         with self._stall_lock:
@@ -282,6 +315,16 @@ class FixtureHTTPServer(ThreadingHTTPServer):
                 self._stall_generations.get(token, 0),
                 self._stall_triggered_at.get(token, 0),
             )
+
+    def trigger_close(self, token: str) -> int:
+        with self._close_lock:
+            generation = self._close_generations.get(token, 0) + 1
+            self._close_generations[token] = generation
+            return generation
+
+    def close_generation(self, token: str) -> int:
+        with self._close_lock:
+            return self._close_generations.get(token, 0)
 
     def handle_error(self, request: object, client_address: tuple[str, int]) -> None:
         # Media clients commonly abandon a keep-alive connection after a seek

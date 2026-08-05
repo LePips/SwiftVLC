@@ -285,6 +285,17 @@ enum AccessibilityID {
     static let errorLabel = "pipInterruption.error"
   }
 
+  enum PiPNativeLifecycleValidation {
+    static let videoView = "pipNativeLifecycle.videoView"
+    static let stateLabel = "pipNativeLifecycle.state"
+    static let possibleLabel = "pipNativeLifecycle.possible"
+    static let activeLabel = "pipNativeLifecycle.active"
+    static let lifecycleEventsLabel = "pipNativeLifecycle.lifecycleEvents"
+    static let resultLabel = "pipNativeLifecycle.result"
+    static let runButton = "pipNativeLifecycle.run"
+    static let errorLabel = "pipNativeLifecycle.error"
+  }
+
   enum MatrixHValidation {
     static let stateLabel = "validation.matrixH.state"
     static let currentTimeLabel = "validation.matrixH.currentTime"
