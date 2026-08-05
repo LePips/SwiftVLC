@@ -384,8 +384,8 @@ struct PiPLongStallValidationCase: View {
       Spacer()
       Text(value)
         .foregroundStyle(.secondary)
-        .accessibilityIdentifier(identifier)
     }
+    .qualificationAccessibilityValue(value, title: title, identifier: identifier)
   }
 
   private static func residentBytes() -> UInt64 {
