@@ -12,6 +12,7 @@ DERIVED_DATA="${SWIFTVLC_DEVICE_DERIVED_DATA:-$ROOT_DIR/.device-test-build}"
 FIXTURES="${SWIFTVLC_DEVICE_FIXTURES:-$ROOT_DIR/.qualification-fixtures}"
 OUTPUT_ROOT="${SWIFTVLC_DEVICE_RESULTS:-$ROOT_DIR/.qualification-results}"
 REQUIRE_STABLE=false
+EXPLORATORY_CURRENT_ONLY=false
 SKIP_BUILD=false
 ONLY_SCENARIOS=()
 ADAPTIVE_SOAK_SECONDS="${SWIFTVLC_ADAPTIVE_SOAK_SECONDS:-7200}"
@@ -52,6 +53,9 @@ Options:
                           accepted-start-delayed-failure, hls-seek,
                           harness-regressions, ui-failures, thumbnail-preview
   --require-stable        Refuse beta/unknown OS or a non-matching matrix row
+  --exploratory-current-only
+                          Allow iphone-current-only lanes on a newer iPhone OS;
+                          evidence remains exploratory and cannot qualify rows
   --skip-build            Reuse an existing signed runner in derived data
   -h, --help              Show this help
 
@@ -123,6 +127,7 @@ while [[ $# -gt 0 ]]; do
     --output) OUTPUT_ROOT="$2"; shift 2 ;;
     --only) ONLY_SCENARIOS+=("$2"); shift 2 ;;
     --require-stable) REQUIRE_STABLE=true; shift ;;
+    --exploratory-current-only) EXPLORATORY_CURRENT_ONLY=true; shift ;;
     --skip-build) SKIP_BUILD=true; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Error: unknown option $1" >&2; usage >&2; exit 2 ;;
@@ -409,8 +414,31 @@ device_matches_hardware_row() {
     "$OUTPUT_DIR/device.json" > /dev/null
 }
 
+exclude_opt_in_current_scenarios() {
+  FILTERED_SCENARIOS=()
+  for scenario in "${ONLY_SCENARIOS[@]}"; do
+    if [[ "$scenario" != "accepted-start-delayed-failure" ]]; then
+      FILTERED_SCENARIOS+=("$scenario")
+    fi
+  done
+  ONLY_SCENARIOS=("${FILTERED_SCENARIOS[@]}")
+}
+
 if ! device_matches_hardware_row "iphone-current"; then
-  if [[ "$SCENARIOS_WERE_EXPLICIT" == true ]]; then
+  if [[ "$EXPLORATORY_CURRENT_ONLY" == true ]]; then
+    if ! python3 "$SCRIPT_DIR/exploratory-device-policy.py" \
+      --device-info "$OUTPUT_DIR/device.json" \
+      --matrix "$SCRIPT_DIR/matrix.json"; then
+      echo "Error: --exploratory-current-only requires an exploratory iPhone" >&2
+      echo "  on an OS newer than the matrix's iphone-current row." >&2
+      exit 2
+    fi
+    echo "Including iphone-current-only scenarios as exploratory evidence."
+    echo "These results cannot qualify or close any stable matrix row."
+    if [[ "$SCENARIOS_WERE_EXPLICIT" == false ]]; then
+      exclude_opt_in_current_scenarios
+    fi
+  elif [[ "$SCENARIOS_WERE_EXPLICIT" == true ]]; then
     for scenario in "${ONLY_SCENARIOS[@]}"; do
       if [[ "$scenario" == "capability-convergence" || "$scenario" == "native-lifecycle" || "$scenario" == "terminal-outcomes" || "$scenario" == "adaptive-hls-soak" || "$scenario" == pip-render-performance-* || "$scenario" == "cadence-matrix" || "$scenario" == "native-subtitle-matrix" || "$scenario" == timebase-*-soak || "$scenario" == "deferred-pause-rejection" || "$scenario" == "accepted-start-delayed-failure" ]]; then
         echo "Error: $scenario requires the iphone-current hardware row." >&2
@@ -428,13 +456,7 @@ if ! device_matches_hardware_row "iphone-current"; then
     echo "Skipping iphone-current-only qualification scenarios: selected device does not match iphone-current."
   fi
 elif [[ "$SCENARIOS_WERE_EXPLICIT" == false ]]; then
-  FILTERED_SCENARIOS=()
-  for scenario in "${ONLY_SCENARIOS[@]}"; do
-    if [[ "$scenario" != "accepted-start-delayed-failure" ]]; then
-      FILTERED_SCENARIOS+=("$scenario")
-    fi
-  done
-  ONLY_SCENARIOS=("${FILTERED_SCENARIOS[@]}")
+  exclude_opt_in_current_scenarios
 fi
 
 RESULTS_TSV="$WORK_DIR/results.tsv"

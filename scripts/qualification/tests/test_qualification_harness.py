@@ -27,6 +27,7 @@ def load_script(name: str):
 
 
 device_info = load_script("device-info.py")
+exploratory_device_policy = load_script("exploratory-device-policy.py")
 fixture_server = load_script("fixture-server.py")
 prepare_xctestrun = load_script("prepare-xctestrun.py")
 verify_fixtures = load_script("verify-fixtures.py")
@@ -73,6 +74,48 @@ class DeviceInfoTests(unittest.TestCase):
         self.assertTrue(normalized["connected"])
         self.assertTrue(normalized["qualificationEligible"])
         self.assertEqual(normalized["matchingHardwareRows"], ["iphone-current"])
+
+
+class ExploratoryDevicePolicyTests(unittest.TestCase):
+    matrix = {
+        "hardware": [
+            {"id": "iphone-current", "deviceFamily": "iPhone", "osMajor": 26}
+        ]
+    }
+
+    def record(self, **selected):
+        return {
+            "mode": "exploratory",
+            "selected": {"deviceFamily": "iPhone", "osMajor": 27, **selected},
+        }
+
+    def test_future_iphone_os_can_run_current_only_lanes_exploratorily(self):
+        self.assertTrue(
+            exploratory_device_policy.permits_current_only(
+                self.record(osReleaseType="beta"), self.matrix
+            )
+        )
+
+    def test_matching_or_older_os_cannot_bypass_matrix_selection(self):
+        self.assertFalse(
+            exploratory_device_policy.permits_current_only(
+                self.record(osMajor=26), self.matrix
+            )
+        )
+
+    def test_ipad_cannot_borrow_the_iphone_current_lanes(self):
+        self.assertFalse(
+            exploratory_device_policy.permits_current_only(
+                self.record(deviceFamily="iPad"), self.matrix
+            )
+        )
+
+    def test_qualification_mode_never_uses_the_exploratory_override(self):
+        record = self.record()
+        record["mode"] = "qualification"
+        self.assertFalse(
+            exploratory_device_policy.permits_current_only(record, self.matrix)
+        )
 
 
 class XCTestrunTests(unittest.TestCase):

@@ -298,6 +298,10 @@ Use `--require-stable` for release evidence. It fails before testing if the
 device is a simulator, runs beta or unknown software, or does not match a
 hardware row in `matrix.json`. Without that option, the same command is useful
 for exploratory beta-OS testing, but its report remains ineligible for release.
+On an iPhone running an OS newer than the matrix's `iphone-current` row,
+`--exploratory-current-only` also exercises the longer current-device lanes.
+The policy rejects matching/older OS versions, iPads, and qualification-mode
+devices; all resulting evidence remains exploratory and cannot satisfy a row.
 
 This lane is intentionally fail-closed: its current automated scenarios are a
 candidate qualification subset, not a claim that all 53 qualification rows
