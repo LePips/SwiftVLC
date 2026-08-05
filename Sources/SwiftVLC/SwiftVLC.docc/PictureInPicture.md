@@ -216,9 +216,11 @@ and a lossless stream of control-timebase corrections. The device-validation
 harness's Matrix I writes both to JSON Lines as they occur, so a multi-hour
 run remains recoverable even if the app later terminates.
 
-The capture includes the libVLC media clock, control-timebase value and rate,
-delivered sample timestamp, frame counters, drop count, generation, and each
-timebase write. It deliberately does **not** label the media clock as an audio
+The capture includes the polled libVLC media clock, a second native media-clock
+sample taken synchronously at the decoded-frame display callback, the
+control-timebase value and rate, delivered sample timestamp, frame counters,
+drop count, generation, and each timebase write. It deliberately does **not**
+label either media-clock sample as an audio
 presentation timestamp. Release qualification must pair the JSONL with an
 audio/video measurement and an AVPlayer baseline recorded with the same
 fixture and physical device.

@@ -18,6 +18,7 @@ ADAPTIVE_SOAK_SECONDS="${SWIFTVLC_ADAPTIVE_SOAK_SECONDS:-7200}"
 PIP_PERFORMANCE_SECONDS="${SWIFTVLC_PIP_PERFORMANCE_SECONDS:-900}"
 CADENCE_SECONDS="${SWIFTVLC_CADENCE_SECONDS:-600}"
 NATIVE_SUBTITLE_SECONDS="${SWIFTVLC_NATIVE_SUBTITLE_SECONDS:-900}"
+TIMEBASE_SOAK_SECONDS="${SWIFTVLC_TIMEBASE_SOAK_SECONDS:-7200}"
 
 usage() {
   cat <<'EOF'
@@ -46,6 +47,7 @@ Options:
                           pip-render-performance-4k60,
                           cadence-matrix,
                           native-subtitle-matrix,
+                          timebase-vod-soak, timebase-live-soak,
                           deferred-pause-rejection,
                           accepted-start-delayed-failure, hls-seek,
                           harness-regressions, ui-failures, thumbnail-preview
@@ -97,6 +99,16 @@ case "$NATIVE_SUBTITLE_SECONDS" in
 esac
 if [[ "$NATIVE_SUBTITLE_SECONDS" -lt 900 ]]; then
   echo "Error: SWIFTVLC_NATIVE_SUBTITLE_SECONDS must be at least 900." >&2
+  exit 2
+fi
+case "$TIMEBASE_SOAK_SECONDS" in
+  ''|*[!0-9]*)
+    echo "Error: SWIFTVLC_TIMEBASE_SOAK_SECONDS must be a positive integer." >&2
+    exit 2
+    ;;
+esac
+if [[ "$TIMEBASE_SOAK_SECONDS" -lt 7200 ]]; then
+  echo "Error: SWIFTVLC_TIMEBASE_SOAK_SECONDS must be at least 7200." >&2
   exit 2
 fi
 
@@ -376,6 +388,7 @@ DEFAULT_SCENARIOS=(analyzer ui-suite harness-regressions live-media background-a
 DEFAULT_SCENARIOS+=(pip-render-performance-1080p60 pip-render-performance-4k60)
 DEFAULT_SCENARIOS+=(cadence-matrix)
 DEFAULT_SCENARIOS+=(native-subtitle-matrix)
+DEFAULT_SCENARIOS+=(timebase-vod-soak timebase-live-soak)
 SCENARIOS_WERE_EXPLICIT=false
 if [[ ${#ONLY_SCENARIOS[@]} -eq 0 ]]; then
   ONLY_SCENARIOS=("${DEFAULT_SCENARIOS[@]}")
@@ -384,7 +397,7 @@ else
 fi
 for scenario in "${ONLY_SCENARIOS[@]}"; do
   case "$scenario" in
-    analyzer|ui-suite|native-live|direct-live|live-media|background-audio|continuity|capability-convergence|vod-controls|long-stall|failed-start|dismissal|interruptions|native-lifecycle|terminal-outcomes|adaptive-hls-soak|pip-render-performance-1080p60|pip-render-performance-4k60|cadence-matrix|native-subtitle-matrix|deferred-pause-rejection|accepted-start-delayed-failure|hls-seek|harness-regressions|ui-failures|thumbnail-preview) ;;
+    analyzer|ui-suite|native-live|direct-live|live-media|background-audio|continuity|capability-convergence|vod-controls|long-stall|failed-start|dismissal|interruptions|native-lifecycle|terminal-outcomes|adaptive-hls-soak|pip-render-performance-1080p60|pip-render-performance-4k60|cadence-matrix|native-subtitle-matrix|timebase-vod-soak|timebase-live-soak|deferred-pause-rejection|accepted-start-delayed-failure|hls-seek|harness-regressions|ui-failures|thumbnail-preview) ;;
     *) echo "Error: unknown scenario: $scenario" >&2; exit 2 ;;
   esac
 done
@@ -399,7 +412,7 @@ device_matches_hardware_row() {
 if ! device_matches_hardware_row "iphone-current"; then
   if [[ "$SCENARIOS_WERE_EXPLICIT" == true ]]; then
     for scenario in "${ONLY_SCENARIOS[@]}"; do
-      if [[ "$scenario" == "capability-convergence" || "$scenario" == "native-lifecycle" || "$scenario" == "terminal-outcomes" || "$scenario" == "adaptive-hls-soak" || "$scenario" == pip-render-performance-* || "$scenario" == "cadence-matrix" || "$scenario" == "native-subtitle-matrix" || "$scenario" == "deferred-pause-rejection" || "$scenario" == "accepted-start-delayed-failure" ]]; then
+      if [[ "$scenario" == "capability-convergence" || "$scenario" == "native-lifecycle" || "$scenario" == "terminal-outcomes" || "$scenario" == "adaptive-hls-soak" || "$scenario" == pip-render-performance-* || "$scenario" == "cadence-matrix" || "$scenario" == "native-subtitle-matrix" || "$scenario" == timebase-*-soak || "$scenario" == "deferred-pause-rejection" || "$scenario" == "accepted-start-delayed-failure" ]]; then
         echo "Error: $scenario requires the iphone-current hardware row." >&2
         exit 2
       fi
@@ -407,7 +420,7 @@ if ! device_matches_hardware_row "iphone-current"; then
   else
     FILTERED_SCENARIOS=()
     for scenario in "${ONLY_SCENARIOS[@]}"; do
-      if [[ "$scenario" != "capability-convergence" && "$scenario" != "native-lifecycle" && "$scenario" != "terminal-outcomes" && "$scenario" != "adaptive-hls-soak" && "$scenario" != pip-render-performance-* && "$scenario" != "cadence-matrix" && "$scenario" != "native-subtitle-matrix" && "$scenario" != "deferred-pause-rejection" && "$scenario" != "accepted-start-delayed-failure" ]]; then
+      if [[ "$scenario" != "capability-convergence" && "$scenario" != "native-lifecycle" && "$scenario" != "terminal-outcomes" && "$scenario" != "adaptive-hls-soak" && "$scenario" != pip-render-performance-* && "$scenario" != "cadence-matrix" && "$scenario" != "native-subtitle-matrix" && "$scenario" != timebase-*-soak && "$scenario" != "deferred-pause-rejection" && "$scenario" != "accepted-start-delayed-failure" ]]; then
         FILTERED_SCENARIOS+=("$scenario")
       fi
     done
@@ -495,6 +508,7 @@ run_scenario() {
   local rendering_path=""
   local performance_profile=""
   local performance_url=""
+  local timebase_mode=""
   case "$scenario" in
     analyzer)
       test_identifiers=("iOSUITests/PiPMotionRegionAnalyzerTests")
@@ -638,6 +652,15 @@ run_scenario() {
       route="NativeSubtitleMatrixValidation"
       selected_xctestrun="$DESTINATION_XCTESTRUN"
       ;;
+    timebase-vod-soak|timebase-live-soak)
+      test_identifiers=(
+        "iOSUITests/TimebaseSoakDeviceUITests/test_directPiPTimebaseSoak"
+      )
+      route="TimebaseSoakValidation"
+      timebase_mode="${scenario#timebase-}"
+      timebase_mode="${timebase_mode%-soak}"
+      selected_xctestrun="$DESTINATION_XCTESTRUN"
+      ;;
     deferred-pause-rejection)
       test_identifiers=(
         "iOSUITests/PiPDeferredPauseDeviceUITests/test_deferredPauseRejectionAndCancellationStayTruthful"
@@ -711,6 +734,9 @@ run_scenario() {
       --environment SWIFTVLC_NATIVE_SUBTITLE_DEVICE=YES \
       --environment SWIFTVLC_NATIVE_SUBTITLE_BASE_URL_BASE64="$(printf '%s/' "$BASE_URL" | base64 | tr -d '\r\n')" \
       --environment SWIFTVLC_NATIVE_SUBTITLE_SECONDS="$NATIVE_SUBTITLE_SECONDS" \
+      --environment SWIFTVLC_TIMEBASE_SOAK_DEVICE=YES \
+      --environment SWIFTVLC_TIMEBASE_SOAK_BASE_URL_BASE64="$(printf '%s/' "$BASE_URL" | base64 | tr -d '\r\n')" \
+      --environment SWIFTVLC_TIMEBASE_SOAK_SECONDS="$TIMEBASE_SOAK_SECONDS" \
       --environment SWIFTVLC_PIP_DEFERRED_PAUSE_DEVICE=YES \
       --environment SWIFTVLC_PIP_DELAYED_START_FAILURE_DEVICE=YES \
       --environment SWIFTVLC_PIP_OVERLAY_DEVICE=YES \
@@ -743,6 +769,9 @@ run_scenario() {
   local subtitle_time_toc=""
   local subtitle_metal_trace=""
   local subtitle_metal_toc=""
+  local timebase_trace_status="not-applicable"
+  local timebase_audio_trace=""
+  local timebase_audio_toc=""
   local xcodebuild_log="$OUTPUT_DIR/$scenario-xcodebuild.log"
   local result_bundle="$OUTPUT_DIR/$scenario.xcresult"
   local test_selection_args=()
@@ -765,6 +794,7 @@ run_scenario() {
       -skip-testing:iOSUITests/PiPRenderPerformanceDeviceUITests
       -skip-testing:iOSUITests/PiPCadenceDeviceUITests
       -skip-testing:iOSUITests/NativeSubtitleMatrixDeviceUITests
+      -skip-testing:iOSUITests/TimebaseSoakDeviceUITests
       -skip-testing:iOSUITests/PiPDeferredPauseDeviceUITests
       -skip-testing:iOSUITests/PiPDelayedStartFailureDeviceUITests
       -skip-testing:iOSUITests/PiPOverlayDeviceUITests
@@ -834,6 +864,18 @@ run_scenario() {
       subtitle_time_toc="$OUTPUT_DIR/$scenario-time-attempt$attempt-toc.xml"
       subtitle_metal_trace="$OUTPUT_DIR/$scenario-metal-attempt$attempt.trace"
       subtitle_metal_toc="$OUTPUT_DIR/$scenario-metal-attempt$attempt-toc.xml"
+    elif [[ "$scenario" == timebase-*-soak ]]; then
+      attempt_token="$run_id-$timebase_mode-$attempt"
+      attempt_xctestrun="$WORK_DIR/destination-$scenario-attempt$attempt.xctestrun"
+      python3 "$SCRIPT_DIR/prepare-xctestrun.py" \
+        "$selected_xctestrun" "$attempt_xctestrun" \
+        --environment SWIFTVLC_DEVICE_LOG_PREFIX="$final_log_prefix" \
+        --environment SWIFTVLC_TIMEBASE_SOAK_MODE="$timebase_mode" \
+        --environment SWIFTVLC_TIMEBASE_SOAK_TOKEN="$attempt_token"
+      cp "$attempt_xctestrun" "$OUTPUT_DIR/destination-$scenario-attempt$attempt.xctestrun"
+      timebase_trace_status="missing"
+      timebase_audio_trace="$OUTPUT_DIR/$scenario-audio-attempt$attempt.trace"
+      timebase_audio_toc="$OUTPUT_DIR/$scenario-audio-attempt$attempt-toc.xml"
     fi
     set +e
     if [[ "$scenario" == "adaptive-hls-soak" ]]; then
@@ -1074,6 +1116,52 @@ PY
       elif [[ "$test_status" -eq 0 ]]; then
         subtitle_trace_status="captured"
       fi
+    elif [[ "$scenario" == timebase-*-soak ]]; then
+      xcodebuild test-without-building \
+        -xctestrun "$attempt_xctestrun" \
+        -destination "platform=iOS,id=$DEVICE_UDID" \
+        -collect-test-diagnostics never \
+        -test-timeouts-enabled YES \
+        -default-test-execution-time-allowance "$((TIMEBASE_SOAK_SECONDS + 600))" \
+        -maximum-test-execution-time-allowance "$((TIMEBASE_SOAK_SECONDS + 600))" \
+        "${test_selection_args[@]}" \
+        -resultBundlePath "$attempt_bundle" \
+        > "$attempt_log" 2>&1 &
+      local timebase_xcodebuild_pid=$!
+      ACTIVE_XCODEBUILD_PID="$timebase_xcodebuild_pid"
+      local timebase_started=false
+      for _ in {1..600}; do
+        if ! kill -0 "$timebase_xcodebuild_pid" 2>/dev/null; then
+          break
+        fi
+        if grep -q "swiftvlcTimebaseReady=$attempt_token" "$OUTPUT_DIR/fixture-requests.jsonl" 2>/dev/null; then
+          timebase_started=true
+          break
+        fi
+        sleep 0.1
+      done
+      local timebase_trace_failed=false
+      if [[ "$timebase_started" == false ]]; then
+        timebase_trace_failed=true
+        echo "Error: timebase fixture did not start before Audio System Trace capture." >> "$attempt_log"
+      elif ! record_performance_trace \
+          "Audio System Trace" "$timebase_audio_trace" "$timebase_audio_toc" \
+          "$TIMEBASE_SOAK_SECONDS" "$timebase_xcodebuild_pid" \
+          "$OUTPUT_DIR/$scenario-audio-xctrace-attempt$attempt.log"; then
+        timebase_trace_failed=true
+        echo "Error: Audio System Trace capture failed." >> "$attempt_log"
+      fi
+      if [[ "$timebase_trace_failed" == true ]]; then
+        kill -TERM "$timebase_xcodebuild_pid" 2>/dev/null
+      fi
+      wait "$timebase_xcodebuild_pid"
+      test_status=$?
+      ACTIVE_XCODEBUILD_PID=""
+      if [[ "$timebase_trace_failed" == true ]]; then
+        test_status=1
+      elif [[ "$test_status" -eq 0 ]]; then
+        timebase_trace_status="captured"
+      fi
     else
       xcodebuild test-without-building \
         -xctestrun "$attempt_xctestrun" \
@@ -1286,6 +1374,10 @@ PY
       qualification_scenarios=("native-subtitle-matrix")
       qualification_attachments=("qualification-native-subtitle-matrix.json")
       ;;
+    timebase-vod-soak|timebase-live-soak)
+      qualification_scenarios=("$scenario")
+      qualification_attachments=("qualification-$scenario.json")
+      ;;
     deferred-pause-rejection)
       qualification_scenarios=("deferred-pause-rejection")
       qualification_attachments=("qualification-deferred-pause-rejection.json")
@@ -1301,6 +1393,7 @@ PY
       && [[ "$allocation_trace_status" != "missing" ]] \
       && [[ "$performance_trace_status" != "missing" ]] \
       && [[ "$subtitle_trace_status" != "missing" ]] \
+      && [[ "$timebase_trace_status" != "missing" ]] \
       && [[ "$log_status" == "captured" ]] && [[ -d "$result_bundle" ]]; then
       local attachments="$OUTPUT_DIR/$scenario-attachments"
       local hardware_id evidence_file evidence_relative export_status materialize_status
@@ -1388,6 +1481,19 @@ PY
             if [[ "$augment_subtitle_status" -ne 0 ]]; then
               continue
             fi
+          elif [[ "$scenario" == timebase-*-soak ]]; then
+            set +e
+            python3 "$SCRIPT_DIR/augment-timebase-evidence.py" \
+              --evidence "$evidence_file" \
+              --raw-root "$OUTPUT_DIR/$scenario-documents" \
+              --audio-trace "$timebase_audio_trace" \
+              --audio-toc "$timebase_audio_toc" \
+              --digest-script "$ROOT_DIR/scripts/artifact-tree-digest.py"
+            local augment_timebase_status=$?
+            set -e
+            if [[ "$augment_timebase_status" -ne 0 ]]; then
+              continue
+            fi
           fi
           materialized_count=$((materialized_count + 1))
           materialized_scenarios+=("$qualification_scenario")
@@ -1440,6 +1546,7 @@ PY
     || [[ "$allocation_trace_status" == "missing" ]] \
     || [[ "$performance_trace_status" == "missing" ]] \
     || [[ "$subtitle_trace_status" == "missing" ]] \
+    || [[ "$timebase_trace_status" == "missing" ]] \
     || [[ "$evidence_status" == "missing" ]]; then
     result="fail"
   fi

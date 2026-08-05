@@ -270,6 +270,30 @@ to the same candidate run. A missing subtitle track, absent overlay pixels,
 failed resize, more than 10% lost pictures, incomplete transition, wrong HDR
 metadata, shortened duration, or missing trace rejects the row.
 
+The `timebase-vod-soak` and `timebase-live-soak` lanes each hold direct PiP
+active for at least 7,200 seconds. Rates 0.5x, 1x, and 2x divide the measured
+interval into three long phases. The candidate also performs pause/resume,
+VOD seek (or records the live non-applicability), replacement, a bounded
+two-worker thermal load, a real cross-process audio-session interruption, and
+periodic SpringBoard PiP resizing. One-second clock, audio-output, and frame
+samples plus every control-timebase write are appended to recoverable JSONL;
+only a 60-second compact series travels through XCTest. The host rejects a
+short raw capture, malformed rows, correction-sequence gaps, or a mismatch
+between compact and raw corrections, then binds its SHA-256 and a full Audio
+System Trace to the candidate evidence. The audio series is explicitly a
+latency-adjusted presentation estimate paired with the system audio trace; it
+never relabels libVLC media time as an audio timestamp. A 60-180 second
+AVPlayer comparison uses the same URL and device, including
+`AVPlayerItemVideoOutput` presentation time. Backward frame presentation,
+more than 2.1 seconds of observed drift/correction, missing transitions,
+unbalanced interruption, static/failed system PiP, or absent trace/raw data
+rejects either row.
+
+The VOD lane uses a deterministic four-hour HLS timeline backed by the cached
+two-second transport-stream segments. Discontinuities bind every segment wrap
+into one finite, seekable timeline; the lane does not depend on libVLC input
+repeat behavior and cannot exhaust its media during the rate schedule.
+
 Use `--require-stable` for release evidence. It fails before testing if the
 device is a simulator, runs beta or unknown software, or does not match a
 hardware row in `matrix.json`. Without that option, the same command is useful
@@ -277,11 +301,10 @@ for exploratory beta-OS testing, but its report remains ineligible for release.
 
 This lane is intentionally fail-closed: its current automated scenarios are a
 candidate qualification subset, not a claim that all 53 qualification rows
-passed. The harness has prepared automated coverage for 51 rows;
-`timebase-vod-soak` and `timebase-live-soak` remain to be automated.
-`report.json` therefore keeps `releaseGateSatisfied` false until a matrix
-runner has produced complete candidate-bound evidence for every required
-hardware/OS row described below.
+passed. The harness has prepared automated coverage for all 53 rows. This is
+not a claim that any newly prepared row passed: `report.json` keeps
+`releaseGateSatisfied` false until a matrix runner has produced complete
+candidate-bound evidence for every required hardware/OS row described below.
 
 Qualification is bound to both halves of the shipped package. The
 XCFramework tree digest identifies the native engine and headers, while the

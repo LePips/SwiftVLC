@@ -351,6 +351,18 @@ enum AccessibilityID {
     static let errorLabel = "nativeSubtitleMatrix.error"
   }
 
+  enum TimebaseSoakValidation {
+    static let videoView = "timebaseSoak.videoView"
+    static let possibleLabel = "timebaseSoak.possible"
+    static let activeLabel = "timebaseSoak.active"
+    static let phaseLabel = "timebaseSoak.phase"
+    static let progressLabel = "timebaseSoak.progress"
+    static let interruptionLabel = "timebaseSoak.interruptions"
+    static let resultLabel = "timebaseSoak.result"
+    static let runButton = "timebaseSoak.run"
+    static let errorLabel = "timebaseSoak.error"
+  }
+
   enum MatrixHValidation {
     static let stateLabel = "validation.matrixH.state"
     static let currentTimeLabel = "validation.matrixH.currentTime"

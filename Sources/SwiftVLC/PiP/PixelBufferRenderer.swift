@@ -77,6 +77,9 @@ final class PixelBufferRenderer: Sendable {
     var timebase: CMTimebase?
     var decodedFrameCount: UInt64 = 0
     var lastDecodedAt: ContinuousClock.Instant?
+    /// Qualification-only libVLC media clock sampled synchronously when the
+    /// decoded frame reaches the vmem display callback.
+    var lastDecodedFrameMediaTimeSeconds: Double?
     /// Opt-in qualification probe. Disabled for normal clients so sampling
     /// decoded pixels adds no work to the production hot path.
     var contentFingerprintingEnabled = false
@@ -136,6 +139,7 @@ final class PixelBufferRenderer: Sendable {
     let changed = state.withLock { state -> Bool in
       guard state.playbackGeneration != generation else { return false }
       state.playbackGeneration = generation
+      state.lastDecodedFrameMediaTimeSeconds = nil
       state.advanceRenderGeneration()
       return true
     }
@@ -159,6 +163,7 @@ final class PixelBufferRenderer: Sendable {
       state.measuredConversionCount = 0
       state.measuredConversionNanoseconds = 0
       state.maximumMeasuredConversionNanoseconds = 0
+      state.lastDecodedFrameMediaTimeSeconds = nil
     }
     if enabled {
       contentDiagnosticsEnabled.store(true, ordering: .releasing)

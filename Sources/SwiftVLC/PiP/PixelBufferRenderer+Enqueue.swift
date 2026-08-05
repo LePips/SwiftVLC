@@ -76,6 +76,7 @@ struct PixelBufferRendererTelemetrySnapshot: Sendable, Equatable {
   let playbackGeneration: UInt64?
   let voutGeneration: UInt64?
   let decodedFrameCount: UInt64
+  let lastDecodedFrameMediaTimeSeconds: Double?
   let decodedContentChangeCount: UInt64
   let lastDecodedContentFingerprint: UInt64?
   let renderGeneration: UInt64
@@ -264,6 +265,7 @@ extension PixelBufferRenderer {
     let decoded = state.withLock {
       (
         frameCount: $0.decodedFrameCount,
+        mediaTimeSeconds: $0.lastDecodedFrameMediaTimeSeconds,
         lastAt: $0.lastDecodedAt,
         contentChangeCount: $0.decodedContentChangeCount,
         contentFingerprint: $0.lastDecodedContentFingerprint,
@@ -291,6 +293,7 @@ extension PixelBufferRenderer {
         playbackGeneration: $0.latestPlaybackGeneration,
         voutGeneration: $0.latestVoutGeneration,
         decodedFrameCount: decoded.frameCount,
+        lastDecodedFrameMediaTimeSeconds: decoded.mediaTimeSeconds,
         decodedContentChangeCount: decoded.contentChangeCount,
         lastDecodedContentFingerprint: decoded.contentFingerprint,
         renderGeneration: decoded.renderGeneration,

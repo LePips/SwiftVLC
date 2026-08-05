@@ -51,6 +51,9 @@ public struct PiPTimebaseDiagnosticSnapshot: Codable, Sendable, Equatable {
   public let controlTimebaseRate: Double?
   public let driftSeconds: Double?
   public let decodedFrameCount: UInt64
+  /// libVLC media clock sampled at the decoded frame's vmem display callback.
+  /// This is distinct from the control-timebase presentation timestamp.
+  public let lastDecodedFrameMediaTimeSeconds: Double?
   public let decodedContentChangeCount: UInt64
   public let lastDecodedContentFingerprint: UInt64?
   public let renderGeneration: UInt64
@@ -125,6 +128,7 @@ extension PiPController {
       controlTimebaseRate: controlTimebase.map { CMTimebaseGetRate($0) },
       driftSeconds: timebaseSeconds.map { mediaTimeSeconds - $0 },
       decodedFrameCount: telemetry.decodedFrameCount,
+      lastDecodedFrameMediaTimeSeconds: telemetry.lastDecodedFrameMediaTimeSeconds,
       decodedContentChangeCount: telemetry.decodedContentChangeCount,
       lastDecodedContentFingerprint: telemetry.lastDecodedContentFingerprint,
       renderGeneration: telemetry.renderGeneration,

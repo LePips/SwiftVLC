@@ -23,6 +23,10 @@ class RangeNotSatisfiable(ValueError):
     pass
 
 
+TIMEBASE_VOD_SECONDS = 14_400
+ADAPTIVE_SEGMENT_SECONDS = 2
+
+
 class FixtureHandler(BaseHTTPRequestHandler):
     server: "FixtureHTTPServer"
     protocol_version = "HTTP/1.1"
@@ -391,6 +395,7 @@ class FixtureHTTPServer(ThreadingHTTPServer):
             "retry-ts",
             "abr-ts",
             "abr-low-ts",
+            "timebase-vod-ts",
         }:
             return "ts"
         raise ValueError(f"unsupported adaptive mode: {mode}")
@@ -433,7 +438,7 @@ class FixtureHTTPServer(ThreadingHTTPServer):
         variants = ["low", "high"]
         if mode == "abr-low-ts":
             variants = ["low"]
-        elif mode == "abr-high-fmp4":
+        elif mode in {"abr-high-fmp4", "timebase-vod-ts"}:
             variants = ["high"]
         with self._adaptive_lock:
             state = self._adaptive_state(token)
@@ -478,6 +483,7 @@ class FixtureHTTPServer(ThreadingHTTPServer):
 
         is_live = playlist_type == "live"
         is_subtitle_vod = mode in {"abr-low-ts", "abr-high-fmp4"}
+        is_timebase_vod = mode == "timebase-vod-ts"
         media_sequence = int((now - started) / 2) if is_live else 0
         if is_live:
             window_count = min(6, len(segments))
@@ -489,10 +495,21 @@ class FixtureHTTPServer(ThreadingHTTPServer):
             # bytes. A discontinuity at every wrap resets segment timestamps
             # while the playlist timeline remains monotonic.
             indices = range(max(len(segments), 60))
+        elif is_timebase_vod:
+            # The rate schedule can consume more than 8,000 media seconds
+            # during a 7,200-second wall-clock qualification run. Publish a
+            # four-hour seekable timeline so the 0.5x, 1x, and 2x phases,
+            # replacement, and AVPlayer baseline can never reach EOF.
+            indices = range(TIMEBASE_VOD_SECONDS // ADAPTIVE_SEGMENT_SECONDS)
         else:
             indices = range(len(segments))
 
-        discontinuity = playlist_type == "event" or is_live or is_subtitle_vod
+        discontinuity = (
+            playlist_type == "event"
+            or is_live
+            or is_subtitle_vod
+            or is_timebase_vod
+        )
         lines = [
             "#EXTM3U",
             "#EXT-X-VERSION:7" if container == "fmp4" else "#EXT-X-VERSION:3",
@@ -520,13 +537,15 @@ class FixtureHTTPServer(ThreadingHTTPServer):
             should_discontinue = (
                 playlist_type == "event" and offset == midpoint
             ) or (is_live and sequence % len(segments) == midpoint) or (
-                is_subtitle_vod and offset > 0 and sequence % len(segments) == 0
+                (is_subtitle_vod or is_timebase_vod)
+                and offset > 0
+                and sequence % len(segments) == 0
             )
             if should_discontinue:
                 lines.append("#EXT-X-DISCONTINUITY")
             segment = segments[sequence % len(segments)]
             uri = f"{variant}/{segment.name}"
-            if is_live:
+            if is_live or is_timebase_vod:
                 uri += f"?sequence={sequence}"
             lines.extend(["#EXTINF:2.000,", uri])
         if not is_live:
