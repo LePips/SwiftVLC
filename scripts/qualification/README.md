@@ -128,6 +128,17 @@ resident memory throughout the fault and rejects growth beyond a 96 MiB bound;
 the combined attachment records the raw per-backend timings and memory values
 as well as the matrix-required recovery and bounded-memory outcomes.
 
+The dismissal lane materializes the matrix-wide `restore` and `close` rows in
+one hardware run. For native and direct backends, it starts real system PiP,
+uses the moving-pixel oracle to locate the window, reveals SpringBoard's
+controls, and taps the restore or close corner by normalized coordinates. This
+avoids localized system labels while still exercising the real affordances.
+Evidence is emitted only when restore invokes the host callback exactly once,
+close invokes it zero times, and public lifecycle events report ordered
+`restoreRequested` or `userClosed` reasons respectively. Each of the four app
+launches writes a separate library log so an earlier backend/action error
+cannot be overwritten by a later cycle.
+
 The iPhone-current-only deferred-pause-rejection lane drives the exact AVKit
 playback command entry point while a qualification SPI changes only libVLC's
 native pause-capability answer. It proves a permanently unpausable input
