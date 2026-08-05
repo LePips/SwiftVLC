@@ -129,7 +129,10 @@ final class PiPContinuityDeviceUITests: ShowcaseIOSTestCase {
   private func loadInitialVODAndStartPictureInPicture() {
     app.buttons[AccessibilityID.PiPContinuityValidation.loadVODButton].tap()
     waitForLabel(state, equals: "playing", timeout: 20)
+    // iOS 27 lazily materializes Form rows below the initial phone viewport.
+    reveal(playbackSnapshot, swiping: .up)
     waitForLabel(playbackSnapshot, equals: "finite:seekable:interactive", timeout: 15)
+    reveal(nativePlaybackSnapshot, swiping: .up)
     _ = waitForNativePlaybackSnapshot(
       generation: generation.label,
       expectsFiniteDuration: true,
@@ -156,6 +159,7 @@ final class PiPContinuityDeviceUITests: ShowcaseIOSTestCase {
   ) -> ReplacementMeasurement {
     let previousGeneration = generation.label
     let button = app.buttons[buttonIdentifier]
+    reveal(button, swiping: .up)
     XCTAssertTrue(button.waitForExistence(timeout: 5))
     button.tap()
 
