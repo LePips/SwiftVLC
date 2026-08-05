@@ -37,8 +37,8 @@ Issue reporters do not need to inspect logs or manually record observations.
 Clone the requested SwiftVLC tag on a Mac with the current Xcode, connect one
 unlocked and trusted iPhone or iPad with Developer Mode enabled, then
 double-click **Validate SwiftVLC.command** at the repository root. A free Apple
-Personal Team is sufficient; the launcher detects the installed Apple
-Development identity and uses unique disposable bundle identifiers.
+Personal Team is sufficient; the launcher detects teams configured in Xcode
+and uses unique disposable bundle identifiers.
 
 The launcher preflights Xcode, signing, the physical device, its OS/build, and
 the pinned libVLC release artifact. After one confirmation it builds, installs,

@@ -40,7 +40,7 @@ echo "SwiftVLC physical-device validation"
 echo "==================================="
 echo
 
-for command in curl git jq python3 security shasum swift xcodebuild xcrun; do
+for command in curl defaults git jq python3 shasum swift xcodebuild xcrun; do
   if ! command -v "$command" >/dev/null 2>&1; then
     echo "Error: required tool is unavailable: $command" >&2
     echo "Install the current Xcode and its Command Line Tools, then try again." >&2
@@ -60,25 +60,27 @@ if ! xcodebuild -checkFirstLaunchStatus >/dev/null 2>&1; then
 fi
 
 detect_teams() {
-  security find-identity -p codesigning -v 2>/dev/null \
-    | sed -nE '/"Apple Development:/{s/.*\(([A-Z0-9]{10})\)".*/\1/p;}' \
+  defaults read com.apple.dt.Xcode IDEProvisioningTeamByIdentifier 2>/dev/null \
+    | sed -nE 's/^[[:space:]]*teamID = ([A-Z0-9]{10});/\1/p' \
     | sort -u
 }
 
+teams=()
+while IFS= read -r team; do
+  [[ -n "$team" ]] && teams+=("$team")
+done < <(detect_teams)
+if [[ ${#teams[@]} -eq 0 ]]; then
+  echo "Error: Xcode has no Apple developer team available for signing." >&2
+  echo "In Xcode > Settings > Accounts, add an Apple ID, then retry." >&2
+  echo "A free Personal Team is sufficient." >&2
+  exit 1
+fi
+
 if [[ -z "$DEVELOPMENT_TEAM" ]]; then
-  teams=()
-  while IFS= read -r team; do
-    [[ -n "$team" ]] && teams+=("$team")
-  done < <(detect_teams)
-  if [[ ${#teams[@]} -eq 0 ]]; then
-    echo "Error: no Apple Development signing identity was found." >&2
-    echo "In Xcode > Settings > Accounts, add an Apple ID and create a development" >&2
-    echo "certificate. A free Personal Team is sufficient." >&2
-    exit 1
-  elif [[ ${#teams[@]} -eq 1 ]]; then
+  if [[ ${#teams[@]} -eq 1 ]]; then
     DEVELOPMENT_TEAM="${teams[0]}"
   elif [[ -t 0 ]]; then
-    echo "Choose the Apple Development team to use:"
+    echo "Choose the Xcode development team to use:"
     index=1
     for team in "${teams[@]}"; do
       echo "  $index) $team"
@@ -95,8 +97,18 @@ if [[ -z "$DEVELOPMENT_TEAM" ]]; then
     fi
     DEVELOPMENT_TEAM="${teams[$((selection - 1))]}"
   else
-    echo "Error: multiple Apple Development teams were found." >&2
+    echo "Error: multiple Xcode development teams were found." >&2
     echo "Re-run with --team TEAM. Available teams: ${teams[*]}" >&2
+    exit 2
+  fi
+else
+  configured=false
+  for team in "${teams[@]}"; do
+    [[ "$team" == "$DEVELOPMENT_TEAM" ]] && configured=true
+  done
+  if [[ "$configured" != true ]]; then
+    echo "Error: team $DEVELOPMENT_TEAM is not available in Xcode." >&2
+    echo "Available teams: ${teams[*]}" >&2
     exit 2
   fi
 fi
