@@ -6,8 +6,6 @@ import XCTest
 final class AudioSessionOwnershipDeviceUITests: ShowcaseIOSTestCase {
   private static let ownershipURLEnvironment =
     "SWIFTVLC_AUDIO_SESSION_OWNERSHIP_URL_BASE64"
-  private static let focusProbeRunnerBundleIdentifier =
-    "com.swiftvlc.showcase.ios.uitests.xctrunner"
 
   func test_libraryAndApplicationManagedOwnershipIsExact() throws {
     #if targetEnvironment(simulator)
@@ -396,9 +394,12 @@ final class AudioSessionOwnershipDeviceUITests: ShowcaseIOSTestCase {
       )
     }
 
-    guard Bundle.main.bundleIdentifier == Self.focusProbeRunnerBundleIdentifier else {
+    guard
+      let focusProbeRunnerBundleIdentifier = Bundle.main.bundleIdentifier,
+      !focusProbeRunnerBundleIdentifier.isEmpty
+    else {
       throw OwnershipUITestFailure(
-        "Unexpected focus-probe runner bundle: \(Bundle.main.bundleIdentifier ?? "nil")"
+        "The focus-probe runner has no bundle identifier"
       )
     }
     guard app.state == .runningForeground else {
@@ -407,7 +408,7 @@ final class AudioSessionOwnershipDeviceUITests: ShowcaseIOSTestCase {
       )
     }
     let probeApplication = XCUIApplication(
-      bundleIdentifier: Self.focusProbeRunnerBundleIdentifier
+      bundleIdentifier: focusProbeRunnerBundleIdentifier
     )
     probeApplication.activate()
     guard probeApplication.state == .runningForeground else {
@@ -508,7 +509,7 @@ final class AudioSessionOwnershipDeviceUITests: ShowcaseIOSTestCase {
       "phase": expectedPhase,
       "source": "foreground-XCTest-runner-audio-session",
       "activationSucceeded": true,
-      "probeApplicationBundleIdentifier": Self.focusProbeRunnerBundleIdentifier,
+      "probeApplicationBundleIdentifier": focusProbeRunnerBundleIdentifier,
       "probeApplicationStateAtActivation": "runningForeground",
       "candidateApplicationStateBeforeProbe": "runningForeground",
       "candidateApplicationStateDuringActivation": candidateStateDuringActivation,

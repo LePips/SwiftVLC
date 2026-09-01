@@ -11,10 +11,12 @@ import os
 import plistlib
 import re
 import subprocess
+import sys
 import tempfile
 import threading
 import time
 import unittest
+import zipfile
 from unittest import mock
 from pathlib import Path
 
@@ -35,6 +37,8 @@ device_info = load_script("device-info.py")
 exploratory_device_policy = load_script("exploratory-device-policy.py")
 fixture_server = load_script("fixture-server.py")
 prepare_xctestrun = load_script("prepare-xctestrun.py")
+configure_signing = load_script("configure-signing.py")
+package_volunteer_report = load_script("package-volunteer-report.py")
 verify_fixtures = load_script("verify-fixtures.py")
 candidate_metadata = load_script("candidate-metadata.py")
 materialize_evidence = load_script("materialize-evidence.py")
@@ -234,7 +238,7 @@ class QualificationRunnerStorageTests(unittest.TestCase):
     def test_runner_requires_the_release_oracle_decoder_tools(self):
         script = (ROOT / "qualification" / "run-device-tests.sh").read_text()
         self.assertIn(
-            "for command in curl ffmpeg ffprobe git jq python3 shasum tar xcodebuild xcrun",
+            "for command in curl ffmpeg ffprobe git jq plutil python3 shasum tar xcodebuild xcrun",
             script,
         )
 
@@ -254,6 +258,43 @@ class QualificationRunnerStorageTests(unittest.TestCase):
         self.assertGreater(len(commands), 0)
         for command in commands:
             self.assertIn('-derivedDataPath "$DERIVED_DATA"', command)
+
+    def test_disposable_signing_identity_is_used_end_to_end(self):
+        script = (ROOT / "qualification" / "run-device-tests.sh").read_text()
+        volunteer = (ROOT / "qualification" / "volunteer-validation.sh").read_text()
+        self.assertIn('--development-team "$DEVELOPMENT_TEAM"', volunteer)
+        self.assertIn('python3 "$SCRIPT_DIR/configure-signing.py"', script)
+        self.assertIn('DEVELOPMENT_TEAM="$DEVELOPMENT_TEAM"', script)
+        self.assertIn('-destination "platform=iOS,id=$DEVICE_UDID"', script)
+        self.assertIn("-allowProvisioningUpdates", script)
+        self.assertIn("-allowProvisioningDeviceRegistration", script)
+        self.assertIn(
+            "CANDIDATE_BUNDLE_IDENTIFIER=$(read_app_bundle_identifier", script
+        )
+        self.assertIn(
+            "TEST_RUNNER_BUNDLE_IDENTIFIER=$(read_app_bundle_identifier", script
+        )
+        self.assertEqual(script.count('python3 "$SCRIPT_DIR/prepare-xctestrun.py"'), 1)
+        self.assertEqual(
+            script.count('--domain-identifier "$CANDIDATE_BUNDLE_IDENTIFIER"'),
+            2,
+        )
+        self.assertNotIn("--domain-identifier com.swiftvlc.showcase.ios", script)
+        ownership_test = (
+            ROOT.parent
+            / "Showcase"
+            / "UITests"
+            / "iOS"
+            / "Tests"
+            / "AudioSessionOwnershipDeviceUITests.swift"
+        ).read_text()
+        self.assertIn(
+            "let focusProbeRunnerBundleIdentifier = Bundle.main.bundleIdentifier",
+            ownership_test,
+        )
+        self.assertNotIn(
+            '"com.swiftvlc.showcase.ios.uitests.xctrunner"', ownership_test
+        )
 
     def test_runner_binds_retry_lifecycle_and_raw_error_attempt_evidence(self):
         script = (ROOT / "qualification" / "run-device-tests.sh").read_text()
@@ -792,7 +833,13 @@ class QualificationRunnerStorageTests(unittest.TestCase):
         environment = os.environ.copy()
         environment["SWIFTVLC_ADAPTIVE_SOAK_SECONDS"] = "60"
         completed = subprocess.run(
-            ["bash", str(script), "--require-stable"],
+            [
+                "bash",
+                str(script),
+                "--require-stable",
+                "--development-team",
+                "ABCDE12345",
+            ],
             check=False,
             capture_output=True,
             text=True,
@@ -816,6 +863,9 @@ class QualificationRunnerStorageTests(unittest.TestCase):
 
 
 class XCTestrunTests(unittest.TestCase):
+    app_bundle_identifier = "com.swiftvlc.validation.team.app"
+    runner_bundle_identifier = "com.swiftvlc.validation.team.uitests.xctrunner"
+
     @staticmethod
     def ui_test_plan():
         return {
@@ -836,7 +886,12 @@ class XCTestrunTests(unittest.TestCase):
 
     def test_destination_artifact_transform_removes_local_paths(self):
         original = self.ui_test_plan()
-        transformed = prepare_xctestrun.transform(original, {"ATTACH": "YES"})
+        transformed = prepare_xctestrun.transform(
+            original,
+            {"ATTACH": "YES"},
+            test_host_bundle_identifier=self.runner_bundle_identifier,
+            ui_target_app_bundle_identifier=self.app_bundle_identifier,
+        )
         target = transformed["TestConfigurations"][0]["TestTargets"][0]
         for key in prepare_xctestrun.REMOVED_PATH_KEYS:
             self.assertNotIn(key, target)
@@ -849,6 +904,8 @@ class XCTestrunTests(unittest.TestCase):
             original,
             {"FIXTURE": "http://127.0.0.1/media.mp4"},
             use_destination_artifacts=False,
+            test_host_bundle_identifier=self.runner_bundle_identifier,
+            ui_target_app_bundle_identifier=self.app_bundle_identifier,
         )
         target = transformed["TestConfigurations"][0]["TestTargets"][0]
         self.assertEqual(target["TestBundlePath"], "/tmp/test.xctest")
@@ -858,6 +915,170 @@ class XCTestrunTests(unittest.TestCase):
             target["TestingEnvironmentVariables"]["FIXTURE"],
             "http://127.0.0.1/media.mp4",
         )
+
+    def test_destination_artifact_transform_uses_explicit_signed_identifiers(self):
+        transformed = prepare_xctestrun.transform(
+            self.ui_test_plan(),
+            {},
+            test_host_bundle_identifier=self.runner_bundle_identifier,
+            ui_target_app_bundle_identifier=self.app_bundle_identifier,
+        )
+        target = transformed["TestConfigurations"][0]["TestTargets"][0]
+        self.assertEqual(
+            target["TestHostBundleIdentifier"], self.runner_bundle_identifier
+        )
+        self.assertEqual(
+            target["UITargetAppBundleIdentifier"], self.app_bundle_identifier
+        )
+
+    def test_destination_artifact_transform_rejects_malformed_identifiers(self):
+        with self.assertRaisesRegex(ValueError, "invalid bundle identifier"):
+            prepare_xctestrun.transform(
+                self.ui_test_plan(),
+                {},
+                test_host_bundle_identifier="not a bundle",
+                ui_target_app_bundle_identifier=self.app_bundle_identifier,
+            )
+
+    def test_cli_requires_both_signed_bundle_identifiers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.xctestrun"
+            destination = root / "destination.xctestrun"
+            with source.open("wb") as output:
+                plistlib.dump(self.ui_test_plan(), output)
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(ROOT / "qualification" / "prepare-xctestrun.py"),
+                    str(source),
+                    str(destination),
+                ],
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("--test-host-bundle-identifier", result.stderr)
+            self.assertIn("--ui-target-app-bundle-identifier", result.stderr)
+            self.assertFalse(destination.exists())
+
+
+class ConfigureSigningTests(unittest.TestCase):
+    project_text = """
+DEVELOPMENT_TEAM = MTAQ5K5D6P;
+DEVELOPMENT_TEAM = MTAQ5K5D6P;
+PRODUCT_BUNDLE_IDENTIFIER = com.swiftvlc.showcase.ios;
+PRODUCT_BUNDLE_IDENTIFIER = com.swiftvlc.showcase.ios;
+PRODUCT_BUNDLE_IDENTIFIER = com.swiftvlc.showcase.ios.uitests;
+PRODUCT_BUNDLE_IDENTIFIER = com.swiftvlc.showcase.ios.uitests;
+PRODUCT_BUNDLE_IDENTIFIER = com.swiftvlc.showcase.macos;
+"""
+
+    def test_configures_only_the_disposable_ios_project(self):
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory) / "project.pbxproj"
+            project.write_text(self.project_text)
+            app_id, tests_id = configure_signing.configure(
+                project,
+                "WNWACJNFDX",
+                "com.swiftvlc.validation.wnwacjnfdx",
+            )
+            value = project.read_text()
+            self.assertEqual(app_id, "com.swiftvlc.validation.wnwacjnfdx.app")
+            self.assertEqual(tests_id, "com.swiftvlc.validation.wnwacjnfdx.uitests")
+            self.assertEqual(value.count("DEVELOPMENT_TEAM = WNWACJNFDX;"), 2)
+            self.assertIn(
+                "PRODUCT_BUNDLE_IDENTIFIER = com.swiftvlc.showcase.macos;",
+                value,
+            )
+
+    def test_refuses_an_unexpected_project_shape(self):
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory) / "project.pbxproj"
+            project.write_text(self.project_text.replace("DEVELOPMENT_TEAM", "", 1))
+            with self.assertRaisesRegex(ValueError, "expected 2"):
+                configure_signing.configure(
+                    project,
+                    "WNWACJNFDX",
+                    "com.swiftvlc.validation.wnwacjnfdx",
+                )
+
+
+class VolunteerReportPrivacyTests(unittest.TestCase):
+    def test_team_scoped_app_test_and_runner_identifiers_are_scrubbed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run = root / "run"
+            run.mkdir()
+            team = "ABCDE12345"
+            app_identifier = "com.swiftvlc.validation.abcde12345.app"
+            tests_identifier = "com.swiftvlc.validation.abcde12345.uitests"
+            runner_identifier = f"{tests_identifier}.xctrunner"
+            (run / "configure-signing.log").write_text(
+                f"appBundleIdentifier={app_identifier}\n"
+                f"uiTestBundleIdentifier={tests_identifier}\n"
+            )
+            (run / "build.log").write_text(
+                f"DEVELOPMENT_TEAM = {team}\n" f"runner = {runner_identifier}\n"
+            )
+            (run / "candidate-metadata.json").write_text(
+                json.dumps(
+                    {
+                        "candidateAppBundleIdentifier": app_identifier,
+                        "testRunnerBundleIdentifier": runner_identifier,
+                    }
+                )
+            )
+            (run / "device.json").write_text(json.dumps({"selected": {}}))
+            output = root / "report.zip"
+            package_volunteer_report.package(run, output)
+            with zipfile.ZipFile(output) as archive:
+                contents = b"\n".join(
+                    archive.read(name) for name in archive.namelist()
+                ).decode(errors="replace")
+            for secret in (
+                team,
+                app_identifier,
+                tests_identifier,
+                runner_identifier,
+            ):
+                self.assertNotIn(secret, contents)
+
+    def test_metadata_bundle_identifiers_are_scrubbed_without_build_logs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run = root / "run"
+            run.mkdir()
+            team = "ABCDE12345"
+            app_identifier = "com.swiftvlc.validation.abcde12345.app"
+            tests_identifier = "com.swiftvlc.validation.abcde12345.uitests"
+            runner_identifier = f"{tests_identifier}.xctrunner"
+            (run / "candidate-metadata.json").write_text(
+                json.dumps(
+                    {
+                        "candidateAppBundleIdentifier": app_identifier,
+                        "testRunnerBundleIdentifier": runner_identifier,
+                    }
+                )
+            )
+            (run / "device.json").write_text(json.dumps({"selected": {}}))
+            (run / "partial.log").write_text(
+                " ".join((team, app_identifier, tests_identifier, runner_identifier))
+            )
+            output = root / "report.zip"
+            package_volunteer_report.package(run, output)
+            with zipfile.ZipFile(output) as archive:
+                contents = b"\n".join(
+                    archive.read(name) for name in archive.namelist()
+                ).decode(errors="replace")
+            for secret in (
+                team,
+                team.lower(),
+                app_identifier,
+                tests_identifier,
+                runner_identifier,
+            ):
+                self.assertNotIn(secret, contents)
 
 
 class CandidateMetadataTests(unittest.TestCase):
@@ -918,6 +1139,7 @@ class CandidateMetadataTests(unittest.TestCase):
         metadata = {
             "formatVersion": 2,
             "version": "1.1.0",
+            "candidateAppBundleIdentifier": "com.swiftvlc.validation.team.app",
             "sourceCommit": "b" * 40,
             "releaseSourceDigestAlgorithm": "swiftvlc-git-tree-v1",
             "releaseSourceDigest": "c" * 64,
@@ -925,6 +1147,9 @@ class CandidateMetadataTests(unittest.TestCase):
             "candidateAppDigest": "a" * 64,
             "artifactDigestAlgorithm": "swiftvlc-tree-v1",
             "artifactDigest": "d" * 64,
+            "testRunnerBundleIdentifier": (
+                "com.swiftvlc.validation.team.uitests.xctrunner"
+            ),
             "testRunnerDigestAlgorithm": "swiftvlc-tree-v1",
             "testRunnerDigest": "e" * 64,
             "testBundleRelativePath": "PlugIns/iOSUITests.xctest",
@@ -953,6 +1178,51 @@ class CandidateMetadataTests(unittest.TestCase):
             ),
             metadata,
         )
+        for field, replacement in (
+            ("candidateAppBundleIdentifier", "not a bundle"),
+            ("testRunnerBundleIdentifier", "com.swiftvlc.validation.team.runner"),
+        ):
+            with self.subTest(field=field):
+                malformed = dict(metadata, **{field: replacement})
+                with self.assertRaises(candidate_metadata.CandidateMetadataError):
+                    candidate_metadata.validate(
+                        malformed,
+                        "1.1.0",
+                        malformed["candidateAppDigest"],
+                        malformed["artifactDigest"],
+                    )
+
+    def test_runner_binding_reads_the_signed_runner_bundle_identifier(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runner = root / "iOSUITests-Runner.app"
+            test_bundle = runner / "PlugIns" / "iOSUITests.xctest"
+            test_bundle.mkdir(parents=True)
+            runner_identifier = "com.swiftvlc.validation.team.uitests.xctrunner"
+            with (runner / "Info.plist").open("wb") as output:
+                plistlib.dump({"CFBundleIdentifier": runner_identifier}, output)
+            (test_bundle / "fixture").write_text("signed test fixture")
+            xctestrun = root / "fixture.xctestrun"
+            xctestrun.write_text("fixture")
+            catalog = qualification_policy.catalog_record(
+                ["iOSUITests/AnalyzerTests/test_pixels"]
+            )
+            catalog_path = root / "catalog.json"
+            catalog_path.write_text(json.dumps(catalog))
+            fixture_manifest = root / "fixture-manifest.json"
+            fixture_manifest.write_text("{}")
+            bindings = candidate_metadata.qualification_bindings(
+                test_runner=runner,
+                test_bundle=test_bundle,
+                xctestrun=xctestrun,
+                test_catalog=catalog_path,
+                matrix=ROOT / "qualification" / "matrix.json",
+                feature_manifest=(ROOT / "qualification" / "feature-manifest-v1.json"),
+                profiles=ROOT / "qualification" / "profiles-v1.json",
+                fixture_manifest=fixture_manifest,
+                digest_script=ROOT / "artifact-tree-digest.py",
+            )
+            self.assertEqual(bindings["testRunnerBundleIdentifier"], runner_identifier)
 
     def test_metadata_reads_source_identity_from_the_signed_app_payload(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -964,6 +1234,7 @@ class CandidateMetadataTests(unittest.TestCase):
             with (app / "Info.plist").open("wb") as output:
                 plistlib.dump(
                     {
+                        "CFBundleIdentifier": "com.swiftvlc.validation.team.app",
                         "SwiftVLCSourceCommit": "b" * 40,
                         "SwiftVLCReleaseSourceDigest": "c" * 64,
                         "SwiftVLCArtifactDigest": "a" * 64,
@@ -980,12 +1251,106 @@ class CandidateMetadataTests(unittest.TestCase):
             self.assertEqual(metadata["releaseSourceDigest"], "c" * 64)
             self.assertEqual(metadata["candidateAppDigest"], "a" * 64)
             self.assertEqual(metadata["artifactDigest"], "a" * 64)
+            self.assertEqual(
+                metadata["candidateAppBundleIdentifier"],
+                "com.swiftvlc.validation.team.app",
+            )
 
             forged = dict(metadata, sourceCommit="d" * 40)
             with self.assertRaises(candidate_metadata.CandidateMetadataError):
                 candidate_metadata.verify(
                     forged, app, xcframework, "1.1.0", digest_script
                 )
+            forged = dict(
+                metadata,
+                candidateAppBundleIdentifier="com.swiftvlc.validation.other.app",
+            )
+            with self.assertRaises(candidate_metadata.CandidateMetadataError):
+                candidate_metadata.verify(
+                    forged, app, xcframework, "1.1.0", digest_script
+                )
+            malformed = dict(metadata, candidateAppBundleIdentifier="not a bundle")
+            with self.assertRaises(candidate_metadata.CandidateMetadataError):
+                candidate_metadata.validate(
+                    malformed,
+                    "1.1.0",
+                    malformed["candidateAppDigest"],
+                    malformed["artifactDigest"],
+                )
+
+    def test_format_two_verification_rejects_valid_but_swapped_bundle_identity(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            app = root / "iOS.app"
+            app.mkdir()
+            xcframework = root / "libvlc.xcframework"
+            xcframework.mkdir()
+            with (app / "Info.plist").open("wb") as output:
+                plistlib.dump(
+                    {
+                        "CFBundleIdentifier": "com.swiftvlc.validation.team.app",
+                        "SwiftVLCSourceCommit": "b" * 40,
+                        "SwiftVLCReleaseSourceDigest": "c" * 64,
+                        "SwiftVLCArtifactDigest": "a" * 64,
+                    },
+                    output,
+                )
+            digest_script = root / "digest.py"
+            digest_script.write_text(f'print("{"a" * 64}")\n')
+            catalog = ["iOSUITests/AnalyzerTests/test_pixels"]
+            bindings = {
+                "testRunnerBundleIdentifier": (
+                    "com.swiftvlc.validation.team.uitests.xctrunner"
+                ),
+                "testRunnerDigestAlgorithm": "swiftvlc-tree-v1",
+                "testRunnerDigest": "e" * 64,
+                "testBundleRelativePath": "PlugIns/iOSUITests.xctest",
+                "testBundleDigestAlgorithm": "swiftvlc-tree-v1",
+                "testBundleDigest": "f" * 64,
+                "baseXCTestRunDigestAlgorithm": "sha256",
+                "baseXCTestRunDigest": "1" * 64,
+                "baseXCTestRunName": "iOS_iphoneos.xctestrun",
+                "testCatalogDigestAlgorithm": "swiftvlc-test-catalog-v1",
+                "testCatalogDigest": qualification_policy.catalog_digest(catalog),
+                "testCatalogCount": 1,
+                "testCatalog": catalog,
+                "qualificationMatrixChecksum": "2" * 64,
+                "featureManifestChecksum": "3" * 64,
+                "qualificationProfilesChecksum": "4" * 64,
+                "fixtureManifestChecksum": "5" * 64,
+                "qualificationPolicyDigestAlgorithm": (
+                    "swiftvlc-qualification-policy-v1"
+                ),
+                "qualificationPolicyDigest": qualification_policy.policy_digest(),
+            }
+            metadata = candidate_metadata.create(
+                app,
+                xcframework,
+                "1.1.0",
+                digest_script,
+                bindings,
+            )
+            for field, replacement in (
+                (
+                    "candidateAppBundleIdentifier",
+                    "com.swiftvlc.validation.other.app",
+                ),
+                (
+                    "testRunnerBundleIdentifier",
+                    "com.swiftvlc.validation.other.uitests.xctrunner",
+                ),
+            ):
+                with self.subTest(field=field):
+                    forged = dict(metadata, **{field: replacement})
+                    with self.assertRaises(candidate_metadata.CandidateMetadataError):
+                        candidate_metadata.verify(
+                            forged,
+                            app,
+                            xcframework,
+                            "1.1.0",
+                            digest_script,
+                            bindings,
+                        )
 
 
 class FixtureManifestTests(unittest.TestCase):
@@ -2919,6 +3284,9 @@ class QualificationRecordAssemblyTests(unittest.TestCase):
                 {
                     "formatVersion": 2,
                     "version": "1.1.0",
+                    "candidateAppBundleIdentifier": (
+                        "com.swiftvlc.validation.team.app"
+                    ),
                     "artifactDigestAlgorithm": "swiftvlc-tree-v1",
                     "artifactDigest": "a" * 64,
                     "sourceCommit": "b" * 40,
@@ -2926,6 +3294,9 @@ class QualificationRecordAssemblyTests(unittest.TestCase):
                     "releaseSourceDigest": "c" * 64,
                     "candidateAppDigestAlgorithm": "swiftvlc-tree-v1",
                     "candidateAppDigest": "d" * 64,
+                    "testRunnerBundleIdentifier": (
+                        "com.swiftvlc.validation.team.uitests.xctrunner"
+                    ),
                     "testRunnerDigestAlgorithm": "swiftvlc-tree-v1",
                     "testRunnerDigest": "e" * 64,
                     "testBundleRelativePath": "PlugIns/iOSUITests.xctest",

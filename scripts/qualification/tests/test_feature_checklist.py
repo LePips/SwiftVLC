@@ -113,6 +113,7 @@ class FeatureChecklistTests(unittest.TestCase):
     def identity(self) -> dict:
         return {
             "version": "1.1.0-beta.1",
+            "candidateAppBundleIdentifier": "com.swiftvlc.validation.team.app",
             "sourceCommit": "b" * 40,
             "releaseSourceDigestAlgorithm": "swiftvlc-git-tree-v1",
             "releaseSourceDigest": "c" * 64,
@@ -647,6 +648,9 @@ class FeatureChecklistTests(unittest.TestCase):
                     ).hexdigest(),
                     "qualificationProfilesChecksum": "e" * 64,
                     "fixtureManifestChecksum": "f" * 64,
+                    "testRunnerBundleIdentifier": (
+                        "com.swiftvlc.validation.team.uitests.xctrunner"
+                    ),
                     "testRunnerDigestAlgorithm": "swiftvlc-tree-v1",
                     "testRunnerDigest": "1" * 64,
                     "testBundleRelativePath": "PlugIns/iOSUITests.xctest",

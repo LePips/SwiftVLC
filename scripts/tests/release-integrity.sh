@@ -1899,6 +1899,7 @@ catalog_record = policy.catalog_record(catalog)
 identity = {
     "formatVersion": 2,
     "version": "1.1.0",
+    "candidateAppBundleIdentifier": "com.swiftvlc.validation.fixture.app",
     "sourceCommit": commit,
     "releaseSourceDigestAlgorithm": "swiftvlc-git-tree-v1",
     "releaseSourceDigest": source_digest,
@@ -1906,6 +1907,9 @@ identity = {
     "artifactDigest": artifact_digest,
     "candidateAppDigestAlgorithm": "swiftvlc-tree-v1",
     "candidateAppDigest": "a" * 64,
+    "testRunnerBundleIdentifier": (
+        "com.swiftvlc.validation.fixture.uitests.xctrunner"
+    ),
     "testRunnerDigestAlgorithm": "swiftvlc-tree-v1",
     "testRunnerDigest": "b" * 64,
     "testBundleRelativePath": "PlugIns/iOSUITests.xctest",

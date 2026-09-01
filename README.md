@@ -198,6 +198,7 @@ Before a release candidate, connect a trusted, unlocked physical iPhone or iPad
 with Developer Mode enabled and run the human-facing device checklist:
 
 ```bash
+export SWIFTVLC_DEVELOPMENT_TEAM=ABCDE12345  # team shown in Xcode Settings
 ./scripts/qualification/qualify.sh full --device "My iPhone" --require-stable
 ```
 
@@ -205,7 +206,9 @@ The approximately one-hour `full` profile reports broad functional confidence
 without pretending it ran the multi-hour endurance matrix. The `release`
 profile retains those real durations and must be run for each required device
 row before the stable release gate can pass. Neither command publishes a
-release. See [the device qualification guide](scripts/qualification/README.md)
+release. The team is applied only to a disposable source export with
+team-scoped bundle identifiers; the checked-out Xcode project is not rewritten.
+See [the device qualification guide](scripts/qualification/README.md)
 for profiles, evidence, and checklist status semantics.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md#testing-strategy) for test tags,

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import plistlib
+import re
 from pathlib import Path
 
 REMOVED_PATH_KEYS = {
@@ -13,6 +14,15 @@ REMOVED_PATH_KEYS = {
     "TestHostPath",
     "UITargetAppPath",
 }
+BUNDLE_IDENTIFIER_PATTERN = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9-]*(?:\.[A-Za-z0-9][A-Za-z0-9-]*)+$"
+)
+
+
+def validate_bundle_identifier(value: str) -> str:
+    if BUNDLE_IDENTIFIER_PATTERN.fullmatch(value) is None:
+        raise ValueError(f"invalid bundle identifier: {value!r}")
+    return value
 
 
 def transform(
@@ -20,7 +30,15 @@ def transform(
     environment: dict[str, str],
     *,
     use_destination_artifacts: bool = True,
+    test_host_bundle_identifier: str,
+    ui_target_app_bundle_identifier: str,
 ) -> dict:
+    test_host_bundle_identifier = validate_bundle_identifier(
+        test_host_bundle_identifier
+    )
+    ui_target_app_bundle_identifier = validate_bundle_identifier(
+        ui_target_app_bundle_identifier
+    )
     configurations = value.get("TestConfigurations", [])
     targets = [
         target for config in configurations for target in config.get("TestTargets", [])
@@ -37,9 +55,9 @@ def transform(
             target.update(
                 {
                     "UseDestinationArtifacts": True,
-                    "TestHostBundleIdentifier": "com.swiftvlc.showcase.ios.uitests.xctrunner",
+                    "TestHostBundleIdentifier": test_host_bundle_identifier,
                     "TestBundleDestinationRelativePath": "__TESTHOST__/PlugIns/iOSUITests.xctest",
-                    "UITargetAppBundleIdentifier": "com.swiftvlc.showcase.ios",
+                    "UITargetAppBundleIdentifier": ui_target_app_bundle_identifier,
                 }
             )
         testing_environment = target.setdefault("TestingEnvironmentVariables", {})
@@ -62,6 +80,14 @@ def main() -> None:
             "write the result beside the input so __TESTROOT__ still resolves"
         ),
     )
+    parser.add_argument(
+        "--test-host-bundle-identifier",
+        required=True,
+    )
+    parser.add_argument(
+        "--ui-target-app-bundle-identifier",
+        required=True,
+    )
     args = parser.parse_args()
 
     if (
@@ -81,11 +107,16 @@ def main() -> None:
 
     with args.input.open("rb") as source:
         value = plistlib.load(source)
-    transformed = transform(
-        value,
-        environment,
-        use_destination_artifacts=not args.preserve_product_paths,
-    )
+    try:
+        transformed = transform(
+            value,
+            environment,
+            use_destination_artifacts=not args.preserve_product_paths,
+            test_host_bundle_identifier=args.test_host_bundle_identifier,
+            ui_target_app_bundle_identifier=args.ui_target_app_bundle_identifier,
+        )
+    except ValueError as error:
+        parser.error(str(error))
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with args.output.open("wb") as output:
         plistlib.dump(transformed, output, fmt=plistlib.FMT_BINARY, sort_keys=False)

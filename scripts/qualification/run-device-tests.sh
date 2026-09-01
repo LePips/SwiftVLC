@@ -9,6 +9,7 @@ ROOT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 VERSION="1.1.0"
 DEVICE_SELECTOR=""
+DEVELOPMENT_TEAM="${SWIFTVLC_DEVELOPMENT_TEAM:-}"
 CANDIDATE_APP=""
 CANDIDATE_METADATA=""
 XCTESTRUN_OVERRIDE=""
@@ -37,6 +38,8 @@ app-log, fixture-server, device, source, and binary identity evidence.
 Options:
   --version VERSION       Candidate version (default: 1.1.0)
   --device IDENTIFIER     CoreDevice id, UDID, ECID, or exact device name
+  --development-team ID  Required for a new build: signs the disposable export
+                          with team-scoped bundle IDs (or set the matching env)
   --candidate-app PATH    Prebuilt signed iOS.app to install and test
   --candidate-metadata PATH
                           Source/app identity JSON for a prebuilt candidate
@@ -137,6 +140,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --version) VERSION="$2"; shift 2 ;;
     --device) DEVICE_SELECTOR="$2"; shift 2 ;;
+    --development-team) DEVELOPMENT_TEAM="$2"; shift 2 ;;
     --candidate-app) CANDIDATE_APP="$2"; shift 2 ;;
     --candidate-metadata) CANDIDATE_METADATA="$2"; shift 2 ;;
     --xctestrun) XCTESTRUN_OVERRIDE="$2"; shift 2 ;;
@@ -152,6 +156,21 @@ while [[ $# -gt 0 ]]; do
     *) echo "Error: unknown option $1" >&2; usage >&2; exit 2 ;;
   esac
 done
+
+if [[ -n "$DEVELOPMENT_TEAM" && ! "$DEVELOPMENT_TEAM" =~ ^[A-Z0-9]{10}$ ]]; then
+  echo "Error: --development-team must be a 10-character Apple team identifier." >&2
+  exit 2
+fi
+if [[ "$SKIP_BUILD" == false && -z "$DEVELOPMENT_TEAM" ]]; then
+  echo "Error: --development-team is required when building the signed candidate." >&2
+  echo "  Use --skip-build only with an already signed, metadata-bound runner." >&2
+  exit 2
+fi
+if [[ "$SKIP_BUILD" == true && -n "$DEVELOPMENT_TEAM" ]]; then
+  echo "Error: --development-team cannot affect an existing --skip-build runner." >&2
+  echo "  Omit the team; signed bundle identities are read from the retained apps." >&2
+  exit 2
+fi
 
 # Report-only probe authority is resolved before device discovery or a build.
 # It cannot be mixed with candidate lanes or promoted by --require-stable.
@@ -186,7 +205,7 @@ if [[ "$REQUIRE_STABLE" == true ]]; then
   done
 fi
 
-for command in curl ffmpeg ffprobe git jq python3 shasum tar xcodebuild xcrun; do
+for command in curl ffmpeg ffprobe git jq plutil python3 shasum tar xcodebuild xcrun; do
   if ! command -v "$command" >/dev/null 2>&1; then
     echo "Error: required command is unavailable: $command" >&2
     exit 1
@@ -324,17 +343,28 @@ if [[ "$SKIP_BUILD" == false ]]; then
   ln -s "$ROOT_DIR/Vendor" "$BUILD_SOURCE_ROOT/Vendor"
   "$BUILD_SOURCE_ROOT/scripts/setup-dev.sh" --skip-download \
     > "$OUTPUT_DIR/setup-local-source.log"
-  xcodebuild build-for-testing \
-    -project "$BUILD_SOURCE_ROOT/Showcase/SwiftVLCShowcase.xcodeproj" \
-    -scheme iOS \
-    -configuration Release \
-    -destination 'generic/platform=iOS' \
-    -derivedDataPath "$DERIVED_DATA" \
-    SWIFTVLC_SOURCE_COMMIT="$BUILD_SOURCE_COMMIT" \
-    SWIFTVLC_RELEASE_SOURCE_DIGEST="$BUILD_SOURCE_DIGEST" \
-    SWIFTVLC_ARTIFACT_DIGEST="$BUILD_ARTIFACT_DIGEST" \
-    CODE_SIGNING_ALLOWED=YES \
-    > "$OUTPUT_DIR/build.log"
+  team_suffix=$(printf '%s' "$DEVELOPMENT_TEAM" | tr '[:upper:]' '[:lower:]')
+  python3 "$SCRIPT_DIR/configure-signing.py" \
+    "$BUILD_SOURCE_ROOT/Showcase/SwiftVLCShowcase.xcodeproj/project.pbxproj" \
+    --team "$DEVELOPMENT_TEAM" \
+    --bundle-prefix "com.swiftvlc.validation.$team_suffix" \
+    > "$OUTPUT_DIR/configure-signing.log"
+  build_args=(
+    build-for-testing
+    -project "$BUILD_SOURCE_ROOT/Showcase/SwiftVLCShowcase.xcodeproj"
+    -scheme iOS
+    -configuration Release
+    -destination "platform=iOS,id=$DEVICE_UDID"
+    -derivedDataPath "$DERIVED_DATA"
+    -allowProvisioningUpdates
+    -allowProvisioningDeviceRegistration
+    SWIFTVLC_SOURCE_COMMIT="$BUILD_SOURCE_COMMIT"
+    SWIFTVLC_RELEASE_SOURCE_DIGEST="$BUILD_SOURCE_DIGEST"
+    SWIFTVLC_ARTIFACT_DIGEST="$BUILD_ARTIFACT_DIGEST"
+    CODE_SIGNING_ALLOWED=YES
+    DEVELOPMENT_TEAM="$DEVELOPMENT_TEAM"
+  )
+  xcodebuild "${build_args[@]}" > "$OUTPUT_DIR/build.log"
 fi
 
 RUNNER_APP="$DERIVED_DATA/Build/Products/Release-iphoneos/iOSUITests-Runner.app"
@@ -352,6 +382,29 @@ for app in "$CANDIDATE_APP" "$RUNNER_APP"; do
   fi
   codesign --verify --deep --strict "$app"
 done
+
+read_app_bundle_identifier() {
+  local app="$1"
+  local description="$2"
+  local identifier
+  if ! identifier=$(plutil -extract CFBundleIdentifier raw -- "$app/Info.plist") \
+      || [[ ! "$identifier" =~ ^[A-Za-z0-9][A-Za-z0-9-]*(\.[A-Za-z0-9][A-Za-z0-9-]*)+$ ]]; then
+    echo "Error: $description has no valid CFBundleIdentifier: $app" >&2
+    exit 1
+  fi
+  printf '%s\n' "$identifier"
+}
+
+CANDIDATE_BUNDLE_IDENTIFIER=$(read_app_bundle_identifier \
+  "$CANDIDATE_APP" "candidate application")
+TEST_RUNNER_BUNDLE_IDENTIFIER=$(read_app_bundle_identifier \
+  "$RUNNER_APP" "UI-test runner")
+
+prepare_xctestrun() {
+  python3 "$SCRIPT_DIR/prepare-xctestrun.py" "$@" \
+    --test-host-bundle-identifier "$TEST_RUNNER_BUNDLE_IDENTIFIER" \
+    --ui-target-app-bundle-identifier "$CANDIDATE_BUNDLE_IDENTIFIER"
+}
 
 TEST_BUNDLES=()
 while IFS= read -r test_bundle; do
@@ -446,7 +499,7 @@ SOURCE_COMMIT=$(jq -r '.sourceCommit' "$CANDIDATE_IDENTITY")
 SOURCE_DIGEST=$(jq -r '.releaseSourceDigest' "$CANDIDATE_IDENTITY")
 
 DESTINATION_XCTESTRUN="$WORK_DIR/destination.xctestrun"
-python3 "$SCRIPT_DIR/prepare-xctestrun.py" "$XCTESTRUN" "$DESTINATION_XCTESTRUN" \
+prepare_xctestrun "$XCTESTRUN" "$DESTINATION_XCTESTRUN" \
   --environment SWIFTVLC_PIP_LIVE_URL_BASE64="$PIP_LIVE_URL_BASE64" \
   --environment SWIFTVLC_PIP_CONTINUITY_DEVICE=YES \
   --environment SWIFTVLC_PIP_CAPABILITY_DEVICE=YES \
@@ -472,7 +525,7 @@ python3 "$SCRIPT_DIR/prepare-xctestrun.py" "$XCTESTRUN" "$DESTINATION_XCTESTRUN"
 cp "$DESTINATION_XCTESTRUN" "$OUTPUT_DIR/destination.xctestrun"
 
 LAUNCH_XCTESTRUN="$WORK_DIR/destination-launch.xctestrun"
-python3 "$SCRIPT_DIR/prepare-xctestrun.py" "$XCTESTRUN" "$LAUNCH_XCTESTRUN" \
+prepare_xctestrun "$XCTESTRUN" "$LAUNCH_XCTESTRUN" \
   --environment SWIFTVLC_DEVICE_FIXTURE_URL_BASE64="$VOD_URL_BASE64" \
   --environment SWIFTVLC_DEVICE_LOG_PREFIX="$run_id"
 cp "$LAUNCH_XCTESTRUN" "$OUTPUT_DIR/destination-launch.xctestrun"
@@ -513,7 +566,7 @@ cp "$STREAMS_FILE" "$OUTPUT_DIR/streams.local.json"
 xcrun devicectl device copy to \
   --device "$DEVICE_UDID" \
   --domain-type appDataContainer \
-  --domain-identifier com.swiftvlc.showcase.ios \
+  --domain-identifier "$CANDIDATE_BUNDLE_IDENTIFIER" \
   --source "$STREAMS_FILE" \
   --destination Documents/streams.local.json \
   > "$OUTPUT_DIR/stage-streams.log"
@@ -1007,7 +1060,7 @@ run_scenario() {
   log_name="$scenario.jsonl"
   if [[ -n "$route" ]]; then
     selected_xctestrun="$WORK_DIR/destination-$scenario.xctestrun"
-    python3 "$SCRIPT_DIR/prepare-xctestrun.py" "$XCTESTRUN" "$selected_xctestrun" \
+    prepare_xctestrun "$XCTESTRUN" "$selected_xctestrun" \
       --environment SWIFTVLC_PIP_LIVE_URL_BASE64="$PIP_LIVE_URL_BASE64" \
       --environment SWIFTVLC_PIP_CONTINUITY_DEVICE=YES \
       --environment SWIFTVLC_PIP_CAPABILITY_DEVICE=YES \
@@ -1054,7 +1107,7 @@ run_scenario() {
     cp "$selected_xctestrun" "$OUTPUT_DIR/destination-$scenario.xctestrun"
   elif [[ "$scenario" != "analyzer" ]]; then
     selected_xctestrun="$WORK_DIR/destination-$scenario.xctestrun"
-    python3 "$SCRIPT_DIR/prepare-xctestrun.py" "$XCTESTRUN" "$selected_xctestrun" \
+    prepare_xctestrun "$XCTESTRUN" "$selected_xctestrun" \
       --environment SWIFTVLC_DEVICE_FIXTURE_URL_BASE64="$VOD_URL_BASE64" \
       --environment SWIFTVLC_DEVICE_LOG_PREFIX="$run_id-$scenario"
     cp "$selected_xctestrun" "$OUTPUT_DIR/destination-$scenario.xctestrun"
@@ -1167,13 +1220,13 @@ run_scenario() {
       attempt_xctestrun="$WORK_DIR/destination-$scenario-attempt$attempt.xctestrun"
       if [[ "$scenario" == "adaptive-hls-soak" ]]; then
         attempt_token="$run_id-adaptive-$attempt"
-        python3 "$SCRIPT_DIR/prepare-xctestrun.py" \
+        prepare_xctestrun \
           "$selected_xctestrun" "$attempt_xctestrun" \
           --environment SWIFTVLC_DEVICE_LOG_PREFIX="$final_log_prefix" \
           --environment SWIFTVLC_ADAPTIVE_SOAK_TOKEN="$attempt_token"
       elif [[ "$scenario" == "progressive-http-range-seek" ]]; then
         attempt_token="$final_log_prefix"
-        python3 "$SCRIPT_DIR/prepare-xctestrun.py" \
+        prepare_xctestrun \
           "$selected_xctestrun" "$attempt_xctestrun" \
           --environment SWIFTVLC_DEVICE_LOG_PREFIX="$final_log_prefix" \
           --environment SWIFTVLC_PROGRESSIVE_HTTP_RANGE_ATTEMPT_TOKEN="$attempt_token"
@@ -1182,7 +1235,7 @@ run_scenario() {
         local reset_url="$BASE_URL/adaptive/$attempt_token/timebase-vod-ts/master.m3u8"
         local reset_url_base64
         reset_url_base64=$(printf '%s' "$reset_url" | base64 | tr -d '\r\n')
-        python3 "$SCRIPT_DIR/prepare-xctestrun.py" \
+        prepare_xctestrun \
           "$selected_xctestrun" "$attempt_xctestrun" \
           --environment SWIFTVLC_DEVICE_LOG_PREFIX="$final_log_prefix" \
           --environment SWIFTVLC_AUDIO_MEDIA_SERVICES_RESET_URL_BASE64="$reset_url_base64"
@@ -1191,12 +1244,12 @@ run_scenario() {
         local ownership_url="$BASE_URL/adaptive/$attempt_token/timebase-vod-ts/master.m3u8"
         local ownership_url_base64
         ownership_url_base64=$(printf '%s' "$ownership_url" | base64 | tr -d '\r\n')
-        python3 "$SCRIPT_DIR/prepare-xctestrun.py" \
+        prepare_xctestrun \
           "$selected_xctestrun" "$attempt_xctestrun" \
           --environment SWIFTVLC_DEVICE_LOG_PREFIX="$final_log_prefix" \
           --environment SWIFTVLC_AUDIO_SESSION_OWNERSHIP_URL_BASE64="$ownership_url_base64"
       else
-        python3 "$SCRIPT_DIR/prepare-xctestrun.py" \
+        prepare_xctestrun \
           "$selected_xctestrun" "$attempt_xctestrun" \
           --environment SWIFTVLC_DEVICE_LOG_PREFIX="$final_log_prefix"
       fi
@@ -1213,7 +1266,7 @@ run_scenario() {
       local attempt_performance_url="$performance_url?swiftvlcQualification=$attempt_token"
       local attempt_performance_url_base64
       attempt_performance_url_base64=$(printf '%s' "$attempt_performance_url" | base64 | tr -d '\r\n')
-      python3 "$SCRIPT_DIR/prepare-xctestrun.py" \
+      prepare_xctestrun \
         "$selected_xctestrun" "$attempt_xctestrun" \
         --environment SWIFTVLC_DEVICE_LOG_PREFIX="$final_log_prefix" \
         --environment SWIFTVLC_PIP_PERFORMANCE_URL_BASE64="$attempt_performance_url_base64"
@@ -1228,7 +1281,7 @@ run_scenario() {
     elif [[ "$scenario" == "native-subtitle-matrix" ]]; then
       attempt_token="$run_id-subtitle-$attempt"
       attempt_xctestrun="$WORK_DIR/destination-$scenario-attempt$attempt.xctestrun"
-      python3 "$SCRIPT_DIR/prepare-xctestrun.py" \
+      prepare_xctestrun \
         "$selected_xctestrun" "$attempt_xctestrun" \
         --environment SWIFTVLC_DEVICE_LOG_PREFIX="$final_log_prefix" \
         --environment SWIFTVLC_NATIVE_SUBTITLE_TOKEN="$attempt_token"
@@ -1243,7 +1296,7 @@ run_scenario() {
     elif [[ "$scenario" == timebase-*-soak ]]; then
       attempt_token="$run_id-$timebase_mode-$attempt"
       attempt_xctestrun="$WORK_DIR/destination-$scenario-attempt$attempt.xctestrun"
-      python3 "$SCRIPT_DIR/prepare-xctestrun.py" \
+      prepare_xctestrun \
         "$selected_xctestrun" "$attempt_xctestrun" \
         --environment SWIFTVLC_DEVICE_LOG_PREFIX="$final_log_prefix" \
         --environment SWIFTVLC_TIMEBASE_SOAK_MODE="$timebase_mode" \
@@ -1785,7 +1838,7 @@ EOF
     xcrun devicectl device copy from \
       --device "$DEVICE_UDID" \
       --domain-type appDataContainer \
-      --domain-identifier com.swiftvlc.showcase.ios \
+      --domain-identifier "$CANDIDATE_BUNDLE_IDENTIFIER" \
       --source Documents \
       --destination "$document_capture" \
       > "$OUTPUT_DIR/$scenario-pull-log.log" 2>&1

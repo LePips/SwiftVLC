@@ -12,7 +12,6 @@ import zipfile
 from pathlib import Path
 from typing import Any
 
-
 SENSITIVE_VALUE_KEYS = {
     "coredeviceidentifier",
     "ecid",
@@ -103,8 +102,35 @@ def sensitive_values(device: Any) -> set[str]:
     return values
 
 
+def bundle_identifier_values(value: Any) -> set[str]:
+    values: set[str] = set()
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if key.lower().endswith("bundleidentifier") and isinstance(child, str):
+                values.add(child)
+            values.update(bundle_identifier_values(child))
+    elif isinstance(value, list):
+        for child in value:
+            values.update(bundle_identifier_values(child))
+    return values
+
+
+def expand_signing_values(values: set[str]) -> set[str]:
+    expanded = set(values)
+    for value in values:
+        if value.endswith(".xctrunner"):
+            expanded.add(value.removesuffix(".xctrunner"))
+        match = re.match(
+            r"^com\.swiftvlc\.validation\.([A-Za-z0-9]{10})(?:\.|$)",
+            value,
+        )
+        if match:
+            expanded.add(match.group(1))
+    return expanded
+
+
 def signing_values(run_dir: Path) -> set[str]:
-    """Collect developer-team and disposable bundle identifiers from build logs."""
+    """Collect signing identities from logs and structured retained evidence."""
     values: set[str] = set()
     for name in ("configure-signing.log", "build.log"):
         path = run_dir / name
@@ -120,7 +146,20 @@ def signing_values(run_dir: Path) -> set[str]:
             flags=re.MULTILINE,
         ):
             values.add(identifier)
-    return values
+
+    structured_paths = [run_dir / name for name in JSON_FILES]
+    structured_paths.extend(sorted((run_dir / "evidence").glob("*.json")))
+    for path in structured_paths:
+        if not path.is_file():
+            continue
+        try:
+            values.update(bundle_identifier_values(json.loads(path.read_text())))
+        except (OSError, json.JSONDecodeError):
+            # The normal collection pass rejects unreadable/malformed JSON and
+            # never emits an archive. Secret discovery must remain best-effort
+            # so it can also scrub partial runs.
+            continue
+    return expand_signing_values(values)
 
 
 def read_scenarios(run_dir: Path) -> tuple[list[dict[str, Any]], bool]:
@@ -170,7 +209,9 @@ def device_summary(run_dir: Path) -> dict[str, Any]:
     return {key: value[key] for key in allowed if key in value}
 
 
-def failure_reasons(run_dir: Path, scenarios: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def failure_reasons(
+    run_dir: Path, scenarios: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
     results = []
     pattern = re.compile(
         r"(?:error:|failed -|encountered an error|Testing failed:|TEST EXECUTE FAILED)",
@@ -191,7 +232,8 @@ def failure_reasons(run_dir: Path, scenarios: list[dict[str, Any]]) -> list[dict
         results.append(
             {
                 "scenario": scenario,
-                "reasons": reasons or ["No concise failure line was found; see the included log."],
+                "reasons": reasons
+                or ["No concise failure line was found; see the included log."],
             }
         )
     return results
@@ -220,7 +262,9 @@ def summary_markdown(
     if planned:
         lines.append(f"- Planned scenario drivers: **{planned}**")
         if len(scenarios) < planned:
-            lines.append(f"- Unfinished scenario drivers: **{planned - len(scenarios)}**")
+            lines.append(
+                f"- Unfinished scenario drivers: **{planned - len(scenarios)}**"
+            )
     if device:
         model = device.get("marketingName") or device.get("productType") or "unknown"
         os_description = " ".join(

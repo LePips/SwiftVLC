@@ -1725,6 +1725,45 @@ class AppleAudioQualificationPolicyTests(unittest.TestCase):
         )
         self.validate_ownership(evidence)
 
+    def test_audio_session_focus_probe_is_bound_to_the_signed_runner_identity(self):
+        evidence = ownership_evidence()
+        dynamic_identifier = "com.swiftvlc.validation.abcde12345.uitests.xctrunner"
+
+        def rewrite_probe_identifiers(value: object) -> None:
+            if isinstance(value, dict):
+                if "probeApplicationBundleIdentifier" in value:
+                    value["probeApplicationBundleIdentifier"] = dynamic_identifier
+                for child in value.values():
+                    rewrite_probe_identifiers(child)
+            elif isinstance(value, list):
+                for child in value:
+                    rewrite_probe_identifiers(child)
+
+        rewrite_probe_identifiers(evidence)
+        policy.validate_audio_session_ownership_evidence(
+            evidence,
+            retained_base=None,
+            require_retained=False,
+            expected_probe_bundle_identifier=dynamic_identifier,
+        )
+        policy.validate_evidence_semantics(
+            evidence,
+            SCENARIOS["audio-session-ownership"],
+            expected_probe_bundle_identifier=dynamic_identifier,
+        )
+        for mismatched_identifier in (
+            policy.CANONICAL_TEST_RUNNER_BUNDLE_IDENTIFIER,
+            "com.swiftvlc.validation.other.uitests.xctrunner",
+        ):
+            with self.subTest(identifier=mismatched_identifier):
+                with self.assertRaises(policy.QualificationPolicyError):
+                    policy.validate_audio_session_ownership_evidence(
+                        evidence,
+                        retained_base=None,
+                        require_retained=False,
+                        expected_probe_bundle_identifier=mismatched_identifier,
+                    )
+
     def test_audio_session_ownership_v3_rejects_every_schema_boundary(self):
         evidence = ownership_evidence()
         mutations: list[Mutation] = [

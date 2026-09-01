@@ -7,6 +7,7 @@ import argparse
 import datetime as dt
 import json
 import os
+import re
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -38,6 +39,7 @@ REQUIRED_SUPPORT_SCENARIOS = {
     ),
     "release": RELEASE_MANDATORY_SCENARIOS,
 }
+DEVELOPMENT_TEAM_PATTERN = re.compile(r"^[A-Z0-9]{10}$")
 
 
 class ConfigurationError(ValueError):
@@ -298,6 +300,8 @@ def build_runner_command(
     ]
     if device_identifier:
         command.extend(["--device", device_identifier])
+    if args.development_team:
+        command.extend(["--development-team", args.development_team])
     for option, value in (
         ("--candidate-app", args.candidate_app),
         ("--candidate-metadata", args.candidate_metadata),
@@ -364,6 +368,14 @@ def _print_profiles(profiles: Profiles) -> None:
         )
 
 
+def _development_team(value: str) -> str:
+    if DEVELOPMENT_TEAM_PATTERN.fullmatch(value) is None:
+        raise argparse.ArgumentTypeError(
+            "development team must be a 10-character Apple team identifier"
+        )
+    return value
+
+
 def _parser(profile_names: Sequence[str]) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
@@ -376,6 +388,15 @@ def _parser(profile_names: Sequence[str]) -> argparse.ArgumentParser:
     parser.add_argument("--version", default="1.1.0")
     parser.add_argument(
         "--device", help="CoreDevice id, UDID, ECID, or exact device name"
+    )
+    parser.add_argument(
+        "--development-team",
+        default=os.environ.get("SWIFTVLC_DEVELOPMENT_TEAM"),
+        type=_development_team,
+        help=(
+            "Apple development team used to sign a disposable build with "
+            "team-scoped bundle identifiers"
+        ),
     )
     parser.add_argument("--candidate-app", type=Path)
     parser.add_argument("--candidate-metadata", type=Path)
@@ -442,6 +463,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     if args.profile is None:
         parser.error("a profile is required (smoke, full, or release)")
+    if not args.skip_build and not args.development_team:
+        parser.error(
+            "--development-team (or SWIFTVLC_DEVELOPMENT_TEAM) is required "
+            "when building a signed candidate"
+        )
+    if args.skip_build and args.development_team:
+        parser.error(
+            "--development-team cannot be combined with --skip-build; "
+            "the retained apps already own their signing identity"
+        )
     profile = profiles.profiles[args.profile]
     require_stable = profile.stable_environment_required or args.require_stable
     if require_stable and args.exploratory_current_only:

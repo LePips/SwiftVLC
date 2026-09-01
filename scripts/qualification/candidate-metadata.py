@@ -16,10 +16,30 @@ import qualification_policy as policy
 
 SHA1 = re.compile(r"[0-9a-f]{40}")
 SHA256 = re.compile(r"[0-9a-f]{64}")
+BUNDLE_IDENTIFIER = re.compile(
+    r"[A-Za-z0-9][A-Za-z0-9-]*(?:\.[A-Za-z0-9][A-Za-z0-9-]*)+"
+)
 
 
 class CandidateMetadataError(ValueError):
     pass
+
+
+def validated_bundle_identifier(value: object, description: str) -> str:
+    if not isinstance(value, str) or BUNDLE_IDENTIFIER.fullmatch(value) is None:
+        raise CandidateMetadataError(f"{description} has no valid bundle identifier")
+    return value
+
+
+def app_bundle_identifier(app: Path, description: str) -> str:
+    try:
+        with (app / "Info.plist").open("rb") as source:
+            info = plistlib.load(source)
+    except (OSError, plistlib.InvalidFileException) as error:
+        raise CandidateMetadataError(
+            f"cannot read {description} Info.plist: {error}"
+        ) from error
+    return validated_bundle_identifier(info.get("CFBundleIdentifier"), description)
 
 
 def command_output(arguments: list[str]) -> str:
@@ -61,6 +81,11 @@ def validate(
     if not SHA256.fullmatch(str(metadata.get("releaseSourceDigest", ""))):
         raise CandidateMetadataError(
             "candidate metadata has no valid releaseSourceDigest"
+        )
+    if metadata.get("formatVersion") == 2 or "candidateAppBundleIdentifier" in metadata:
+        validated_bundle_identifier(
+            metadata.get("candidateAppBundleIdentifier"),
+            "candidate metadata",
         )
     if metadata.get("formatVersion") == 2:
         try:
@@ -128,6 +153,9 @@ def create(
     metadata = {
         "formatVersion": 2 if bindings is not None else 1,
         "version": version,
+        "candidateAppBundleIdentifier": validated_bundle_identifier(
+            info.get("CFBundleIdentifier"), "candidate application"
+        ),
         "sourceCommit": info.get("SwiftVLCSourceCommit"),
         "releaseSourceDigestAlgorithm": "swiftvlc-git-tree-v1",
         "releaseSourceDigest": info.get("SwiftVLCReleaseSourceDigest"),
@@ -155,7 +183,10 @@ def verify(
         embedded["candidateAppDigest"],
         embedded["artifactDigest"],
     )
-    for field in ("sourceCommit", "releaseSourceDigest"):
+    compared_fields = ["sourceCommit", "releaseSourceDigest"]
+    if "candidateAppBundleIdentifier" in validated:
+        compared_fields.append("candidateAppBundleIdentifier")
+    for field in compared_fields:
         if validated.get(field) != embedded[field]:
             raise CandidateMetadataError(
                 f"candidate metadata {field} does not match the signed app: "
@@ -222,6 +253,9 @@ def qualification_bindings(
     except policy.QualificationPolicyError as error:
         raise CandidateMetadataError(str(error)) from error
     return {
+        "testRunnerBundleIdentifier": app_bundle_identifier(
+            runner, "signed UI-test runner"
+        ),
         "testRunnerDigestAlgorithm": "swiftvlc-tree-v1",
         "testRunnerDigest": command_output(
             ["python3", str(digest_script), str(runner)]

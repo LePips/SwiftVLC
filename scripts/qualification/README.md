@@ -16,6 +16,7 @@ feature checklists beside the raw report:
 
 ```bash
 ./scripts/qualification/qualify.sh --list-profiles
+export SWIFTVLC_DEVELOPMENT_TEAM=ABCDE12345  # team shown in Xcode Settings
 ./scripts/qualification/qualify.sh smoke --device "My iPhone"
 ./scripts/qualification/qualify.sh full --device "My beta iPhone" --exploratory-current-only
 ./scripts/qualification/qualify.sh full --device "My iPhone" --require-stable
@@ -62,6 +63,7 @@ export SWIFTVLC_QUALIFICATION_ROOT="/absolute/path/on/your/external-ssd/SwiftVLC
 
 ./scripts/qualification/run-device-tests.sh \
   --only cadence-semantics-probe \
+  --development-team ABCDE12345 \
   --device "My beta iPhone" \
   --exploratory-current-only \
   --derived-data "$SWIFTVLC_QUALIFICATION_ROOT/DerivedData" \
@@ -179,6 +181,7 @@ device evidence can be accepted.
 
 ```bash
 ./scripts/qualification/run-device-tests.sh \
+  --development-team ABCDE12345 \
   --derived-data /absolute/path/to/device-build \
   --work-root /absolute/path/to/temporary-work \
   --output /absolute/path/to/evidence
@@ -190,10 +193,20 @@ The profile wrapper forwards the same storage controls:
 export SWIFTVLC_QUALIFICATION_ROOT="/absolute/path/on/your/external-ssd/SwiftVLC-Qualification"
 
 ./scripts/qualification/qualify.sh full \
+  --development-team ABCDE12345 \
   --derived-data "$SWIFTVLC_QUALIFICATION_ROOT/DerivedData" \
   --work-root "$SWIFTVLC_QUALIFICATION_ROOT/Tmp" \
+  --fixtures "$SWIFTVLC_QUALIFICATION_ROOT/Fixtures" \
   --output "$SWIFTVLC_QUALIFICATION_ROOT/Results"
 ```
+
+`--development-team` configures only the disposable exported project. It uses
+team-scoped bundle identifiers, enables Xcode's automatic provisioning for that
+build, and carries the actual signed app and test-runner identifiers through
+the xctestrun, device-container access, candidate metadata, and audio-focus
+evidence policy. `SWIFTVLC_DEVELOPMENT_TEAM` is the equivalent environment
+setting. The volunteer validator detects an Xcode team and forwards it
+automatically; it never rewrites the checked-out project.
 
 DerivedData, generated fixtures, evidence, and disposable source snapshots
 default to ignored directories beside the repository. A checkout on an
@@ -216,13 +229,14 @@ digest. Candidate metadata also records and verifies the complete XCFramework
 tree digest; a signed app cannot be paired with evidence naming a different
 engine artifact.
 
-Format-version 2 candidate metadata also binds the complete signed UI-test
-runner tree, the one embedded `.xctest` bundle, the selected base `.xctestrun`
-file, and the exact non-empty leaf-test catalog enumerated for the pinned
-physical device. If the build produces more than one `.xctestrun`, the runner
-fails unless `--xctestrun` selects one explicitly. Reused/prebuilt candidates
-are not trusted from their metadata: all of these trees, files, catalogs, and
-policy manifests are recomputed before testing.
+Format-version 2 candidate metadata also binds the actual signed candidate and
+UI-test-runner bundle identifiers, the complete signed UI-test runner tree, the
+one embedded `.xctest` bundle, the selected base `.xctestrun` file, and the
+exact non-empty leaf-test catalog enumerated for the pinned physical device. If
+the build produces more than one `.xctestrun`, the runner fails unless
+`--xctestrun` selects one explicitly. Reused/prebuilt candidates are not trusted
+from their metadata: all of these trees, files, catalogs, and policy manifests
+are recomputed before testing.
 
 `matrix.json` owns the immutable runner contracts that map each runner lane to
 its exact XCTest selection, qualification scenarios, and attachment names.

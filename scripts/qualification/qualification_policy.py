@@ -37,6 +37,10 @@ class QualificationPolicyError(ValueError):
 SHA1 = re.compile(r"[0-9a-f]{40}")
 SHA256 = re.compile(r"[0-9a-f]{64}")
 ID = re.compile(r"[a-z0-9][a-z0-9-]*")
+BUNDLE_IDENTIFIER = re.compile(
+    r"[A-Za-z0-9][A-Za-z0-9-]*(?:\.[A-Za-z0-9][A-Za-z0-9-]*)+"
+)
+CANONICAL_TEST_RUNNER_BUNDLE_IDENTIFIER = "com.swiftvlc.showcase.ios.uitests.xctrunner"
 
 # These are release claims, not tuning knobs.  Exploratory runs may request a
 # shorter duration, but a stable row is always measured against this table even
@@ -1107,7 +1111,9 @@ QUALIFICATION_POLICY_DOCUMENT = {
         "networkAuthority": "retained-server-transcript-only-v1",
     },
     "requiredCandidateBindings": [
+        "candidateAppBundleIdentifier",
         "candidateAppDigest",
+        "testRunnerBundleIdentifier",
         "testRunnerDigest",
         "testBundleDigest",
         "baseXCTestRunDigest",
@@ -1145,9 +1151,7 @@ def canonical_json_bytes(value: object) -> bytes:
         OverflowError,
         RecursionError,
     ) as error:
-        raise QualificationPolicyError(
-            f"cannot canonicalize JSON: {error}"
-        ) from error
+        raise QualificationPolicyError(f"cannot canonicalize JSON: {error}") from error
 
 
 def policy_digest() -> str:
@@ -1864,6 +1868,7 @@ def validate_evidence_semantics(
     artifact_base: Path | None = None,
     artifact_stem: str | None = None,
     require_host_artifacts: bool = False,
+    expected_probe_bundle_identifier: str = (CANONICAL_TEST_RUNNER_BUNDLE_IDENTIFIER),
 ) -> set[tuple[str, ...]]:
     scenario_id = scenario["id"]
     try:
@@ -1927,10 +1932,18 @@ def validate_evidence_semantics(
             require_retained=require_retained,
         )
     elif scenario_id == "audio-session-ownership":
+        if (
+            not isinstance(expected_probe_bundle_identifier, str)
+            or BUNDLE_IDENTIFIER.fullmatch(expected_probe_bundle_identifier) is None
+        ):
+            raise QualificationPolicyError(
+                "candidate has no valid testRunnerBundleIdentifier"
+            )
         validate_audio_session_ownership_evidence(
             evidence,
             retained_base=retained_base,
             require_retained=require_retained,
+            expected_probe_bundle_identifier=expected_probe_bundle_identifier,
         )
     elif scenario_id == "progressive-http-range-seek":
         artifact_fingerprints.update(
@@ -2935,6 +2948,7 @@ def _validate_apple_audio_focus_probe(
     expected_before: tuple[int, int],
     expected_delta: int,
     expected_outcome: str,
+    expected_probe_bundle_identifier: str,
     extra_fields: Mapping[str, object] | None = None,
 ) -> dict:
     expected_extras = dict(extra_fields or {})
@@ -2978,8 +2992,7 @@ def _validate_apple_audio_focus_probe(
         probe["phase"] != expected_phase
         or probe["source"] != "foreground-XCTest-runner-audio-session"
         or probe["activationSucceeded"] is not True
-        or probe["probeApplicationBundleIdentifier"]
-        != "com.swiftvlc.showcase.ios.uitests.xctrunner"
+        or probe["probeApplicationBundleIdentifier"] != expected_probe_bundle_identifier
         or probe["probeApplicationStateAtActivation"] != "runningForeground"
         or probe["candidateApplicationStateBeforeProbe"] != "runningForeground"
         or probe["candidateApplicationStateDuringActivation"]
@@ -3224,6 +3237,7 @@ def validate_audio_session_ownership_evidence(
     *,
     retained_base: Path | None,
     require_retained: bool,
+    expected_probe_bundle_identifier: str = CANONICAL_TEST_RUNNER_BUNDLE_IDENTIFIER,
 ) -> None:
     scenario_id = "audio-session-ownership"
     _validate_raw_evidence_shape(
@@ -3386,6 +3400,7 @@ def validate_audio_session_ownership_evidence(
             expected_before=(0, 0),
             expected_delta=0,
             expected_outcome="candidate-session-released",
+            expected_probe_bundle_identifier=expected_probe_bundle_identifier,
         )
     ]
     library_focus = evidence.get("libraryReleaseFocusProbes")
@@ -3402,6 +3417,7 @@ def validate_audio_session_ownership_evidence(
                 expected_before=(0, 0),
                 expected_delta=0,
                 expected_outcome="candidate-session-released",
+                expected_probe_bundle_identifier=expected_probe_bundle_identifier,
                 extra_fields={"forcedModuleOrder": expected_order},
             )
         )
@@ -3424,6 +3440,7 @@ def validate_audio_session_ownership_evidence(
                 expected_before=(index, index),
                 expected_delta=1,
                 expected_outcome="candidate-session-active-after-output-teardown",
+                expected_probe_bundle_identifier=expected_probe_bundle_identifier,
                 extra_fields={"forcedAudioOutputModule": module},
             )
         )
@@ -3435,6 +3452,7 @@ def validate_audio_session_ownership_evidence(
             expected_before=(2, 2),
             expected_delta=0,
             expected_outcome="candidate-session-released",
+            expected_probe_bundle_identifier=expected_probe_bundle_identifier,
         )
     )
     _validate_apple_audio_focus_probe_causality(
@@ -9536,14 +9554,11 @@ def validate_error_inventory(
     if not isinstance(errors, list) or value.get("errorCount") != len(errors):
         raise QualificationPolicyError("host error inventory errorCount mismatch")
     paths: set[str] = set()
-    test_log_families: dict[
-        str, list[tuple[str, str, str | None]]
-    ] | None = None
+    test_log_families: dict[str, list[tuple[str, str, str | None]]] | None = None
     if format_version == 2:
         assert canonical_test_catalog is not None
         test_log_families = {
-            identifier: []
-            for identifier in canonical_test_catalog["testIdentifiers"]
+            identifier: [] for identifier in canonical_test_catalog["testIdentifiers"]
         }
     for file_record in raw_files:
         if not isinstance(file_record, dict):
@@ -9635,13 +9650,9 @@ def validate_error_inventory(
         action_files = raw_files
         if format_version == 2:
             action_files = [
-                record
-                for record in raw_files
-                if record.get("childName") is not None
+                record for record in raw_files if record.get("childName") is not None
             ]
-            observed_children = Counter(
-                record["childName"] for record in action_files
-            )
+            observed_children = Counter(record["childName"] for record in action_files)
             expected_children = Counter(
                 {child: 1 for child in DECLARED_TEST_CHILD_LOGS["terminal-outcomes"]}
             )
@@ -9870,8 +9881,10 @@ def validate_expected_error_evidence(
 
 
 PROVENANCE_FIELDS = (
+    "candidateAppBundleIdentifier",
     "candidateAppDigestAlgorithm",
     "candidateAppDigest",
+    "testRunnerBundleIdentifier",
     "testRunnerDigestAlgorithm",
     "testRunnerDigest",
     "testBundleRelativePath",
@@ -9945,6 +9958,25 @@ def validate_candidate_identity(candidate: dict, *, strict: bool = True) -> dict
                 raise QualificationPolicyError(
                     f"candidate metadata {field} must be {expected!r}"
                 )
+    for field in (
+        "candidateAppBundleIdentifier",
+        "testRunnerBundleIdentifier",
+    ):
+        if strict or field in candidate:
+            value = candidate.get(field)
+            if not isinstance(value, str) or BUNDLE_IDENTIFIER.fullmatch(value) is None:
+                raise QualificationPolicyError(
+                    f"candidate metadata has no valid {field}"
+                )
+    if strict:
+        candidate_bundle = candidate["candidateAppBundleIdentifier"]
+        runner_bundle = candidate["testRunnerBundleIdentifier"]
+        if candidate_bundle == runner_bundle or not runner_bundle.endswith(
+            ".xctrunner"
+        ):
+            raise QualificationPolicyError(
+                "candidate and UI-test runner bundle identifiers are inconsistent"
+            )
     if strict:
         if candidate.get("qualificationPolicyDigest") != policy_digest():
             raise QualificationPolicyError(
@@ -10903,6 +10935,7 @@ def validate_evidence(
         artifact_base=artifact_base or retained_base,
         artifact_stem=artifact_stem,
         require_host_artifacts=enforce_host_artifacts,
+        expected_probe_bundle_identifier=identity.get("testRunnerBundleIdentifier"),
     )
 
 

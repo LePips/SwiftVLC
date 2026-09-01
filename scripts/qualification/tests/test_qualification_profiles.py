@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import re
 import subprocess
 import sys
@@ -99,9 +100,7 @@ class QualificationProfileTests(unittest.TestCase):
         self.assertEqual(ownership["execution"], "automated")
         self.assertEqual(ownership["evidenceLevel"], "system-output")
         self.assertEqual(ownership["scenarioIds"], ["audio-session-ownership"])
-        self.assertEqual(
-            ownership["runnerScenarioIds"], ["audio-session-ownership"]
-        )
+        self.assertEqual(ownership["runnerScenarioIds"], ["audio-session-ownership"])
         self.assertNotIn("blocker", ownership)
         for profile_name in ("full", "release"):
             with self.subTest(profile=profile_name):
@@ -285,6 +284,8 @@ class QualificationProfileTests(unittest.TestCase):
                 str(QUALIFICATION / "qualify.py"),
                 "smoke",
                 "--dry-run",
+                "--development-team",
+                "ABCDE12345",
                 "--work-root",
                 str(external_work),
             ],
@@ -295,6 +296,61 @@ class QualificationProfileTests(unittest.TestCase):
         self.assertIn("Dry run only", result.stdout)
         self.assertIn("--only vod-controls", result.stdout)
         self.assertIn(f"--work-root {external_work}", result.stdout)
+        self.assertIn("--development-team ABCDE12345", result.stdout)
+
+    def test_building_requires_a_valid_explicit_development_team(self):
+        for extra_arguments, expected in (
+            ([], "--development-team"),
+            (
+                ["--development-team", "invalid-team"],
+                "10-character Apple team identifier",
+            ),
+        ):
+            with self.subTest(arguments=extra_arguments):
+                result = subprocess.run(
+                    [
+                        sys.executable,
+                        str(QUALIFICATION / "qualify.py"),
+                        "smoke",
+                        "--dry-run",
+                        *extra_arguments,
+                    ],
+                    text=True,
+                    capture_output=True,
+                )
+                self.assertEqual(result.returncode, 2)
+                self.assertIn(expected, result.stderr)
+
+    def test_development_team_environment_is_validated_and_forwarded(self):
+        environment = dict(os.environ, SWIFTVLC_DEVELOPMENT_TEAM="ABCDE12345")
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(QUALIFICATION / "qualify.py"),
+                "smoke",
+                "--dry-run",
+            ],
+            text=True,
+            capture_output=True,
+            env=environment,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--development-team ABCDE12345", result.stdout)
+
+        environment["SWIFTVLC_DEVELOPMENT_TEAM"] = "bad"
+        rejected = subprocess.run(
+            [
+                sys.executable,
+                str(QUALIFICATION / "qualify.py"),
+                "smoke",
+                "--dry-run",
+            ],
+            text=True,
+            capture_output=True,
+            env=environment,
+        )
+        self.assertEqual(rejected.returncode, 2)
+        self.assertIn("10-character Apple team identifier", rejected.stderr)
 
     def test_only_release_checklist_enforces_required_feature_completeness(self):
         arguments = Namespace(
