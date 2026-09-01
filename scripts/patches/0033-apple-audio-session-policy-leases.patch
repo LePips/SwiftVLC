@@ -1,0 +1,169 @@
+diff --git a/include/vlc/libvlc_media_player.h b/include/vlc/libvlc_media_player.h
+index 9403639a40b0a0eb3a2a732d5248d386f6d06686..80775ef7ce50b65b9340ec948e64be574163d829 100644
+--- a/include/vlc/libvlc_media_player.h
++++ b/include/vlc/libvlc_media_player.h
+@@ -391,6 +391,19 @@ typedef enum swiftvlc_apple_audio_command_origin
+     swiftvlc_apple_audio_command_explicit_resume = 1,
+ } swiftvlc_apple_audio_command_origin;
+ 
++/** Opaque, process-broker-owned Apple audio-session activation lease. Zero is
++ * always invalid. A live media player receives the same token on repeated
++ * acquire calls until the exact token is released or media services change
++ * epoch. */
++typedef uint64_t swiftvlc_apple_audio_session_lease_t;
++
++typedef enum swiftvlc_apple_audio_session_lease_result_t
++{
++    swiftvlc_apple_audio_session_lease_failed = -1,
++    swiftvlc_apple_audio_session_lease_application_managed = 0,
++    swiftvlc_apple_audio_session_lease_acquired = 1,
++} swiftvlc_apple_audio_session_lease_result_t;
++
+ #define SWIFTVLC_APPLE_AUDIO_RECOVERY_SNAPSHOT_VERSION 1
+ typedef struct swiftvlc_apple_audio_recovery_snapshot_t
+ {
+@@ -443,6 +456,19 @@ LIBVLC_API bool
+ swiftvlc_libvlc_media_player_get_apple_audio_recovery_snapshot(
+     libvlc_media_player_t *, swiftvlc_apple_audio_recovery_snapshot_t *);
+ 
++/** Acquire the media player's unique library-managed PiP/video-only audio
++ * session lease. Application-managed policy is enforced here and performs no
++ * AVAudioSession operation. */
++LIBVLC_API int
++swiftvlc_libvlc_media_player_acquire_apple_audio_session_lease(
++    libvlc_media_player_t *, swiftvlc_apple_audio_session_lease_t *);
++
++/** Consume exactly one matching live lease. Stale, foreign, reset-invalidated,
++ * and duplicate releases return false and never alter another owner. */
++LIBVLC_API bool
++swiftvlc_libvlc_media_player_release_apple_audio_session_lease(
++    libvlc_media_player_t *, swiftvlc_apple_audio_session_lease_t);
++
+ LIBVLC_API bool swiftvlc_libvlc_media_player_get_media_length_snapshot(
+     libvlc_media_player_t *p_mi,
+     swiftvlc_media_player_media_length_snapshot_t *snapshot );
+diff --git a/lib/libvlc.sym b/lib/libvlc.sym
+index 75d6aaebc85b8afccde9b5d013b86d973a9b50bf..0fc5b3e95de4b46cd32f23c9727b31fe0d13edfc 100644
+--- a/lib/libvlc.sym
++++ b/lib/libvlc.sym
+@@ -143,6 +143,8 @@ swiftvlc_libvlc_media_player_get_sample_buffer_renderer_snapshot
+ swiftvlc_libvlc_media_player_request_next_frame
+ swiftvlc_libvlc_media_player_cancel_next_frame_request
+ swiftvlc_libvlc_media_player_get_apple_audio_recovery_snapshot
++swiftvlc_libvlc_media_player_acquire_apple_audio_session_lease
++swiftvlc_libvlc_media_player_release_apple_audio_session_lease
+ swiftvlc_libvlc_pip_extensions_version
+ libvlc_media_player_get_nsobject
+ libvlc_media_player_get_position
+diff --git a/lib/media_player.c b/lib/media_player.c
+index c48142efb5ac03ce5443f86e3bf25046bf2fa957..69e50949688ee391d02ca713c72fe1328ec41df8 100644
+--- a/lib/media_player.c
++++ b/lib/media_player.c
+@@ -1005,6 +1005,12 @@ static void libvlc_media_player_destroy( libvlc_media_player_t *p_mi )
+ {
+     assert( p_mi );
+ 
++#ifdef __APPLE__
++    /* The process broker owns the opaque lease table. Retire every token
++     * before the media-player address can be reused by another instance. */
++    vlc_apple_audio_session_release_all_leases(p_mi);
++#endif
++
+     /* Detach Callback from the main libvlc object */
+     var_DelCallback( vlc_object_instance(p_mi),
+                      "snapshot-file", snapshot_was_taken, p_mi );
+@@ -1197,6 +1203,53 @@ swiftvlc_libvlc_media_player_get_apple_audio_recovery_snapshot(
+     return true;
+ }
+ 
++static bool
++libvlc_media_player_AppleAudioSessionIsApplicationManaged(
++    libvlc_media_player_t *p_mi)
++{
++    char *management = var_InheritString(p_mi,
++                                         "apple-audio-session-management");
++    bool application_managed = management != NULL
++                            && strcmp(management, "application") == 0;
++    free(management);
++    return application_managed;
++}
++
++int
++swiftvlc_libvlc_media_player_acquire_apple_audio_session_lease(
++    libvlc_media_player_t *p_mi,
++    swiftvlc_apple_audio_session_lease_t *lease)
++{
++    if (lease == NULL)
++        return swiftvlc_apple_audio_session_lease_failed;
++    *lease = 0;
++    if (p_mi == NULL)
++        return swiftvlc_apple_audio_session_lease_failed;
++    if (libvlc_media_player_AppleAudioSessionIsApplicationManaged(p_mi))
++        return swiftvlc_apple_audio_session_lease_application_managed;
++#ifdef __APPLE__
++    return vlc_apple_audio_session_acquire_lease(p_mi, lease) == VLC_SUCCESS
++         ? swiftvlc_apple_audio_session_lease_acquired
++         : swiftvlc_apple_audio_session_lease_failed;
++#else
++    return swiftvlc_apple_audio_session_lease_failed;
++#endif
++}
++
++bool
++swiftvlc_libvlc_media_player_release_apple_audio_session_lease(
++    libvlc_media_player_t *p_mi,
++    swiftvlc_apple_audio_session_lease_t lease)
++{
++    if (p_mi == NULL || lease == 0)
++        return false;
++#ifdef __APPLE__
++    return vlc_apple_audio_session_release_lease(p_mi, lease);
++#else
++    return false;
++#endif
++}
++
+ bool
+ swiftvlc_libvlc_media_player_get_media_length_snapshot(
+     libvlc_media_player_t *p_mi,
+diff --git a/src/libvlc-module.c b/src/libvlc-module.c
+index 7af1aa8ac20a565803f35c65d867399deb574142..a3a038d946136f87af3a99f7d37e88b0de2767be 100644
+--- a/src/libvlc-module.c
++++ b/src/libvlc-module.c
+@@ -135,6 +135,11 @@ static const char *const ppsz_snap_formats[] =
+ 
+ #define ROLE_TEXT N_("Media role")
+ #define ROLE_LONGTEXT N_("Media (player) role for operating system policy.")
++#define APPLE_AUDIO_SESSION_MANAGEMENT_TEXT \
++    N_("Apple audio-session management owner")
++#define APPLE_AUDIO_SESSION_MANAGEMENT_LONGTEXT N_( \
++    "Select whether VLC configures and activates the process-global Apple " \
++    "audio session, or leaves every such mutation to the application.")
+ 
+ #define AUDIO_BITEXACT_TEXT N_("Enable bit-exact mode (pure mode)")
+ #define AUDIO_BITEXACT_LONGTEXT N_( \
+@@ -156,6 +161,12 @@ static const char *ppsz_roles_text[] = {
+     N_("Notification"),  N_("Animation"), N_("Production"),
+     N_("Accessibility"), N_("Test"),
+ };
++static const char *ppsz_apple_audio_session_management[] = {
++    "library", "application",
++};
++static const char *ppsz_apple_audio_session_management_text[] = {
++    N_("Library managed"), N_("Application managed"),
++};
+ 
+ #define GAIN_TEXT N_("Audio gain")
+ #define GAIN_LONGTEXT N_( \
+@@ -1641,6 +1652,11 @@ vlc_module_begin ()
+         change_short('A')
+     add_string( "role", "video", ROLE_TEXT, ROLE_LONGTEXT )
+         change_string_list( ppsz_roles, ppsz_roles_text )
++    add_string("apple-audio-session-management", "library",
++               APPLE_AUDIO_SESSION_MANAGEMENT_TEXT,
++               APPLE_AUDIO_SESSION_MANAGEMENT_LONGTEXT)
++        change_string_list(ppsz_apple_audio_session_management,
++                           ppsz_apple_audio_session_management_text)
+ 
+     set_subcategory( SUBCAT_AUDIO_AFILTER )
+         add_bool( "audio-bitexact", false, AUDIO_BITEXACT_TEXT,

@@ -1,0 +1,898 @@
+From: SwiftVLC Maintainers <swiftvlc@localhost>
+Date: Mon, 31 Aug 2026 18:00:00 +0200
+Subject: [PATCH] backport audited post-pin playback and cast fixes
+
+Apply the audited 1.1 stability backports to c833c4be0 plus SwiftVLC
+patches 0001 through 0026. The upstream commits were applied in this frozen
+dependency order:
+
+  0ab833bfbb2012fabfa9f2e308261b8abaed3647
+      player: fix player seeking to AB loop start while paused
+  f573990efc348205a60a967a19924f5746359835
+      player: fix initial seeking in AB loop policy
+  ef2f3434c4b10784b612dbfac402c637ce71703a
+      player: pass a valid date to the PLAYING timer event
+  2b807d98b2ba8733dee502926401b95853194f59
+      transcode: unload the decoder before cleaning fmt_in
+  2febc7486de3985506243cc4fae36a3287b58c50
+      input: decoder: unload the packetizer before cleaning its fmt_in
+  de592342d31900eb9c85de97ad1feb5879f718fc
+      chromecast: Add duration for streams
+  8fbd8560ef1bed8546b14c88e08f98c1dc5decad
+      sout: chromecast: fix CLOSE json message parsing
+  37afe71a69684c7fe594934ad0dca4542a48cf19
+      sout: chromecast: avoid unecessary string copies
+  5efe99a912ce3ebc9d62829e91b0aed5280345ba
+      sout: chromecast: fix exposed URL formatting
+  8bc99a65e253aae5d4c687a33a76c916c521db77
+      chromecast: Remove invalid attribute
+  39e76682953ffd5357d0ee06e3b5a79512c3118d
+      chromecast: Improve stream type detection
+
+The six Chromecast commits are one atomic protocol group. 37afe's null-safe
+json_get_str_view is kept in a production header shared by every namespace
+handler and the linked regression probe. 5efe's RFC 3986 composer is adapted
+around patch 0001's non-throwing communication failure and isConnected()
+contract.
+
+The URL boundary rejects scoped/link-local/loopback/unspecified/multicast IPv6,
+unreachable IPv4 classes, and their IPv4-mapped IPv6 equivalents before
+artwork/content URLs or LOAD. Wrapper-generated artwork metadata records its
+published URL, restores the original source before route invalidation, and
+regenerates it after a successful reinit. 8bc's invalid autoplay member stays
+removed.
+
+DEMUX_GET_LENGTH is queried through a production helper with both output
+arguments. Failure or unknown becomes VLC_TICK_INVALID, every successful live
+source (including a positive seek-window duration) becomes
+INPUT_DURATION_INDEFINITE, and only finite non-live media retains its duration.
+The cast adaptation preserves patch 0001's ownership and failure contracts.
+
+The decoder backports unload their modules before owner-owned fmt_in storage is
+cleared. ef2f3434 supplies the valid resume epoch consumed by patch 0014's
+stale-pause filter.
+
+Intentionally excluded: 46c85, 853d, and c949/52a. The 6c097 VSBD recovery
+change is also excluded: it must be adapted only after the final 0027 strict
+frame-step display/submission context is frozen.
+
+Validation is source- and production-linked-probe backed by
+scripts/validate-post-pin-stability.sh. The probe compiles VLC's JSON grammar,
+tokeniser, json_get_str(), URL composer, and the exact Cast duration, artwork,
+and protocol helpers; it does not substitute a handwritten JSON model. No
+libVLC artifact or generated source is part of this patch.
+---
+diff --git a/modules/stream_out/Makefile.am b/modules/stream_out/Makefile.am
+index a0abe1b98692b866e64718fa87dff4e502957afd..ad3eda73a673cc43ab6a893523667f9bb3773cc1 100644
+--- a/modules/stream_out/Makefile.am
++++ b/modules/stream_out/Makefile.am
+@@ -139,7 +139,10 @@ libstream_out_chromecast_plugin_la_SOURCES = stream_out/chromecast/cast.cpp stre
+                                              stream_out/chromecast/cast_channel.proto \
+                                              stream_out/renderer_common.hpp \
+                                              stream_out/renderer_common.cpp \
+-                                             stream_out/chromecast/chromecast_common.h stream_out/chromecast/chromecast_ctrl.cpp \
++                                             stream_out/chromecast/chromecast_common.h \
++                                             stream_out/chromecast/chromecast_demux_duration.hpp \
++                                             stream_out/chromecast/chromecast_protocol.hpp \
++                                             stream_out/chromecast/chromecast_ctrl.cpp \
+                                              stream_out/chromecast/chromecast_communication.cpp
+ nodist_libstream_out_chromecast_plugin_la_SOURCES = stream_out/chromecast/@PROTOBUF_VERSION@/cast_channel.pb.cc
+ libstream_out_chromecast_plugin_la_CPPFLAGS = $(AM_CPPFLAGS) -Istream_out/chromecast/@PROTOBUF_VERSION@ $(CHROMECAST_CFLAGS)
+diff --git a/modules/stream_out/chromecast/chromecast.h b/modules/stream_out/chromecast/chromecast.h
+index c316f70b8078656d1b2bcfac38b427594255f547..4134a671b6005fff66f79d2f8bdf878e10099e1c 100644
+--- a/modules/stream_out/chromecast/chromecast.h
++++ b/modules/stream_out/chromecast/chromecast.h
+@@ -122,7 +122,7 @@ public:
+     unsigned msgReceiverClose(const std::string& destinationId);
+     unsigned msgAuth();
+     unsigned msgPlayerLoad( const std::string& destinationId,
+-                            const std::string& mime, const vlc_meta_t *p_meta );
++                            const std::string& mime, const vlc_meta_t *p_meta, vlc_tick_t input_length );
+     unsigned msgPlayerPlay( const std::string& destinationId, int64_t mediaSessionId );
+     unsigned msgPlayerStop( const std::string& destinationId, int64_t mediaSessionId );
+     unsigned msgPlayerPause( const std::string& destinationId, int64_t mediaSessionId );
+@@ -133,10 +133,7 @@ public:
+                                  float volume, bool mute);
+     ssize_t receive( uint8_t *p_data, size_t i_size, int i_timeout, bool *pb_timeout );
+ 
+-    const std::string getServerIp()
+-    {
+-        return m_serverIp;
+-    }
++    std::string getServerBaseURL() const;
+ 
+     /* True once the control connection to the receiver is established. A
+      * constructor that fails to connect leaves this false instead of
+@@ -153,7 +150,7 @@ private:
+                      const std::string & destinationId = DEFAULT_CHOMECAST_RECEIVER,
+                      castchannel::CastMessage_PayloadType payloadType = castchannel::CastMessage_PayloadType_STRING);
+     int pushMediaPlayerMessage( const std::string& destinationId, const std::stringstream & payload );
+-    std::string GetMedia( const std::string& mime, const vlc_meta_t *p_meta );
++    std::string GetMedia( const std::string& mime, const vlc_meta_t *p_meta, vlc_tick_t input_length );
+     unsigned getNextReceiverRequestId();
+     unsigned getNextRequestId();
+ 
+@@ -228,6 +225,7 @@ private:
+     void doStop();
+ 
+     void setMeta( vlc_meta_t *p_meta );
++    void setInputLength( vlc_tick_t length );
+ 
+     vlc_tick_t getPlaybackTimestamp();
+ 
+@@ -257,7 +255,9 @@ private:
+     static void set_pause_state(void*, bool paused);
+ 
+     static void set_meta(void*, vlc_meta_t *p_meta);
++    static void set_input_length(void*, vlc_tick_t length);
+ 
++    void restoreHttpArtwork();
+     void prepareHttpArtwork();
+ 
+     static vlc_tick_t   timeCCToVLC(double);
+@@ -294,6 +294,7 @@ private:
+     bool m_request_stop;
+     bool m_request_load;
+     bool m_paused;
++    vlc_tick_t m_input_length;
+     bool m_input_eof;
+     bool m_cc_eof;
+     bool m_pace;
+@@ -315,6 +316,7 @@ private:
+ 
+     httpd_file_t     *m_httpd_file;
+     std::string       m_art_http_ip;
++    std::string       m_art_http_url;
+     char             *m_art_url;
+     unsigned          m_art_idx;
+ 
+diff --git a/modules/stream_out/chromecast/chromecast_common.h b/modules/stream_out/chromecast/chromecast_common.h
+index 35abdd00a4e3e65b4cca110a2be16bec38fb44c0..c4f96da1dafc1768f7ca2dac08e716f9b1f682f6 100644
+--- a/modules/stream_out/chromecast/chromecast_common.h
++++ b/modules/stream_out/chromecast/chromecast_common.h
+@@ -70,6 +70,8 @@ typedef struct
+ 
+     void (*pf_set_meta)(void*, vlc_meta_t *p_meta);
+ 
++    void (*pf_set_input_length)(void*, vlc_tick_t length);
++
+ } chromecast_common;
+ 
+ # ifdef __cplusplus
+diff --git a/modules/stream_out/chromecast/chromecast_communication.cpp b/modules/stream_out/chromecast/chromecast_communication.cpp
+index 5cf5d13521bc0c55438457a4d9fcff3f4ffba737..e3ab573a1f1bad09757dd8368a13bd695f9c858b 100644
+--- a/modules/stream_out/chromecast/chromecast_communication.cpp
++++ b/modules/stream_out/chromecast/chromecast_communication.cpp
+@@ -28,12 +28,15 @@
+ #endif
+ 
+ #include "chromecast.h"
++#include "chromecast_protocol.hpp"
+ #ifdef HAVE_POLL_H
+ # include <poll.h>
+ #endif
+ 
+ #include <iomanip>
+ 
++#include <vlc_input_item.h>
++
+ ChromecastCommunication::ChromecastCommunication( vlc_object_t* p_module,
+     std::string serverPath, unsigned int serverPort, const char* targetIP, unsigned int devicePort )
+     : m_module( p_module )
+@@ -80,6 +83,18 @@ ChromecastCommunication::ChromecastCommunication( vlc_object_t* p_module,
+         return;
+     }
+ 
++    if (!chromecast_server_host_is_publishable(psz_localIP))
++    {
++        msg_Err(m_module,
++                "Refusing unreachable Chromecast server address: %s",
++                psz_localIP);
++        vlc_tls_Close(m_tls);
++        m_tls = NULL;
++        vlc_tls_ClientDelete(m_creds);
++        m_creds = NULL;
++        return;
++    }
++
+     m_serverIp = psz_localIP;
+ }
+ 
+@@ -303,8 +318,14 @@ static std::string meta_get_escaped(const vlc_meta_t *p_meta, vlc_meta_type_t ty
+     return escape_json(std::string(psz));
+ }
+ 
++std::string ChromecastCommunication::getServerBaseURL() const
++{
++    return chromecast_server_base_url(m_serverIp, m_serverPort);
++}
++
+ std::string ChromecastCommunication::GetMedia( const std::string& mime,
+-                                               const vlc_meta_t *p_meta )
++                                               const vlc_meta_t *p_meta,
++                                               vlc_tick_t input_length )
+ {
+     std::stringstream ss;
+ 
+@@ -364,28 +385,37 @@ std::string ChromecastCommunication::GetMedia( const std::string& mime,
+         }
+     }
+ 
+-    std::stringstream chromecast_url;
+-    chromecast_url << "http://" << m_serverIp << ":" << m_serverPort << m_serverPath;
++    const std::string server_base_url = getServerBaseURL();
++    if (server_base_url.empty())
++    {
++        msg_Err(m_module, "Refusing to publish an unreachable Chromecast URL");
++        return {};
++    }
++    const std::string chromecast_url = server_base_url + m_serverPath;
+ 
+-    msg_Dbg( m_module, "s_chromecast_url: %s", chromecast_url.str().c_str());
++    msg_Dbg( m_module, "s_chromecast_url: %s", chromecast_url.c_str());
+ 
+-    ss << "\"contentId\":\"" << chromecast_url.str() << "\""
+-       << ",\"streamType\":\"LIVE\""
+-       << ",\"contentType\":\"" << mime << "\"";
++    const std::string media_fields =
++        chromecast_media_fields(chromecast_url, mime, input_length);
++    if (media_fields.empty())
++        return {};
++    ss << media_fields;
+ 
+     return ss.str();
+ }
+ 
+ unsigned ChromecastCommunication::msgPlayerLoad( const std::string& destinationId,
+-                                             const std::string& mime, const vlc_meta_t *p_meta )
++                                             const std::string& mime, const vlc_meta_t *p_meta, vlc_tick_t input_length )
+ {
+     unsigned id = getNextRequestId();
+-    std::stringstream ss;
+-    ss << "{\"type\":\"LOAD\","
+-       <<  "\"media\":{" << GetMedia( mime, p_meta ) << "},"
+-       <<  "\"autoplay\":\"false\","
+-       <<  "\"requestId\":" << id
+-       << "}";
++    const std::string media = GetMedia(mime, p_meta, input_length);
++    if (media.empty())
++        return kInvalidId;
++
++    const std::string payload = chromecast_load_payload(media, id);
++    if (payload.empty())
++        return kInvalidId;
++    std::stringstream ss(payload);
+ 
+     return pushMediaPlayerMessage( destinationId, ss ) == VLC_SUCCESS ? id : kInvalidId;
+ }
+diff --git a/modules/stream_out/chromecast/chromecast_ctrl.cpp b/modules/stream_out/chromecast/chromecast_ctrl.cpp
+index af8ba6d655874a1d821d402cb556b9c72278d83e..0ab2e2efefe0a16794d443c68344f17252bcb184 100644
+--- a/modules/stream_out/chromecast/chromecast_ctrl.cpp
++++ b/modules/stream_out/chromecast/chromecast_ctrl.cpp
+@@ -32,6 +32,7 @@
+ #endif
+ 
+ #include "chromecast.h"
++#include "chromecast_protocol.hpp"
+ 
+ #include <cassert>
+ #include <cerrno>
+@@ -42,10 +43,6 @@
+ #include <vlc_rand.h>
+ #include <vlc_threads.h>
+ 
+-extern "C" {
+-#include "../../demux/json/json.h"
+-}
+-
+ /* deadline regarding pings sent from receiver */
+ #define PING_WAIT_TIME 6000
+ #define PING_WAIT_RETRIES 1
+@@ -143,6 +140,7 @@ intf_sys_t::intf_sys_t(vlc_object_t * const p_this, int port, std::string device
+  , m_request_stop( false )
+  , m_request_load( false )
+  , m_paused( false )
++ , m_input_length( VLC_TICK_INVALID )
+  , m_input_eof( false )
+  , m_cc_eof( false )
+  , m_pace( false )
+@@ -164,9 +162,7 @@ intf_sys_t::intf_sys_t(vlc_object_t * const p_this, int port, std::string device
+     if( unlikely(m_ctl_thread_interrupt == NULL) )
+         throw std::runtime_error( "error creating interrupt context" );
+ 
+-    std::stringstream ss;
+-    ss << "http://" << m_communication->getServerIp() << ":" << port;
+-    m_art_http_ip = ss.str();
++    m_art_http_ip = m_communication->getServerBaseURL();
+ 
+     char *device_name = var_GetString(p_this, "sout-chromecast-device-name");
+     if (device_name)
+@@ -182,6 +178,7 @@ intf_sys_t::intf_sys_t(vlc_object_t * const p_this, int port, std::string device
+     m_common.pf_send_input_event = send_input_event;
+     m_common.pf_set_pause_state  = set_pause_state;
+     m_common.pf_set_meta         = set_meta;
++    m_common.pf_set_input_length = set_input_length;
+ 
+     assert( var_Type( vlc_object_parent(vlc_object_parent(m_module)), CC_SHARED_VAR_NAME) == 0 );
+     if (var_Create( vlc_object_parent(vlc_object_parent(m_module)), CC_SHARED_VAR_NAME, VLC_VAR_ADDRESS ) == VLC_SUCCESS )
+@@ -248,6 +245,12 @@ void intf_sys_t::reinit()
+ {
+     assert( m_state == Dead );
+ 
++    /* The route can change between reconnects. Invalidate the old advertised
++     * server address before opening a new control socket so a failed/scoped
++     * route can never reuse stale artwork metadata. */
++    restoreHttpArtwork();
++    m_art_http_ip.clear();
++
+     if( m_communication )
+     {
+         vlc_join( m_chromecastThread, NULL );
+@@ -277,6 +280,17 @@ void intf_sys_t::reinit()
+         return;
+     }
+ 
++    m_art_http_ip = m_communication->getServerBaseURL();
++    if (m_art_http_ip.empty())
++    {
++        msg_Warn(m_module, "reconnected Chromecast route is not publishable");
++        delete m_communication;
++        m_communication = NULL;
++        return;
++    }
++
++    prepareHttpArtwork();
++
+     m_state = Authenticating;
+     if( vlc_clone( &m_chromecastThread, ChromecastThread, this) )
+     {
+@@ -340,8 +354,26 @@ static int httpd_file_fill_cb( httpd_file_sys_t *data, httpd_file_t *,
+     return p_sys->httpd_file_fill( psz_request, pp_data, pi_data );
+ }
+ 
++void intf_sys_t::restoreHttpArtwork()
++{
++    const char *current = m_meta != NULL
++                        ? vlc_meta_Get(m_meta, vlc_meta_ArtworkURL) : NULL;
++    const std::string restored = chromecast_restore_wrapped_artwork_url(
++        current != NULL ? current : "", m_art_url != NULL ? m_art_url : "",
++        m_art_http_url);
++    if (current != NULL && restored != current)
++        vlc_meta_Set(m_meta, vlc_meta_ArtworkURL, restored.c_str());
++    m_art_http_url.clear();
++}
++
+ void intf_sys_t::prepareHttpArtwork()
+ {
++    /* An empty base URL means the control socket selected an address that a
++     * separate Cast receiver cannot use (notably scoped/link-local IPv6).
++     * Never rewrite metadata to advertise an unreachable artwork URL. */
++    if (m_art_http_ip.empty())
++        return;
++
+     const char *psz_art = m_meta ? vlc_meta_Get( m_meta, vlc_meta_ArtworkURL ) : NULL;
+     /* Abort if there is no art or if the art is already served */
+     if( !psz_art || strncmp( psz_art, "http", 4) == 0 )
+@@ -375,13 +407,19 @@ void intf_sys_t::prepareHttpArtwork()
+         if( !m_httpd_file )
+             return;
+ 
++        char *source_artwork = strdup( psz_art );
++        if (source_artwork == NULL)
++            return;
+         free( m_art_url );
+-        m_art_url = strdup( psz_art );
++        m_art_url = source_artwork;
+     }
+ 
+-    std::stringstream ss;
+-    ss << m_art_http_ip << ss_art_idx.str();
+-    vlc_meta_Set( m_meta, vlc_meta_ArtworkURL, ss.str().c_str() );
++    const std::string published =
++        chromecast_artwork_url(m_art_http_ip, ss_art_idx.str());
++    if (published.empty())
++        return;
++    m_art_http_url = published;
++    vlc_meta_Set( m_meta, vlc_meta_ArtworkURL, published.c_str() );
+ }
+ 
+ void intf_sys_t::tryLoad()
+@@ -414,7 +452,7 @@ void intf_sys_t::tryLoad()
+     // Reset the mediaSessionID to allow the new session to become the current one.
+     // we cannot start a new load when the last one is still processing
+     m_last_request_id =
+-        m_communication->msgPlayerLoad( m_appTransportId, m_mime, m_meta );
++        m_communication->msgPlayerLoad( m_appTransportId, m_mime, m_meta, m_input_length );
+     if( m_last_request_id != ChromecastCommunication::kInvalidId )
+         m_state = Loading;
+ }
+@@ -748,8 +786,7 @@ void intf_sys_t::processAuthMessage( const castchannel::CastMessage& msg )
+ void intf_sys_t::processHeartBeatMessage( const castchannel::CastMessage& msg , const struct json_object *entry )
+ {
+     VLC_UNUSED(msg);
+-    const char *tmp = json_get_str(entry, "type");
+-    std::string type = tmp ? tmp : ""; 
++    const std::string_view type = json_get_str_view(entry, "type");
+     if (type == "PING")
+     {
+         msg_Dbg( m_module, "PING received from the Chromecast");
+@@ -757,19 +794,18 @@ void intf_sys_t::processHeartBeatMessage( const castchannel::CastMessage& msg ,
+     }
+     else if (type == "PONG")
+     {
+-        msg_Dbg( m_module, "PONG received from the Chromecast");
++        msg_Dbg(m_module, "PONG received from the Chromecast");
+         m_pingRetriesLeft = PING_WAIT_RETRIES;
+     }
+     else
+     {
+-        msg_Warn( m_module, "Heartbeat command not supported: %s", type.c_str());
++        msg_Warn(m_module, "Heartbeat command not supported: %s", type.data());
+     }
+ }
+ 
+ bool intf_sys_t::processReceiverMessage( const castchannel::CastMessage& msg , const struct json_object *entry )
+ {
+-    const char *tmp = json_get_str(entry, "type");
+-    std::string type = tmp ? tmp : "";
++    const std::string_view type = json_get_str_view(entry, "type");
+ 
+     bool ret = true;
+     if (type == "RECEIVER_STATUS")
+@@ -806,8 +842,7 @@ bool intf_sys_t::processReceiverMessage( const castchannel::CastMessage& msg , c
+             if ( p_app != NULL )
+             {
+                 msg_Dbg( m_module, "Media receiver application was already running" );
+-                tmp = json_get_str(p_app, "transportId");
+-                m_appTransportId = tmp ? tmp: "";
++                m_appTransportId = json_get_str_view(p_app, "transportId");
+                 m_communication->msgConnect( m_appTransportId );
+                 setState( Ready );
+             }
+@@ -821,8 +856,7 @@ bool intf_sys_t::processReceiverMessage( const castchannel::CastMessage& msg , c
+             if ( p_app != NULL )
+             {
+                 msg_Dbg( m_module, "Media receiver application has been started." );
+-                tmp = json_get_str(p_app, "transportId");
+-                m_appTransportId = tmp ? tmp: "";
++                m_appTransportId = json_get_str_view(p_app, "transportId");
+                 m_communication->msgConnect( m_appTransportId );
+                 setState( Ready );
+             }
+@@ -880,8 +914,7 @@ bool intf_sys_t::processReceiverMessage( const castchannel::CastMessage& msg , c
+ 
+ void intf_sys_t::processMediaMessage( const castchannel::CastMessage& msg , const struct json_object *entry )
+ {
+-    const char *tmp = json_get_str(entry, "type");
+-    std::string type = tmp ? tmp: "";
++    const std::string_view type = json_get_str_view(entry, "type");
+     int64_t requestId = (int64_t) json_get_num(entry,"requestId");
+ 
+     vlc::threads::mutex_locker lock( m_lock );
+@@ -901,14 +934,11 @@ void intf_sys_t::processMediaMessage( const castchannel::CastMessage& msg , cons
+             return;
+         }
+         int64_t sessionId = (int64_t) json_get_num(&status->array.entries[0].object,"mediaSessionId");
+-        tmp = json_get_str(&status->array.entries[0].object,"playerState");
+-        std::string newPlayerState = tmp ? tmp: "";
+-        tmp = json_get_str(&status->array.entries[0].object,"idleReason");
+-        std::string idleReason = tmp ? tmp: "";
++        const std::string_view newPlayerState = json_get_str_view(&status->array.entries[0].object,"playerState");
++        const std::string_view idleReason = json_get_str_view(&status->array.entries[0].object,"idleReason");
+ 
+-        msg_Dbg( m_module, "Player state: %s sessionId: %" PRId64,
+-                 json_get_str(&status->array.entries[0].object,"playerState"),
+-                 sessionId );
++        msg_Dbg(m_module, "Player state: %s sessionId: %" PRId64,
++                newPlayerState.data(), sessionId);
+ 
+         if (sessionId != 0 && m_mediaSessionId != 0 && m_mediaSessionId != sessionId)
+         {
+@@ -1007,7 +1037,7 @@ void intf_sys_t::processMediaMessage( const castchannel::CastMessage& msg , cons
+                 }
+             }
+             else
+-                msg_Warn( m_module, "Unknown Chromecast MEDIA_STATUS state %s", newPlayerState.c_str());
++                msg_Warn(m_module, "Unknown Chromecast MEDIA_STATUS state %s", newPlayerState.data());
+         }
+     }
+     else if (type == "LOAD_FAILED")
+@@ -1031,14 +1061,9 @@ void intf_sys_t::processMediaMessage( const castchannel::CastMessage& msg , cons
+ 
+ }
+ 
+-void intf_sys_t::processConnectionMessage( const castchannel::CastMessage& msg , const struct json_object *entry )
++void intf_sys_t::processConnectionMessage( const castchannel::CastMessage& , const struct json_object *entry )
+ {
+-    const struct json_value *value = json_get(entry, msg.payload_utf8().c_str());
+-    if (!value) {
+-        msg_Err(m_module, "connection message: bad payload");
+-        return;
+-    }
+-    std::string type = json_get_str(&value->object, "type");
++    const std::string_view type = json_get_str_view(entry, "type");
+ 
+     if ( type == "CLOSE" )
+     {
+@@ -1052,7 +1077,7 @@ void intf_sys_t::processConnectionMessage( const castchannel::CastMessage& msg ,
+     else
+     {
+         msg_Warn( m_module, "Connection command not supported: %s",
+-                type.c_str());
++                  type.data() );
+     }
+ }
+ 
+@@ -1244,6 +1269,13 @@ void intf_sys_t::setMeta(vlc_meta_t *p_meta)
+     if (m_meta != NULL)
+         vlc_meta_Delete(m_meta);
+     m_meta = p_meta;
++    m_art_http_url.clear();
++}
++
++void intf_sys_t::setInputLength(vlc_tick_t length)
++{
++    vlc::threads::mutex_locker lock( m_lock );
++    m_input_length = length;
+ }
+ 
+ vlc_tick_t intf_sys_t::getPlaybackTimestamp()
+@@ -1343,3 +1375,9 @@ void intf_sys_t::set_meta(void *pt, vlc_meta_t *p_meta)
+     intf_sys_t *p_this = static_cast<intf_sys_t*>(pt);
+     p_this->setMeta( p_meta );
+ }
++
++void intf_sys_t::set_input_length(void *pt, vlc_tick_t length)
++{
++    intf_sys_t *p_this = static_cast<intf_sys_t*>(pt);
++    p_this->setInputLength( length );
++}
+diff --git a/modules/stream_out/chromecast/chromecast_demux.cpp b/modules/stream_out/chromecast/chromecast_demux.cpp
+index 7a44bc17ea15939b1a9e80d05f7ba563d7871787..82f89058d65189f1455e0c2fe797829a1424a8ad 100644
+--- a/modules/stream_out/chromecast/chromecast_demux.cpp
++++ b/modules/stream_out/chromecast/chromecast_demux.cpp
+@@ -33,6 +33,7 @@
+ #include <vlc_demux.h>
+ 
+ #include "chromecast_common.h"
++#include "chromecast_demux_duration.hpp"
+ 
+ #include <cassert>
+ #include <new>
+@@ -89,12 +90,12 @@ struct demux_cc
+ 
+         if (demux_Control( p_demux->s, DEMUX_CAN_SEEK, &m_can_seek ) != VLC_SUCCESS)
+             m_can_seek = false;
+-        /* DEMUX_GET_LENGTH takes two arguments (vlc_tick_t *, bool *live);
+-         * the adaptive demuxer reads both, so the live flag must be passed
+-         * or it reads a stray stack slot and writes through it. */
+-        bool b_unused_live;
+-        if (demux_Control( p_demux->s, DEMUX_GET_LENGTH, &m_length, &b_unused_live ) != VLC_SUCCESS)
+-            m_length = -1;
++        m_length = chromecast_query_demux_input_length(
++            [this](vlc_tick_t *duration, bool *live) {
++                return demux_Control(p_demux->s, DEMUX_GET_LENGTH,
++                                     duration, live);
++            });
++        p_renderer->pf_set_input_length( p_renderer->p_opaque, m_length );
+ 
+         int i_current_title;
+         if( demux_Control( p_demux->s, DEMUX_GET_TITLE,
+@@ -145,6 +146,7 @@ struct demux_cc
+     {
+         assert(p_renderer);
+         p_renderer->pf_set_meta( p_renderer->p_opaque, NULL );
++        p_renderer->pf_set_input_length( p_renderer->p_opaque, VLC_TICK_INVALID );
+         p_renderer->pf_set_demux_enabled(p_renderer->p_opaque, false, NULL, NULL);
+     }
+ 
+diff --git a/modules/stream_out/chromecast/chromecast_demux_duration.hpp b/modules/stream_out/chromecast/chromecast_demux_duration.hpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..633cc87f8dcf3bc539d649d7f68a290ad0d83c26
+--- /dev/null
++++ b/modules/stream_out/chromecast/chromecast_demux_duration.hpp
+@@ -0,0 +1,26 @@
++/*****************************************************************************
++ * chromecast_demux_duration.hpp: Cast duration classification
++ *****************************************************************************/
++
++#ifndef VLC_CHROMECAST_DEMUX_DURATION_HPP
++#define VLC_CHROMECAST_DEMUX_DURATION_HPP
++
++#include <vlc_common.h>
++#include <vlc_input_item.h>
++
++/* Query DEMUX_GET_LENGTH through the production caller and translate its
++ * duration/live pair into the Cast duration contract. A live demux can expose
++ * a positive seek-window length; that is still an indefinite stream, not VOD. */
++template <typename Query>
++static inline vlc_tick_t chromecast_query_demux_input_length(Query &&query)
++{
++    vlc_tick_t duration = VLC_TICK_INVALID;
++    bool live = false;
++    if (query(&duration, &live) != VLC_SUCCESS)
++        return VLC_TICK_INVALID;
++    if (live)
++        return INPUT_DURATION_INDEFINITE;
++    return duration > VLC_TICK_0 ? duration : VLC_TICK_INVALID;
++}
++
++#endif
+diff --git a/modules/stream_out/chromecast/chromecast_protocol.hpp b/modules/stream_out/chromecast/chromecast_protocol.hpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..c6c9085362522d23bc1fc9a1926c9ba4bfc1f174
+--- /dev/null
++++ b/modules/stream_out/chromecast/chromecast_protocol.hpp
+@@ -0,0 +1,159 @@
++/*****************************************************************************
++ * chromecast_protocol.hpp: narrow, testable Chromecast protocol helpers
++ *****************************************************************************/
++
++#ifndef VLC_CHROMECAST_PROTOCOL_HPP
++#define VLC_CHROMECAST_PROTOCOL_HPP
++
++#include <cstdlib>
++#include <cstring>
++#include <iomanip>
++#include <memory>
++#include <sstream>
++#include <string>
++#include <string_view>
++
++#ifndef _WIN32
++# include <arpa/inet.h>
++#endif
++
++#include <vlc_common.h>
++#include <vlc_input_item.h>
++#include <vlc_network.h>
++#include <vlc_url.h>
++
++extern "C" {
++#include "../../demux/json/json.h"
++}
++
++/* json_get_str() returns NULL for both a missing member and a member whose
++ * value is not a JSON string. Never construct std::string/string_view from
++ * that nullable pointer directly. */
++static inline std::string_view
++json_get_str_view(const struct json_object *object, const char *key)
++{
++    const char *value = json_get_str(object, key);
++    return value != NULL ? value : "";
++}
++
++/* The host embedded in a Cast content/artwork URL must be usable by another
++ * device. A scoped IPv6 literal ("%en0") is meaningful only to the sender,
++ * and an unscoped link-local literal cannot identify its interface to the
++ * receiver. Fail closed instead of publishing an unreachable URL. */
++static inline bool
++chromecast_ipv4_is_publishable(const struct in_addr &address)
++{
++    const uint32_t value = ntohl(address.s_addr);
++    return value != INADDR_ANY
++        && (value & UINT32_C(0xff000000)) != UINT32_C(0x7f000000)
++        && !IN_MULTICAST(value);
++}
++
++static inline bool
++chromecast_server_host_is_publishable(const std::string &host)
++{
++    if (host.empty() || host.find('%') != std::string::npos)
++        return false;
++
++    struct in_addr ipv4;
++    if (inet_pton(AF_INET, host.c_str(), &ipv4) == 1)
++        return chromecast_ipv4_is_publishable(ipv4);
++
++    struct in6_addr ipv6;
++    if (inet_pton(AF_INET6, host.c_str(), &ipv6) != 1)
++        return false;
++
++    if (IN6_IS_ADDR_V4MAPPED(&ipv6))
++    {
++        std::memcpy(&ipv4, &ipv6.s6_addr[12], sizeof(ipv4));
++        return chromecast_ipv4_is_publishable(ipv4);
++    }
++
++    return !IN6_IS_ADDR_UNSPECIFIED(&ipv6)
++        && !IN6_IS_ADDR_LOOPBACK(&ipv6)
++        && !IN6_IS_ADDR_LINKLOCAL(&ipv6)
++        && !IN6_IS_ADDR_MULTICAST(&ipv6);
++}
++
++static inline std::string
++chromecast_artwork_url(const std::string &base_url, const std::string &path)
++{
++    if (base_url.empty() || path.empty())
++        return {};
++    return base_url + path;
++}
++
++static inline std::string
++chromecast_restore_wrapped_artwork_url(const std::string &current_url,
++                                       const std::string &source_url,
++                                       const std::string &published_url)
++{
++    if (!source_url.empty() && !published_url.empty()
++     && current_url == published_url)
++        return source_url;
++    return current_url;
++}
++
++static inline std::string
++chromecast_server_base_url(const std::string &host, unsigned port)
++{
++    if (!chromecast_server_host_is_publishable(host))
++        return {};
++
++    vlc_url_t components{};
++    components.psz_protocol = const_cast<char *>("http");
++    components.psz_host = const_cast<char *>(host.c_str());
++    components.i_port = port;
++
++    std::unique_ptr<char, decltype(&std::free)> url(
++        vlc_uri_compose(&components), &std::free);
++    return url != nullptr ? std::string(url.get()) : std::string();
++}
++
++static inline const char *
++chromecast_stream_type(vlc_tick_t input_length)
++{
++    if (input_length > VLC_TICK_0)
++        return "BUFFERED";
++    if (input_length == INPUT_DURATION_INDEFINITE)
++        return "LIVE";
++    return "NONE";
++}
++
++static inline std::string
++chromecast_media_fields(const std::string &content_id, const std::string &mime,
++                        vlc_tick_t input_length)
++{
++    if (content_id.empty())
++        return {};
++
++    const bool buffered = input_length > VLC_TICK_0;
++    std::ostringstream fields;
++    fields << "\"contentId\":\"" << content_id << "\""
++           << ",\"streamType\":\"" << chromecast_stream_type(input_length)
++           << "\""
++           << ",\"contentType\":\"" << mime << "\"";
++    if (buffered)
++    {
++        fields.setf(std::ios_base::fixed, std::ios_base::floatfield);
++        fields << ",\"duration\":" << std::setprecision(6)
++               << secf_from_vlc_tick(input_length);
++    }
++    return fields.str();
++}
++
++static inline std::string
++chromecast_load_payload(const std::string &media, unsigned request_id)
++{
++    if (media.empty())
++        return {};
++
++    std::ostringstream payload;
++    payload << "{\"type\":\"LOAD\","
++            << "\"media\":{" << media << "},"
++            << "\"requestId\":" << request_id
++            << "}";
++    return payload.str();
++}
++
++#endif
+diff --git a/modules/stream_out/chromecast/meson.build b/modules/stream_out/chromecast/meson.build
+index 70ec0e950e44b51ceea33c970f0a4b1b6e8613b6..38be756ae862ef0b400d53489948e1d8bbf600c8 100644
+--- a/modules/stream_out/chromecast/meson.build
++++ b/modules/stream_out/chromecast/meson.build
+@@ -57,6 +57,8 @@ vlc_modules += {
+         'cast.cpp',
+         'chromecast.h',
+         'chromecast_common.h',
++        'chromecast_demux_duration.hpp',
++        'chromecast_protocol.hpp',
+         'chromecast_ctrl.cpp',
+         'chromecast_communication.cpp',
+         '../../demux/json/json.c',
+diff --git a/modules/stream_out/transcode/transcode.h b/modules/stream_out/transcode/transcode.h
+index 6821ea37a4d3a59847b172b399d941a67781b568..ee8f50d8a4119ba4f8961f50b589c205485b14ab 100644
+--- a/modules/stream_out/transcode/transcode.h
++++ b/modules/stream_out/transcode/transcode.h
+@@ -179,8 +179,10 @@ static inline void dec_Delete( decoder_t *p_dec )
+         return;
+ 
+     struct decoder_owner *p_owner = dec_get_owner( p_dec );
++
++    decoder_Clean(p_dec);
+     es_format_Clean( &p_owner->fmt_in );
+-    decoder_Destroy( p_dec );
++    vlc_object_delete(p_dec);
+ }
+ 
+ static inline void es_format_SetMeta( es_format_t *p_dst, const es_format_t *p_src )
+diff --git a/src/input/decoder.c b/src/input/decoder.c
+index bbba9e667d0b79d4246a04a3e84d9fa33bf877ca..8e4ffc822be924f9cf547d3d9d7712a2cf011e84 100644
+--- a/src/input/decoder.c
++++ b/src/input/decoder.c
+@@ -2325,6 +2325,8 @@ static void DeleteDecoder( vlc_input_decoder_t *p_owner, enum es_format_category
+              (char*)&p_dec->fmt_in->i_codec );
+ 
+     decoder_Clean( p_dec );
++    if( p_owner->p_packetizer != NULL )
++        decoder_Clean( p_owner->p_packetizer );
+ 
+     /* Free all packets still in the decoder fifo. */
+     block_FifoEmpty( p_owner->p_fifo );
+@@ -2401,8 +2403,9 @@ static void DeleteDecoder( vlc_input_decoder_t *p_owner, enum es_format_category
+         vlc_meta_Delete( p_owner->p_description );
+ 
+     block_FifoRelease( p_owner->p_fifo );
+-    decoder_Destroy( p_owner->p_packetizer );
+-    decoder_Destroy( &p_owner->dec );
++    if( p_owner->p_packetizer != NULL )
++        vlc_object_delete( p_owner->p_packetizer );
++    vlc_object_delete( &p_owner->dec );
+ }
+ 
+ /* */
+diff --git a/src/player/input.c b/src/player/input.c
+index 857c802511682605a2c2a7dc33eb5db18c2202be..0281e68c69d8608e012fbe48df992dd828a529cf 100644
+--- a/src/player/input.c
++++ b/src/player/input.c
+@@ -296,9 +296,10 @@ vlc_player_input_HandleState(struct vlc_player_input *input,
+             break;
+         case VLC_PLAYER_STATE_PLAYING:
+             input->pause_date = VLC_TICK_INVALID;
++            vlc_player_SignalAtoBLoop(player);
+             vlc_player_UpdateTimerEvent(player, NULL,
+                                         VLC_PLAYER_TIMER_EVENT_PLAYING,
+-                                        input->pause_date);
++                                        state_date);
+             /* fall through */
+         case VLC_PLAYER_STATE_STARTED:
+             if (player->started &&
+@@ -313,6 +314,7 @@ vlc_player_input_HandleState(struct vlc_player_input *input,
+             assert(state_date != VLC_TICK_INVALID);
+             input->pause_date = state_date;
+ 
++            vlc_player_SignalAtoBLoop(player);
+             vlc_player_UpdateTimerEvent(player, NULL,
+                                         VLC_PLAYER_TIMER_EVENT_PAUSED,
+                                         input->pause_date);
+diff --git a/src/player/player.c b/src/player/player.c
+index 5582221d2cdfc1d3e5739ceb23ad28cf7db3e757..c2fdc80134765afdf86e3ad5d4210af63bbf48f4 100644
+--- a/src/player/player.c
++++ b/src/player/player.c
+@@ -195,7 +195,7 @@ vlc_player_GetAtoBLoopDeadline(vlc_player_t *player)
+ {
+     struct vlc_player_input *input = vlc_player_get_input_locked(player);
+ 
+-    if (!input || !input->abloop_state[0].set || !input->abloop_state[1].set)
++    if (!input || input->pause_date != VLC_TICK_INVALID || !input->abloop_state[0].set || !input->abloop_state[1].set)
+         return VLC_TICK_MIN;
+ 
+     vlc_tick_t now = vlc_tick_now();
+@@ -1609,7 +1609,9 @@ vlc_player_SetAtoBLoopTime(vlc_player_t *player, vlc_tick_t a_time, vlc_tick_t b
+     input->abloop_state[1].pos = 0;
+     input->abloop_state[1].set = true;
+ 
+-    vlc_player_SetTime(player, a_time);
++    vlc_tick_t current = vlc_player_input_GetTime(input, false, vlc_tick_now());
++    if (current == VLC_TICK_INVALID || current < a_time || current > b_time)
++        vlc_player_SetTime(player, a_time);
+ 
+     vlc_player_SendEvent(player, on_atobloop_changed, VLC_PLAYER_ABLOOP_A, a_time, 0);
+     vlc_player_SendEvent(player, on_atobloop_changed, VLC_PLAYER_ABLOOP_B, b_time, 0);
+@@ -1637,7 +1639,9 @@ vlc_player_SetAtoBLoopPosition(vlc_player_t *player, double a_pos, double b_pos)
+     input->abloop_state[1].pos = b_pos;
+     input->abloop_state[1].set = true;
+ 
+-    vlc_player_SetPosition(player, a_pos);
++    double current = vlc_player_input_GetPos(input, false, vlc_tick_now());
++    if (current < a_pos || current > b_pos)
++        vlc_player_SetPosition(player, a_pos);
+ 
+     vlc_player_SendEvent(player, on_atobloop_changed, VLC_PLAYER_ABLOOP_A, VLC_TICK_INVALID, a_pos);
+     vlc_player_SendEvent(player, on_atobloop_changed, VLC_PLAYER_ABLOOP_B, VLC_TICK_INVALID, b_pos);

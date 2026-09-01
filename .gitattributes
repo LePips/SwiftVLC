@@ -1,1 +1,4 @@
-scripts/patches/*.patch whitespace=-space-before-tab
+# Unified-diff context lines for an otherwise blank source line are a single
+# space by definition. Do not make `git diff --check` treat those required
+# patch payload bytes as source-code trailing whitespace.
+scripts/patches/*.patch -whitespace

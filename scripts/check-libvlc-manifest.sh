@@ -3,8 +3,9 @@
 # Verifies that the archive members of every libvlc.a slice in
 # Vendor/libvlc.xcframework match the manifests checked in under
 # scripts/libvlc-manifests/. A rebuilt binary that silently drops or
-# gains plugins/objects in one slice (e.g. the tvOS slice losing or
-# growing the Chromecast plugin stack) shows up as a manifest diff.
+# gains plugins/objects in one slice shows up as a manifest diff. A semantic
+# validator also prevents --write from blessing a rebuild that lost required
+# renderer/Chromecast objects (or accidentally added Chromecast to tvOS).
 #
 # Regenerate a manifest after an intentional rebuild with:
 #   ./scripts/check-libvlc-manifest.sh --write
@@ -18,24 +19,53 @@ set -euo pipefail
 repo_root=$(cd "$(dirname "$0")/.." && pwd)
 xcframework="$repo_root/Vendor/libvlc.xcframework"
 manifests="$repo_root/scripts/libvlc-manifests"
-
+feature_validator="$repo_root/scripts/validate_libvlc_feature_contract.py"
 write_mode=false
-if [ "${1:-}" = "--write" ]; then
-  write_mode=true
-fi
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --write)
+      write_mode=true
+      shift
+      ;;
+    --xcframework)
+      if [ "$#" -lt 2 ]; then
+        echo "error: --xcframework requires a path" >&2
+        exit 2
+      fi
+      xcframework=$2
+      shift 2
+      ;;
+    --help|-h)
+      echo "Usage: $0 [--write] [--xcframework PATH]"
+      exit 0
+      ;;
+    *)
+      echo "error: unknown argument: $1" >&2
+      exit 2
+      ;;
+  esac
+done
 
 if [ ! -d "$xcframework" ]; then
   echo "error: $xcframework not found — run ./scripts/setup-dev.sh first" >&2
   exit 1
 fi
 
+if [ ! -f "$feature_validator" ]; then
+  echo "error: $feature_validator not found" >&2
+  exit 1
+fi
+
+scratch=$(mktemp -d "${TMPDIR:-/tmp}/swiftvlc-libvlc-manifest.XXXXXX")
+trap 'rm -rf -- "$scratch"' EXIT
+
 # Prints "<arch> <member>" lines for every architecture in the archive,
 # sorted bytewise so the output is stable across machines.
 list_members() {
   local archive=$1
   local tmpdir
-  tmpdir=$(mktemp -d)
-  trap 'rm -rf "$tmpdir"' RETURN
+  tmpdir=$(mktemp -d "$scratch/thin.XXXXXX")
 
   local archs
   archs=$(lipo -archs "$archive")
@@ -50,19 +80,47 @@ list_members() {
     fi
     ar t "$thin" | sed "s/^/$arch /"
   done | LC_ALL=C sort
+
+  rm -rf -- "$tmpdir"
 }
 
 failures=0
+slice_count=0
 
+# Capture and semantically validate every real archive before comparing or
+# rewriting any checked-in manifest. This makes --write all-or-nothing with
+# respect to the product feature contract.
 for slice_dir in "$xcframework"/*/; do
   slice=$(basename "$slice_dir")
   archive="$slice_dir/libvlc.a"
   [ -f "$archive" ] || continue
+  slice_count=$((slice_count + 1))
+  actual="$scratch/$slice.txt"
+  list_members "$archive" > "$actual"
+
+  if ! python3 "$feature_validator" --slice "$slice" --members "$actual"; then
+    echo "FAIL  $slice — libvlc feature contract is not satisfied"
+    failures=$((failures + 1))
+  fi
+done
+
+if [ "$slice_count" -eq 0 ]; then
+  echo "error: no libvlc.a slices found under $xcframework" >&2
+  exit 1
+fi
+
+if [ "$failures" -gt 0 ]; then
+  echo "libvlc feature-contract check failed ($failures slice(s))"
+  exit 1
+fi
+
+for actual in "$scratch"/*.txt; do
+  slice=$(basename "$actual" .txt)
   manifest="$manifests/$slice.txt"
 
   if $write_mode; then
     mkdir -p "$manifests"
-    list_members "$archive" > "$manifest"
+    cp "$actual" "$manifest"
     echo "WROTE $slice ($(wc -l < "$manifest" | tr -d ' ') members)"
     continue
   fi
@@ -73,7 +131,7 @@ for slice_dir in "$xcframework"/*/; do
     continue
   fi
 
-  if diff -u "$manifest" <(list_members "$archive"); then
+  if diff -u "$manifest" "$actual"; then
     echo "PASS  $slice"
   else
     echo "FAIL  $slice — archive members differ from checked-in manifest"

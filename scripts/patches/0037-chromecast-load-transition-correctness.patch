@@ -1,0 +1,2308 @@
+diff --git a/modules/stream_out/chromecast/cast.cpp b/modules/stream_out/chromecast/cast.cpp
+index 4afe65c680ff359badf55fc0dbcafa9c6e0336f8..48d2e9daa1cc73df006bb48ebd5d0b4581486721 100644
+--- a/modules/stream_out/chromecast/cast.cpp
++++ b/modules/stream_out/chromecast/cast.cpp
+@@ -60,9 +60,10 @@ struct sout_access_out_sys_t
+     sout_access_out_sys_t(httpd_host_t *httpd_host, intf_sys_t * const intf);
+     ~sout_access_out_sys_t();
+ 
+-    void clear();
+     void stop();
+-    void prepare(sout_stream_t *p_stream, const std::string &mime);
++    cc_stream_token_t prepare(sout_stream_t *p_stream,
++                              cc_input_generation_t,
++                              const std::string &mime);
+     int url_cb(httpd_client_t *cl, httpd_message_t *answer, const httpd_message_t *query);
+     void fifo_put_back(block_t *);
+     ssize_t write(sout_access_out_t *p_access, block_t *p_block);
+@@ -76,6 +77,9 @@ private:
+     void restoreCopy();
+ 
+     intf_sys_t * const m_intf;
++    cc_input_generation_t m_generation;
++    cc_stream_token_t m_next_stream_token;
++    cc_stream_token_t m_stream_token;
+     httpd_url_t       *m_url;
+     httpd_client_t    *m_client;
+     vlc_fifo_t        *m_fifo;
+@@ -100,7 +104,11 @@ struct sout_stream_sys_t
+         , i_port(port)
+         , first_video_keyframe_pts( -1 )
+         , es_changed( true )
+-        , cc_has_input( false )
++        , chain_generation( 0 )
++        , chain_stream_token( 0 )
++        , remote_generation( 0 )
++        , chain_claimed( false )
++        , generation_rejected( false )
+         , cc_flushing( false )
+         , cc_eof( false )
+         , has_video( false )
+@@ -123,6 +131,7 @@ struct sout_stream_sys_t
+                          const audio_format_t* p_fmt ) const;
+     bool startSoutChain(sout_stream_t* p_stream,
+                         const std::vector<sout_stream_id_sys_t*> &new_streams,
++                        cc_input_generation_t generation,
+                         const std::string &sout, int new_transcoding_state);
+     void stopSoutChain(sout_stream_t* p_stream);
+     sout_stream_id_sys_t *GetSubId( sout_stream_t*, sout_stream_id_sys_t*, bool update = true );
+@@ -146,7 +155,11 @@ struct sout_stream_sys_t
+     vlc_tick_t                         first_video_keyframe_pts;
+ 
+     bool                               es_changed;
+-    bool                               cc_has_input;
++    cc_input_generation_t              chain_generation;
++    cc_stream_token_t                  chain_stream_token;
++    cc_input_generation_t              remote_generation;
++    bool                               chain_claimed;
++    bool                               generation_rejected;
+     bool                               cc_flushing;
+     bool                               cc_eof;
+     bool                               has_video;
+@@ -169,6 +182,7 @@ struct sout_stream_id_sys_t
+     es_format_t           fmt;
+     const char            *es_id;
+     sout_stream_id_sys_t  *p_sub_id;
++    cc_input_generation_t generation;
+     bool                  flushed;
+ };
+ 
+@@ -273,7 +287,7 @@ static int ProxySend(sout_stream_t *p_stream, void *_id, block_t *p_buffer)
+ {
+     sout_stream_sys_t *p_sys = reinterpret_cast<sout_stream_sys_t *>( p_stream->p_sys );
+     sout_stream_id_sys_t *id = reinterpret_cast<sout_stream_id_sys_t *>( _id );
+-    if (p_sys->cc_has_input
++    if (p_sys->chain_claimed
+      || p_sys->out_streams_added >= p_sys->out_streams.size() - p_sys->spu_streams_count)
+     {
+         if (p_sys->has_video)
+@@ -297,12 +311,22 @@ static int ProxySend(sout_stream_t *p_stream, void *_id, block_t *p_buffer)
+         }
+ 
+         int ret = sout_StreamIdSend(p_stream->p_next, id, p_buffer);
+-        if (ret == VLC_SUCCESS && !p_sys->cc_has_input)
++        if (ret == VLC_SUCCESS && !p_sys->chain_claimed)
+         {
+             /* Start the chromecast only when all streams are added into the
+              * last sout (the http one) */
+-            p_sys->p_intf->setHasInput(p_sys->mime);
+-            p_sys->cc_has_input = true;
++            if (!p_sys->p_intf->setHasInput(p_sys->chain_generation,
++                                            p_sys->chain_stream_token,
++                                            p_sys->mime))
++            {
++                /* The write already reached the shared HTTP FIFO. Unwind to
++                 * the top-level Send owner so it can safely destroy the whole
++                 * nested chain and purge every stale A/V byte. */
++                p_sys->generation_rejected = true;
++                return VLC_EGENERIC;
++            }
++            p_sys->remote_generation = p_sys->chain_generation;
++            p_sys->chain_claimed = true;
+         }
+         return ret;
+     }
+@@ -350,6 +374,9 @@ static int httpd_url_cb(httpd_callback_sys_t *data, httpd_client_t *cl,
+ sout_access_out_sys_t::sout_access_out_sys_t(httpd_host_t *httpd_host,
+                                              intf_sys_t * const intf)
+     : m_intf(intf)
++    , m_generation(0)
++    , m_next_stream_token(0)
++    , m_stream_token(0)
+     , m_client(NULL)
+     , m_header(NULL)
+     , m_copy_chain(NULL)
+@@ -424,34 +451,38 @@ void sout_access_out_sys_t::restoreCopy()
+     }
+ }
+ 
+-void sout_access_out_sys_t::clear()
+-{
+-    vlc_fifo_Lock(m_fifo);
+-    clearUnlocked();
+-    vlc_fifo_Unlock(m_fifo);
+-    vlc_fifo_Signal(m_fifo);
+-}
+-
+ void sout_access_out_sys_t::stop()
+ {
+     vlc_fifo_Lock(m_fifo);
+     clearUnlocked();
+-    m_intf->setPacing(false);
++    m_intf->setPacing(m_generation, false);
++    m_generation = 0;
++    m_stream_token = 0;
+     m_client = NULL;
+     vlc_fifo_Unlock(m_fifo);
+     vlc_fifo_Signal(m_fifo);
+ }
+ 
+-void sout_access_out_sys_t::prepare(sout_stream_t *p_stream, const std::string &mime)
++cc_stream_token_t sout_access_out_sys_t::prepare(
++    sout_stream_t *p_stream, cc_input_generation_t generation,
++    const std::string &mime)
+ {
+     var_SetAddress(p_stream, SOUT_CFG_PREFIX "access-out-sys", this);
+ 
+     vlc_fifo_Lock(m_fifo);
+     clearUnlocked();
+-    m_intf->setPacing(false);
++    m_intf->setPacing(m_generation, false);
++    m_generation = generation;
++    do
++        ++m_next_stream_token;
++    while (m_next_stream_token == 0);
++    m_stream_token = m_next_stream_token;
++    m_client = NULL;
+     m_mime = mime;
+     m_eof = false;
+     vlc_fifo_Unlock(m_fifo);
++    vlc_fifo_Signal(m_fifo);
++    return m_stream_token;
+ }
+ 
+ void sout_access_out_sys_t::fifo_put_back(block_t *p_block)
+@@ -469,6 +500,19 @@ int sout_access_out_sys_t::url_cb(httpd_client_t *cl, httpd_message_t *answer,
+ 
+     vlc_fifo_Lock(m_fifo);
+ 
++    const char *query_args = reinterpret_cast<const char *>(query->psz_args);
++    if (query_args == NULL
++     || !chromecast_stream_query_matches(query_args, m_stream_token))
++    {
++        answer->i_proto = HTTPD_PROTO_HTTP;
++        answer->i_version = 0;
++        answer->i_type = HTTPD_MSG_ANSWER;
++        answer->i_status = 410;
++        httpd_MsgAdd(answer, "Connection", "close");
++        vlc_fifo_Unlock(m_fifo);
++        return VLC_SUCCESS;
++    }
++
+     if (!answer->i_body_offset)
+     {
+         /* When doing a lot a load requests, we can serve data to a client that
+@@ -480,11 +524,12 @@ int sout_access_out_sys_t::url_cb(httpd_client_t *cl, httpd_message_t *answer,
+ 
+     /* Send data per 512kB minimum */
+     size_t i_min_buffer = 524288;
+-    while (m_client && vlc_fifo_GetBytes(m_fifo) < i_min_buffer && !m_eof)
++    while (m_client == cl && vlc_fifo_GetBytes(m_fifo) < i_min_buffer
++        && !m_eof)
+         vlc_fifo_Wait(m_fifo);
+ 
+     block_t *p_block = NULL;
+-    if (m_client && vlc_fifo_GetBytes(m_fifo) > 0)
++    if (m_client == cl && vlc_fifo_GetBytes(m_fifo) > 0)
+     {
+         /* if less data is available, then we must be EOF */
+         if (vlc_fifo_GetBytes(m_fifo) < i_min_buffer)
+@@ -519,7 +564,7 @@ int sout_access_out_sys_t::url_cb(httpd_client_t *cl, httpd_message_t *answer,
+             p_block = p_first;
+ 
+         if (vlc_fifo_GetBytes(m_fifo) < HTTPD_BUFFER_PACE)
+-            m_intf->setPacing(false);
++            m_intf->setPacing(m_generation, false);
+     }
+ 
+     answer->i_proto  = HTTPD_PROTO_HTTP;
+@@ -590,7 +635,7 @@ ssize_t sout_access_out_sys_t::write(sout_access_out_t *p_access, block_t *p_blo
+              * drop the first block in order to make room. The demux filter
+              * will be unpaced when the data is read from the httpd thread. */
+ 
+-            m_intf->setPacing(true);
++            m_intf->setPacing(m_generation, true);
+ 
+             while (vlc_fifo_GetBytes(m_fifo) >= HTTPD_BUFFER_MAX)
+             {
+@@ -614,7 +659,7 @@ void sout_access_out_sys_t::close()
+ {
+     vlc_fifo_Lock(m_fifo);
+     m_eof = true;
+-    m_intf->setPacing(false);
++    m_intf->setPacing(m_generation, false);
+     vlc_fifo_Unlock(m_fifo);
+     vlc_fifo_Signal(m_fifo);
+ }
+@@ -672,6 +717,25 @@ static void *Add(sout_stream_t *p_stream, const es_format_t *p_fmt, const char *
+     sout_stream_sys_t *p_sys = reinterpret_cast<sout_stream_sys_t *>( p_stream->p_sys );
+     vlc_mutex_locker locker(&p_sys->lock);
+ 
++    const cc_input_generation_t generation =
++        p_sys->p_intf->generationForNewStream();
++    if (generation == 0)
++    {
++        msg_Err(p_stream, "rejecting unowned Chromecast stream");
++        return NULL;
++    }
++    for (const sout_stream_id_sys_t *existing : p_sys->streams)
++    {
++        if (existing->generation != generation)
++        {
++            msg_Err(p_stream,
++                    "mixed Chromecast input generations in one sout");
++            return NULL;
++        }
++    }
++    if (p_sys->streams.empty())
++        p_sys->cc_eof = false;
++
+     if (!p_sys->b_supports_video)
+     {
+         if (p_fmt->i_cat != AUDIO_ES)
+@@ -684,6 +748,7 @@ static void *Add(sout_stream_t *p_stream, const es_format_t *p_fmt, const char *
+         es_format_Copy( &p_sys_id->fmt, p_fmt );
+         p_sys_id->es_id = es_id;
+         p_sys_id->p_sub_id = NULL;
++        p_sys_id->generation = generation;
+         p_sys_id->flushed = false;
+ 
+         p_sys->streams.push_back( p_sys_id );
+@@ -736,10 +801,18 @@ static void DelInternal(sout_stream_t *p_stream, void *_id, bool reset_config)
+     if ( p_sys->out_streams.empty() )
+     {
+         p_sys->stopSoutChain(p_stream);
+-        p_sys->p_intf->requestPlayerStop();
+-        p_sys->access_out_live.clear();
++        if (p_sys->remote_generation != 0)
++            p_sys->p_intf->requestPlayerStop(p_sys->remote_generation);
++        p_sys->access_out_live.stop();
+         p_sys->transcoding_state = TRANSCODING_NONE;
+     }
++    if (p_sys->streams.empty())
++    {
++        p_sys->remote_generation = 0;
++        p_sys->chain_generation = 0;
++        p_sys->chain_claimed = false;
++        p_sys->generation_rejected = false;
++    }
+ }
+ 
+ static void Del(sout_stream_t *p_stream, void *_id)
+@@ -843,16 +916,37 @@ void sout_stream_sys_t::stopSoutChain(sout_stream_t *p_stream)
+         sout_StreamChainDelete( p_out, NULL );
+         p_out = NULL;
+     }
++    chain_generation = 0;
++    chain_stream_token = 0;
++    chain_claimed = false;
++    generation_rejected = false;
+ }
+ 
+ bool sout_stream_sys_t::startSoutChain(sout_stream_t *p_stream,
+                                        const std::vector<sout_stream_id_sys_t*> &new_streams,
++                                       cc_input_generation_t generation,
+                                        const std::string &sout, int new_transcoding_state)
+ {
++    if (generation == 0 || new_streams.empty()
++     || !p_intf->mayBuildChain(generation))
++        return false;
++    for (const sout_stream_id_sys_t *stream : new_streams)
++    {
++        if (stream->generation != generation)
++        {
++            msg_Err(p_stream,
++                    "rejecting mixed Chromecast chain generations");
++            return false;
++        }
++    }
++
+     stopSoutChain( p_stream );
+ 
+     msg_Dbg( p_stream, "Creating chain %s", sout.c_str() );
+-    cc_has_input = false;
++    chain_generation = generation;
++    chain_stream_token = 0;
++    chain_claimed = false;
++    generation_rejected = false;
+     first_video_keyframe_pts = -1;
+     video_proxy_id = NULL;
+     has_video = false;
+@@ -860,13 +954,20 @@ bool sout_stream_sys_t::startSoutChain(sout_stream_t *p_stream,
+     spu_streams_count = 0;
+     transcoding_state = new_transcoding_state;
+ 
+-    access_out_live.prepare( p_stream, mime );
++    chain_stream_token = access_out_live.prepare(p_stream, generation, mime);
++    if (chain_stream_token == 0)
++    {
++        stopSoutChain(p_stream);
++        access_out_live.stop();
++        return false;
++    }
+ 
+     p_out = sout_StreamChainNew(VLC_OBJECT(p_stream), sout.c_str(), NULL);
+     if (p_out == NULL) {
+         msg_Dbg(p_stream, "could not create sout chain:%s", sout.c_str());
+         out_streams.clear();
+-        access_out_live.clear();
++        access_out_live.stop();
++        stopSoutChain( p_stream );
+         return false;
+     }
+ 
+@@ -880,7 +981,6 @@ bool sout_stream_sys_t::startSoutChain(sout_stream_t *p_stream,
+         if ( p_sys_id->p_sub_id == NULL )
+         {
+             msg_Err( p_stream, "can't handle %4.4s stream", (char *)&p_sys_id->fmt.i_codec );
+-            es_format_Clean( &p_sys_id->fmt );
+             it = out_streams.erase( it );
+         }
+         else
+@@ -896,13 +996,18 @@ bool sout_stream_sys_t::startSoutChain(sout_stream_t *p_stream,
+     if (out_streams.empty())
+     {
+         stopSoutChain( p_stream );
+-        access_out_live.clear();
++        access_out_live.stop();
+         return false;
+     }
+ 
+     /* Ask to retry if we are not transcoding everything (because we can trust
+      * what we encode) */
+-    p_intf->setRetryOnFail(transcodingCanFallback());
++    if (!p_intf->setRetryOnFail(generation, transcodingCanFallback()))
++    {
++        stopSoutChain( p_stream );
++        access_out_live.stop();
++        return false;
++    }
+ 
+     return true;
+ }
+@@ -976,6 +1081,25 @@ bool sout_stream_sys_t::UpdateOutput( sout_stream_t *p_stream )
+     if ( !es_changed )
+         return true;
+ 
++    if (streams.empty())
++        return false;
++
++    const cc_input_generation_t generation = streams.front()->generation;
++    if (generation == 0 || !p_intf->mayBuildChain(generation))
++    {
++        msg_Err(p_stream, "rejecting stale Chromecast output generation");
++        return false;
++    }
++    for (const sout_stream_id_sys_t *stream : streams)
++    {
++        if (stream->generation != generation)
++        {
++            msg_Err(p_stream,
++                    "rejecting mixed Chromecast output generations");
++            return false;
++        }
++    }
++
+     es_changed = false;
+ 
+     bool canRemux = true;
+@@ -1046,7 +1170,10 @@ bool sout_stream_sys_t::UpdateOutput( sout_stream_t *p_stream )
+ 
+     if (new_streams.empty())
+     {
+-        p_intf->requestPlayerStop();
++        stopSoutChain(p_stream);
++        access_out_live.stop();
++        if (remote_generation != 0)
++            p_intf->requestPlayerStop(remote_generation);
+         return true;
+     }
+ 
+@@ -1128,9 +1255,12 @@ bool sout_stream_sys_t::UpdateOutput( sout_stream_t *p_stream )
+           << "std{mux=" << ( is_webm ? DEFAULT_MUXER_WEBM : DEFAULT_MUXER )
+           << ",access=chromecast-http}";
+ 
+-    if ( !startSoutChain( p_stream, new_streams, ssout.str(),
++    if ( !startSoutChain( p_stream, new_streams, generation, ssout.str(),
+                           new_transcoding_state ) )
+-        p_intf->requestPlayerStop();
++    {
++        if (remote_generation != 0)
++            p_intf->requestPlayerStop(remote_generation);
++    }
+     return true;
+ }
+ 
+@@ -1197,7 +1327,27 @@ static int Send(sout_stream_t *p_stream, void *_id, block_t *p_buffer)
+         return VLC_EGENERIC;
+     }
+ 
++    if (p_sys->chain_generation == 0
++     || p_sys->chain_stream_token == 0
++     || id->generation != p_sys->chain_generation)
++    {
++        msg_Err(p_stream, "rejecting stale Chromecast stream block");
++        block_ChainRelease(p_buffer);
++        p_sys->stopSoutChain(p_stream);
++        p_sys->access_out_live.stop();
++        return VLC_EGENERIC;
++    }
++
+     int ret = sout_StreamIdSend(p_sys->p_out, next_id, p_buffer);
++    if (p_sys->generation_rejected)
++    {
++        /* ProxySend rejected the first-block generation after bytes had
++         * already reached the shared FIFO. Only this outer owner can safely
++         * tear down every nested ES and purge those bytes together. */
++        p_sys->stopSoutChain(p_stream);
++        p_sys->access_out_live.stop();
++        return VLC_EGENERIC;
++    }
+     if (ret != VLC_SUCCESS)
+         DelInternal(p_stream, id, false);
+ 
+@@ -1223,21 +1373,38 @@ static void Flush( sout_stream_t *p_stream, void *_id )
+ 
+         p_sys->access_out_live.stop();
+ 
+-        if (p_sys->cc_has_input)
++        if (p_sys->remote_generation != 0)
+         {
+-            p_sys->p_intf->requestPlayerStop();
+-            p_sys->cc_has_input = false;
++            p_sys->p_intf->requestPlayerStop(p_sys->remote_generation);
++            p_sys->remote_generation = 0;
+         }
+         p_sys->out_force_reload = p_sys->es_changed = true;
+     }
+ }
+ 
+-static void on_input_event_cb(void *data, enum cc_input_event event, union cc_input_arg arg )
++static void on_input_event_cb(void *data, cc_input_generation_t generation,
++                              enum cc_input_event event,
++                              union cc_input_arg arg )
+ {
+     sout_stream_t *p_stream = reinterpret_cast<sout_stream_t*>(data);
+     sout_stream_sys_t *p_sys = reinterpret_cast<sout_stream_sys_t *>( p_stream->p_sys );
+ 
+     vlc_mutex_locker locker(&p_sys->lock);
++    bool generation_known = false;
++    for (const sout_stream_id_sys_t *stream : p_sys->streams)
++    {
++        if (stream->generation == generation)
++        {
++            generation_known = true;
++            break;
++        }
++    }
++    if (!generation_known)
++    {
++        msg_Warn(p_stream, "ignoring stale Chromecast input event");
++        return;
++    }
++
+     switch (event)
+     {
+         case CC_INPUT_EVENT_EOF:
+@@ -1252,6 +1419,7 @@ static void on_input_event_cb(void *data, enum cc_input_event event, union cc_in
+             break;
+         case CC_INPUT_EVENT_RETRY:
+             p_sys->stopSoutChain( p_stream );
++            p_sys->access_out_live.stop();
+             if( p_sys->transcodingCanFallback() )
+             {
+                 p_sys->setNextTranscodingState();
+@@ -1393,8 +1561,11 @@ static void Close(sout_stream_t *p_stream)
+     assert(p_sys->streams.empty() && p_sys->out_streams.empty());
+ 
+     httpd_host_t *httpd_host = p_sys->httpd_host;
+-    delete p_sys->p_intf;
++    intf_sys_t *p_intf = p_sys->p_intf;
++    p_intf->setOnInputEventCb(NULL, NULL);
++    p_sys->access_out_live.stop();
+     delete p_sys;
++    delete p_intf;
+     /* Delete last since p_intf and p_sys depends on httpd_host */
+     httpd_HostDelete(httpd_host);
+ }
+diff --git a/modules/stream_out/chromecast/chromecast.h b/modules/stream_out/chromecast/chromecast.h
+index 92d7298eb5d2e0ba885515430f51887d4369132b..a2b0ca2beef4bfe5512848872b265943ef0cde97 100644
+--- a/modules/stream_out/chromecast/chromecast.h
++++ b/modules/stream_out/chromecast/chromecast.h
+@@ -50,6 +50,8 @@
+ 
+ #define PACKET_HEADER_LEN 4
+ 
++struct chromecast_artwork_file_sys_t;
++
+ // Media player Chromecast app id
+ static const std::string DEFAULT_CHOMECAST_RECEIVER = "receiver-0";
+ /* see https://developers.google.com/cast/docs/reference/messages */
+@@ -121,7 +123,10 @@ public:
+     unsigned msgReceiverClose(const std::string& destinationId);
+     unsigned msgAuth();
+     unsigned msgPlayerLoad( const std::string& destinationId,
+-                            const std::string& mime, const vlc_meta_t *p_meta, vlc_tick_t input_length );
++                            cc_stream_token_t stream_token,
++                            const std::string& mime,
++                            const vlc_meta_t *p_meta,
++                            vlc_tick_t input_length );
+     unsigned msgPlayerPlay( const std::string& destinationId, int64_t mediaSessionId );
+     unsigned msgPlayerStop( const std::string& destinationId, int64_t mediaSessionId );
+     unsigned msgPlayerPause( const std::string& destinationId, int64_t mediaSessionId );
+@@ -149,7 +154,10 @@ private:
+                      const std::string & destinationId = DEFAULT_CHOMECAST_RECEIVER,
+                      castchannel::CastMessage_PayloadType payloadType = castchannel::CastMessage_PayloadType_STRING);
+     int pushMediaPlayerMessage( const std::string& destinationId, const std::stringstream & payload );
+-    std::string GetMedia( const std::string& mime, const vlc_meta_t *p_meta, vlc_tick_t input_length );
++    std::string GetMedia(cc_stream_token_t stream_token,
++                         const std::string& mime,
++                         const vlc_meta_t *p_meta,
++                         vlc_tick_t input_length);
+     unsigned getNextReceiverRequestId();
+     unsigned getNextRequestId();
+ 
+@@ -186,18 +194,23 @@ struct intf_sys_t
+         return m_communication != NULL && m_communication->isConnected();
+     }
+ 
+-    void setRetryOnFail(bool);
+-    void setHasInput(const std::string mime_type = "");
++    cc_input_generation_t generationForNewStream() const;
++    bool mayBuildChain(cc_input_generation_t) const;
++    bool setRetryOnFail(cc_input_generation_t, bool);
++    bool setHasInput(cc_input_generation_t, cc_stream_token_t,
++                     const std::string mime_type = "");
+ 
+     void setOnInputEventCb(on_input_event_itf on_input_event, void *on_input_event_data);
+-    void setDemuxEnabled(bool enabled, on_paused_changed_itf on_paused_changed,
++    bool setDemuxEnabled(cc_input_generation_t, bool enabled,
++                         on_paused_changed_itf on_paused_changed,
+                          void *on_paused_changed_data);
+-    void requestPlayerStop();
++    bool requestPlayerStop(cc_input_generation_t);
+     States state() const;
+ 
+-    void setPacing(bool do_pace);
+-    int pace();
+-    void sendInputEvent(enum cc_input_event event, union cc_input_arg arg);
++    bool setPacing(cc_input_generation_t, bool do_pace);
++    int pace(cc_input_generation_t);
++    bool sendInputEvent(cc_input_generation_t, enum cc_input_event event,
++                        union cc_input_arg arg);
+     vlc_tick_t getPauseDelay();
+ 
+     unsigned int getHttpStreamPort() const;
+@@ -206,16 +219,27 @@ struct intf_sys_t
+ 
+     std::string getDeviceName() const { return m_device_name; };
+ 
+-    int httpd_file_fill( uint8_t *psz_request, uint8_t **pp_data, size_t *pi_data );
++    int httpd_file_fill(const std::string &source_artwork,
++                        uint8_t **pp_data, size_t *pi_data);
+     void interrupt_wake_up();
+ private:
++    cc_input_generation_t beginInput(bool initially_paused);
++    void endInput(cc_input_generation_t);
++    bool inputGenerationCanLoad(cc_input_generation_t) const;
++    bool queuedInputCanLoad(cc_input_generation_t,
++                            cc_stream_token_t) const;
++    bool queuedInputCanCommit(cc_input_generation_t,
++                              cc_stream_token_t) const;
++    void clearQueuedInput();
++    void clearPendingInput();
++    void promotePendingInput();
+     void reinit();
+     bool handleMessages(int timeout_ms, bool heartbeat_timeout);
+ 
+     bool processMessage(const castchannel::CastMessage &msg);
+     void queueMessage( QueueableMessages msg );
+ 
+-    void setPauseState(bool paused);
++    bool setPauseState(cc_input_generation_t, bool paused);
+     bool sendDesiredPauseState();
+     bool recordMediaRequest(chromecast_media_command command,
+                             unsigned request_id);
+@@ -233,10 +257,10 @@ private:
+     void tryLoad();
+     void doStop();
+ 
+-    void setMeta( vlc_meta_t *p_meta );
+-    void setInputLength( vlc_tick_t length );
++    bool setMeta(cc_input_generation_t, vlc_meta_t *p_meta);
++    bool setInputLength(cc_input_generation_t, vlc_tick_t length);
+ 
+-    vlc_tick_t getPlaybackTimestamp();
++    vlc_tick_t getPlaybackTimestamp(cc_input_generation_t);
+ 
+     double getPlaybackPosition() const;
+ 
+@@ -255,19 +279,27 @@ private:
+ private:
+     static void* ChromecastThread(void* p_data);
+ 
+-    static vlc_tick_t get_time(void*);
++    static cc_input_generation_t begin_input(void *, bool);
++    static void end_input(void *, cc_input_generation_t);
++
++    static vlc_tick_t get_time(void *, cc_input_generation_t);
+ 
+-    static int pace(void*);
+-    static void send_input_event(void *, enum cc_input_event event, union cc_input_arg arg);
+-    static void set_demux_enabled(void *, bool, on_paused_changed_itf, void *);
++    static int pace(void *, cc_input_generation_t);
++    static bool send_input_event(void *, cc_input_generation_t,
++                                 enum cc_input_event event,
++                                 union cc_input_arg arg);
++    static bool set_demux_enabled(void *, cc_input_generation_t, bool,
++                                  on_paused_changed_itf, void *);
+ 
+-    static void set_pause_state(void*, bool paused);
++    static bool set_pause_state(void *, cc_input_generation_t, bool paused);
+ 
+-    static void set_meta(void*, vlc_meta_t *p_meta);
+-    static void set_input_length(void*, vlc_tick_t length);
++    static bool set_meta(void *, cc_input_generation_t, vlc_meta_t *p_meta);
++    static bool set_input_length(void *, cc_input_generation_t,
++                                 vlc_tick_t length);
+ 
+     void restoreHttpArtwork();
+-    void prepareHttpArtwork();
++    bool prepareHttpArtwork(cc_input_generation_t, cc_stream_token_t,
++                            std::string *published_url);
+ 
+ private:
+     vlc_object_t  * const m_module;
+@@ -291,6 +323,9 @@ private:
+     on_paused_changed_itf m_on_paused_changed;
+     void                 *m_on_paused_changed_data;
+ 
++    on_paused_changed_itf m_pending_on_paused_changed;
++    void                 *m_pending_on_paused_changed_data;
++
+     ChromecastCommunication *m_communication;
+     std::queue<QueueableMessages> m_msgQueue;
+     States m_state;
+@@ -300,10 +335,27 @@ private:
+     bool m_played_once;
+     bool m_paused_once;
+     bool m_request_stop;
+-    bool m_request_load;
++    bool m_load_commit_in_progress;
+     bool m_desired_paused;
++    cc_input_generation_t m_queued_load_generation;
++    cc_stream_token_t m_queued_stream_token;
++    std::string m_queued_mime;
++    cc_input_generation_t m_next_input_generation;
++    cc_input_generation_t m_active_input_generation;
++    bool m_active_input_owner_live;
++    bool m_active_demux_enabled;
++    cc_input_generation_t m_pending_input_generation;
++    bool m_pending_input_owner_live;
++    bool m_pending_demux_enabled;
++    bool m_pending_desired_paused;
++    bool m_pending_retry_on_fail;
++    bool m_pending_pace;
++    vlc_tick_t m_pending_input_length;
++    bool m_pending_input_eof;
++    bool m_pending_input_eof_known;
+     vlc_tick_t m_input_length;
+     bool m_input_eof;
++    bool m_input_eof_known;
+     bool m_cc_eof;
+     bool m_pace;
+     bool m_interrupted;
+@@ -314,6 +366,7 @@ private:
+     uint8_t m_statusRetriesLeft;
+ 
+     vlc_meta_t *m_meta;
++    vlc_meta_t *m_pending_meta;
+ 
+     vlc_interrupt_t *m_ctl_thread_interrupt;
+ 
+@@ -328,6 +381,7 @@ private:
+     } const m_httpd;
+ 
+     httpd_file_t     *m_httpd_file;
++    chromecast_artwork_file_sys_t *m_httpd_file_sys;
+     std::string       m_art_http_ip;
+     std::string       m_art_http_url;
+     char             *m_art_url;
+diff --git a/modules/stream_out/chromecast/chromecast_common.h b/modules/stream_out/chromecast/chromecast_common.h
+index c4f96da1dafc1768f7ca2dac08e716f9b1f682f6..785801535a2fd2efee4f82bc2e2c43555133af29 100644
+--- a/modules/stream_out/chromecast/chromecast_common.h
++++ b/modules/stream_out/chromecast/chromecast_common.h
+@@ -26,6 +26,7 @@
+ #define VLC_CHROMECAST_COMMON_H
+ 
+ #include <vlc_input.h>
++#include <stdint.h>
+ 
+ # ifdef __cplusplus
+ extern "C" {
+@@ -50,7 +51,13 @@ union cc_input_arg
+     bool eof;
+ };
+ 
+-typedef void (*on_input_event_itf)( void *data, enum cc_input_event, union cc_input_arg );
++/* Zero is reserved for an unbound or stale input. */
++typedef uint64_t cc_input_generation_t;
++/* A fresh nonzero token identifies one concrete HTTP chain/LOAD attempt. */
++typedef uint64_t cc_stream_token_t;
++
++typedef void (*on_input_event_itf)( void *data, cc_input_generation_t,
++                                    enum cc_input_event, union cc_input_arg );
+ 
+ typedef void (*on_paused_changed_itf)( void *data, bool );
+ 
+@@ -58,19 +65,25 @@ typedef struct
+ {
+     void *p_opaque;
+ 
+-    void (*pf_set_demux_enabled)(void *, bool enabled, on_paused_changed_itf, void *);
++    cc_input_generation_t (*pf_begin_input)(void *, bool initially_paused);
++    void (*pf_end_input)(void *, cc_input_generation_t);
++
++    bool (*pf_set_demux_enabled)(void *, cc_input_generation_t, bool enabled,
++                                 on_paused_changed_itf, void *);
+ 
+-    vlc_tick_t (*pf_get_time)(void*);
++    vlc_tick_t (*pf_get_time)(void *, cc_input_generation_t);
+ 
+-    int (*pf_pace)(void*);
++    int (*pf_pace)(void *, cc_input_generation_t);
+ 
+-    void (*pf_send_input_event)(void*, enum cc_input_event, union cc_input_arg);
++    bool (*pf_send_input_event)(void *, cc_input_generation_t,
++                                enum cc_input_event, union cc_input_arg);
+ 
+-    void (*pf_set_pause_state)(void*, bool paused);
++    bool (*pf_set_pause_state)(void *, cc_input_generation_t, bool paused);
+ 
+-    void (*pf_set_meta)(void*, vlc_meta_t *p_meta);
++    bool (*pf_set_meta)(void *, cc_input_generation_t, vlc_meta_t *p_meta);
+ 
+-    void (*pf_set_input_length)(void*, vlc_tick_t length);
++    bool (*pf_set_input_length)(void *, cc_input_generation_t,
++                                vlc_tick_t length);
+ 
+ } chromecast_common;
+ 
+@@ -79,4 +92,3 @@ typedef struct
+ # endif
+ 
+ #endif // VLC_CHROMECAST_COMMON_H
+-
+diff --git a/modules/stream_out/chromecast/chromecast_communication.cpp b/modules/stream_out/chromecast/chromecast_communication.cpp
+index 87c6669eca03c325a793b0d7bc2a4f98d591b73a..11f68bda2e395bace8bf8b6f89bc62c75c16033e 100644
+--- a/modules/stream_out/chromecast/chromecast_communication.cpp
++++ b/modules/stream_out/chromecast/chromecast_communication.cpp
+@@ -360,7 +360,9 @@ std::string ChromecastCommunication::getServerBaseURL() const
+     return chromecast_server_base_url(m_serverIp, m_serverPort);
+ }
+ 
+-std::string ChromecastCommunication::GetMedia( const std::string& mime,
++std::string ChromecastCommunication::GetMedia(
++                                               cc_stream_token_t stream_token,
++                                               const std::string& mime,
+                                                const vlc_meta_t *p_meta,
+                                                vlc_tick_t input_length )
+ {
+@@ -437,7 +439,13 @@ std::string ChromecastCommunication::GetMedia( const std::string& mime,
+         msg_Err(m_module, "Refusing to publish an unreachable Chromecast URL");
+         return {};
+     }
+-    const std::string chromecast_url = server_base_url + m_serverPath;
++    const std::string chromecast_url = chromecast_stream_url(
++        server_base_url, m_serverPath, stream_token);
++    if (chromecast_url.empty())
++    {
++        msg_Err(m_module, "Refusing to publish an unowned Chromecast stream");
++        return {};
++    }
+ 
+     msg_Dbg( m_module, "s_chromecast_url: %s", chromecast_url.c_str());
+ 
+@@ -451,10 +459,14 @@ std::string ChromecastCommunication::GetMedia( const std::string& mime,
+ }
+ 
+ unsigned ChromecastCommunication::msgPlayerLoad( const std::string& destinationId,
+-                                             const std::string& mime, const vlc_meta_t *p_meta, vlc_tick_t input_length )
++                                             cc_stream_token_t stream_token,
++                                             const std::string& mime,
++                                             const vlc_meta_t *p_meta,
++                                             vlc_tick_t input_length )
+ {
+     unsigned id = getNextRequestId();
+-    const std::string media = GetMedia(mime, p_meta, input_length);
++    const std::string media = GetMedia(stream_token, mime, p_meta,
++                                       input_length);
+     if (media.empty())
+         return kInvalidId;
+ 
+diff --git a/modules/stream_out/chromecast/chromecast_ctrl.cpp b/modules/stream_out/chromecast/chromecast_ctrl.cpp
+index 624d76d7b6c2ed9c8784560aa6cb3971186d28d5..8de1bda3ece3f3dba3f64c3149fd73ad99a07d83 100644
+--- a/modules/stream_out/chromecast/chromecast_ctrl.cpp
++++ b/modules/stream_out/chromecast/chromecast_ctrl.cpp
+@@ -36,6 +36,7 @@
+ 
+ #include <cassert>
+ #include <cerrno>
++#include <new>
+ #include <vector>
+ 
+ #include <vlc_fixups.h>
+@@ -57,6 +58,12 @@
+ #define CONTROL_STATE_TIMEOUT_MS 15000
+ #define MEDIA_PROGRESS_TIMEOUT_MS 30000
+ 
++struct chromecast_artwork_file_sys_t
++{
++    intf_sys_t *owner;
++    const std::string source_artwork;
++};
++
+ extern "C" {
+ 
+ struct chromecast_ctrl_json {
+@@ -143,6 +150,8 @@ intf_sys_t::intf_sys_t(vlc_object_t * const p_this, int port, std::string device
+  , m_on_input_event_data( NULL )
+  , m_on_paused_changed( NULL )
+  , m_on_paused_changed_data( NULL )
++ , m_pending_on_paused_changed( NULL )
++ , m_pending_on_paused_changed_data( NULL )
+  , m_communication( NULL )
+  , m_state( Authenticating )
+  , m_stateDeadline( chromecast_deadline(vlc_tick_now(),
+@@ -151,10 +160,26 @@ intf_sys_t::intf_sys_t(vlc_object_t * const p_this, int port, std::string device
+  , m_played_once( false )
+  , m_paused_once( false )
+  , m_request_stop( false )
+- , m_request_load( false )
++ , m_load_commit_in_progress( false )
+  , m_desired_paused( false )
++ , m_queued_load_generation( 0 )
++ , m_queued_stream_token( 0 )
++ , m_next_input_generation( 0 )
++ , m_active_input_generation( 0 )
++ , m_active_input_owner_live( false )
++ , m_active_demux_enabled( false )
++ , m_pending_input_generation( 0 )
++ , m_pending_input_owner_live( false )
++ , m_pending_demux_enabled( false )
++ , m_pending_desired_paused( false )
++ , m_pending_retry_on_fail( false )
++ , m_pending_pace( false )
++ , m_pending_input_length( VLC_TICK_INVALID )
++ , m_pending_input_eof( false )
++ , m_pending_input_eof_known( false )
+  , m_input_length( VLC_TICK_INVALID )
+  , m_input_eof( false )
++ , m_input_eof_known( false )
+  , m_cc_eof( false )
+  , m_pace( false )
+  , m_interrupted( false )
+@@ -164,9 +189,11 @@ intf_sys_t::intf_sys_t(vlc_object_t * const p_this, int port, std::string device
+  , m_stopRetriesLeft( 1 )
+  , m_statusRetriesLeft( 1 )
+  , m_meta( NULL )
++ , m_pending_meta( NULL )
+  , m_ctl_thread_interrupt( NULL )
+  , m_httpd( httpd_host, port )
+  , m_httpd_file(NULL)
++ , m_httpd_file_sys(NULL)
+  , m_art_url(NULL)
+  , m_art_idx(0)
+  , m_cc_time_last_request_date( VLC_TICK_INVALID )
+@@ -190,6 +217,8 @@ intf_sys_t::intf_sys_t(vlc_object_t * const p_this, int port, std::string device
+     }
+     
+     m_common.p_opaque = this;
++    m_common.pf_begin_input       = begin_input;
++    m_common.pf_end_input         = end_input;
+     m_common.pf_set_demux_enabled = set_demux_enabled;
+     m_common.pf_get_time         = get_time;
+     m_common.pf_pace             = pace;
+@@ -252,9 +281,12 @@ intf_sys_t::~intf_sys_t()
+ 
+     if (m_meta != NULL)
+         vlc_meta_Delete(m_meta);
++    if (m_pending_meta != NULL)
++        vlc_meta_Delete(m_pending_meta);
+ 
+     if( m_httpd_file )
+         httpd_FileDelete( m_httpd_file );
++    delete m_httpd_file_sys;
+ 
+     free( m_art_url );
+ }
+@@ -332,8 +364,6 @@ void intf_sys_t::reinit()
+         return;
+     }
+ 
+-    prepareHttpArtwork();
+-
+     m_pingRetriesLeft = PING_WAIT_RETRIES;
+     m_terminal_transport.store(false, std::memory_order_release);
+     m_state = Authenticating;
+@@ -347,20 +377,10 @@ void intf_sys_t::reinit()
+     m_reconnecting = false;
+ }
+ 
+-int intf_sys_t::httpd_file_fill( uint8_t *, uint8_t **pp_data, size_t *pi_data )
++int intf_sys_t::httpd_file_fill(const std::string &source_artwork,
++                                uint8_t **pp_data, size_t *pi_data)
+ {
+-    char *psz_art;
+-    {
+-        vlc::threads::mutex_locker lock( m_lock );
+-        if( !m_art_url )
+-        {
+-            return VLC_EGENERIC;
+-        }
+-        psz_art = strdup( m_art_url );
+-    }
+-
+-    stream_t *s = vlc_stream_NewURL( m_module, psz_art );
+-    free( psz_art );
++    stream_t *s = vlc_stream_NewURL(m_module, source_artwork.c_str());
+     if( !s )
+         return VLC_EGENERIC;
+ 
+@@ -395,10 +415,12 @@ int intf_sys_t::httpd_file_fill( uint8_t *, uint8_t **pp_data, size_t *pi_data )
+ }
+ 
+ static int httpd_file_fill_cb( httpd_file_sys_t *data, httpd_file_t *,
+-                          uint8_t *psz_request, uint8_t **pp_data, size_t *pi_data )
++                          uint8_t *, uint8_t **pp_data, size_t *pi_data )
+ {
+-    intf_sys_t *p_sys = static_cast<intf_sys_t*>((void *)data);
+-    return p_sys->httpd_file_fill( psz_request, pp_data, pi_data );
++    chromecast_artwork_file_sys_t *file_sys =
++        static_cast<chromecast_artwork_file_sys_t *>((void *)data);
++    return file_sys->owner->httpd_file_fill(file_sys->source_artwork,
++                                            pp_data, pi_data);
+ }
+ 
+ void intf_sys_t::restoreHttpArtwork()
+@@ -413,22 +435,54 @@ void intf_sys_t::restoreHttpArtwork()
+     m_art_http_url.clear();
+ }
+ 
+-void intf_sys_t::prepareHttpArtwork()
++bool intf_sys_t::prepareHttpArtwork(
++    cc_input_generation_t generation, cc_stream_token_t stream_token,
++    std::string *published_url)
+ {
++    assert(published_url != NULL);
++    published_url->clear();
++    if (!queuedInputCanCommit(generation, stream_token))
++        return false;
++
++    const auto input_meta = [this, generation]() -> vlc_meta_t * {
++        if (generation == m_pending_input_generation
++         && m_pending_input_owner_live)
++            return m_pending_meta;
++        if (generation == m_active_input_generation
++         && m_active_input_owner_live
++         && m_pending_input_generation == 0)
++            return m_meta;
++        return NULL;
++    };
++
+     /* An empty base URL means the control socket selected an address that a
+      * separate Cast receiver cannot use (notably scoped/link-local IPv6).
+      * Never rewrite metadata to advertise an unreachable artwork URL. */
+     if (m_art_http_ip.empty())
+-        return;
++        return true;
+ 
+-    const char *psz_art = m_meta ? vlc_meta_Get( m_meta, vlc_meta_ArtworkURL ) : NULL;
++    vlc_meta_t *meta = input_meta();
++    const char *psz_art = meta != NULL
++                        ? vlc_meta_Get(meta, vlc_meta_ArtworkURL) : NULL;
+     /* Abort if there is no art or if the art is already served */
+-    if( !psz_art || strncmp( psz_art, "http", 4) == 0 )
+-        return;
++    if (psz_art == NULL)
++        return true;
++
++    const std::string source_artwork(psz_art);
++    if (source_artwork.compare(0, 4, "http") == 0)
++    {
++        /* A same-generation reload can see the URL wrapped by its first
++         * successful LOAD. Preserve that exact publication contract. */
++        if (!m_art_http_url.empty() && source_artwork == m_art_http_url
++         && m_httpd_file != NULL && m_art_url != NULL)
++            *published_url = m_art_http_url;
++        return true;
++    }
+ 
+     std::stringstream ss_art_idx;
+ 
+-    if( m_art_url && strcmp( m_art_url, psz_art ) == 0 )
++    if (m_httpd_file != NULL && m_art_url != NULL
++     && source_artwork == m_art_url)
+     {
+         /* Same art: use the previous cached artwork url */
+         assert( m_art_idx != 0 );
+@@ -442,76 +496,207 @@ void intf_sys_t::prepareHttpArtwork()
+         ss_art_idx << getHttpArtRoot() << "/" << m_art_idx;
+         m_art_idx++;
+ 
++        char *replacement_art_url = strdup(source_artwork.c_str());
++        if (replacement_art_url == NULL)
++            return true;
++        chromecast_artwork_file_sys_t *candidate_file_sys =
++            new (std::nothrow) chromecast_artwork_file_sys_t{
++                this, source_artwork};
++        if (candidate_file_sys == NULL)
++        {
++            free(replacement_art_url);
++            return true;
++        }
++        const std::string route = m_art_http_ip;
++
++        /* Endpoint creation and deletion can enter the HTTP server. Work on
++         * copied input with the controller unlocked, then publish only after
++         * the generation, metadata, and receiver route all revalidate. */
+         m_lock.unlock();
++        httpd_file_t *candidate = httpd_FileNew(
++            m_httpd.m_host, ss_art_idx.str().c_str(),
++            "application/octet-stream", NULL, NULL,
++            httpd_file_fill_cb,
++            (httpd_file_sys_t *)candidate_file_sys);
++        m_lock.lock();
++
++        meta = input_meta();
++        const char *current_artwork = meta != NULL
++                                    ? vlc_meta_Get(meta,
++                                                   vlc_meta_ArtworkURL)
++                                    : NULL;
++        const bool transaction_valid = queuedInputCanCommit(
++                                        generation, stream_token)
++                                    && route == m_art_http_ip
++                                    && current_artwork != NULL
++                                    && source_artwork == current_artwork;
++        if (candidate == NULL || !transaction_valid)
++        {
++            m_lock.unlock();
++            if (candidate != NULL)
++                httpd_FileDelete(candidate);
++            delete candidate_file_sys;
++            m_lock.lock();
++            free(replacement_art_url);
++            return queuedInputCanCommit(generation, stream_token);
++        }
+ 
+-        if( m_httpd_file )
+-            httpd_FileDelete( m_httpd_file );
+-        m_httpd_file = httpd_FileNew( m_httpd.m_host, ss_art_idx.str().c_str(),
+-                                      "application/octet-stream", NULL, NULL,
+-                                      httpd_file_fill_cb, (httpd_file_sys_t *) this );
++        httpd_file_t *old_httpd_file = m_httpd_file;
++        chromecast_artwork_file_sys_t *old_file_sys = m_httpd_file_sys;
++        m_httpd_file = candidate;
++        m_httpd_file_sys = candidate_file_sys;
++        free( m_art_url );
++        m_art_url = replacement_art_url;
+ 
++        m_lock.unlock();
++        if (old_httpd_file != NULL)
++            httpd_FileDelete(old_httpd_file);
++        delete old_file_sys;
+         m_lock.lock();
+-        if( !m_httpd_file )
+-            return;
+ 
+-        char *source_artwork = strdup( psz_art );
+-        if (source_artwork == NULL)
+-            return;
+-        free( m_art_url );
+-        m_art_url = source_artwork;
++        if (!queuedInputCanCommit(generation, stream_token))
++            return false;
++        meta = input_meta();
++        current_artwork = meta != NULL
++                        ? vlc_meta_Get(meta, vlc_meta_ArtworkURL) : NULL;
++        if (route != m_art_http_ip || current_artwork == NULL
++         || source_artwork != current_artwork)
++            return true;
+     }
+ 
+     const std::string published =
+         chromecast_artwork_url(m_art_http_ip, ss_art_idx.str());
+     if (published.empty())
+-        return;
+-    m_art_http_url = published;
+-    vlc_meta_Set( m_meta, vlc_meta_ArtworkURL, published.c_str() );
++        return true;
++    meta = input_meta();
++    if (meta == NULL || !queuedInputCanCommit(generation, stream_token))
++        return false;
++    vlc_meta_Set(meta, vlc_meta_ArtworkURL, published.c_str());
++    *published_url = published;
++    return true;
+ }
+ 
+ void intf_sys_t::tryLoad()
+ {
+-    if( !m_request_load )
+-        return;
+-
+-    if ( !isStateReady() )
++    for (;;)
+     {
+-        if ( m_state == Dead )
++        if (m_queued_load_generation == 0 || m_load_commit_in_progress)
++            return;
++
++        const cc_input_generation_t generation = m_queued_load_generation;
++        const cc_stream_token_t stream_token = m_queued_stream_token;
++        if (!queuedInputCanLoad(generation, stream_token))
+         {
+-            msg_Warn( m_module, "no Chromecast hook possible");
+-            if (!m_reconnecting)
+-                m_request_load = false;
++            if (generation == m_queued_load_generation
++             && stream_token == m_queued_stream_token)
++                clearQueuedInput();
++            return;
+         }
+-        else if( m_state == Connected )
++
++        if (m_request_stop || m_state == Stopping)
++            return;
++        if (isStatePlaying())
+         {
+-            assert( m_communication );
+-            msg_Dbg( m_module, "Starting the media receiver application" );
+-            // Don't use setState as we don't want to signal the condition in this case.
+-            m_state = Launching;
+-            armStateDeadline(Launching);
+-            if (m_communication->msgReceiverLaunchApp()
+-                    == ChromecastCommunication::kInvalidId)
+-                setConnectionDead();
++            doStop();
++            return;
+         }
+-        return;
+-    }
+ 
+-    m_request_load = false;
++        /* TakenOver/LoadFailed are loadable only while the media receiver
++         * app's transport is still alive. If that app has disappeared,
++         * relaunch it through the ordinary Connected path instead of
++         * asserting or publishing a LOAD with an empty destination. */
++        if (isStateReady() && m_appTransportId.empty())
++        {
++            m_state = Connected;
++            armStateDeadline(Connected);
++        }
+ 
+-    // We should now be in the ready state, and therefore have a valid transportId
+-    assert( m_appTransportId.empty() == false );
+-    // Reset the mediaSessionID to allow the new session to become the current one.
+-    // we cannot start a new load when the last one is still processing
+-    const unsigned request_id =
+-        m_communication->msgPlayerLoad( m_appTransportId, m_mime, m_meta, m_input_length );
+-    if( recordMediaRequest(chromecast_media_command::Load, request_id) )
+-    {
+-        m_state = Loading;
+-        armStateDeadline(Loading);
+-        updateProgressWatchdog(Loading);
++        if ( !isStateReady() )
++        {
++            if ( m_state == Dead )
++                msg_Warn( m_module, "no Chromecast hook possible");
++            else if( m_state == Connected )
++            {
++                assert( m_communication );
++                msg_Dbg( m_module,
++                         "Starting the media receiver application" );
++                // Don't use setState as we don't want to signal the condition in this case.
++                m_state = Launching;
++                armStateDeadline(Launching);
++                if (m_communication->msgReceiverLaunchApp()
++                        == ChromecastCommunication::kInvalidId)
++                    setConnectionDead();
++            }
++            return;
++        }
++
++        if (m_communication == NULL || !m_communication->isConnected())
++        {
++            setConnectionDead();
++            return;
++        }
++
++        m_load_commit_in_progress = true;
++        std::string published_artwork_url;
++        if (!prepareHttpArtwork(generation, stream_token,
++                                &published_artwork_url)
++         || !queuedInputCanCommit(generation, stream_token))
++        {
++            m_load_commit_in_progress = false;
++            const bool same_load = generation == m_queued_load_generation
++                                && stream_token == m_queued_stream_token;
++            if (same_load && !inputGenerationCanLoad(generation))
++                clearQueuedInput();
++            /* File endpoint creation temporarily releases m_lock. Re-evaluate
++             * any surviving queue now: a newer chain may have won, metadata
++             * may have been detached, or the receiver app may need relaunch.
++             * The first-block callback already returned, so no later event is
++             * guaranteed to call tryLoad() again. */
++            if (m_queued_load_generation != 0)
++                continue;
++            return;
++        }
++
++        if (generation == m_pending_input_generation)
++            promotePendingInput();
++        if (!queuedInputCanCommit(generation, stream_token)
++         || generation != m_active_input_generation
++         || !m_active_input_owner_live)
++        {
++            m_load_commit_in_progress = false;
++            return;
++        }
++
++        m_mime = m_queued_mime;
++        m_art_http_url = published_artwork_url;
++        clearQueuedInput();
++
++        /* Only now is the prior STOP/session contract finished. Reset state
++         * for this exact generation immediately before emitting its LOAD. */
++        std::queue<QueueableMessages> empty;
++        std::swap(m_msgQueue, empty);
++        m_played_once = false;
++        m_paused_once = false;
++        m_cc_eof = false;
++        clearMediaSessionState();
++
++        // We should now be ready and therefore have a valid transportId.
++        assert( m_appTransportId.empty() == false );
++        // Reset the mediaSessionID so the new session can become current.
++        const unsigned request_id =
++            m_communication->msgPlayerLoad(m_appTransportId, stream_token,
++                                           m_mime, m_meta, m_input_length);
++        m_load_commit_in_progress = false;
++        if( recordMediaRequest(chromecast_media_command::Load, request_id) )
++        {
++            m_state = Loading;
++            armStateDeadline(Loading);
++            updateProgressWatchdog(Loading);
++        }
++        else
++            setState( LoadFailed );
++        return;
+     }
+-    else
+-        setState( LoadFailed );
+ }
+ 
+ void intf_sys_t::clearMediaSessionState()
+@@ -745,34 +930,196 @@ void intf_sys_t::setConnectionDead()
+     vlc_interrupt_raise(m_ctl_thread_interrupt);
+ }
+ 
+-void intf_sys_t::setRetryOnFail( bool enabled )
++void intf_sys_t::clearPendingInput()
++{
++    if (m_pending_meta != NULL)
++        vlc_meta_Delete(m_pending_meta);
++    m_pending_meta = NULL;
++    m_pending_input_generation = 0;
++    m_pending_input_owner_live = false;
++    m_pending_demux_enabled = false;
++    m_pending_desired_paused = false;
++    m_pending_retry_on_fail = false;
++    m_pending_pace = false;
++    m_pending_input_length = VLC_TICK_INVALID;
++    m_pending_input_eof = false;
++    m_pending_input_eof_known = false;
++    m_pending_on_paused_changed = NULL;
++    m_pending_on_paused_changed_data = NULL;
++}
++
++void intf_sys_t::clearQueuedInput()
++{
++    m_queued_load_generation = 0;
++    m_queued_stream_token = 0;
++    m_queued_mime.clear();
++}
++
++bool intf_sys_t::queuedInputCanLoad(
++    cc_input_generation_t generation, cc_stream_token_t stream_token) const
++{
++    return generation != 0 && stream_token != 0
++        && generation == m_queued_load_generation
++        && stream_token == m_queued_stream_token
++        && inputGenerationCanLoad(generation);
++}
++
++bool intf_sys_t::queuedInputCanCommit(
++    cc_input_generation_t generation, cc_stream_token_t stream_token) const
++{
++    return queuedInputCanLoad(generation, stream_token)
++        && !m_request_stop && m_state != Stopping && !isStatePlaying()
++        && isStateReady() && !m_appTransportId.empty()
++        && m_communication != NULL
++        && m_communication->isConnected();
++}
++
++cc_input_generation_t intf_sys_t::beginInput(bool initially_paused)
+ {
+     vlc::threads::mutex_locker locker(m_lock);
+-    m_retry_on_fail = enabled;
++    if (m_pending_input_generation != 0
++     && m_queued_load_generation == m_pending_input_generation)
++        clearQueuedInput();
++    clearPendingInput();
++
++    do
++        ++m_next_input_generation;
++    while (m_next_input_generation == 0
++        || m_next_input_generation == m_active_input_generation);
++
++    m_pending_input_generation = m_next_input_generation;
++    m_pending_input_owner_live = true;
++    m_pending_desired_paused = initially_paused;
++    return m_pending_input_generation;
+ }
+ 
+-void intf_sys_t::setHasInput( const std::string mime_type )
++void intf_sys_t::endInput(cc_input_generation_t generation)
+ {
+     vlc::threads::mutex_locker locker(m_lock);
+-    msg_Dbg( m_module, "Loading content" );
++    if (generation != 0 && generation == m_pending_input_generation)
++    {
++        if (m_queued_load_generation == generation)
++            clearQueuedInput();
++        clearPendingInput();
++        return;
++    }
++    if (generation != 0 && generation == m_active_input_generation)
++    {
++        if (m_queued_load_generation == generation)
++            clearQueuedInput();
++        /* Keep the active identity until its tagged sout issues the final STOP,
++         * but detach every demux-owned callback immediately. */
++        m_active_input_owner_live = false;
++        m_active_demux_enabled = false;
++        m_pace = false;
++        m_on_paused_changed = NULL;
++        m_on_paused_changed_data = NULL;
++        m_pace_cond.signal();
++    }
++}
+ 
+-    if( m_state == Dead )
+-        reinit();
++cc_input_generation_t intf_sys_t::generationForNewStream() const
++{
++    vlc::threads::mutex_locker locker(m_lock);
++    if (m_pending_input_generation != 0 && m_pending_input_owner_live)
++        return m_pending_input_generation;
++    if (m_active_input_generation != 0 && m_active_input_owner_live)
++        return m_active_input_generation;
++    return 0;
++}
+ 
+-    this->m_mime = mime_type;
++bool intf_sys_t::mayBuildChain(cc_input_generation_t generation) const
++{
++    vlc::threads::mutex_locker locker(m_lock);
++    if (generation != 0 && generation == m_pending_input_generation)
++        return m_pending_input_owner_live;
++    return generation != 0 && generation == m_active_input_generation
++        && m_active_input_owner_live && m_pending_input_generation == 0;
++}
+ 
+-    /* new input: clear message queue */
+-    std::queue<QueueableMessages> empty;
+-    std::swap(m_msgQueue, empty);
++bool intf_sys_t::inputGenerationCanLoad(
++    cc_input_generation_t generation) const
++{
++    if (generation != 0 && generation == m_pending_input_generation)
++        return m_pending_input_owner_live;
++    return generation != 0 && generation == m_active_input_generation
++        && m_active_input_owner_live && m_pending_input_generation == 0;
++}
+ 
+-    prepareHttpArtwork();
++void intf_sys_t::promotePendingInput()
++{
++    assert(m_pending_input_generation != 0);
++    if (m_meta != NULL)
++        vlc_meta_Delete(m_meta);
+ 
+-    m_request_stop = false;
+-    m_played_once = false;
+-    m_paused_once = false;
+-    m_cc_eof = false;
+-    m_request_load = true;
+-    clearMediaSessionState();
++    m_active_input_generation = m_pending_input_generation;
++    m_active_input_owner_live = m_pending_input_owner_live;
++    m_active_demux_enabled = m_pending_demux_enabled;
++    m_desired_paused = m_pending_desired_paused;
++    m_retry_on_fail = m_pending_retry_on_fail;
++    m_pace = m_pending_pace;
++    m_input_length = m_pending_input_length;
++    m_input_eof = m_pending_input_eof;
++    m_input_eof_known = m_pending_input_eof_known;
++    m_on_paused_changed = m_pending_on_paused_changed;
++    m_on_paused_changed_data = m_pending_on_paused_changed_data;
++    m_meta = m_pending_meta;
++    m_pending_meta = NULL;
++    clearPendingInput();
++    m_pace_cond.signal();
++}
++
++bool intf_sys_t::setRetryOnFail(cc_input_generation_t generation,
++                                bool enabled)
++{
++    vlc::threads::mutex_locker locker(m_lock);
++    if (generation != 0 && generation == m_pending_input_generation
++     && m_pending_input_owner_live)
++    {
++        m_pending_retry_on_fail = enabled;
++        return true;
++    }
++    if (generation != 0 && generation == m_active_input_generation
++     && m_active_input_owner_live)
++    {
++        m_retry_on_fail = enabled;
++        return true;
++    }
++    return false;
++}
++
++bool intf_sys_t::setHasInput(cc_input_generation_t generation,
++                             cc_stream_token_t stream_token,
++                             const std::string mime_type)
++{
++    vlc::threads::mutex_locker locker(m_lock);
++    if (stream_token == 0 || !inputGenerationCanLoad(generation))
++        return false;
++
++    msg_Dbg( m_module, "Loading content for input generation %" PRIu64,
++             generation );
++
++    if( m_state == Dead )
++    {
++        reinit();
++        /* reinit() joins and reconnects without m_lock held. A renderer switch
++         * or teardown during that window makes this first block stale. */
++        if (!inputGenerationCanLoad(generation))
++            return false;
++        if (m_state == Dead || m_communication == NULL
++         || !m_communication->isConnected())
++            return false;
++    }
++
++    m_queued_load_generation = generation;
++    m_queued_stream_token = stream_token;
++    m_queued_mime = mime_type;
++
++    /* A new first block can arrive before the old receiver session has
++     * acknowledged STOP. Keep the new input pending and preserve exact old
++     * request attribution until that handoff reaches a loadable state. */
++    if (isStatePlaying() && !m_request_stop)
++        doStop();
+ 
+     /* A receiver-side stop ends the old media session, not the receiver app.
+      * Reuse its still-valid transport for the next input. */
+@@ -785,6 +1132,16 @@ void intf_sys_t::setHasInput( const std::string mime_type )
+     tryLoad();
+ 
+     m_stateChangedCond.signal();
++    if (m_state == Dead || m_communication == NULL
++     || !m_communication->isConnected()
++     || !inputGenerationCanLoad(generation))
++    {
++        if (m_queued_load_generation == generation
++         && m_queued_stream_token == stream_token)
++            clearQueuedInput();
++        return false;
++    }
++    return true;
+ }
+ 
+ bool intf_sys_t::isStateError() const
+@@ -831,13 +1188,24 @@ bool intf_sys_t::isStateReady() const
+     }
+ }
+ 
+-void intf_sys_t::setPacing(bool do_pace)
++bool intf_sys_t::setPacing(cc_input_generation_t generation, bool do_pace)
+ {
+     vlc::threads::mutex_locker locker( m_lock );
+-    if( m_pace == do_pace )
+-        return;
+-    m_pace = do_pace;
++    bool *pace_value;
++    if (generation != 0 && generation == m_pending_input_generation
++     && m_pending_input_owner_live)
++        pace_value = &m_pending_pace;
++    else if (generation != 0 && generation == m_active_input_generation
++          && m_active_input_owner_live)
++        pace_value = &m_pace;
++    else
++        return false;
++
++    if( *pace_value == do_pace )
++        return true;
++    *pace_value = do_pace;
+     m_pace_cond.signal();
++    return true;
+ }
+ 
+ static void interrupt_wake_up_cb( void *data )
+@@ -853,10 +1221,26 @@ void intf_sys_t::interrupt_wake_up()
+     m_pace_cond.signal();
+ }
+ 
+-int intf_sys_t::pace()
++int intf_sys_t::pace(cc_input_generation_t generation)
+ {
+     vlc::threads::mutex_locker locker( m_lock );
+ 
++    const auto pending_owner = [this, generation]() {
++        return generation != 0
++            && generation == m_pending_input_generation
++            && m_pending_input_owner_live;
++    };
++    const auto active_owner = [this, generation]() {
++        return generation != 0
++            && generation == m_active_input_generation
++            && m_active_input_owner_live;
++    };
++
++    if (!pending_owner() && !active_owner())
++        return CC_PACE_ERR;
++    if (pending_owner() && m_state == Dead)
++        return CC_PACE_ERR;
++
+     m_interrupted = false;
+     vlc_interrupt_register( interrupt_wake_up_cb, this );
+     int ret = 0;
+@@ -865,11 +1249,35 @@ int intf_sys_t::pace()
+     /* Wait for the sout to send more data via http (m_pace), or wait for the
+      * CC to finish. In case the demux filter is EOF, we always wait for
+      * 500msec (unless interrupted from the input thread). */
+-    while( !isFinishedPlaying() && ( m_pace || m_input_eof ) && !m_interrupted && ret == 0 )
++    while (!m_interrupted && ret == 0)
++    {
++        bool should_wait;
++        if (pending_owner())
++            should_wait = m_pending_pace || m_pending_input_eof;
++        else if (active_owner())
++            should_wait = !isFinishedPlaying()
++                       && (m_pace || m_input_eof);
++        else
++            break;
++        if (!should_wait)
++            break;
+         ret = m_pace_cond.timedwait( m_lock, deadline );
++    }
+ 
+     vlc_interrupt_unregister();
+ 
++    if (pending_owner())
++    {
++        /* EOF here only means that VLC finished producing the successor's
++         * bytes. The receiver has not loaded that generation yet, so keep the
++         * demux alive until promotion instead of reporting receiver-ended. */
++        if (m_state == Dead)
++            return CC_PACE_ERR;
++        return ret == 0 ? CC_PACE_OK : CC_PACE_OK_WAIT;
++    }
++    if (!active_owner())
++        return CC_PACE_ERR;
++
+     if( m_cc_eof )
+         return CC_PACE_OK_ENDED;
+     else if( isStateError() || m_state == Stopped )
+@@ -886,20 +1294,44 @@ int intf_sys_t::pace()
+     return ret == 0 ? CC_PACE_OK : CC_PACE_OK_WAIT;
+ }
+ 
+-void intf_sys_t::sendInputEvent(enum cc_input_event event, union cc_input_arg arg)
++bool intf_sys_t::sendInputEvent(cc_input_generation_t generation,
++                                enum cc_input_event event,
++                                union cc_input_arg arg)
+ {
+-    on_input_event_itf on_input_event;
+-    void *data;
++    on_input_event_itf on_input_event = NULL;
++    void *data = NULL;
+     {
+         vlc::threads::mutex_locker locker( m_lock );
++        bool *input_eof;
++        bool *input_eof_known;
++        if (generation != 0 && generation == m_pending_input_generation
++         && m_pending_input_owner_live)
++        {
++            if (event == CC_INPUT_EVENT_RETRY)
++                return false;
++            input_eof = &m_pending_input_eof;
++            input_eof_known = &m_pending_input_eof_known;
++        }
++        else if (generation != 0 && generation == m_active_input_generation
++              && m_active_input_owner_live)
++        {
++            input_eof = &m_input_eof;
++            input_eof_known = &m_input_eof_known;
++        }
++        else
++            return false;
++
+         on_input_event = m_on_input_event;
+         data = m_on_input_event_data;
+ 
+         switch (event)
+         {
+             case CC_INPUT_EVENT_EOF:
+-                if (m_input_eof != arg.eof)
+-                    m_input_eof = arg.eof;
++                if (!*input_eof_known || *input_eof != arg.eof)
++                {
++                    *input_eof_known = true;
++                    *input_eof = arg.eof;
++                }
+                 else
+                 {
+                     /* Don't send twice the same event */
+@@ -913,7 +1345,8 @@ void intf_sys_t::sendInputEvent(enum cc_input_event event, union cc_input_arg ar
+     }
+ 
+     if (on_input_event)
+-        on_input_event(data, event, arg);
++        on_input_event(data, generation, event, arg);
++    return true;
+ }
+ 
+ /**
+@@ -1477,8 +1910,12 @@ bool intf_sys_t::processMediaMessage( const castchannel::CastMessage& msg,
+             json_get_str_view(media_status, "idleReason");
+         const json_object *extended_status =
+             json_get_object(media_status, "extendedStatus");
+-        const bool receiver_loading = extended_status != NULL
+-            && json_get_str_view(extended_status, "playerState") == "LOADING";
++        const std::string_view extended_player_state = extended_status != NULL
++            ? json_get_str_view(extended_status, "playerState")
++            : std::string_view{};
++        const bool receiver_loading = chromecast_initial_load_is_pending(
++            m_played_once, m_state == Loading || m_state == Buffering,
++            new_player_state, extended_player_state, idle_reason);
+         const bool clock_state = new_player_state == "PLAYING"
+                               || new_player_state == "BUFFERING"
+                               || new_player_state == "PAUSED";
+@@ -1523,12 +1960,10 @@ bool intf_sys_t::processMediaMessage( const castchannel::CastMessage& msg,
+ 
+         if (new_player_state == "IDLE")
+         {
+-            /* A matching LOAD can temporarily report IDLE while its extended
+-             * status is LOADING. Keep waiting in that one state. Every actual
+-             * terminal state clears session IDs, requests, and sampled clock. */
+-            if (m_state == Loading
+-             && command == chromecast_media_command::Load
+-             && receiver_loading)
++            /* An attributed session can repeatedly broadcast primary IDLE
++             * while extended status remains LOADING. Keep the original
++             * nonrenewable progress deadline; all terminal reasons below win. */
++            if (receiver_loading)
+             {
+                 m_cc_clock.clear();
+                 m_cc_time_last_request_date = now;
+@@ -1562,11 +1997,17 @@ bool intf_sys_t::processMediaMessage( const castchannel::CastMessage& msg,
+             else
+             {
+                 const bool failed_load = new_session || m_state == Loading;
++                const bool local_stop = m_state == Stopping || m_request_stop
++                    || command == chromecast_media_command::Stop;
+                 const bool finished = !failed_load
+                                    && idle_reason == "FINISHED";
+                 clearMediaSessionState();
+-                m_cc_eof = finished;
++                /* A local STOP racing the receiver's natural FINISHED report
++                 * is still a local handoff. Do not expose it as end-of-media
++                 * to a demux that may already be rebuilding after a seek. */
++                m_cc_eof = finished && !local_stop;
+                 setState(failed_load ? LoadFailed
++                                    : local_stop ? Ready
+                                     : finished ? Ready : Stopped);
+             }
+             return true;
+@@ -1942,24 +2383,35 @@ void intf_sys_t::doStop()
+     }
+ }
+ 
+-void intf_sys_t::requestPlayerStop()
++bool intf_sys_t::requestPlayerStop(cc_input_generation_t generation)
+ {
+     vlc::threads::mutex_locker lock( m_lock );
++    if (generation == 0)
++        return false;
++
++    bool canceled_queued_load = false;
++    if (generation == m_queued_load_generation)
++    {
++        clearQueuedInput();
++        canceled_queued_load = true;
++    }
++    if (generation != m_active_input_generation)
++        return canceled_queued_load;
+ 
+     std::queue<QueueableMessages> empty;
+     std::swap(m_msgQueue, empty);
+ 
+     m_retry_on_fail = false;
+-    m_request_load = false;
+ 
+     if( vlc_killed() )
+     {
+         if( !isStatePlaying() )
+-            return;
++            return true;
+         queueMessage( Stop );
+     }
+     else
+         doStop();
++    return true;
+ }
+ 
+ States intf_sys_t::state() const
+@@ -1976,35 +2428,58 @@ void intf_sys_t::setOnInputEventCb(on_input_event_itf on_input_event,
+     m_on_input_event_data = on_input_event_data;
+ }
+ 
+-void intf_sys_t::setDemuxEnabled(bool enabled,
+-                                 on_paused_changed_itf on_paused_changed,
+-                                 void *on_paused_changed_data)
++bool intf_sys_t::setDemuxEnabled(
++    cc_input_generation_t generation, bool enabled,
++    on_paused_changed_itf on_paused_changed,
++    void *on_paused_changed_data)
+ {
+     vlc::threads::mutex_locker lock( m_lock );
+-    m_on_paused_changed = on_paused_changed;
+-    m_on_paused_changed_data = on_paused_changed_data;
+-
+-    if( enabled )
++    if (generation != 0 && generation == m_pending_input_generation
++     && m_pending_input_owner_live)
++    {
++        m_pending_demux_enabled = enabled;
++        m_pending_on_paused_changed = enabled ? on_paused_changed : NULL;
++        m_pending_on_paused_changed_data = enabled
++            ? on_paused_changed_data : NULL;
++        return true;
++    }
++    if (generation != 0 && generation == m_active_input_generation
++     && m_active_input_owner_live)
+     {
+-        if( m_state == Dead && !vlc_killed() )
+-            reinit();
++        m_active_demux_enabled = enabled;
++        m_on_paused_changed = enabled ? on_paused_changed : NULL;
++        m_on_paused_changed_data = enabled ? on_paused_changed_data : NULL;
++        return true;
+     }
++    return false;
+ }
+ 
+-void intf_sys_t::setPauseState(bool paused)
++bool intf_sys_t::setPauseState(cc_input_generation_t generation, bool paused)
+ {
+     vlc::threads::mutex_locker lock( m_lock );
++    if (generation != 0 && generation == m_pending_input_generation
++     && m_pending_input_owner_live)
++    {
++        m_pending_desired_paused = paused;
++        return true;
++    }
++    if (generation == 0 || generation != m_active_input_generation
++     || !m_active_input_owner_live)
++        return false;
++
+     if (m_desired_paused != paused)
+         m_pauseRetriesLeft = 1;
+     m_desired_paused = paused;
+     msg_Info( m_module, "%s state", paused ? "paused" : "playing" );
+     if (!sendDesiredPauseState())
+         setConnectionDead();
++    return true;
+ }
+ 
+ bool intf_sys_t::sendDesiredPauseState()
+ {
+-    if (m_mediaSessionId == 0 || m_communication == NULL
++    if (m_active_input_generation == 0 || m_mediaSessionId == 0
++     || m_communication == NULL
+      || (m_state != Playing && m_state != Paused
+       && m_state != Buffering))
+         return true;
+@@ -2044,24 +2519,58 @@ bool intf_sys_t::isFinishedPlaying()
+     return m_cc_eof || isStateError() || m_state == Stopped;
+ }
+ 
+-void intf_sys_t::setMeta(vlc_meta_t *p_meta)
++bool intf_sys_t::setMeta(cc_input_generation_t generation,
++                         vlc_meta_t *p_meta)
+ {
+     vlc::threads::mutex_locker lock( m_lock );
+-    if (m_meta != NULL)
+-        vlc_meta_Delete(m_meta);
+-    m_meta = p_meta;
+-    m_art_http_url.clear();
++    vlc_meta_t **slot;
++    if (generation != 0 && generation == m_pending_input_generation
++     && m_pending_input_owner_live)
++        slot = &m_pending_meta;
++    else if (generation != 0 && generation == m_active_input_generation
++          && m_active_input_owner_live)
++        slot = &m_meta;
++    else
++    {
++        if (p_meta != NULL)
++            vlc_meta_Delete(p_meta);
++        return false;
++    }
++
++    if (*slot != NULL)
++        vlc_meta_Delete(*slot);
++    *slot = p_meta;
++    if (slot == &m_meta)
++        m_art_http_url.clear();
++    return true;
+ }
+ 
+-void intf_sys_t::setInputLength(vlc_tick_t length)
++bool intf_sys_t::setInputLength(cc_input_generation_t generation,
++                                vlc_tick_t length)
+ {
+     vlc::threads::mutex_locker lock( m_lock );
+-    m_input_length = length;
++    if (generation != 0 && generation == m_pending_input_generation
++     && m_pending_input_owner_live)
++    {
++        m_pending_input_length = length;
++        return true;
++    }
++    if (generation != 0 && generation == m_active_input_generation
++     && m_active_input_owner_live)
++    {
++        m_input_length = length;
++        return true;
++    }
++    return false;
+ }
+ 
+-vlc_tick_t intf_sys_t::getPlaybackTimestamp()
++vlc_tick_t intf_sys_t::getPlaybackTimestamp(
++    cc_input_generation_t generation)
+ {
+     vlc::threads::mutex_locker lock( m_lock );
++    if (generation == 0 || generation != m_active_input_generation
++     || !m_active_input_owner_live)
++        return VLC_TICK_INVALID;
+     switch( m_state )
+     {
+         case Buffering:
+@@ -2097,6 +2606,10 @@ vlc_tick_t intf_sys_t::getPlaybackTimestamp()
+ 
+ void intf_sys_t::setState( States state )
+ {
++    if (state == Stopped && m_queued_load_generation != 0
++     && !m_appTransportId.empty())
++        state = Ready;
++
+     if ( m_state != state )
+     {
+ #ifndef NDEBUG
+@@ -2112,14 +2625,22 @@ void intf_sys_t::setState( States state )
+             case Ready:
+                 tryLoad();
+                 break;
++            case LoadFailed:
++            case TakenOver:
++                if (m_queued_load_generation != 0)
++                    tryLoad();
++                break;
+             case Paused:
+                 if ((m_played_once || !m_desired_paused)
++                 && m_active_input_owner_live && m_active_demux_enabled
+                  && m_on_paused_changed != NULL)
+                     m_on_paused_changed(m_on_paused_changed_data, true);
+                 m_paused_once = true;
+                 break;
+             case Playing:
+-                if (m_played_once && m_paused_once && m_on_paused_changed != NULL)
++                if (m_played_once && m_paused_once
++                 && m_active_input_owner_live && m_active_demux_enabled
++                 && m_on_paused_changed != NULL)
+                     m_on_paused_changed(m_on_paused_changed_data, false);
+                 m_played_once = true;
+                 break;
+@@ -2131,45 +2652,69 @@ void intf_sys_t::setState( States state )
+     }
+ }
+ 
+-vlc_tick_t intf_sys_t::get_time(void *pt)
++cc_input_generation_t intf_sys_t::begin_input(void *pt,
++                                               bool initially_paused)
++{
++    intf_sys_t *p_this = static_cast<intf_sys_t*>(pt);
++    return p_this->beginInput(initially_paused);
++}
++
++void intf_sys_t::end_input(void *pt, cc_input_generation_t generation)
++{
++    intf_sys_t *p_this = static_cast<intf_sys_t*>(pt);
++    p_this->endInput(generation);
++}
++
++vlc_tick_t intf_sys_t::get_time(void *pt,
++                                cc_input_generation_t generation)
+ {
+     intf_sys_t *p_this = static_cast<intf_sys_t*>(pt);
+-    return p_this->getPlaybackTimestamp();
++    return p_this->getPlaybackTimestamp(generation);
+ }
+ 
+-void intf_sys_t::set_demux_enabled(void *pt, bool enabled,
+-                                   on_paused_changed_itf itf, void *data)
++bool intf_sys_t::set_demux_enabled(void *pt,
++                                   cc_input_generation_t generation,
++                                   bool enabled, on_paused_changed_itf itf,
++                                   void *data)
+ {
+     intf_sys_t *p_this = static_cast<intf_sys_t*>(pt);
+-    p_this->setDemuxEnabled(enabled, itf, data);
++    return p_this->setDemuxEnabled(generation, enabled, itf, data);
+ }
+ 
+-int intf_sys_t::pace(void *pt)
++int intf_sys_t::pace(void *pt, cc_input_generation_t generation)
+ {
+     intf_sys_t *p_this = static_cast<intf_sys_t*>(pt);
+-    return p_this->pace();
++    return p_this->pace(generation);
+ }
+ 
+-void intf_sys_t::send_input_event(void *pt, enum cc_input_event event, union cc_input_arg arg)
++bool intf_sys_t::send_input_event(void *pt,
++                                  cc_input_generation_t generation,
++                                  enum cc_input_event event,
++                                  union cc_input_arg arg)
+ {
+     intf_sys_t *p_this = static_cast<intf_sys_t*>(pt);
+-    return p_this->sendInputEvent(event, arg);
++    return p_this->sendInputEvent(generation, event, arg);
+ }
+ 
+-void intf_sys_t::set_pause_state(void *pt, bool paused)
++bool intf_sys_t::set_pause_state(void *pt,
++                                 cc_input_generation_t generation,
++                                 bool paused)
+ {
+     intf_sys_t *p_this = static_cast<intf_sys_t*>(pt);
+-    p_this->setPauseState( paused );
++    return p_this->setPauseState(generation, paused);
+ }
+ 
+-void intf_sys_t::set_meta(void *pt, vlc_meta_t *p_meta)
++bool intf_sys_t::set_meta(void *pt, cc_input_generation_t generation,
++                          vlc_meta_t *p_meta)
+ {
+     intf_sys_t *p_this = static_cast<intf_sys_t*>(pt);
+-    p_this->setMeta( p_meta );
++    return p_this->setMeta(generation, p_meta);
+ }
+ 
+-void intf_sys_t::set_input_length(void *pt, vlc_tick_t length)
++bool intf_sys_t::set_input_length(void *pt,
++                                  cc_input_generation_t generation,
++                                  vlc_tick_t length)
+ {
+     intf_sys_t *p_this = static_cast<intf_sys_t*>(pt);
+-    p_this->setInputLength( length );
++    return p_this->setInputLength(generation, length);
+ }
+diff --git a/modules/stream_out/chromecast/chromecast_demux.cpp b/modules/stream_out/chromecast/chromecast_demux.cpp
+index 52ceb2b946dcda7a8dac340414d179072c045dda..522b0bc5d759ead3139ef69978caa44970ac8f36 100644
+--- a/modules/stream_out/chromecast/chromecast_demux.cpp
++++ b/modules/stream_out/chromecast/chromecast_demux.cpp
+@@ -46,11 +46,33 @@ struct demux_cc
+     demux_cc(demux_t * const demux, chromecast_common * const renderer)
+         :p_demux(demux)
+         ,p_renderer(renderer)
++        ,m_generation( 0 )
++        ,m_cached_paused( false )
+         ,m_enabled( true )
+     {
++        beginInput();
+         init();
+     }
+ 
++    void beginInput()
++    {
++        assert( p_renderer != NULL );
++        assert( m_generation == 0 );
++        m_generation = p_renderer->pf_begin_input( p_renderer->p_opaque,
++                                                   m_cached_paused );
++        assert( m_generation != 0 );
++    }
++
++    void endInput()
++    {
++        assert( p_renderer != NULL );
++        if( m_generation != 0 )
++        {
++            p_renderer->pf_end_input( p_renderer->p_opaque, m_generation );
++            m_generation = 0;
++        }
++    }
++
+     void init()
+     {
+         resetDemuxEof();
+@@ -81,10 +103,12 @@ struct demux_cc
+                         free( psz_meta );
+                     }
+                 }
+-                p_renderer->pf_set_meta( p_renderer->p_opaque, p_meta );
++                p_renderer->pf_set_meta( p_renderer->p_opaque, m_generation,
++                                         p_meta );
+             }
+             else if (demux_Control( p_demux->s, DEMUX_GET_META, p_meta) == VLC_SUCCESS)
+-                p_renderer->pf_set_meta( p_renderer->p_opaque, p_meta );
++                p_renderer->pf_set_meta( p_renderer->p_opaque, m_generation,
++                                         p_meta );
+             else
+                 vlc_meta_Delete( p_meta );
+         }
+@@ -96,7 +120,8 @@ struct demux_cc
+                 return demux_Control(p_demux->s, DEMUX_GET_LENGTH,
+                                      duration, live);
+             });
+-        p_renderer->pf_set_input_length( p_renderer->p_opaque, m_length );
++        p_renderer->pf_set_input_length( p_renderer->p_opaque, m_generation,
++                                         m_length );
+ 
+         int i_current_title;
+         if( demux_Control( p_demux->s, DEMUX_GET_TITLE,
+@@ -137,7 +162,8 @@ struct demux_cc
+ 
+         es_out_Control( p_demux->s->out, ES_OUT_RESET_PCR );
+ 
+-        p_renderer->pf_set_demux_enabled(p_renderer->p_opaque, true,
++        p_renderer->pf_set_demux_enabled(p_renderer->p_opaque, m_generation,
++                                         true,
+                                          on_paused_changed_cb, p_demux);
+ 
+         resetTimes();
+@@ -146,9 +172,11 @@ struct demux_cc
+     void deinit()
+     {
+         assert(p_renderer);
+-        p_renderer->pf_set_meta( p_renderer->p_opaque, NULL );
+-        p_renderer->pf_set_input_length( p_renderer->p_opaque, VLC_TICK_INVALID );
+-        p_renderer->pf_set_demux_enabled(p_renderer->p_opaque, false, NULL, NULL);
++        p_renderer->pf_set_meta( p_renderer->p_opaque, m_generation, NULL );
++        p_renderer->pf_set_input_length( p_renderer->p_opaque, m_generation,
++                                         VLC_TICK_INVALID );
++        p_renderer->pf_set_demux_enabled(p_renderer->p_opaque, m_generation,
++                                         false, NULL, NULL);
+     }
+ 
+     void resetTimes()
+@@ -172,24 +200,30 @@ struct demux_cc
+     ~demux_cc()
+     {
+         if( p_renderer )
++        {
+             deinit();
++            endInput();
++        }
+     }
+ 
+     void resetDemuxEof()
+     {
+         m_demux_eof = false;
+-        p_renderer->pf_send_input_event( p_renderer->p_opaque, CC_INPUT_EVENT_EOF,
++        p_renderer->pf_send_input_event( p_renderer->p_opaque, m_generation,
++                                         CC_INPUT_EVENT_EOF,
+                                          cc_input_arg { false } );
+     }
+ 
+     void setPauseState(bool paused)
+     {
+-        p_renderer->pf_set_pause_state( p_renderer->p_opaque, paused );
++        m_cached_paused = paused;
++        p_renderer->pf_set_pause_state( p_renderer->p_opaque, m_generation,
++                                        paused );
+     }
+ 
+     vlc_tick_t getCCTime()
+     {
+-        return p_renderer->pf_get_time( p_renderer->p_opaque );
++        return p_renderer->pf_get_time( p_renderer->p_opaque, m_generation );
+     }
+ 
+     vlc_tick_t getTime()
+@@ -238,7 +272,7 @@ struct demux_cc
+             return demux_Demux( p_demux->s );
+ 
+         /* The CC sout is not pacing, so we pace here */
+-        int pace = p_renderer->pf_pace( p_renderer->p_opaque );
++        int pace = p_renderer->pf_pace( p_renderer->p_opaque, m_generation );
+         switch (pace)
+         {
+             case CC_PACE_ERR:
+@@ -250,6 +284,7 @@ struct demux_cc
+ 
+                 resetDemuxEof();
+                 p_renderer->pf_send_input_event( p_renderer->p_opaque,
++                                                 m_generation,
+                                                  CC_INPUT_EVENT_RETRY,
+                                                  cc_input_arg{false} );
+                 break;
+@@ -289,6 +324,7 @@ struct demux_cc
+                 });
+             if( drained_and_empty )
+                 p_renderer->pf_send_input_event( p_renderer->p_opaque,
++                                                 m_generation,
+                                                  CC_INPUT_EVENT_EOF,
+                                                  cc_input_arg{ true } );
+ 
+@@ -305,7 +341,20 @@ struct demux_cc
+     int Control( demux_t *, int i_query, va_list args )
+     {
+         if( !m_enabled && i_query != DEMUX_FILTER_ENABLE )
++        {
++            /* VLC does not replay its pause state when this reusable filter is
++             * enabled for a different renderer. Cache controls received while
++             * disabled so the next input generation starts with truthful
++             * intent, without sending a command to the detached controller. */
++            if( i_query == DEMUX_SET_PAUSE_STATE )
++            {
++                va_list ap;
++                va_copy( ap, args );
++                m_cached_paused = va_arg( ap, int ) != 0;
++                va_end( ap );
++            }
+             return demux_vaControl( p_demux->s, i_query, args );
++        }
+ 
+         switch (i_query)
+         {
+@@ -403,6 +452,7 @@ struct demux_cc
+             p_renderer = static_cast<chromecast_common *>(
+                         var_InheritAddress( p_demux, CC_SHARED_VAR_NAME ) );
+             assert(p_renderer != NULL);
++            beginInput();
+             m_enabled = true;
+             init();
+             return VLC_SUCCESS;
+@@ -410,6 +460,7 @@ struct demux_cc
+         case DEMUX_FILTER_DISABLE:
+ 
+             deinit();
++            endInput();
+ 
+             /* Seek back to last known position. Indeed we don't want to resume
+              * from the input position that can be more than 1 minutes forward
+@@ -428,6 +479,8 @@ struct demux_cc
+ protected:
+     demux_t     * const p_demux;
+     chromecast_common  * p_renderer;
++    cc_input_generation_t m_generation;
++    bool          m_cached_paused;
+     vlc_tick_t    m_length;
+     bool          m_can_seek;
+     bool          m_enabled;
+diff --git a/modules/stream_out/chromecast/chromecast_protocol.hpp b/modules/stream_out/chromecast/chromecast_protocol.hpp
+index f314dc761e5d10d5a144daaf144c98d4f1d1e301..ee60eb4e42e6d610f3a80668d6eedd81e05d3d60 100644
+--- a/modules/stream_out/chromecast/chromecast_protocol.hpp
++++ b/modules/stream_out/chromecast/chromecast_protocol.hpp
+@@ -8,6 +8,7 @@
+ #include <cmath>
+ #include <cerrno>
+ #include <cstddef>
++#include <cstdint>
+ #include <cstdlib>
+ #include <cstring>
+ #include <iomanip>
+@@ -297,6 +298,25 @@ chromecast_json_media_session_id(const struct json_object *object,
+         json_get_num(object, "mediaSessionId"), result);
+ }
+ 
++/* Cast can publish primary IDLE with extended LOADING while an attributed
++ * first load is still starting. requestId is not a state signal once the
++ * session is bound, but a terminal idleReason always wins. Keep this bounded
++ * to the pre-play Loading/Buffering phase so a later IDLE cannot resurrect an
++ * already played session. */
++static inline bool
++chromecast_initial_load_is_pending(bool played_once,
++                                   bool controller_starting,
++                                   std::string_view player_state,
++                                   std::string_view extended_player_state,
++                                   std::string_view idle_reason)
++{
++    return !played_once
++        && controller_starting
++        && player_state == "IDLE"
++        && extended_player_state == "LOADING"
++        && idle_reason.empty();
++}
++
+ /* Receiver time is sampled, never invented. currentTime and playbackRate
+  * must be finite and non-negative before conversion. Only PLAYING advances
+  * the sampled clock; PAUSED and BUFFERING freeze at the receiver's reported
+@@ -523,6 +543,50 @@ chromecast_server_base_url(const std::string &host, unsigned port)
+     return url != nullptr ? std::string(url.get()) : std::string();
+ }
+ 
++static inline std::string
++chromecast_stream_query(uint64_t stream_token)
++{
++    if (stream_token == 0)
++        return {};
++    return "streamToken=" + std::to_string(stream_token);
++}
++
++static inline bool
++chromecast_stream_query_matches(std::string_view query,
++                                uint64_t expected_stream_token)
++{
++    static constexpr std::string_view prefix = "streamToken=";
++    if (expected_stream_token == 0 || query.size() <= prefix.size()
++     || query.compare(0, prefix.size(), prefix) != 0)
++        return false;
++
++    const std::string_view value = query.substr(prefix.size());
++    if (value.size() > 1 && value.front() == '0')
++        return false;
++
++    uint64_t parsed = 0;
++    for (const char c : value)
++    {
++        if (c < '0' || c > '9')
++            return false;
++        const uint64_t digit = static_cast<uint64_t>(c - '0');
++        if (parsed > (std::numeric_limits<uint64_t>::max() - digit) / 10)
++            return false;
++        parsed = parsed * 10 + digit;
++    }
++    return parsed == expected_stream_token;
++}
++
++static inline std::string
++chromecast_stream_url(const std::string &base_url, const std::string &path,
++                      uint64_t stream_token)
++{
++    const std::string query = chromecast_stream_query(stream_token);
++    if (base_url.empty() || path.empty() || query.empty())
++        return {};
++    return base_url + path + "?" + query;
++}
++
+ static inline const char *
+ chromecast_stream_type(vlc_tick_t input_length)
+ {

@@ -18,6 +18,12 @@ from pathlib import Path
 from typing import Any
 
 SCHEMA_VERSION = 3
+PROOF_SLICE_KEYS = (
+    "librarySha256",
+    "headersTreeDigest",
+    "manifestSha256",
+    "memberCount",
+)
 SDK_BY_PLATFORM = {
     ("ios", None): "iphoneos",
     ("ios", "simulator"): "iphonesimulator",
@@ -331,6 +337,8 @@ def load_record(path: Path) -> dict[str, Any]:
         value = json.loads(path.read_text())
     except (OSError, ValueError) as error:
         fail(f"cannot read provenance {path}: {error}")
+    if not isinstance(value, dict):
+        fail(f"{path} is not a provenance object")
     if value.get("schemaVersion") != SCHEMA_VERSION:
         fail(f"{path} is not schema version {SCHEMA_VERSION}")
     return value
@@ -379,26 +387,69 @@ def verify(arguments: argparse.Namespace) -> None:
 
 
 def normalized_build_inputs(record: dict[str, Any]) -> dict[str, Any]:
+    build = record.get("build")
+    if not isinstance(build, dict):
+        fail("provenance build record is not an object")
     return {
         key: value
-        for key, value in record.get("build", {}).items()
+        for key, value in build.items()
         if key not in {"builtAt", "invocationId"}
     }
 
 
+def indexed_slices(record: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    slices = record.get("slices")
+    if not isinstance(slices, list) or not slices:
+        fail("provenance slices must be a non-empty array")
+    indexed: dict[str, dict[str, Any]] = {}
+    for index, item in enumerate(slices):
+        if not isinstance(item, dict):
+            fail(f"provenance slice at index {index} is not an object")
+        identifier = item.get("identifier")
+        if not isinstance(identifier, str) or not identifier:
+            fail(f"provenance slice at index {index} has an invalid identifier")
+        if identifier in indexed:
+            fail(f"provenance contains duplicate slice {identifier}")
+        indexed[identifier] = item
+    return indexed
+
+
 def slice_inputs(record: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    artifact_keys = {
-        "librarySha256",
-        "headersTreeDigest",
-        "manifestSha256",
-        "memberCount",
-    }
+    artifact_keys = set(PROOF_SLICE_KEYS)
     return {
-        item["identifier"]: {
+        identifier: {
             key: value for key, value in item.items() if key not in artifact_keys
         }
-        for item in record.get("slices", [])
+        for identifier, item in indexed_slices(record).items()
     }
+
+
+def proof_slices(record: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    output: dict[str, dict[str, Any]] = {}
+    for identifier, item in sorted(indexed_slices(record).items()):
+        missing = [key for key in PROOF_SLICE_KEYS if key not in item]
+        if missing:
+            fail(
+                f"provenance slice {identifier} is missing reproducibility fields: "
+                f"{', '.join(missing)}"
+            )
+        output[identifier] = {key: item[key] for key in PROOF_SLICE_KEYS}
+    return output
+
+
+def exact_json_equal(actual: Any, expected: Any) -> bool:
+    """Compare decoded JSON without Python's bool/int numeric coercion."""
+    if type(actual) is not type(expected):
+        return False
+    if isinstance(expected, dict):
+        return actual.keys() == expected.keys() and all(
+            exact_json_equal(actual[key], value) for key, value in expected.items()
+        )
+    if isinstance(expected, list):
+        return len(actual) == len(expected) and all(
+            exact_json_equal(left, right) for left, right in zip(actual, expected)
+        )
+    return actual == expected
 
 
 def compare(arguments: argparse.Namespace) -> None:
@@ -426,20 +477,15 @@ def compare(arguments: argparse.Namespace) -> None:
     second_invocation = second_build.get("invocationId")
     if not first_invocation or first_invocation == second_invocation:
         fail("reproducibility proof requires independent build invocations")
-    first_slices = {item["identifier"]: item for item in first.get("slices", [])}
-    second_slices = {item["identifier"]: item for item in second.get("slices", [])}
+    first_slices = indexed_slices(first)
+    second_slices = indexed_slices(second)
     if set(first_slices) != set(second_slices):
         fail("build slice sets differ")
     differences = []
     for identifier in sorted(first_slices):
         before = first_slices[identifier]
         after = second_slices[identifier]
-        for key in (
-            "librarySha256",
-            "headersTreeDigest",
-            "manifestSha256",
-            "memberCount",
-        ):
+        for key in PROOF_SLICE_KEYS:
             if before.get(key) != after.get(key):
                 differences.append(f"{identifier}.{key}")
     if first.get("xcframeworkTreeDigest") != second.get("xcframeworkTreeDigest"):
@@ -461,18 +507,7 @@ def compare(arguments: argparse.Namespace) -> None:
             "firstInvocationId": first_invocation,
             "secondInvocationId": second_invocation,
             "xcframeworkTreeDigest": first["xcframeworkTreeDigest"],
-            "slices": {
-                identifier: {
-                    key: first_slices[identifier][key]
-                    for key in (
-                        "librarySha256",
-                        "headersTreeDigest",
-                        "manifestSha256",
-                        "memberCount",
-                    )
-                }
-                for identifier in sorted(first_slices)
-            },
+            "slices": proof_slices(first),
         }
         arguments.output.write_text(json.dumps(proof, indent=2, sort_keys=True) + "\n")
     print(
@@ -487,30 +522,53 @@ def verify_proof(arguments: argparse.Namespace) -> None:
         proof = json.loads(arguments.proof.read_text())
     except (OSError, ValueError) as error:
         fail(f"cannot read reproducibility proof {arguments.proof}: {error}")
+    if not isinstance(proof, dict):
+        fail("reproducibility proof is not an object")
     if proof.get("schemaVersion") != 2:
         fail("reproducibility proof has an unsupported schema")
+    required_provenance_fields = (
+        "vlcSourceRevision",
+        "pinnedRevision",
+        "buildConfiguration",
+        "contribChecksums",
+        "xcframeworkTreeDigest",
+    )
+    missing = [key for key in required_provenance_fields if key not in provenance]
+    if missing:
+        fail(f"provenance is missing proof fields: {', '.join(missing)}")
+    patch_manifest = provenance.get("patchManifest")
+    if not isinstance(patch_manifest, dict) or "sha256" not in patch_manifest:
+        fail("provenance patch manifest is missing its checksum")
     expected = {
         "vlcSourceRevision": provenance["vlcSourceRevision"],
         "pinnedRevision": provenance["pinnedRevision"],
-        "patchManifestSha256": provenance["patchManifest"]["sha256"],
+        "patchManifestSha256": patch_manifest["sha256"],
         "buildConfiguration": provenance["buildConfiguration"],
         "contribChecksums": provenance["contribChecksums"],
         "buildInputs": normalized_build_inputs(provenance),
         "sliceInputs": slice_inputs(provenance),
         "xcframeworkTreeDigest": provenance["xcframeworkTreeDigest"],
+        "slices": proof_slices(provenance),
     }
     for key, value in expected.items():
-        if proof.get(key) != value:
+        if not exact_json_equal(proof.get(key), value):
             fail(f"reproducibility proof does not match provenance at {key}")
-    if not provenance.get("build", {}).get("cleanBuild"):
+    build = provenance["build"]
+    if build.get("cleanBuild") is not True:
         fail("provenance does not describe a clean build")
-    invocation_ids = {
-        proof.get("firstInvocationId"),
-        proof.get("secondInvocationId"),
-    }
-    if None in invocation_ids or len(invocation_ids) != 2:
+    first_invocation = proof.get("firstInvocationId")
+    second_invocation = proof.get("secondInvocationId")
+    if (
+        not isinstance(first_invocation, str)
+        or not isinstance(second_invocation, str)
+        or first_invocation == second_invocation
+    ):
         fail("reproducibility proof does not describe independent builds")
-    if provenance["build"].get("invocationId") not in invocation_ids:
+    invocation_ids = {
+        invocation_id(first_invocation),
+        invocation_id(second_invocation),
+    }
+    if build.get("invocationId") not in invocation_ids:
         fail("provenance build invocation is absent from reproducibility proof")
     print(
         f"libVLC reproducibility proof verified: "

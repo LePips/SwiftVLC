@@ -15,6 +15,7 @@
 #   ./build-libvlc.sh --macos-only # macOS only (fastest for dev)
 #   ./build-libvlc.sh --catalyst   # Add Mac Catalyst (arm64 + x86_64)
 #   ./build-libvlc.sh --clean      # Remove build directory
+#   ./build-libvlc.sh --clean-build --all # Required when patch 0038 is selected
 #   ./build-libvlc.sh --hash=abc   # Pin to a specific VLC commit
 
 set -e
@@ -187,14 +188,27 @@ check_prerequisites() {
 
 # --- Disk space check ---
 check_disk_space() {
-    local required_gb=40
+    # Contrib and per-SDK/architecture build products coexist until the
+    # XCFramework is assembled. Count the actual compile_libvlc invocations,
+    # including both simulator architectures, so an `--all` preflight reflects
+    # the peak working set instead of the number of final XCFramework slices.
+    local build_count=0
+    if [ "$BUILD_IOS" = yes ]; then build_count=$((build_count + 3)); fi
+    if [ "$BUILD_TVOS" = yes ]; then build_count=$((build_count + 3)); fi
+    if [ "$BUILD_VISIONOS" = yes ]; then build_count=$((build_count + 3)); fi
+    if [ "$BUILD_MACOS" = yes ]; then build_count=$((build_count + 2)); fi
+    if [ "$BUILD_CATALYST" = yes ]; then build_count=$((build_count + 2)); fi
+
+    local required_gb=$((20 + build_count * 6))
+    if [ "$required_gb" -lt 40 ]; then
+        required_gb=40
+    fi
     local available_kb
     available_kb=$(df -k "$SCRIPT_DIR" | awk 'NR==2 {print $4}')
     local available_gb=$((available_kb / 1024 / 1024))
 
     if [ "$available_gb" -lt "$required_gb" ]; then
-        warn "Low disk space: ${available_gb}GB available, ~${required_gb}GB recommended for a full build."
-        warn "The build may fail if disk space runs out."
+        error "Insufficient disk space on the build volume: ${available_gb}GB available, ${required_gb}GB required for ${build_count} selected architecture builds."
     fi
 }
 
@@ -331,6 +345,10 @@ done
 
 # --- Run startup checks ---
 check_prerequisites
+info "Verifying native validator asset manifest..."
+if ! python3 "${SCRIPT_DIR}/verify-native-validator-assets.py"; then
+    error "Native validator asset manifest verification failed."
+fi
 check_disk_space
 
 # Normalize architecture name for directory naming
@@ -682,6 +700,16 @@ fi
 export SOURCE_DATE_EPOCH
 info "Reproducible build epoch: ${SOURCE_DATE_EPOCH} (pinned commit timestamp)"
 
+# Validator selectors are initialized even when no patch directory is active;
+# later linked gates use them under `set -u` to choose the newest owner or an
+# older fallback without depending on manifest-block scope.
+chromecast_metadata_warning_patch_listed=no
+chromecast_metadata_schema_patch_listed=no
+chromecast_load_transition_patch_listed=no
+apple_assembly_metadata_patch_listed=no
+swiftvlc_manifest_extension_version=""
+swiftvlc_apple_audio_session_leases_listed=no
+
 # --- Step 1b: Apply patches ---
 if [ -n "${PATCHES_DIR}" ] && [ -d "${PATCHES_DIR}" ]; then
     info "Applying patches from ${PATCHES_DIR}..."
@@ -700,8 +728,56 @@ if [ -n "${PATCHES_DIR}" ] && [ -d "${PATCHES_DIR}" ]; then
     while IFS= read -r manifest_entry; do
         [ -n "$manifest_entry" ] || continue
         manifest_order+=("${PATCHES_DIR}/${manifest_entry}")
+        manifest_extension_candidate=""
+        case "$manifest_entry" in
+            0004-samplebuffer-pip-safety-geometry.patch)
+                manifest_extension_candidate=1 ;;
+            0022-atomic-pip-playback-snapshot.patch)
+                manifest_extension_candidate=2 ;;
+            0024-native-pip-overlays.patch)
+                manifest_extension_candidate=3 ;;
+            0027-strict-frame-step-contract.patch)
+                manifest_extension_candidate=4 ;;
+            0029-sample-buffer-renderer-recovery.patch)
+                manifest_extension_candidate=5 ;;
+            0030-vmem-picture-pts.patch)
+                manifest_extension_candidate=6 ;;
+            0031-effective-playback-rate-event.patch)
+                manifest_extension_candidate=7 ;;
+            0032-audio-media-services-reset.patch)
+                manifest_extension_candidate=8 ;;
+            0033-apple-audio-session-policy-leases.patch)
+                swiftvlc_apple_audio_session_leases_listed=yes ;;
+        esac
+        if [ -n "$manifest_extension_candidate" ] &&
+           { [ -z "$swiftvlc_manifest_extension_version" ] ||
+             [ "$manifest_extension_candidate" -gt "$swiftvlc_manifest_extension_version" ]; }; then
+            swiftvlc_manifest_extension_version="$manifest_extension_candidate"
+        fi
+        if [ "$manifest_entry" = "0035-chromecast-metadata-warning.patch" ]; then
+            chromecast_metadata_warning_patch_listed=yes
+        fi
+        if [ "$manifest_entry" = "0036-chromecast-metadata-schema-correctness.patch" ]; then
+            chromecast_metadata_schema_patch_listed=yes
+        fi
+        if [ "$manifest_entry" = "0037-chromecast-load-transition-correctness.patch" ]; then
+            chromecast_load_transition_patch_listed=yes
+        fi
+        if [ "$manifest_entry" = "0038-apple-assembly-metadata.patch" ]; then
+            apple_assembly_metadata_patch_listed=yes
+        fi
     done <<< "$manifest_listing"
     info "Patch manifest verified: ${#manifest_order[@]} patches"
+
+    # Patch 0038 changes the assembler tool recipe and command selection.
+    # Incremental build roots can retain an older NASM path in contrib
+    # configuration and old assembly objects in archives, so source replay is
+    # insufficient evidence. Refuse every non-clean build while 0038 is part
+    # of the selected manifest.
+    if [ "$apple_assembly_metadata_patch_listed" = yes ] &&
+       [ "$CLEAN_BUILD" != yes ]; then
+        error "Patch 0038 requires --clean-build; cached tools, contrib configuration, or assembly objects cannot be reused."
+    fi
     cd "${VLC_SRC}"
 
     # Ordered patches can intentionally overlap (0003 refines code introduced
@@ -816,7 +892,75 @@ if [ -n "${PATCHES_DIR}" ] && [ -d "${PATCHES_DIR}" ]; then
             fi
         done
     fi
+
+    # This must be the first gate after the ordered replay. It validates the
+    # exact 0038 source/tool contract before the build script performs any of
+    # its dynamic source edits below.
+    if [ "$apple_assembly_metadata_patch_listed" = yes ]; then
+        info "Validating Apple assembly tool and Mach-O metadata source contract..."
+        "${SCRIPT_DIR}/validate-apple-assembly-metadata-patch.sh" \
+            "${VLC_SRC}" "${BUILD_DIR}/validation/0038-apple-assembly-metadata"
+    fi
+
+    # Patches 0035–0037 deliberately change no public API, so they have no
+    # additive source marker that can trigger a validator. Every successor
+    # owns the inherited proof at its exact predecessor boundary, so run only
+    # the newest listed contract. In particular, frozen 0036's fail-closed
+    # mutation fixtures are valid on reconstructed 0036 source, not directly
+    # on 0037's final source where new code may contain the same token.
+    if [ "$chromecast_load_transition_patch_listed" = yes ]; then
+        info "Validating Chromecast generation-safe load transitions and inherited metadata contracts..."
+        "${SCRIPT_DIR}/validate-chromecast-load-transition.sh" \
+            "${VLC_SRC}" "${BUILD_DIR}/validation/0037-chromecast-load-transition"
+    elif [ "$chromecast_metadata_schema_patch_listed" = yes ]; then
+        info "Validating Chromecast metadata schema and one-shot warnings..."
+        "${SCRIPT_DIR}/validate-chromecast-metadata-schema.sh" \
+            "${VLC_SRC}" "${BUILD_DIR}/validation/0036-chromecast-metadata-schema"
+    elif [ "$chromecast_metadata_warning_patch_listed" = yes ]; then
+        info "Validating Chromecast music metadata and one-shot warnings..."
+        "${SCRIPT_DIR}/validate-chromecast-metadata-warning.sh" "${VLC_SRC}"
+    fi
     cd "${BUILD_DIR}"
+fi
+
+# The ordered manifest, rather than whichever checked-in header happens to be
+# present during a migration, owns the exact additive native ABI expected from
+# this build. Clear inherited values first so custom manifests cannot silently
+# validate against a caller's stale environment.
+unset SWIFTVLC_EXPECTED_EXTENSION_VERSION
+unset SWIFTVLC_REQUIRE_APPLE_AUDIO_SESSION_LEASES
+if [ "$swiftvlc_apple_audio_session_leases_listed" = yes ] &&
+   [ "$swiftvlc_manifest_extension_version" != 8 ]; then
+    error "Patch 0033 requires the manifest-owned extension version 8 from patch 0032."
+fi
+if [ -n "$swiftvlc_manifest_extension_version" ]; then
+    export SWIFTVLC_EXPECTED_EXTENSION_VERSION="$swiftvlc_manifest_extension_version"
+    export SWIFTVLC_REQUIRE_APPLE_AUDIO_SESSION_LEASES="$swiftvlc_apple_audio_session_leases_listed"
+    info "Selected native extension contract: version ${SWIFTVLC_EXPECTED_EXTENSION_VERSION}, Apple audio-session leases ${SWIFTVLC_REQUIRE_APPLE_AUDIO_SESSION_LEASES}"
+
+    # The shared composition resolver starts at strict frame-step version 4.
+    # Versions 1-3 retain their feature-specific source checks and are still
+    # bound across every produced archive by the linked contract below.
+    if [ "$SWIFTVLC_EXPECTED_EXTENSION_VERSION" -ge 4 ]; then
+        native_source_contract_args=(
+            --source-root "$VLC_SRC"
+            --expected-version "$SWIFTVLC_EXPECTED_EXTENSION_VERSION"
+            --run-mutations
+        )
+        if [ "$SWIFTVLC_REQUIRE_APPLE_AUDIO_SESSION_LEASES" = yes ]; then
+            native_source_contract_args+=(--require-apple-audio-session-leases)
+        fi
+        info "Validating the manifest-owned native extension source and vendored-header contract..."
+        "${SCRIPT_DIR}/validate-native-extension-contract.sh" \
+            "${native_source_contract_args[@]}"
+    else
+        info "Native extension versions 1-3 use their feature-specific source gates; exact archive validation will run for every produced slice."
+    fi
+elif grep -q 'swiftvlc_libvlc_pip_extensions_version' \
+    "${VLC_SRC}/include/vlc/libvlc_media_player.h" 2>/dev/null; then
+    error "Patched VLC source exposes a SwiftVLC native extension, but the selected manifest has no recognized extension-version owner."
+else
+    info "Selected patch manifest has no SwiftVLC native extension contract."
 fi
 
 # Exercise the exact production helper whenever this patch is in the engine
@@ -832,6 +976,36 @@ if [ -f "${VLC_SRC}/modules/video_output/apple/VLCSampleBufferOverlayGeometry.h"
     "${SCRIPT_DIR}/validate-native-pip-overlay-geometry.sh" "${VLC_SRC}"
     info "Validating native PiP overlay pixel formats and metadata..."
     "${SCRIPT_DIR}/validate-native-pip-overlay-pixels.sh"
+fi
+
+# Trigger on either half of the additive renderer API so a partial patch
+# cannot evade validation. The validator requires both the deterministic
+# recovery header and the public telemetry declaration.
+if [ -f "${VLC_SRC}/modules/video_output/apple/VLCSampleBufferRendererRecovery.h" ] ||
+   grep -q \
+       'swiftvlc_libvlc_media_player_get_sample_buffer_renderer_snapshot' \
+       "${VLC_SRC}/include/vlc/libvlc_media_player.h" 2>/dev/null; then
+    info "Validating native sample-buffer renderer recovery contracts..."
+    "${SCRIPT_DIR}/validate-sample-buffer-renderer-recovery.sh" "${VLC_SRC}"
+fi
+
+if grep -q 'swiftvlc_next_frame_request_result_t' \
+    "${VLC_SRC}/include/vlc/libvlc_media_player.h"; then
+    info "Validating strict frame-step terminal, reset, and reuse invariants..."
+    python3 "${SCRIPT_DIR}/patches/validation/strict-frame-step-source-check.py" \
+        "${VLC_SRC}"
+fi
+
+if grep -q 'swiftvlc_libvlc_video_set_callbacks_atomic_v2' \
+    "${VLC_SRC}/include/vlc/libvlc_media_player.h"; then
+    info "Validating v6 decoded-picture PTS source and ABI invariants..."
+    "${SCRIPT_DIR}/validate-vmem-picture-pts.sh" "${VLC_SRC}"
+fi
+
+if grep -q 'libvlc_MediaPlayerRateChanged' \
+    "${VLC_SRC}/include/vlc/libvlc_events.h"; then
+    info "Validating effective playback-rate event source and ABI invariants..."
+    "${SCRIPT_DIR}/validate-effective-playback-rate-event.sh" "${VLC_SRC}"
 fi
 
 # --- Step 1c: Patch VLC snapshot conversion owner ---
@@ -1268,6 +1442,23 @@ cd "${VLC_SRC}/extras/tools"
 make ${MAKEFLAGS}
 cd "${BUILD_DIR}"
 
+# Patches 0028/0034's linked gates use the tools produced above. Run them
+# before any platform compile so malformed Cast JSON handling, unreachable
+# address publication, duration classification, or UPnP lifecycle regressions
+# fail once rather than once per slice. Keep all generated probe objects under
+# the external build root.
+if [ -f "${VLC_SRC}/modules/stream_out/chromecast/chromecast_protocol.hpp" ]; then
+    if [ "$chromecast_load_transition_patch_listed" != yes ] &&
+       [ -f "${VLC_SRC}/modules/stream_out/chromecast/chromecast_demux_eof.hpp" ]; then
+        info "Validating Chromecast clock, attribution, transport, and EOF invariants..."
+        "${SCRIPT_DIR}/validate-chromecast-state.sh" \
+            "${VLC_SRC}" "${BUILD_DIR}/validation"
+    fi
+    info "Validating post-pin playback, UPnP, and Chromecast invariants..."
+    "${SCRIPT_DIR}/validate-post-pin-stability.sh" \
+        "${VLC_SRC}" "${BUILD_DIR}/validation"
+fi
+
 # --- Step 3: Compile libVLC per platform/arch ---
 #
 # Force autoconf to treat Linux-only syscalls as unavailable. iOS Simulator
@@ -1472,9 +1663,11 @@ fi
 
 info "Creating libvlc.xcframework..."
 mkdir -p "${OUTPUT_DIR}"
-rm -rf "${OUTPUT_DIR}/libvlc.xcframework"
+MACHO_METADATA_REPORT="${OUTPUT_DIR}/libvlc-macho-metadata.json"
 rm -f "${OUTPUT_DIR}/libvlc-provenance.json" \
-    "${OUTPUT_DIR}/libvlc-reproducibility.json"
+    "${OUTPUT_DIR}/libvlc-reproducibility.json" \
+    "${MACHO_METADATA_REPORT}"
+rm -rf "${OUTPUT_DIR}/libvlc.xcframework"
 
 xcodebuild -create-xcframework \
     "${XCFRAMEWORK_ARGS[@]}" \
@@ -1531,6 +1724,104 @@ if grep -q 'bool seekable;' \
         "${OUTPUT_DIR}/libvlc.xcframework"
 fi
 
+if grep -q 'swiftvlc_next_frame_request_result_t' \
+    "${REPO_ROOT}/Sources/CLibVLC/include/vlc/libvlc_media_player.h"; then
+    if [ "$BUILD_MACOS" = "yes" ]; then
+        HOST_MACOS_ARCH=$(uname -m)
+        case "$HOST_MACOS_ARCH" in
+            arm64|x86_64) ;;
+            *) error "Unsupported macOS validation host architecture: $HOST_MACOS_ARCH" ;;
+        esac
+        STRICT_MACOS_BUILD_ROOT="${VLC_SRC}/build-macosx-${HOST_MACOS_ARCH}"
+        if [ ! -f "${STRICT_MACOS_BUILD_ROOT}/config.h" ]; then
+            error "Strict frame-step host build root is incomplete: ${STRICT_MACOS_BUILD_ROOT}"
+        fi
+        info "Validating strict request-correlated frame stepping with source-linked race gates..."
+        "${SCRIPT_DIR}/validate-strict-frame-step.sh" \
+            "${OUTPUT_DIR}/libvlc.xcframework" \
+            "${VLC_SRC}" "${STRICT_MACOS_BUILD_ROOT}"
+    else
+        info "Strict frame-step runtime and source-linked listener/overflow/vmem race gates skipped: no macOS slice was selected (iOS/device-only build)."
+    fi
+fi
+
+if grep -q 'libvlc_MediaPlayerRateChanged' \
+    "${VLC_SRC}/include/vlc/libvlc_events.h"; then
+    if [ "$BUILD_MACOS" = "yes" ]; then
+        HOST_MACOS_ARCH=$(uname -m)
+        case "$HOST_MACOS_ARCH" in
+            arm64|x86_64) ;;
+            *) error "Unsupported macOS rate-event validation host architecture: $HOST_MACOS_ARCH" ;;
+        esac
+        RATE_EVENT_MACOS_BUILD_ROOT="${VLC_SRC}/build-macosx-${HOST_MACOS_ARCH}"
+        info "Validating exact effective playback-rate event source syntax..."
+        "${SCRIPT_DIR}/validate-effective-playback-rate-event.sh" \
+            "${VLC_SRC}" "${RATE_EVENT_MACOS_BUILD_ROOT}" \
+            "${OUTPUT_DIR}/libvlc.xcframework"
+    else
+        info "Effective playback-rate event source syntax gate skipped: no macOS slice was selected."
+    fi
+fi
+
+if grep -q 'swiftvlc_libvlc_video_set_callbacks_atomic_v2' \
+    "${VLC_SRC}/include/vlc/libvlc_media_player.h"; then
+    if [ "$BUILD_MACOS" = "yes" ]; then
+        HOST_MACOS_ARCH=$(uname -m)
+        case "$HOST_MACOS_ARCH" in
+            arm64|x86_64) ;;
+            *) error "Unsupported macOS vmem validation host architecture: $HOST_MACOS_ARCH" ;;
+        esac
+        VMEM_PTS_MACOS_BUILD_ROOT="${VLC_SRC}/build-macosx-${HOST_MACOS_ARCH}"
+        info "Validating linked v6 decoded-picture PTS delivery and generation races..."
+        "${SCRIPT_DIR}/validate-vmem-picture-pts.sh" \
+            "${VLC_SRC}" "${VMEM_PTS_MACOS_BUILD_ROOT}" \
+            "${OUTPUT_DIR}/libvlc.xcframework"
+    else
+        info "v6 decoded-picture PTS runtime gate skipped: no macOS slice was selected."
+    fi
+fi
+
+# Patches 0032/0033 harden both Apple audio-output implementations and route
+# reset recovery plus optional application ownership through one process
+# broker. Run their fail-closed source/mutation/state/ABI proof after all
+# selected slices finish, then type-check against one exact configured Apple
+# device build when the build includes a platform that uses AVAudioSession.
+if grep -q 'audioSessionMediaServicesWereReset:' \
+       "${VLC_SRC}/modules/audio_output/apple/audiounit_ios.m" 2>/dev/null ||
+   grep -q 'audioSessionMediaServicesWereReset:' \
+       "${VLC_SRC}/modules/audio_output/apple/avsamplebuffer.m" 2>/dev/null; then
+    AUDIO_RESET_BUILD_ROOT=""
+    AUDIO_RESET_SDK=""
+    AUDIO_RESET_DEPLOYMENT=""
+    if [ "$BUILD_IOS" = "yes" ]; then
+        AUDIO_RESET_BUILD_ROOT="${VLC_SRC}/build-iphoneos-arm64"
+        AUDIO_RESET_SDK="iphoneos"
+        AUDIO_RESET_DEPLOYMENT="${SWIFTVLC_MIN_IOS}"
+    elif [ "$BUILD_TVOS" = "yes" ]; then
+        AUDIO_RESET_BUILD_ROOT="${VLC_SRC}/build-appletvos-arm64"
+        AUDIO_RESET_SDK="appletvos"
+        AUDIO_RESET_DEPLOYMENT="${SWIFTVLC_MIN_TVOS}"
+    elif [ "$BUILD_VISIONOS" = "yes" ]; then
+        AUDIO_RESET_BUILD_ROOT="${VLC_SRC}/build-xros-arm64"
+        AUDIO_RESET_SDK="xros"
+        AUDIO_RESET_DEPLOYMENT="${SWIFTVLC_MIN_VISIONOS}"
+    elif [ "$BUILD_CATALYST" = "yes" ]; then
+        AUDIO_RESET_BUILD_ROOT="${VLC_SRC}/build-maccatalyst-arm64"
+        AUDIO_RESET_SDK="maccatalyst"
+        AUDIO_RESET_DEPLOYMENT="${SWIFTVLC_MIN_CATALYST}"
+    fi
+
+    if [ -n "$AUDIO_RESET_BUILD_ROOT" ]; then
+        info "Validating Apple audio reset recovery, ownership policy, and leases against ${AUDIO_RESET_SDK}..."
+        "${SCRIPT_DIR}/validate-audio-media-services-reset.sh" \
+            "${VLC_SRC}" "${AUDIO_RESET_BUILD_ROOT}" \
+            "${AUDIO_RESET_SDK}" "${AUDIO_RESET_DEPLOYMENT}"
+    else
+        info "Validating Apple audio reset/ownership source contract (no AVAudioSession device slice selected)..."
+        "${SCRIPT_DIR}/validate-audio-media-services-reset.sh" "${VLC_SRC}"
+    fi
+fi
+
 # Remove the CLibVLC module.modulemap from xcframework headers to avoid
 # "redefinition of module" errors when building with xcodebuild. The CLibVLC
 # SPM target provides its own module map; the xcframework only needs the raw
@@ -1549,79 +1840,50 @@ find "${OUTPUT_DIR}/libvlc.xcframework" -name '*.a' -exec strip -S {} \;
 info "Normalizing archive indexes after stripping..."
 find "${OUTPUT_DIR}/libvlc.xcframework" -name '*.a' -exec xcrun ranlib -D {} \;
 
+# Re-evaluate the manifest-owned identity across every exact archive after the
+# final archive mutation. The central gate inspects every declared architecture
+# and additionally executes its probe when a host-runnable macOS slice exists.
+if [ -n "$swiftvlc_manifest_extension_version" ]; then
+    native_archive_contract_args=(
+        --xcframework "${OUTPUT_DIR}/libvlc.xcframework"
+        --expected-version "$SWIFTVLC_EXPECTED_EXTENSION_VERSION"
+    )
+    if [ "$SWIFTVLC_REQUIRE_APPLE_AUDIO_SESSION_LEASES" = yes ]; then
+        native_archive_contract_args+=(--require-apple-audio-session-leases)
+    fi
+    info "Validating the exact linked native extension archive contract across every produced slice..."
+    "${SCRIPT_DIR}/validate-native-extension-contract.sh" \
+        "${native_archive_contract_args[@]}"
+fi
+
 info "Created: ${OUTPUT_DIR}/libvlc.xcframework"
 
-# --- Step 5: Verify ---
+# --- Step 5: Verify every shipped Mach-O object ---
 #
-# Fail the build if any object file in the xcframework has an LC_BUILD_VERSION
-# with `minos` exceeding the slice's expected deployment target. A contrib
-# that slips the host-SDK default into its objects (see the gsm/CPPFLAGS
-# fix above) would otherwise ship silently and trip the Apple linker with
-# "built for newer 'X' version (Y) than being linked (Z)" warnings in every
-# consumer project. Running this check at build time catches regressions
-# here instead of in user feedback.
-verify_deployment_targets() {
-    info "Verifying deployment-target minimums in xcframework..."
-
-    # slice_dir:expected_min_version — keep in sync with the SWIFTVLC_MIN_*
-    # values above and the xcframework slice naming xcodebuild emits.
-    local slices=(
-        "ios-arm64:${SWIFTVLC_MIN_IOS}"
-        "ios-arm64_x86_64-simulator:${SWIFTVLC_MIN_IOS}"
-        "tvos-arm64:${SWIFTVLC_MIN_TVOS}"
-        "tvos-arm64_x86_64-simulator:${SWIFTVLC_MIN_TVOS}"
-        "xros-arm64:${SWIFTVLC_MIN_VISIONOS}"
-        "xros-arm64_x86_64-simulator:${SWIFTVLC_MIN_VISIONOS}"
-        "macos-arm64_x86_64:${SWIFTVLC_MIN_MACOS}"
-        "ios-arm64_x86_64-maccatalyst:${SWIFTVLC_MIN_CATALYST}"
-    )
-
-    local had_failure=0
-    local slice_spec slice expected lib max_minos highest
-    for slice_spec in "${slices[@]}"; do
-        slice="${slice_spec%%:*}"
-        expected="${slice_spec#*:}"
-        lib="${OUTPUT_DIR}/libvlc.xcframework/${slice}/libvlc.a"
-        [ -f "$lib" ] || continue
-
-        # The highest LC_BUILD_VERSION minos across all objects in the archive.
-        # LC_VERSION_MIN_IPHONEOS (legacy) is not inspected: ld prefers
-        # LC_BUILD_VERSION when present and that's what produces the warning.
-        max_minos=$(otool -l "$lib" 2>/dev/null \
-            | awk '/^[[:space:]]*cmd LC_BUILD_VERSION/{flag=1; next} flag && /^[[:space:]]*minos /{print $2; flag=0}' \
-            | sort -V | tail -1)
-
-        if [ -z "$max_minos" ]; then
-            warn "  ${slice}: no LC_BUILD_VERSION found (skipping)"
-            continue
-        fi
-
-        # Pick the higher of (max_minos, expected); if it's max_minos, fail.
-        highest=$(printf '%s\n%s\n' "$max_minos" "$expected" | sort -V | tail -1)
-        if [ "$highest" = "$expected" ]; then
-            info "  ${slice}: minos=${max_minos} <= deployment=${expected}"
-        else
-            warn "  ${slice}: minos=${max_minos} > deployment=${expected}"
-            warn "    A contrib compiled with the host-SDK default instead of"
-            warn "    SWIFTVLC_MIN_* — consumers will see ld warnings like"
-            warn "    'built for newer X-version than being linked'."
-            had_failure=1
-        fi
-    done
-
-    if [ "$had_failure" -eq 1 ]; then
-        error "Deployment-target verification failed (see warnings above)."
-    fi
-}
-
-verify_deployment_targets
+# A slice-level `otool` maximum can neither detect assembly objects with no
+# platform command nor prove that every object names the right Apple platform.
+# Parse the universal archives and their Mach-O members directly instead. The
+# gate requires exactly one LC_BUILD_VERSION with the exact deployment target,
+# rejects legacy platform commands, validates CPU attribution, and caps section
+# alignment so an accidental Mach-O `.align 16` cannot request 64 KiB.
+info "Verifying per-object Mach-O platform metadata and section alignment..."
+PYTHONDONTWRITEBYTECODE=1 python3 \
+    "${SCRIPT_DIR}/validate-libvlc-macho-metadata.py" \
+    --xcframework "${OUTPUT_DIR}/libvlc.xcframework" \
+    --deployment-target "ios=${SWIFTVLC_MIN_IOS}" \
+    --deployment-target "tvos=${SWIFTVLC_MIN_TVOS}" \
+    --deployment-target "xros=${SWIFTVLC_MIN_VISIONOS}" \
+    --deployment-target "macos=${SWIFTVLC_MIN_MACOS}" \
+    --deployment-target "catalyst=${SWIFTVLC_MIN_CATALYST}" \
+    --json-output "${MACHO_METADATA_REPORT}"
+info "Verified every Mach-O object; report: ${MACHO_METADATA_REPORT}"
 
 # --- Step 6: Record the verified, release-ready artifact ---
 #
-# Provenance is deliberately written only after every deployment-target check
-# passes. The artifact is also stripped above, before hashing, so the two-clean-
-# build proof covers the exact tree release.sh packages; no post-proof rebind is
-# permitted.
+# Provenance is deliberately written only after the complete per-object metadata
+# gate passes. The artifact is also stripped above, before hashing, so the two-
+# clean-build proof covers the exact tree release.sh packages; no post-proof
+# rebind is permitted.
 PROVENANCE_FILE="${OUTPUT_DIR}/libvlc-provenance.json"
 provenance_args=(
     python3 "${SCRIPT_DIR}/libvlc-provenance.py" create
@@ -1634,6 +1896,15 @@ provenance_args=(
     --build-invocation-id "${BUILD_INVOCATION_ID}"
     --build-configuration-file "build-libvlc.sh=${SCRIPT_DIR}/build-libvlc.sh"
     --build-configuration-file "fix-duplicate-symbols.sh=${SCRIPT_DIR}/fix-duplicate-symbols.sh"
+    --build-configuration-file "validate-libvlc-macho-metadata.py=${SCRIPT_DIR}/validate-libvlc-macho-metadata.py"
+    --build-configuration-file "validate-apple-assembly-metadata-patch.sh=${SCRIPT_DIR}/validate-apple-assembly-metadata-patch.sh"
+    --build-configuration-file "validate-chromecast-load-transition.sh=${SCRIPT_DIR}/validate-chromecast-load-transition.sh"
+    --build-configuration-file "validate-native-extension-contract.sh=${SCRIPT_DIR}/validate-native-extension-contract.sh"
+    --build-configuration-file "native-extension-version-probe.c=${SCRIPT_DIR}/patches/validation/native-extension-version-probe.c"
+    --build-configuration-file "pip_extension_version.py=${SCRIPT_DIR}/patches/validation/pip_extension_version.py"
+    --build-configuration-file "validate-post-pin-stability.sh=${SCRIPT_DIR}/validate-post-pin-stability.sh"
+    --build-configuration-file "native-validator-assets.sha256=${SCRIPT_DIR}/native-validator-assets.sha256"
+    --build-configuration-file "verify-native-validator-assets.py=${SCRIPT_DIR}/verify-native-validator-assets.py"
     --make-flags="${MAKEFLAGS}"
     --deployment-target "ios=${SWIFTVLC_MIN_IOS}"
     --deployment-target "tvos=${SWIFTVLC_MIN_TVOS}"

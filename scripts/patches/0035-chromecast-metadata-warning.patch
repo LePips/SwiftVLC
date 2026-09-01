@@ -1,0 +1,52 @@
+diff --git a/modules/stream_out/chromecast/cast.cpp b/modules/stream_out/chromecast/cast.cpp
+index 15e1d2e3df381737351545f02990d9e01642a11d..4afe65c680ff359badf55fc0dbcafa9c6e0336f8 100644
+--- a/modules/stream_out/chromecast/cast.cpp
++++ b/modules/stream_out/chromecast/cast.cpp
+@@ -1070,9 +1070,9 @@ bool sout_stream_sys_t::UpdateOutput( sout_stream_t *p_stream )
+                          _("Casting this video requires conversion. "
+                            "This conversion can use all the available power and "
+                            "could quickly drain your battery." ) );
++            perf_warning_shown = true;
+             if ( res <= 0 )
+                  return false;
+-            perf_warning_shown = true;
+             if ( res == 2 )
+                 config_PutInt(RENDERER_CFG_PREFIX "show-perf-warning", 0 );
+         }
+diff --git a/modules/stream_out/chromecast/chromecast_communication.cpp b/modules/stream_out/chromecast/chromecast_communication.cpp
+index 95cb9e79ee010dddf080456f79668e46433ce5ac..17c776428bd2d4214b94ad673a4e99bec91f9df6 100644
+--- a/modules/stream_out/chromecast/chromecast_communication.cpp
++++ b/modules/stream_out/chromecast/chromecast_communication.cpp
+@@ -405,13 +405,13 @@ std::string ChromecastCommunication::GetMedia( const std::string& mime,
+             {
+                 if( !artist.empty() )
+                     ss << ",\"artist\":\"" << artist << "\"";
+-                if( album.empty() )
++                if( !album.empty() )
+                     ss << ",\"album\":\"" << album << "\"";
+-                if( albumartist.empty() )
++                if( !albumartist.empty() )
+                     ss << ",\"albumArtist\":\"" << albumartist << "\"";
+-                if( tracknumber.empty() )
++                if( !tracknumber.empty() )
+                     ss << ",\"trackNumber\":\"" << tracknumber << "\"";
+-                if( discnumber.empty() )
++                if( !discnumber.empty() )
+                     ss << ",\"discNumber\":\"" << discnumber << "\"";
+             }
+ 
+diff --git a/modules/stream_out/dlna/dlna.cpp b/modules/stream_out/dlna/dlna.cpp
+index 7d55e5e29c173c0317780f8c42c0e85521eaab12..62f02b0233ca888ed4b1c9d6a0018fc93576fc72 100644
+--- a/modules/stream_out/dlna/dlna.cpp
++++ b/modules/stream_out/dlna/dlna.cpp
+@@ -372,9 +372,9 @@ int sout_stream_sys_t::UpdateOutput( sout_stream_t *p_stream )
+                          _("Casting this video requires conversion. "
+                            "This conversion can use all the available power and "
+                            "could quickly drain your battery." ) );
++            perf_warning_shown = true;
+             if ( res <= 0 )
+                  return false;
+-            perf_warning_shown = true;
+             if ( res == 2 )
+                 config_PutInt(RENDERER_CFG_PREFIX "show-perf-warning", 0 );
+         }

@@ -287,14 +287,181 @@ typedef struct swiftvlc_media_player_playback_snapshot_t
     bool seekable;          /**< whether @a media is seekable */
 } swiftvlc_media_player_playback_snapshot_t;
 
+/** Flags describing SwiftVLC's native Apple sample-buffer renderer. */
+typedef enum swiftvlc_sample_buffer_renderer_flags_t
+{
+    /** The snapshot names the display's currently installed renderer. */
+    swiftvlc_sample_buffer_renderer_current = 1u << 0,
+    /** AVFoundation currently requires a flush before decoding can resume. */
+    swiftvlc_sample_buffer_renderer_requires_flush = 1u << 1,
+    /** AVFoundation reports a failed renderer status. */
+    swiftvlc_sample_buffer_renderer_failed = 1u << 2,
+    /** A recovery episode has not produced a postflight-validated submission. */
+    swiftvlc_sample_buffer_renderer_recovery_in_progress = 1u << 3,
+    /** One frame from a postflight-validated enqueue is available for replay. */
+    swiftvlc_sample_buffer_renderer_recovery_sample_available = 1u << 4,
+} swiftvlc_sample_buffer_renderer_flags_t;
+
+/**
+ * Coherent native Apple sample-buffer renderer recovery evidence.
+ *
+ * All counters are cumulative for @a display_generation and saturate rather
+ * than wrapping. A new generation identifies a replaced display renderer, so
+ * callers must not subtract counters across generation changes.
+ *
+ * @warning @a successful_submission_count counts postflight-validated
+ * sample-buffer enqueue calls. It is not evidence of AVFoundation-visible
+ * output. Release qualification must use an independent visible-frame oracle.
+ */
+typedef struct swiftvlc_sample_buffer_renderer_snapshot_t
+{
+    /** Snapshot layout version. This definition has version 1. */
+    uint32_t abi_version;
+    /** Bitwise combination of swiftvlc_sample_buffer_renderer_flags_t. */
+    uint32_t flags;
+    /** Process-unique identity of the currently installed display renderer. */
+    uint64_t display_generation;
+    /** Bounded recovery episodes started by a revoke or failed status. */
+    uint64_t recovery_episode_count;
+    /** Episodes followed by a postflight-validated submission or reset. */
+    uint64_t recovered_episode_count;
+    uint64_t requirement_notification_count;
+    /** Requirement notifications observed while requires-flush was true. */
+    uint64_t revocation_notification_count;
+    uint64_t decode_failure_notification_count;
+    uint64_t foreground_check_count;
+    /** Total bounded recovery flushes, excluding discontinuity flushes. */
+    uint64_t recovery_flush_count;
+    /** Recovery flushes initiated by requiresFlushToResumeDecoding. */
+    uint64_t revocation_flush_count;
+    /** Recovery flushes initiated by an ordinary Failed renderer status. */
+    uint64_t failure_flush_count;
+    uint64_t discontinuity_flush_count;
+    /** Postflight-validated enqueue calls; not framework-visible output. */
+    uint64_t successful_submission_count;
+    /** Postflight-validated submissions closing outstanding episodes. */
+    uint64_t recovery_submission_count;
+    /** Samples rejected retryably before a validated enqueue commit. */
+    uint64_t retryable_submission_count;
+    /** Immediate recovery samples that could not be constructed. */
+    uint64_t recovery_sample_failure_count;
+    /** Failed statuses that remained failed after their bounded flush. */
+    uint64_t permanent_failure_count;
+} swiftvlc_sample_buffer_renderer_snapshot_t;
+
+/** Result of submitting a strict, request-correlated frame step. */
+typedef enum swiftvlc_next_frame_request_result_t
+{
+    /** The request was queued and will produce exactly one terminal event. */
+    swiftvlc_next_frame_request_accepted = 0,
+    /** Another strict request is still in flight on this media player. */
+    swiftvlc_next_frame_request_busy,
+    /** The request identifier is invalid. Identifier zero is reserved. */
+    swiftvlc_next_frame_request_invalid,
+    /** No current input can accept the request. */
+    swiftvlc_next_frame_request_unavailable,
+} swiftvlc_next_frame_request_result_t;
+
+/** Non-negative terminal states carried by the strict frame-step event. */
+typedef enum swiftvlc_frame_step_status_t
+{
+    /** The picture reached output submission and video-clock update. */
+    swiftvlc_frame_step_status_success = 0,
+    /** Playback was running and is now pausing; retry once paused. */
+    swiftvlc_frame_step_status_paused_for_retry = 1,
+    /** The paused decoder is drained and has no next picture. */
+    swiftvlc_frame_step_status_no_frame = 2,
+} swiftvlc_frame_step_status_t;
+
+typedef enum swiftvlc_apple_audio_media_services_phase
+{
+    swiftvlc_apple_audio_media_services_ready = 0,
+    swiftvlc_apple_audio_media_services_lost = 1,
+} swiftvlc_apple_audio_media_services_phase;
+
+typedef enum swiftvlc_apple_audio_command_origin
+{
+    swiftvlc_apple_audio_command_invalidating = 0,
+    swiftvlc_apple_audio_command_explicit_resume = 1,
+} swiftvlc_apple_audio_command_origin;
+
+/** Opaque, process-broker-owned Apple audio-session activation lease. Zero is
+ * always invalid. A live media player receives the same token on repeated
+ * acquire calls until the exact token is released or media services change
+ * epoch. */
+typedef uint64_t swiftvlc_apple_audio_session_lease_t;
+
+typedef enum swiftvlc_apple_audio_session_lease_result_t
+{
+    swiftvlc_apple_audio_session_lease_failed = -1,
+    swiftvlc_apple_audio_session_lease_application_managed = 0,
+    swiftvlc_apple_audio_session_lease_acquired = 1,
+} swiftvlc_apple_audio_session_lease_result_t;
+
+#define SWIFTVLC_APPLE_AUDIO_RECOVERY_SNAPSHOT_VERSION 1
+typedef struct swiftvlc_apple_audio_recovery_snapshot_t
+{
+    uint32_t version;
+    uint32_t size;
+    uint32_t broker_phase;
+    uint32_t command_origin;
+    uint64_t broker_epoch;
+    uint64_t broker_reset_epoch;
+    uint64_t command_generation;
+    uint64_t command_reset_epoch;
+    uint64_t acknowledged_reset_epoch;
+    uint64_t output_incarnation_count;
+    uint64_t successful_rebuild_count;
+    uint64_t explicit_resume_attempt_count;
+    uint64_t explicit_resume_failure_count;
+    uint32_t command_dispatched;
+    uint32_t live_output_count;
+    uint32_t broker_active_owner_count;
+    uint32_t broker_live_lease_count;
+    uint64_t broker_successful_deactivation_count;
+    uint64_t broker_failed_deactivation_count;
+} swiftvlc_apple_audio_recovery_snapshot_t;
+
 /**
  * Version of SwiftVLC's additive pinned-libVLC extensions.
  *
  * Version 1 provides the geometry-aware vmem callback and atomic retained
  * media/length snapshot. Version 2 adds a separate playback snapshot carrying
- * time and seekability without changing the version-1 layout.
+ * time and seekability without changing the version-1 layout. Version 3 adds
+ * native PiP overlay composition. Version 4 adds strict request-correlated
+ * frame stepping and result-bearing vmem output submission. Version 5 adds a
+ * coherent native Apple sample-buffer renderer recovery snapshot. Version 6
+ * adds an atomic vmem generation whose result-bearing display callback also
+ * receives the post-filter, vout-selected picture presentation timestamp at
+ * the vmem output-attempt boundary. Version 7 adds the public
+ * libvlc_MediaPlayerRateChanged event for effective player control-rate
+ * resolution notifications. Version 8 adds Apple audio-session ownership,
+ * causal reset recovery, and read-only qualification telemetry.
  */
 LIBVLC_API unsigned swiftvlc_libvlc_pip_extensions_version( void );
+
+/** Copies a read-only causal Apple audio recovery snapshot. Before calling,
+ * initialize version to SWIFTVLC_APPLE_AUDIO_RECOVERY_SNAPSHOT_VERSION and
+ * size to sizeof(swiftvlc_apple_audio_recovery_snapshot_t). Unsupported
+ * layouts, a NULL player, or an unstable concurrent view return false without
+ * writing any byte. This is safe when the player has no live audio output and
+ * never starts or rebuilds playback. */
+LIBVLC_API bool
+swiftvlc_libvlc_media_player_get_apple_audio_recovery_snapshot(
+    libvlc_media_player_t *, swiftvlc_apple_audio_recovery_snapshot_t *);
+
+/** Acquire the media player's unique library-managed PiP/video-only audio
+ * session lease. Application-managed policy is enforced here and performs no
+ * AVAudioSession operation. */
+LIBVLC_API int
+swiftvlc_libvlc_media_player_acquire_apple_audio_session_lease(
+    libvlc_media_player_t *, swiftvlc_apple_audio_session_lease_t *);
+
+/** Consume exactly one matching live lease. Stale, foreign, reset-invalidated,
+ * and duplicate releases return false and never alter another owner. */
+LIBVLC_API bool
+swiftvlc_libvlc_media_player_release_apple_audio_session_lease(
+    libvlc_media_player_t *, swiftvlc_apple_audio_session_lease_t);
 
 /**
  * Atomically capture the media player's current media and playback length.
@@ -320,6 +487,74 @@ LIBVLC_API bool swiftvlc_libvlc_media_player_get_media_length_snapshot(
 LIBVLC_API bool swiftvlc_libvlc_media_player_get_playback_snapshot(
     libvlc_media_player_t *p_mi,
     swiftvlc_media_player_playback_snapshot_t *snapshot );
+
+/**
+ * Copy native Apple sample-buffer renderer recovery evidence.
+ *
+ * When a media player owns more than one supported display, this selects the
+ * current display with the newest generation. The destination is initialized,
+ * including @a abi_version, even when no supported current display exists.
+ *
+ * \param p_mi the media player
+ * \param[out] snapshot destination for the coherent evidence
+ * \retval true a current native Apple renderer was captured
+ * \retval false no current supported renderer exists, or snapshot is NULL
+ */
+LIBVLC_API bool
+swiftvlc_libvlc_media_player_get_sample_buffer_renderer_snapshot(
+    libvlc_media_player_t *p_mi,
+    swiftvlc_sample_buffer_renderer_snapshot_t *snapshot );
+
+/**
+ * Submit one strict frame-step request.
+ *
+ * Identifier zero is reserved for libvlc_media_player_next_frame() and is
+ * rejected. Once accepted, exactly one
+ * libvlc_MediaPlayerFrameStepCompleted event is emitted. Status
+ * swiftvlc_frame_step_status_success is sent only after the output module
+ * accepted the exact picture for submission and the associated video-clock
+ * update completed. This acknowledges submission, not physical presentation
+ * by the screen. The other non-negative values are
+ * explicit retry/end states; negative values are errno-style failures.
+ * The event's time and position are the player timer point captured
+ * synchronously after that exact picture's clock update, while the shared
+ * clock lock still excludes every later legacy picture update. Position is
+ * -1 when a live or unknown-length input has no meaningful fractional
+ * position. Event delivery may be delayed without changing this
+ * request-correlated snapshot. Early engine failures retain the request
+ * identifier in that event. Once output/terminal commit wins, stop, natural
+ * EOF, error, media replacement, and reset preserve and drain that exact
+ * result before the old input is destroyed; they never relabel it as
+ * cancellation.
+ *
+ * Only one strict request can be active per media player. Traditional
+ * libvlc_media_player_next_frame() calls remain independent and retain their
+ * existing behavior.
+ */
+LIBVLC_API swiftvlc_next_frame_request_result_t
+swiftvlc_libvlc_media_player_request_next_frame(
+    libvlc_media_player_t *p_mi, uint64_t request_id );
+
+/**
+ * Cancel an accepted strict frame-step request.
+ *
+ * Cancellation is matched by identifier, is idempotent for a non-active or
+ * mismatched identifier, and never cancels a later request even when an
+ * identifier is reused. Cancellation and output submission have one atomic
+ * winner. When cancellation wins, the request's sole terminal event has
+ * status -ECANCELED, its slot is reusable before this function returns, and
+ * the ordered output purge completes before a later request can submit a
+ * picture. When output commit already won, cancellation returns false and
+ * the committed request's exact success or submission-failure event remains
+ * authoritative.
+ *
+ * \retval true cancellation won for the active matching request; its slot is
+ * reusable on return
+ * \retval false no matching request was active, output commit already won, or
+ * cancellation was unavailable
+ */
+LIBVLC_API bool swiftvlc_libvlc_media_player_cancel_next_frame_request(
+    libvlc_media_player_t *p_mi, uint64_t request_id );
 
 /**
  * Get the Event Manager from which the media player send event.
@@ -355,6 +590,12 @@ LIBVLC_API int libvlc_media_player_play ( libvlc_media_player_t *p_mi );
  */
 LIBVLC_API void libvlc_media_player_set_pause ( libvlc_media_player_t *mp,
                                                     int do_pause );
+
+/** SwiftVLC-internal pause/resume path that never authorizes post-reset audio
+ * recovery. A non-pausing call invalidates any prior explicit token. */
+LIBVLC_API void
+swiftvlc_libvlc_media_player_set_pause_without_reset_authorization(
+    libvlc_media_player_t *mp, int do_pause);
 
 /**
  * Toggle pause (no effect if there is no media)
@@ -614,6 +855,82 @@ void swiftvlc_libvlc_video_set_format_callbacks_ex(
     libvlc_media_player_t *mp,
     swiftvlc_video_format_ex_cb setup,
     libvlc_video_cleanup_cb cleanup );
+
+/**
+ * Install SwiftVLC's result-bearing vmem display callback.
+ *
+ * When non-NULL this supersedes the legacy void display callback for vmem
+ * outputs opened after this call. Passing NULL restores legacy callback
+ * behavior for subsequently opened vmem outputs. An already-open output keeps
+ * the callback snapshot it acquired at open, matching the lifetime semantics
+ * of the other vmem callbacks. The callback's zero return means the exact
+ * picture reached output submission; negative means it was rejected and must
+ * not be counted as displayed.
+ */
+LIBVLC_API
+void swiftvlc_libvlc_video_set_display_status_callback(
+    libvlc_media_player_t *mp, swiftvlc_video_display_status_cb display );
+
+/**
+ * Atomically install SwiftVLC's complete strict-capable vmem generation.
+ *
+ * A successful enable publishes lock, unlock, legacy display, result-bearing
+ * display, geometry-aware setup, cleanup and opaque as one immutable tuple.
+ * A vmem output racing this call can retain only the complete old tuple or the
+ * complete new tuple. Passing NULL for every callback and opaque atomically
+ * disables the tuple. Any other partial combination is rejected without
+ * changing the currently published generation.
+ *
+ * \retval 0 if the complete generation was published
+ * \retval -EINVAL if the arguments describe a partial generation
+ * \retval -ENOMEM if immutable generation allocation failed
+ */
+LIBVLC_API
+int swiftvlc_libvlc_video_set_callbacks_atomic(
+    libvlc_media_player_t *mp,
+    libvlc_video_lock_cb lock,
+    libvlc_video_unlock_cb unlock,
+    libvlc_video_display_cb display,
+    swiftvlc_video_display_status_cb display_status,
+    swiftvlc_video_format_ex_cb setup,
+    libvlc_video_cleanup_cb cleanup,
+    void *opaque );
+
+/**
+ * Atomically install SwiftVLC's timestamp-bearing vmem generation.
+ *
+ * This is the version-6 counterpart of
+ * swiftvlc_libvlc_video_set_callbacks_atomic(). A successful enable publishes
+ * lock, unlock, legacy display, enhanced result-bearing display,
+ * geometry-aware setup, cleanup and opaque as one immutable tuple. The
+ * enhanced callback receives the presentation time of the post-filter,
+ * vout-selected picture reaching the vmem output attempt. It receives
+ * SWIFTVLC_VMEM_INVALID_PICTURE_PTS_US when that picture has no valid
+ * timestamp. The invalid sentinel does not reject the picture.
+ *
+ * A vmem output racing this call can retain only the complete old tuple or the
+ * complete new tuple. Passing NULL for every callback and opaque atomically
+ * disables the tuple. Any other partial combination is rejected without
+ * changing the currently published generation.
+ *
+ * This API is additive. It does not change the signature or behavior of
+ * swiftvlc_video_display_status_cb or
+ * swiftvlc_libvlc_video_set_callbacks_atomic().
+ *
+ * \retval 0 if the complete generation was published
+ * \retval -EINVAL if the arguments describe a partial generation
+ * \retval -ENOMEM if immutable generation allocation failed
+ */
+LIBVLC_API
+int swiftvlc_libvlc_video_set_callbacks_atomic_v2(
+    libvlc_media_player_t *mp,
+    libvlc_video_lock_cb lock,
+    libvlc_video_unlock_cb unlock,
+    libvlc_video_display_cb display,
+    swiftvlc_video_display_status_v2_cb display_status_v2,
+    swiftvlc_video_format_ex_cb setup,
+    libvlc_video_cleanup_cb cleanup,
+    void *opaque );
 
 
 typedef struct libvlc_video_setup_device_cfg_t
