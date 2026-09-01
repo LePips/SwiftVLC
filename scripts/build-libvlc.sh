@@ -212,6 +212,23 @@ check_disk_space() {
     fi
 }
 
+# Finder, Spotlight, and filesystem metadata helpers can recreate dotfiles while
+# a large external-volume tree is being removed. A single rm -rf can therefore
+# leave a newly populated directory behind and report "Directory not empty".
+# Clean builds must start from an absent tree, so retry the whole removal and
+# fail closed if any writer keeps repopulating it.
+remove_build_directory() {
+    local attempt
+    for attempt in 1 2 3 4 5; do
+        if rm -rf "${BUILD_DIR}" && [ ! -e "${BUILD_DIR}" ]; then
+            return
+        fi
+        warn "Build directory cleanup did not settle (attempt ${attempt}/5); retrying..."
+        sleep 1
+    done
+    error "Could not completely remove build directory after 5 attempts: ${BUILD_DIR}"
+}
+
 # --- Parse arguments ---
 for arg in "$@"; do
     case $arg in
@@ -271,13 +288,13 @@ for arg in "$@"; do
             ;;
         --clean)
             echo "Removing build directory: ${BUILD_DIR}"
-            rm -rf "${BUILD_DIR}"
+            remove_build_directory
             echo "Done."
             exit 0
             ;;
         --clean-build)
             echo "Removing build directory: ${BUILD_DIR}"
-            rm -rf "${BUILD_DIR}"
+            remove_build_directory
             CLEAN_BUILD=yes
             echo "Continuing with fresh build..."
             ;;

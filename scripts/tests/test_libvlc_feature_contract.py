@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 from pathlib import Path
+import subprocess
 import tempfile
 import unittest
-
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 VALIDATOR_PATH = REPO_ROOT / "scripts" / "validate_libvlc_feature_contract.py"
@@ -89,10 +90,58 @@ class LibVLCFeatureContractTests(unittest.TestCase):
 
         failures: list[str] = []
         for manifest in manifests:
-            failures.extend(
-                VALIDATOR.validate_contract(manifest.stem, manifest)
-            )
+            failures.extend(VALIDATOR.validate_contract(manifest.stem, manifest))
         self.assertEqual(failures, [])
+
+    def test_clean_retries_when_metadata_repopulates_the_build_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            scripts = root / "scripts"
+            scripts.mkdir()
+            build_script = scripts / "build-libvlc.sh"
+            build_script.write_bytes(
+                (REPO_ROOT / "scripts" / "build-libvlc.sh").read_bytes()
+            )
+            build_directory = scripts / ".build-libvlc"
+            (build_directory / "vlc").mkdir(parents=True)
+            (build_directory / "vlc" / "stale").write_text("stale")
+
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            state = root / "rm-was-raced"
+            (fake_bin / "rm").write_text("""#!/bin/bash
+set -eu
+target="${@: -1}"
+if [ ! -e "$SWIFTVLC_RM_TEST_STATE" ]; then
+  : > "$SWIFTVLC_RM_TEST_STATE"
+  /bin/rm "$@"
+  mkdir -p "$target"
+  : > "$target/.DS_Store"
+  echo "rm: $target: Directory not empty" >&2
+  exit 1
+fi
+exec /bin/rm "$@"
+""")
+            (fake_bin / "rm").chmod(0o755)
+            environment = dict(
+                os.environ,
+                MAKEFLAGS="-j1",
+                PATH=f"{fake_bin}:/usr/bin:/bin:/usr/sbin:/sbin",
+                SWIFTVLC_RM_TEST_STATE=str(state),
+                TERM="dumb",
+            )
+
+            result = subprocess.run(
+                ["bash", str(build_script), "--clean"],
+                text=True,
+                capture_output=True,
+                env=environment,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(state.is_file())
+            self.assertFalse(build_directory.exists())
+            self.assertIn("cleanup did not settle", result.stderr)
 
 
 if __name__ == "__main__":
