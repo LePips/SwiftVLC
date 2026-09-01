@@ -78,9 +78,9 @@ existing weak version shim and reports the event unavailable.
 - `effective-playback-rate-event-abi.cpp`:
   `ded305b206534bd1324a5fb9d1d6800ba9f3e01360eca2da5e602dcaaa92a369`
 - `effective-playback-rate-event-probe.c`:
-  `865d8e90392a4a569ccd4bb3537e0e639940af50908fde62d83bbeeb89373443`
+  `e48829e8ac1402d62c12bd96d1d1953523f5c8f3978a92e716fba2d12f3d2d86`
 - `validate-effective-playback-rate-event.sh`:
-  `293294dabd0cef290473871f562fa8cc14377a6a2d101c11d5c9f7ceb54b584e`
+  `2ffe175e50aa3dab9a7f0014ff7d85131a7da826430b7bbb54a0908928309205`
 
 The source checker proves append-only enum placement, the frozen event
 envelope, the callback's locked-player contract, authoritative getter payload,
@@ -100,6 +100,12 @@ central archive probe also requires the exact manifest-owned extension version
 and every strong symbol through that version, preventing a newer header from
 masking an older linked archive.
 
+The linked probe observes `Opening`, `Playing`, `Stopped`, and error events
+from callbacks attached before `play()`. It never treats the player's legal
+initial sampled `Stopped` state as a failed start. A deadline and 20-second
+process watchdog bound both playback and teardown, and every failure reports
+its stage, last lifecycle event, player state, and rate-event count.
+
 ## Focused evidence (2026-09-01)
 
 All compiler, SwiftPM, and temporary output was placed under
@@ -118,9 +124,11 @@ All compiler, SwiftPM, and temporary output was placed under
 - Full Swift package/test-target compilation: PASS (372 build steps).
 - Focused Swift event mapping, availability, ordered stream, observable
   invalidation, description, and shipped-header tests: PASS, 7/7.
-- Linked native rate-event playback probe: PENDING a rebuilt version-7 macOS
-  archive. The existing released archive predates 0030/0031 and is not valid
-  evidence for the new event.
+- Linked native rate-event playback probe against the clean-build A
+  intermediate version-8 macOS archive: PASS, including eight concurrent
+  transition-aware diagnostic repetitions and the tracked event-driven probe.
+  The enclosing artifact remains unqualified until a fixed exact-head clean
+  build reaches provenance.
 
 ## Scope boundary
 

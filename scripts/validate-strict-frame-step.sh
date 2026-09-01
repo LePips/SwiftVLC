@@ -104,11 +104,19 @@ if [[ -n "$VLC_SOURCE_ROOT" || -n "$VLC_BUILD_ROOT" ]]; then
     echo "Both VLC source and build roots are required for source-linked validation." >&2
     exit 1
   fi
+  if [[ -f "$VLC_BUILD_ROOT/config.h" ]]; then
+    VLC_BUILD_DIR="$(cd "$VLC_BUILD_ROOT" && pwd)"
+  elif [[ -f "$VLC_BUILD_ROOT/build/config.h" ]]; then
+    VLC_BUILD_DIR="$(cd "$VLC_BUILD_ROOT/build" && pwd)"
+  else
+    echo "Strict frame-step VLC host config.h not found under: $VLC_BUILD_ROOT" >&2
+    exit 1
+  fi
   for path in \
     "$VLC_SOURCE_ROOT/include/vlc/libvlc_media_player.h" \
     "$VLC_SOURCE_ROOT/include/vlc_vmem_configuration.h" \
     "$VLC_SOURCE_ROOT/src/player/player.h" \
-    "$VLC_BUILD_ROOT/config.h"; do
+    "$VLC_BUILD_DIR/config.h"; do
     if [[ ! -f "$path" ]]; then
       echo "Strict frame-step source-linked input not found: $path" >&2
       exit 1
@@ -119,17 +127,17 @@ if [[ -n "$VLC_SOURCE_ROOT" || -n "$VLC_BUILD_ROOT" ]]; then
     "$VERSION_DEFINE" \
     -o "$WORK_DIR/source-linked-probe" \
     "$SCRIPT_DIR/patches/validation/strict-frame-step-probe.c" \
-    -I "$VLC_BUILD_ROOT" -I "$VLC_SOURCE_ROOT" \
+    -I "$VLC_BUILD_DIR" -I "$VLC_SOURCE_ROOT" \
     -I "$VLC_SOURCE_ROOT/include" -I "$VLC_SOURCE_ROOT/lib" \
-    -I "$VLC_SOURCE_ROOT/src" -I "$VLC_BUILD_ROOT/include" \
+    -I "$VLC_SOURCE_ROOT/src" -I "$VLC_BUILD_DIR/include" \
     "$ARCHIVE" "${FRAMEWORKS[@]}"
   "$WORK_DIR/source-linked-probe" \
     "$REPO_ROOT/Tests/SwiftVLCTests/Fixtures/twosec.mp4"
 
   clang -std=gnu17 -DHAVE_CONFIG_H -o "$WORK_DIR/vmem-race" \
     "$SCRIPT_DIR/patches/validation/vmem-configuration-race.c" \
-    -I "$VLC_BUILD_ROOT" -I "$VLC_SOURCE_ROOT/include" \
-    -I "$VLC_BUILD_ROOT/include" "$ARCHIVE" "${FRAMEWORKS[@]}"
+    -I "$VLC_BUILD_DIR" -I "$VLC_SOURCE_ROOT/include" \
+    -I "$VLC_BUILD_DIR/include" "$ARCHIVE" "${FRAMEWORKS[@]}"
   "$WORK_DIR/vmem-race"
 else
   echo "Strict frame-step source-linked listener/overflow/vmem race gates skipped: pass VLC source and build roots." >&2

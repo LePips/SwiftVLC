@@ -43,7 +43,7 @@ verify_source "$ABI_C" \
 verify_source "$ABI_CXX" \
     ded305b206534bd1324a5fb9d1d6800ba9f3e01360eca2da5e602dcaaa92a369
 verify_source "$RUNTIME_PROBE" \
-    865d8e90392a4a569ccd4bb3537e0e639940af50908fde62d83bbeeb89373443
+    e48829e8ac1402d62c12bd96d1d1953523f5c8f3978a92e716fba2d12f3d2d86
 
 resolver_args=(--source-root "$VLC_SOURCE_ROOT")
 if [[ -n "${SWIFTVLC_EXPECTED_EXTENSION_VERSION:-}" ]]; then

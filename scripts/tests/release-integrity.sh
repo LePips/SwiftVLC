@@ -1032,7 +1032,10 @@ python3 - \
   "$SCRIPT_DIR/native-validator-assets.sha256" \
   "$SCRIPT_DIR/verify-native-validator-assets.py" \
   "$SCRIPT_DIR/validate-audio-media-services-reset.sh" \
-  "$SCRIPT_DIR/libvlc-provenance.py" <<'PY'
+  "$SCRIPT_DIR/libvlc-provenance.py" \
+  "$SCRIPT_DIR/validate-strict-frame-step.sh" \
+  "$SCRIPT_DIR/patches/validation/effective-playback-rate-event-probe.c" \
+  "$SCRIPT_DIR/patches/validation/vmem-picture-pts-probe.c" <<'PY'
 import ast
 import re
 import sys
@@ -1049,6 +1052,9 @@ validator_asset_manifest = [
 validator_asset_verifier = open(sys.argv[8]).read()
 audio_reset_validator = open(sys.argv[9]).read()
 provenance_tool = open(sys.argv[10]).read()
+strict_frame_validator = open(sys.argv[11]).read()
+effective_rate_probe = open(sys.argv[12]).read()
+vmem_pts_probe = open(sys.argv[13]).read()
 manifest_lines = [
     line.strip() for line in open(sys.argv[3]) if line.strip() and not line.lstrip().startswith("#")
 ]
@@ -1505,6 +1511,85 @@ arc_broker_syntax = (
 )
 if audio_reset_validator.count(arc_broker_syntax) != 1:
     sys.exit("Apple audio broker syntax proof does not mirror its ARC build mode")
+
+for marker in (
+    'if [[ -f "$VLC_BUILD_ROOT/config.h" ]]; then',
+    'VLC_BUILD_DIR="$(cd "$VLC_BUILD_ROOT" && pwd)"',
+    'elif [[ -f "$VLC_BUILD_ROOT/build/config.h" ]]; then',
+    'VLC_BUILD_DIR="$(cd "$VLC_BUILD_ROOT/build" && pwd)"',
+):
+    if strict_frame_validator.count(marker) != 1:
+        sys.exit(
+            "strict-frame validator does not normalize direct and nested "
+            f"configured VLC roots exactly once: {marker}"
+        )
+for stale_include in (
+    '-I "$VLC_BUILD_ROOT"',
+    '-I "$VLC_BUILD_ROOT/include"',
+):
+    if stale_include in strict_frame_validator:
+        sys.exit(
+            "strict-frame validator bypasses its normalized VLC build root: "
+            f"{stale_include}"
+        )
+for marker in (
+    'STRICT_MACOS_BUILD_CONTAINER="${VLC_SRC}/build-macosx-${HOST_MACOS_ARCH}"',
+    'if [ -f "${STRICT_MACOS_BUILD_CONTAINER}/config.h" ]; then',
+    'STRICT_MACOS_BUILD_ROOT="${STRICT_MACOS_BUILD_CONTAINER}"',
+    'elif [ -f "${STRICT_MACOS_BUILD_CONTAINER}/build/config.h" ]; then',
+    'STRICT_MACOS_BUILD_ROOT="${STRICT_MACOS_BUILD_CONTAINER}/build"',
+    '"${VLC_SRC}" "${STRICT_MACOS_BUILD_ROOT}"',
+):
+    if build.count(marker) != 1:
+        sys.exit(
+            "native build does not pass one normalized strict-frame host "
+            f"build root: {marker}"
+        )
+
+for marker in (
+    'if (event->type == libvlc_MediaPlayerPlaying)',
+    'libvlc_MediaPlayerPlaying,',
+    'libvlc_event_attach(events, lifecycle_events[index],',
+    'wait_for_playing(&observations, 5000)',
+    'TIMEOUT effective-rate playback or teardown did not terminate',
+):
+    if effective_rate_probe.count(marker) != 1:
+        sys.exit(
+            "effective-rate runtime probe lost its event-driven bounded "
+            f"startup contract: {marker}"
+        )
+if 'state == libvlc_Error || state == libvlc_Stopped' in effective_rate_probe:
+    sys.exit("effective-rate runtime probe again treats initial Stopped as terminal")
+
+for marker in (
+    'libvlc_event_attach(events, libvlc_MediaPlayerPlaying,',
+    'if (count >= 3 && distinct)',
+    'if (state == libvlc_Stopped && saw_started)',
+    'if (!stop_completed)',
+    'TIMEOUT vmem PTS playback or teardown did not terminate',
+):
+    if vmem_pts_probe.count(marker) != 1:
+        sys.exit(
+            "vmem PTS runtime probe lost its transition/evidence-complete "
+            f"wait contract: {marker}"
+        )
+if re.search(r"if \(count >= 3\)\s+return true;", vmem_pts_probe):
+    sys.exit("vmem PTS runtime probe again accepts duplicate-only callbacks")
+vmem_stop_gate = vmem_pts_probe.index('    if (!stop_completed)\n')
+vmem_quiescing_release = vmem_pts_probe.index(
+    '    libvlc_media_player_release(player);\n'
+    '    player = NULL;\n'
+    '    events = NULL;\n'
+)
+vmem_final_snapshot = vmem_pts_probe.index(
+    '    pthread_mutex_lock(&context.lock);\n'
+    '    count = context.callback_count;\n'
+)
+if not vmem_stop_gate < vmem_quiescing_release < vmem_final_snapshot:
+    sys.exit(
+        "vmem PTS runtime probe snapshots evidence before bounded stop and "
+        "callback-quiescing player release"
+    )
 
 archive_repair = build.index(
     '"${SCRIPT_DIR}/fix-duplicate-symbols.sh" "${OUTPUT_DIR}/libvlc.xcframework"'

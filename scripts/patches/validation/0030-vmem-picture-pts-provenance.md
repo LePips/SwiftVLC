@@ -68,7 +68,7 @@ callback.
 - `pip_extension_version.py`:
   `98adb898d64ed8c8a57bbc883bf10dd96eeb399a2f7671c1d2fceb262fad63b5`
 - `vmem-picture-pts-probe.c`:
-  `9b5303b6812aeb118df284aaaef8e7f6a62f617d402962f2e300fa46a4eb375a`
+  `65347de5f707e49e0d2208e4c8310f84026a518ff87730c0d17eabe5757d3bb7`
 - `vmem-picture-pts-abi.cpp`:
   `b0c92e73eeb6bdf2e940a414d88f25322d99361939d6a77468891c933f1ca068`
 - `vmem-configuration-race.c`:
@@ -78,9 +78,9 @@ callback.
 - `strict-frame-step-probe.c`:
   `bc9c69c9e86bb90cff568f0b32a0aef75b51330634bf5efeddd00b82a723aaa9`
 - `validate-strict-frame-step.sh`:
-  `ccf3548e8d3764106dc42ef08db9d137d0dc4a249271805e3d3c2bd2a94ef0e3`
+  `974b109d9e76de13f72e6e659ab40b1919f7d0d2167f942f58f2a01a31d6f6e3`
 - `validate-vmem-picture-pts.sh`:
-  `f7d40d7e2edc6b5a39a7e8b42eaf431e3b7c9c9c6be08c749f1564f0a8c1ceac`
+  `a00d24e887e957e3e7797967acf49f581570b063262df201a2835f920e22d7d1`
 
 The source checker includes negative mutations for scheduled-date
 substitution, missing `VLC_TICK_0` normalization, zero-for-invalid coercion,
@@ -97,6 +97,16 @@ session leases are a separately provable same-version refinement of version 8.
 Runtime probes receive one exact expected version owned by the ordered patch
 manifest. They neither infer archive identity from the shipped headers nor
 accept an open-ended version range.
+
+The runtime PTS probe treats `play()` as asynchronous: an initial sampled
+`Stopped` state is not terminal until playback activity is observed. It waits
+for the complete evidence predicate (at least three output attempts and two
+distinct PTS values), because VLC may legitimately redisplay the first
+selected picture several times. A 20-second process watchdog bounds playback
+and teardown. Stop must reach `Stopped`, and player release must quiesce every
+vmem callback before the final aggregate is frozen. The strict-frame wrapper
+accepts both a configured build root and VLC's Apple-driver `build/config.h`
+layout.
 
 The validator assets themselves have an exact inventory, SHA-256 and executable
 mode manifest. Clean source replay, native build and release integrity all
@@ -119,9 +129,11 @@ All compiler and temporary output was placed under
 - `git diff --check` on the integrated native tree: PASS.
 - Clean `0001`–`0030` manifest hash verification, patch replay, source/mutation
   validation, source syntax, ABI syntax and `git diff --check`: PASS.
-- Linked public playback probe against a rebuilt version-6 macOS archive:
-  required. The pre-0030 archive reports extension version 5 and is not valid
-  evidence for the new symbol.
+- Linked public playback probe against the clean-build A intermediate
+  version-8 macOS archive: PASS. Ten transition-aware diagnostic repetitions
+  also passed; the tracked evidence-complete probe reported 29 callbacks and
+  PTS progression from 0 to 80000 microseconds. The enclosing artifact remains
+  unqualified until a fixed exact-head clean build reaches provenance.
 
 ## Scope boundary
 

@@ -1836,9 +1836,15 @@ if grep -q 'swiftvlc_next_frame_request_result_t' \
             arm64|x86_64) ;;
             *) error "Unsupported macOS validation host architecture: $HOST_MACOS_ARCH" ;;
         esac
-        STRICT_MACOS_BUILD_ROOT="${VLC_SRC}/build-macosx-${HOST_MACOS_ARCH}"
-        if [ ! -f "${STRICT_MACOS_BUILD_ROOT}/config.h" ]; then
-            error "Strict frame-step host build root is incomplete: ${STRICT_MACOS_BUILD_ROOT}"
+        STRICT_MACOS_BUILD_CONTAINER="${VLC_SRC}/build-macosx-${HOST_MACOS_ARCH}"
+        if [ -f "${STRICT_MACOS_BUILD_CONTAINER}/config.h" ]; then
+            STRICT_MACOS_BUILD_ROOT="${STRICT_MACOS_BUILD_CONTAINER}"
+        elif [ -f "${STRICT_MACOS_BUILD_CONTAINER}/build/config.h" ]; then
+            # VLC's Apple build driver configures out-of-tree builds in this
+            # nested directory while keeping static-lib beside it.
+            STRICT_MACOS_BUILD_ROOT="${STRICT_MACOS_BUILD_CONTAINER}/build"
+        else
+            error "Strict frame-step host build root is incomplete: ${STRICT_MACOS_BUILD_CONTAINER}"
         fi
         info "Validating strict request-correlated frame stepping with source-linked race gates..."
         "${SCRIPT_DIR}/validate-strict-frame-step.sh" \

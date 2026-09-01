@@ -41,7 +41,7 @@ verify_source "$SOURCE_CHECKER" \
 verify_source "$VERSION_RESOLVER" \
     98adb898d64ed8c8a57bbc883bf10dd96eeb399a2f7671c1d2fceb262fad63b5
 verify_source "$PROBE" \
-    9b5303b6812aeb118df284aaaef8e7f6a62f617d402962f2e300fa46a4eb375a
+    65347de5f707e49e0d2208e4c8310f84026a518ff87730c0d17eabe5757d3bb7
 verify_source "$ABI_CXX" \
     b0c92e73eeb6bdf2e940a414d88f25322d99361939d6a77468891c933f1ca068
 verify_source "$RACE" \
