@@ -53,7 +53,11 @@ for await event in discoverer.events {
     case .itemAdded(let renderer):
         print("Found", renderer.name, renderer.type)
         do {
-            try await player.recast(to: renderer)
+            let outcome = try await player.recast(to: renderer)
+            guard outcome.isSettled else {
+                print("Cast did not settle:", outcome)
+                continue
+            }
         } catch {
             print("Cast failed:", error)
         }
@@ -70,6 +74,10 @@ retarget after playback has started, await ``Player/recast(to:)``. It
 keeps the same ``Player`` while replacing the native handle and restarting
 the current media. Pass `nil` to `recast(to:)` to return active playback
 to local output, or to `setRenderer(_:)` before the first play.
+Inspect the returned ``RecastOutcome``: only `.settled` means the replacement
+and requested transport restoration completed. A nonthrowing timeout, failure,
+cancellation, or superseding operation must not be presented as a successful
+cast.
 
 ## Inspecting a renderer
 

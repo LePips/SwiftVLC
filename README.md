@@ -111,7 +111,7 @@ try player.play(url: videoURL)
 player.pause()
 player.stop()
 try player.seek(to: PlaybackPosition(0.5)) // Seek to 50%
-try player.setPlaybackRate(1.5)            // 1.5x speed
+try player.setPlaybackRate(1.5)            // Request 1.5x control rate
 try player.setAudioVolume(0.8)             // 80% volume
 player.isMuted = true
 
@@ -132,6 +132,12 @@ for await event in player.events {
   }
 }
 ```
+
+Playback-rate application is asynchronous inside VLC. A successful setter
+return confirms immediate request acceptance, not that the active input kept
+that rate. On extension-v7 builds, `PlayerEvent.rateChanged` reports the
+effective control state without claiming request correlation or measured
+throughput; `player.rate` remains the authoritative live value.
 
 ## Documentation
 
@@ -177,12 +183,30 @@ The core package uses a comprehensive
 [Swift Testing](https://developer.apple.com/xcode/swift-testing/) suite
 against the real libVLC binary, so regressions in the C bridge surface
 immediately rather than hiding behind a fake. Showcase UI tests use
-XCTest separately. CI runs package tests, lint, doc coverage, and
-Showcase builds on pull requests and on `main`.
+XCTest separately. Every pull request to `main` runs lint and policy checks,
+the package suite with behavior/skip accounting, an iOS test-target compile,
+and an iOS Showcase build. The slower four-platform Showcase matrix, tvOS
+simulator run, and sanitizers run after merge or when manually requested;
+sanitizers also run weekly. Real playback and system-PiP acceptance stays in
+the local physical-device checklist instead of consuming hosted CI minutes.
 
 ```bash
 swift test
 ```
+
+Before a release candidate, connect a trusted, unlocked physical iPhone or iPad
+with Developer Mode enabled and run the human-facing device checklist:
+
+```bash
+./scripts/qualification/qualify.sh full --device "My iPhone" --require-stable
+```
+
+The approximately one-hour `full` profile reports broad functional confidence
+without pretending it ran the multi-hour endurance matrix. The `release`
+profile retains those real durations and must be run for each required device
+row before the stable release gate can pass. Neither command publishes a
+release. See [the device qualification guide](scripts/qualification/README.md)
+for profiles, evidence, and checklist status semantics.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md#testing-strategy) for test tags,
 fixtures, and structure.
@@ -218,6 +242,12 @@ brew install autoconf automake libtool cmake pkg-config gettext
 ```
 
 Expect a full `--all` build to take tens of minutes on Apple Silicon. The script clones VLC at a pinned commit into `scripts/.build-libvlc/`, applies the source patches below, builds every contrib (FFmpeg, dav1d, x264, libass, …) per slice, and assembles the result into `Vendor/libvlc.xcframework`.
+
+A clean all-platform build needs roughly 100 GiB of working space. The script
+checks the volume that contains the repository before compiling and fails early
+when it is too small. Keep the checkout on an external SSD when internal disk
+space is constrained: the VLC source, contrib trees, architecture builds, and
+assembled libraries all remain under `scripts/.build-libvlc/` on that volume.
 
 ### Platform selection
 
@@ -261,49 +291,31 @@ Releases advance `main`, but stable releases can only consume an immutable,
 previously prepared and device-qualified candidate. `setup-dev.sh` flips a
 working checkout back to local sources for day-to-day development.
 
-### Mandatory physical-device gate
-
-Before publishing a stable release, run the connected-device validator against
-the exact source and libVLC artifact that will ship:
-
-```bash
-./Validate\ SwiftVLC.command --yes
-```
-
-Run it from the candidate tag or checkout whose `Package.swift` pins the
-candidate artifact. The command verifies and downloads that immutable artifact,
-then builds, signs, installs, and exercises every matrix scenario that
-applies to the connected iPhone or iPad, then creates one shareable
-`SwiftVLC-Device-Report-*.zip`. No manual in-app checklist is required. A full
-current-iPhone run is intentionally comprehensive and can take 8–10 hours; keep
-the Mac and device powered, unlocked, and connected. Runs on simulators or beta
-and unknown OS builds remain exploratory and cannot satisfy the stable gate.
-
-One device normally covers only one hardware/OS row. Repeat the same command on
-each device required by `scripts/qualification/matrix.json`, retain the raw
-`report.json` from each run, assemble those reports, and run the fail-closed
-qualification check before publishing stable. See
-[scripts/qualification/README.md](scripts/qualification/README.md#release-operator-checklist)
-for the exact candidate-binding, report assembly, and release commands.
-
 ```bash
 ./scripts/build-libvlc.sh --all          # produces Vendor/libvlc.xcframework
 ./scripts/release.sh X.Y.Z --dry-run     # strip + zip + checksum, no push
 ./scripts/release.sh X.Y.Z --prepare /absolute/path/to/candidate
-./Validate\ SwiftVLC.command --yes        # from the candidate tag; repeat per device row
-python3 scripts/qualification/assemble-record.py --help
 ./scripts/check-qualification.sh X.Y.Z /absolute/path/to/candidate/libvlc.xcframework
 ./scripts/release.sh X.Y.Z --candidate /absolute/path/to/candidate
+# Optional beta: strict SemVer pre-releases are published as unqualified pre-releases.
+./scripts/release.sh X.Y.Z-beta.1
 ```
+
+Release mode comes from the validated SemVer tag. A version containing a
+pre-release component (for example `1.1.0-beta.1`) is always marked unqualified
+and published as a GitHub pre-release. A stable version cannot use
+`--unqualified`; it must consume a prepared candidate and pass the complete
+device and feature gates.
 
 What `release.sh` does:
 
 1. Verifies all eight platform slices are present in the xcframework.
 2. In `--prepare` mode, strips and zips once, then records complete-tree, zip,
-   and provenance digests in an immutable candidate directory.
-3. Requires the unattended physical-device matrix to qualify that complete
-   post-strip tree and its exact release-significant Swift source; a stable run
-   refuses to rebuild or mutate either identity.
+   provenance, qualification-matrix, and feature-policy digests in an immutable
+   candidate directory.
+3. Requires physical-device qualification to name that complete post-strip
+   tree and satisfy the versioned feature policy; a stable run refuses to
+   rebuild, mutate, or substitute the policy bound to the candidate.
 4. Verifies the prepared zip expands to the qualified XCFramework and that all
    candidate/provenance checksums still match.
 5. Rewrites `Package.swift` to the remote URL and checksum, pins the Showcase

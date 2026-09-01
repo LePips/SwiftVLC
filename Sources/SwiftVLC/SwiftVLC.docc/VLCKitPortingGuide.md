@@ -13,7 +13,7 @@ behaves differently and a mechanical translation would be wrong.
 
 | VLCKit idiom | SwiftVLC replacement |
 |---|---|
-| `player.position = x` (silently no-ops) | ``Player/seek(to:)-(PlaybackPosition)``, or lenient ``Player/seek(toPosition:fast:)`` |
+| `player.position = x` (silently no-ops) | ``Player/seek(to:fast:)-(PlaybackPosition,_)``, or lenient ``Player/seek(toPosition:fast:)`` |
 | `VLCMediaPlayerState.ended` | ``PlayerEvent/endReached-enum.case`` / ``Player/didReachEnd`` |
 | Mid-playback `setRendererItem:` | ``Player/recast(to:)`` |
 | `currentAudioTrackIndex = -1` | ``Player/selectedAudioTrack`` `= nil` |
@@ -32,8 +32,8 @@ non-seekable stream was a silent no-op, so player UIs scrubbed
 optimistically and let the engine ignore them.
 
 SwiftVLC's strict seeks refuse instead of pretending.
-``Player/seek(to:fast:)`` and
-``Player/seek(to:)-(PlaybackPosition)`` throw
+``Player/seek(to:fast:)-(Duration,_)`` and
+``Player/seek(to:fast:)-(PlaybackPosition,_)`` throw
 ``VLCError/invalidState(_:)`` when the current media is not seekable
 (and ``VLCError/invalidInput(_:)`` for out-of-range targets), so a
 seek that cannot happen is visible at the call site. Check
@@ -55,7 +55,9 @@ let accepted = player.seek(toPosition: PlaybackPosition(0.95))
 ```
 
 For delegate APIs that owe an asynchronous completion, dispatch acceptance is
-not enough. ``Player/requestJump(by:)`` returns a ``SeekRequest`` whose
+not enough. ``Player/requestSeek(to:fast:)-(Duration,_)``, its
+`PlaybackPosition` overload, ``Player/requestSeek(toPosition:fast:)``, and
+``Player/requestJump(by:)`` return a ``SeekRequest`` whose
 ``SeekRequest/outcome`` distinguishes native rejection, authoritative landing,
 bounded timeout, and supersession by a newer timeline command.
 

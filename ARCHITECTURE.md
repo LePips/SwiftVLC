@@ -411,6 +411,7 @@ libVLC's player event types are attached to the event manager and mapped to type
 |---|---|
 | **State** | `stateChanged(PlayerState)`, `mediaStopping`, `encounteredError` |
 | **Time** | `timeChanged(Duration)`, `positionChanged(Double)`, `lengthChanged(Duration)` |
+| **Playback control** | `rateChanged(Float)` (effective-state resolution; not request-correlated or measured throughput) |
 | **Capability** | `seekableChanged(Bool)`, `pausableChanged(Bool)` |
 | **Tracks** | `tracksChanged`, `mediaChanged` |
 | **Buffering** | `bufferingProgress(Float)` |
@@ -622,7 +623,7 @@ invalidate as a payload-free fallback. Seekability payloads also synchronize
 3. **Range policy.** Reports no-content, live/indefinite, and finite media distinctly, and invalidates from event payloads rather than stale observable mirrors.
 4. **State observation.** Distinguishes VLC-initiated state changes from pending PiP-initiated play/pause intent and keeps AVKit's linear-playback policy aligned with seekability.
 5. **Deferred pause.** Debounces transient AVKit pause signals so skips and PiP transitions do not issue an unsafe short-lived native pause.
-6. **Audio policy.** Configures the iOS playback category at construction but defers `setActive(true)` until PiP start or active playback intent. Direct and inactive native construction do not take audio focus; native adoption of an already-active Player activates before publishing backend ownership so automatic PiP cannot outrun session setup. A failed attempt remains retryable at observed native did-start.
+6. **Audio policy.** `VLCInstance.appleAudioSessionPolicy` is the immutable owner shared by Swift and native output. Library-managed PiP performs no construction-time audio mutation: each Player lazily acquires one opaque, exact-owner lease from the same process-wide native broker used by AudioUnit and AVSampleBufferAudioRenderer. The broker serializes category/mode configuration, activation, owner counting, reset epochs, and true-final-owner deactivation; native-handle replacement acquires the successor before releasing the predecessor. Native adoption of an already-active Player acquires before publishing backend ownership so automatic PiP cannot outrun session setup, while failed acquisition remains retryable at observed native did-start. One player-owned notification router delivers disruptions to at most one live PiP controller and supplies the route-loss/reset transport fallback when no controller exists. Application-managed instances receive a native no-op result and suppress every audio-session mutation while retaining the user-action boundary required after media-services reset.
 
 On macOS, the SPI native backend intentionally bypasses SwiftVLC's vmem
 renderer. It gives libVLC a normal `NSView` drawable and deliberately does
@@ -744,11 +745,19 @@ func playAndWaitForState() async throws {
 with Xcode `latest-stable` plus the Swift 6.3.1 open-source toolchain
 from swift.org, invoked via `xcrun --toolchain`. Showcase builds run on
 `macos-26` with Xcode 26.4 because Xcode's built-in SwiftPM must parse
-the Swift 6.3 manifest. The package test step is wrapped by
+the Swift 6.3 manifest. Pull requests compile the iOS test target and iOS
+Showcase; the full Showcase platform matrix and tvOS simulator run after merge
+or on a manual run. The package test step is wrapped by
 `scripts/ci-run-with-timeouts.py`, which enforces a 10-minute wall
 clock and a 3-minute idle watchdog and sends SIGKILL to the process
-group when either fires. Caches cover the libvlc xcframework, compiled
-build products, and SPM dependency checkouts.
+group when either fires. Its xUnit audit rejects anonymous or duplicate test
+identities, enforces the reviewed skip debt, and requires exact class identities
+and passing minima for the native seek, frame, renderer, recast, terminal, and
+teardown contracts; line coverage is informational rather than the behavioral
+oracle. Caches cover the libvlc xcframework, compiled build products, and SPM
+dependency checkouts. Real-output playback, system PiP,
+and long-duration acceptance remain candidate-bound physical-device gates; CI
+tests their fail-closed policy and parsers, not a simulated substitute.
 
 **Physical release qualification.** CI cannot exercise real system PiP,
 SpringBoard controls, device audio interruptions, native video output, or the
@@ -850,10 +859,10 @@ resolves to the new release rather than the preceding tag.
 
 | Workflow | Trigger | Purpose |
 |---|---|---|
-| `test.yml` | Push to `main` / PR | Lints sources, builds all Showcase schemes, runs package tests with coverage, and checks public API doc coverage. |
-| `sanitize.yml` | Push to `main`, selected PR paths, weekly schedule | Runs race, stress, memory, and lifecycle tests under Thread Sanitizer and Address Sanitizer. |
-| `fixtures.yml` | Push to `main` / selected PR paths | Builds the layered dynamic-host fixtures and verifies that applications load exactly one copy of libVLC. |
-| `vendor-manifest.yml` | Push to `main` / binary-manifest PR paths | Verifies every xcframework slice against its checked-in archive-member manifest. |
+| `test.yml` | Push to `main` / PR / manual | PRs run lint, policy, package behavior accounting, iOS test compilation, and the iOS Showcase. Post-merge/manual runs add the full Showcase matrix and tvOS simulator. |
+| `sanitize.yml` | Relevant push to `main` / manual / weekly schedule | Runs race, stress, memory, and lifecycle tests under Thread Sanitizer and Address Sanitizer outside the pull-request critical path. |
+| `fixtures.yml` | Packaging PR or push / manual | Builds the layered dynamic-host fixtures and verifies that applications load exactly one copy of libVLC when packaging topology can change. |
+| `vendor-manifest.yml` | Binary/manifest path change / manual | Verifies every xcframework slice against its checked-in archive-member manifest. |
 | `claude.yml` | Issue comment / PR mention | Claude Code bot integration. |
 
 ---
