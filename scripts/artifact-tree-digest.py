@@ -16,11 +16,17 @@ def update_field(digest: "hashlib._Hash", value: bytes) -> None:
 
 
 def tree_digest(root: Path) -> str:
+    try:
+        root = root.resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise SystemExit(f"Error: cannot resolve artifact directory {root}: {error}")
     if not root.is_dir():
         raise SystemExit(f"Error: artifact directory not found: {root}")
 
     digest = hashlib.sha256(b"SwiftVLC artifact tree digest v1\0")
-    entries = sorted(root.rglob("*"), key=lambda path: path.relative_to(root).as_posix())
+    entries = sorted(
+        root.rglob("*"), key=lambda path: path.relative_to(root).as_posix()
+    )
     if not entries:
         raise SystemExit(f"Error: artifact directory is empty: {root}")
 
@@ -41,7 +47,15 @@ def tree_digest(root: Path) -> str:
             payload = content.digest()
         elif stat.S_ISLNK(metadata.st_mode):
             kind = b"symlink"
-            payload = os.readlink(path).encode()
+            raw_target = os.readlink(path)
+            try:
+                resolved_target = path.resolve(strict=True)
+                resolved_target.relative_to(root)
+            except (OSError, RuntimeError, ValueError):
+                raise SystemExit(
+                    f"Error: artifact symlink target escapes the tree or is broken: {path}"
+                )
+            payload = os.fsencode(raw_target)
         else:
             raise SystemExit(f"Error: unsupported artifact entry type: {path}")
 

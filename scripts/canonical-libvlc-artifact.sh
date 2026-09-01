@@ -49,14 +49,41 @@ import sys
 from pathlib import Path
 
 path = Path(sys.argv[1])
+
+
+def unique_object(pairs):
+    output = {}
+    for key, value in pairs:
+        if key in output:
+            raise ValueError(f"duplicate JSON key: {key!r}")
+        output[key] = value
+    return output
+
+
+def reject_constant(value):
+    raise ValueError(f"non-finite JSON number: {value}")
+
+
 try:
-    value = json.loads(path.read_text())
+    value = json.loads(
+        path.read_text(),
+        object_pairs_hook=unique_object,
+        parse_constant=reject_constant,
+    )
 except (OSError, ValueError) as error:
     raise SystemExit(f"Error: cannot read provenance {path}: {error}")
 
-if value.get("schemaVersion") != 3:
-    raise SystemExit(f"Error: {path} is not libVLC provenance schema 3")
-epoch = value.get("build", {}).get("sourceDateEpoch")
+if not isinstance(value, dict):
+    raise SystemExit(f"Error: {path} is not a libVLC provenance object")
+if type(value.get("schemaVersion")) is not int or value["schemaVersion"] != 4:
+    raise SystemExit(f"Error: {path} is not libVLC provenance schema 4")
+revision = value.get("swiftVLCRevision")
+if not isinstance(revision, str) or re.fullmatch(r"[0-9a-f]{40}", revision) is None:
+    raise SystemExit(f"Error: {path} has an invalid SwiftVLC revision")
+build = value.get("build")
+if not isinstance(build, dict):
+    raise SystemExit(f"Error: {path} has an invalid build record")
+epoch = build.get("sourceDateEpoch")
 digest = value.get("xcframeworkTreeDigest")
 if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < 0:
     raise SystemExit(f"Error: {path} has an invalid sourceDateEpoch")

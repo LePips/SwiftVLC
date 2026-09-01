@@ -343,6 +343,37 @@ HELPEOF
     esac
 done
 
+# Record the exact SwiftVLC commit whose build logic and vendored headers are
+# producing this artifact. A short or symbolic revision would allow a stale
+# clean-build record to be paired with a later checkout after refs move.
+SWIFTVLC_REVISION=$(git -C "${REPO_ROOT}" rev-parse --verify 'HEAD^{commit}')
+if ! [[ "${SWIFTVLC_REVISION}" =~ ^[0-9a-f]{40}$ ]]; then
+    error "Could not resolve SwiftVLC HEAD to a full lowercase commit ID."
+fi
+info "SwiftVLC source provenance: ${SWIFTVLC_REVISION}"
+
+verify_clean_swiftvlc_checkout() {
+    local current_revision
+    local checkout_status
+    current_revision=$(git -C "${REPO_ROOT}" rev-parse --verify 'HEAD^{commit}')
+    if [ "${current_revision}" != "${SWIFTVLC_REVISION}" ]; then
+        error "SwiftVLC HEAD changed during the clean native build."
+    fi
+    checkout_status=$(git -C "${REPO_ROOT}" status --porcelain --untracked-files=all)
+    if [ -n "${checkout_status}" ]; then
+        error "A release-quality --clean-build requires a clean SwiftVLC checkout. Commit, ignore, or remove checkout changes first."
+    fi
+}
+
+# Incremental developer builds may come from an in-progress checkout, but only
+# --clean-build records can enter a reproducibility proof. Fail those builds
+# before compilation rather than attributing dirty tracked or untracked inputs
+# (including an untracked public header) to HEAD. Ignored build outputs do not
+# appear in this check.
+if [ "${CLEAN_BUILD}" = yes ]; then
+    verify_clean_swiftvlc_checkout
+fi
+
 # --- Run startup checks ---
 check_prerequisites
 info "Verifying native validator asset manifest..."
@@ -350,6 +381,15 @@ if ! python3 "${SCRIPT_DIR}/verify-native-validator-assets.py"; then
     error "Native validator asset manifest verification failed."
 fi
 check_disk_space
+
+# Any new native build invalidates the previous two-build evidence immediately.
+# Do this before source setup/compilation so an interrupted replacement cannot
+# leave an older A record or proof looking current beside the prior artifact.
+mkdir -p "${OUTPUT_DIR}"
+rm -f "${OUTPUT_DIR}/libvlc-provenance-a.json" \
+    "${OUTPUT_DIR}/libvlc-provenance.json" \
+    "${OUTPUT_DIR}/libvlc-reproducibility.json" \
+    "${OUTPUT_DIR}/libvlc-macho-metadata.json"
 
 # Normalize architecture name for directory naming
 # VLC's build.sh accepts "aarch64" but creates "arm64" directories internally
@@ -1677,7 +1717,8 @@ fi
 info "Creating libvlc.xcframework..."
 mkdir -p "${OUTPUT_DIR}"
 MACHO_METADATA_REPORT="${OUTPUT_DIR}/libvlc-macho-metadata.json"
-rm -f "${OUTPUT_DIR}/libvlc-provenance.json" \
+rm -f "${OUTPUT_DIR}/libvlc-provenance-a.json" \
+    "${OUTPUT_DIR}/libvlc-provenance.json" \
     "${OUTPUT_DIR}/libvlc-reproducibility.json" \
     "${MACHO_METADATA_REPORT}"
 rm -rf "${OUTPUT_DIR}/libvlc.xcframework"
@@ -1898,12 +1939,18 @@ info "Verified every Mach-O object; report: ${MACHO_METADATA_REPORT}"
 # gate passes. The artifact is also stripped above, before hashing, so the two-
 # clean-build proof covers the exact tree release.sh packages; no post-proof
 # rebind is permitted.
+if [ "${CLEAN_BUILD}" = yes ]; then
+    # Recheck after compilation so a checkout edit or branch move during the
+    # long build cannot be attributed to the revision captured at startup.
+    verify_clean_swiftvlc_checkout
+fi
 PROVENANCE_FILE="${OUTPUT_DIR}/libvlc-provenance.json"
 provenance_args=(
     python3 "${SCRIPT_DIR}/libvlc-provenance.py" create
     --xcframework "${OUTPUT_DIR}/libvlc.xcframework"
     --output "${PROVENANCE_FILE}"
     --vlc-source "${VLC_SRC}"
+    --swiftvlc-revision "${SWIFTVLC_REVISION}"
     --source-revision "${SOURCE_SHA}"
     --pinned-revision "${VLC_HASH}"
     --source-date-epoch "${SOURCE_DATE_EPOCH}"

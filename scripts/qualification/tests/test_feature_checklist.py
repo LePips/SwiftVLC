@@ -242,12 +242,14 @@ class FeatureChecklistTests(unittest.TestCase):
                 "id": "apple-assembly-metadata-contract",
                 "title": "Apple assembly tool and Mach-O metadata contract",
                 "description": (
-                    "Patch 0038 pins and selects the exact bundled NASM, stamps "
-                    "every supported Apple NASM-produced Mach-O object with "
-                    "explicit build-version metadata, bounds libgcrypt text "
-                    "alignment, and rejects stale tools, hidden options, "
-                    "malformed platform inputs, and adversarial source mutations "
-                    "before a native build begins."
+                    "Patch 0038 pins and selects the exact bundled NASM, carries "
+                    "its four fail-closed metadata inputs through scrubbed Meson "
+                    "setup and inherited compile boundaries, stamps every "
+                    "supported Apple NASM-produced Mach-O object with explicit "
+                    "build-version metadata, bounds libgcrypt text alignment, "
+                    "and rejects stale tools, hidden options, malformed platform "
+                    "inputs, and adversarial source mutations before a native "
+                    "build begins."
                 ),
                 "command": (
                     "./scripts/validate-apple-assembly-metadata-patch.sh "

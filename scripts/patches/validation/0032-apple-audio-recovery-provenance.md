@@ -109,9 +109,9 @@
 Validation asset pins for the composed version/archive proof are:
 
 - `audio-media-services-reset-source-check.py`:
-  `790cdcda875ea0d63afe4feabb7842059c4a83302123556b50ace549e9c74365`
+  `77916bf3a651eb9d0e75d78a607e1b0cdb48a115252e18abf10518cc29e6e195`
 - `validate-audio-media-services-reset.sh`:
-  `410817cf391d1f0ce726b02eb29a2e5cdf78996521e1b4c3955f138f02df1622`
+  `447bcf96fd203d4253140a8cf5fca79fb71758d9f031f7ac67d6c32882835b58`
 - `pip_extension_version.py`:
   `98adb898d64ed8c8a57bbc883bf10dd96eeb399a2f7671c1d2fceb262fad63b5`
 - `native-extension-version-probe.c`:
@@ -119,11 +119,15 @@ Validation asset pins for the composed version/archive proof are:
 - `validate-native-extension-contract.sh`:
   `90b7fb271c616ceb2211b8d98937da8fb67af34d017c19214e1da68942389ce0`
 
-The source validator performs structural checks, one deliberate negative
-mutation per gate, ABI parity checks, bounded-exhaustive two-owner/two-output
-state exploration, and long deterministic retry/reset sequences. The shell
-wrapper adds exact ARC-enabled Apple Objective-C/C syntax against a configured
-slice. `build-libvlc.sh` runs the portable proof before architecture
+The source validator performs exactly 130 structural checks with one deliberate
+negative mutation per gate, ABI parity checks, bounded-exhaustive
+two-owner/two-output state exploration, and long deterministic retry/reset
+sequences. ARC is independently bound through the Automake target, the Meson
+flag, and the Meson target's `objc_args`. A comment- and literal-aware token
+scan rejects independently mutated `release`, `retain`, `autorelease`, and
+`[super dealloc]` messages regardless of whitespace or comment placement. The
+shell wrapper adds exact ARC-enabled Apple Objective-C/C syntax against a
+configured slice. `build-libvlc.sh` runs the portable proof before architecture
 compilation and repeats it with configured Apple syntax as a postflight; it
 does not replace the physical oracle.
 

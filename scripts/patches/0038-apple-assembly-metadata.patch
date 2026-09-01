@@ -30,6 +30,29 @@ index dabb62e05e..b91d78d903 100644
  
  	# don't use getpid in UWP as it's not actually available
  	$(APPLY) $(SRC)/gcrypt/gcrypt-uwp-getpid.patch
+diff --git a/contrib/src/main.mak b/contrib/src/main.mak
+index a4f6b6f573..ec59f033b6 100644
+--- a/contrib/src/main.mak
++++ b/contrib/src/main.mak
+@@ -553,13 +553,17 @@ ifdef HAVE_CROSS_COMPILE
+ # build machine compiler and not like most other
+ # buildsystems for the host compilation. Therefore
+ # we clear the enviornment variables using the env
+-# command, except PATH, which is needed.
++# command, except PATH and the fail-closed Apple NASM wrapper inputs.
+ # The values of the mentioned relevant env variables
+ # are passed for the host compilation using the
+ # generated crossfile, so everything should work as
+ # expected.
+ MESONFLAGS += --cross-file $(abspath crossfile.meson)
+ MESON = env -i PATH="$(PATH)" \
++	VLC_APPLE_NASM_REAL="$(VLC_APPLE_NASM_REAL)" \
++	VLC_APPLE_NASM_PLATFORM="$(VLC_APPLE_NASM_PLATFORM)" \
++	VLC_APPLE_NASM_MIN_OS_VERSION="$(VLC_APPLE_NASM_MIN_OS_VERSION)" \
++	VLC_APPLE_NASM_SDK_VERSION="$(VLC_APPLE_NASM_SDK_VERSION)" \
+ 	meson setup -Dpkg_config_path="$(PKG_CONFIG_PATH)" \
+ 	$(MESONFLAGS)
+ 
 diff --git a/extras/package/apple/build.sh b/extras/package/apple/build.sh
 index 7a9b311ce7..5c73e27067 100755
 --- a/extras/package/apple/build.sh

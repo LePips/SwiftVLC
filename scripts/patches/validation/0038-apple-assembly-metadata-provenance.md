@@ -1,7 +1,8 @@
 # Patch 0038: Apple assembly metadata provenance
 
-Status: source-complete candidate, audited 2026-09-01. No native libVLC
-rebuild is claimed by this record.
+Status: source-complete candidate, audited 2026-09-01. No complete native
+libVLC rebuild is claimed by this record; the targeted x86_64 diagnostic below
+is proof of the corrective path only.
 
 ## Identity and authoring base
 
@@ -10,21 +11,18 @@ rebuild is claimed by this record.
 - Authoring base: a fresh replay of the frozen SwiftVLC patch manifest through
   `0036-chromecast-metadata-schema-correctness.patch`. Patch 0037 was not in
   the frozen manifest when 0038 was authored, so it was not used as the base.
-- Final compatibility replay: frozen patch 0037 at SHA-256
+- Corrective compatibility replay: frozen patch 0037 at SHA-256
   `dd3c672da9b7a6fcd82e6eadd298d1c5f86ce75e55d86800de8fd83683461105`
   appears immediately before 0038 in the hash-verified manifest. A fresh
   checkout of the upstream revision accepted all 38 manifest patches in order.
-  The final 0037, post-pin linked/native, and 0038 standalone validators passed
-  there. Actual reverse applications of 0038 and 0037 reproduced the exact
-  validated 0036 predecessor; forward applications restored the validated
-  final tree. The retained replay is
-  `<external-build-root>/Tmp/swiftvlc-0037-final-replay.E144jx/vlc`, with its
-  log at
-  `<external-build-root>/Logs/native-build-a/final-validator-chain-replay.log`.
+  The final 0037, post-pin linked/native, and revised 0038 standalone
+  validators passed there. Actual reverse applications of 0038 and 0037
+  reproduced the validated predecessors; forward applications restored the
+  validated final tree.
 - Patch SHA-256:
-  `402b7ca09aab50fe89391ea22b8b96113b899bce3028406a3293d574eb706beb`.
+  `5f1a58d162c798b2d6f5c2a2fdac9f728279f195ef192405b80272bc2f164c59`.
 - Source checker SHA-256:
-  `86654c8d394f63a8c342ed70286d01bf7fd72c83df45af60e5b456dabfe5341a`.
+  `65b077ed399f44bee2616fb613511c422c97c88245fb82d2384ff4430ad45099`.
 - Installed NASM wrapper SHA-256:
   `531c0d99e01e0c6e04af9d28c6a04121264d240242ae9d5905f014243eb33282`.
 - Nested libgcrypt patch SHA-256:
@@ -57,6 +55,16 @@ to infer a platform would preserve the underlying ambiguity.
 
 The 995 violations above are diagnostic evidence, not an expected-pass
 baseline. A newly built release artifact must have zero violations.
+
+The first clean all-platform build of the source-complete candidate exposed a
+second causal defect after both arm64 iOS slices succeeded. VLC's cross-build
+`MESON` command deliberately runs `env -i PATH=...`; that removed the four
+exported inputs needed by the fail-closed NASM wrapper. Dav1d's x86_64
+configure therefore found the wrapper but its `nasm -v` probe failed because
+`VLC_APPLE_NASM_REAL` was absent. The corrective 0038 hunk forwards only the
+real-binary path, platform, minimum OS, and SDK through that scrubbed setup
+boundary. It does not forward `NASMENV`, compiler flags, `HOME`, or other host
+state.
 
 ## NASM 3.02 provenance
 
@@ -109,7 +117,12 @@ official `NASM_URL`; the exact SHA-512 is checked in either case.
    there is no host-NASM fallback. The wrapper is then placed first in the
    inherited path. Moving the tools binary is intentional because
    `contrib/src/main.mak` prepends the tools bin directory again.
-5. The libgcrypt 1.10.1 source patch emits Darwin `.p2align 4` (16 bytes) at
+5. `contrib/src/main.mak` preserves the setup-time `env -i` boundary while
+   explicitly forwarding the four fail-closed wrapper inputs. Normal GNU make
+   environment inheritance carries the same exported values into Meson/Ninja
+   compile and install recipes. The source checker executes both paths and
+   proves that unrelated host/compiler variables remain scrubbed from setup.
+6. The libgcrypt 1.10.1 source patch emits Darwin `.p2align 4` (16 bytes) at
    the AESNI site and retains `.align 16` on non-Apple assemblers. Its
    `rules.mak` insertion applies exactly once before `$(MOVE)`.
 
@@ -119,16 +132,29 @@ fails closed rather than being stamped as the wrong platform.
 
 ## Executed evidence
 
-- The source checker passed seven exact upstream paths, 13 deliberate source
-  or patch mutations, 30 executable wrapper cases, and eight executable
-  wrapper-installation cases. The installation cases prove that exact 3.02
+- The source checker passed eight exact upstream paths, 19 deliberate source
+  or patch mutations, 30 executable wrapper cases, eight executable
+  wrapper-installation cases, and three cross-Meson setup/compile/install
+  environment cases. The installation cases prove that exact 3.02
   tools and preserved binaries are accepted while stale 2.14, newer 3.03,
   look-alike 3.020, missing, and non-executable binaries fail closed even when
   an acceptable host NASM is available. The wrapper cases cover all
   five accepted `-f`/`--format` spellings, last-option-wins behavior,
   pass-through formats, all eight platforms, normalized two/three-component
   versions, field overflows, missing/invalid values, hidden `NASMENV` options,
-  both response-file spellings, duplicate metadata, and recursion.
+  both response-file spellings, duplicate metadata, and recursion. The Meson
+  cases independently mutate each required variable and both environment
+  boundaries, poison unrelated environment keys, and prove the exact intended
+  scrub/inheritance behavior.
+- The original clean build failed at dav1d's x86_64 iOS Simulator NASM version
+  probe. After applying only the corrective `contrib/src/main.mak` hunk to that
+  retained failed tree, the exact setup command visibly carried all four
+  values, dav1d configured and built, and its `mc_sse.obj` contained one
+  `LC_BUILD_VERSION` with platform 7, minimum OS 18.0, and SDK 26.5. Repeating
+  the retained slice with the official wrapper's `dup3`/`pipe2` cache overrides
+  then completed VLC compilation, static module/contrib linking, and the final
+  x86_64 archive with `Build succeeded!`. This targeted resume proves the
+  causal fix but is not clean-build release evidence.
 - The official NASM 3.02 binary was invoked through the patched wrapper to
   assemble a real x86_64 Mach-O object for each of the eight platform names.
   Every object contained exactly one `LC_BUILD_VERSION`, platform IDs
@@ -142,15 +168,21 @@ fails closed rather than being stamped as the wrong platform.
   applied all 38 patches in order. Final 0037 passed its complete source proof
   (33 inherited 0034 mutations, inherited 0035/0036 source and patch suites,
   44 new source mutations, and three patch mutations) and all three native
-  probes. Patch 0038 then passed 13 source/patch mutations, 30 wrapper cases,
-  and eight installer cases.
+  probes. Patch 0038 then passed 19 source/patch mutations, 30 wrapper cases,
+  eight installer cases, and three cross-Meson environment cases.
 - The final replay passed `git apply --reverse --check`; 0038 and 0037 were
-  actually reversed, reproducing the 0001–0036 full-index binary diff SHA-256
-  `f1e37e25607ae8f174ae3d2ddcc041579eca6b034f7ab139fc8337cf1a2469c9`.
+  actually reversed. Reversing 0038 reproduced the 0001–0037 full-index binary
+  diff SHA-256
+  `4b2420a72eaeb0e5d790e1f945ccdfff6dd3463b98082f7bc51a377bd42f10dd`;
+  reversing 0037 then reproduced the 0001–0036 full-index binary diff SHA-256
+  `0f081b4cf8888bf4b4afed5cda7a7e052775e6671540f059b16b8364691baf21`.
+  Both predecessor trees changed 98 upstream paths. A second fresh checkout
+  replaying exactly 0001–0036 independently reproduced the latter identity;
+  the older `f1e37e…` record used the pre-ARC patch 0032 and is historical.
   The complete 0036 validator and the post-pin legacy linked/native branch
   passed there. Forward checks and actual reapplications restored the final
   full-index binary diff SHA-256
-  `429913eaf702b91acbe1c794dfa88dbd1a350fe225937243cd92e09d1da716ae`.
+  `ef189d468e0ed175050d471888fd5e6093f7200a48764c90791eb2d3b96c27fb`.
   Complete 0037, post-pin final linked/native, and 0038 validators then passed
   again, followed by a final reverse check and `git diff --check`.
 

@@ -239,7 +239,7 @@ Environment recorded for the final isolated pass:
 - 'git diff --check': PASS;
 - native/source standalone validator: PASS.
 
-## Fresh replay and reversibility evidence
+## Historical replay and reversibility evidence
 
 On 2026-09-01, a fresh detached checkout of
 'c833c4be000b426d73ff4324bec574065f00e3df' at
@@ -248,10 +248,18 @@ replayed all 38 patches from the hash-verified manifest. Every patch passed
 both the forward preflight and the immediate reverse preflight. The cumulative
 0001–0036 full-index binary-diff SHA-256 was
 'f1e37e25607ae8f174ae3d2ddcc041579eca6b034f7ab139fc8337cf1a2469c9';
-the final 0001–0038 full-index binary-diff SHA-256 was
+the then-current 0001–0038 full-index binary-diff SHA-256 was
 '429913eaf702b91acbe1c794dfa88dbd1a350fe225937243cd92e09d1da716ae'.
 The replay changed 90 pinned-source paths and 'git diff --check' passed at the
 0036 boundary, at the final tree, after reversal, and after reapplication.
+
+That replay used the then-current patch 0032 at SHA-256
+'3b402d434287d2e64b0169f9a7917b6d4648151374eff85b2ee149c6a964841b'.
+The current manifest instead contains the ARC-corrected patch 0032 at SHA-256
+'299dcf69856805872e803c44e84826d95c39e4eea5876bf1cc0d01de3f99b8c4'.
+Consequently, the cumulative hashes and path count in this historical
+subsection are not identities for the current manifest. The corrective replay
+below supersedes them for release qualification.
 
 Inherited gates ran at their exact replay boundaries:
 
@@ -279,6 +287,33 @@ during this proof.
 
 These results are deterministic source/protocol evidence. They must not be
 interpreted as physical receiver evidence.
+
+### Corrective 0038 compatibility replay
+
+Later on 2026-09-01, the first clean all-platform native build exposed that
+0038's NASM wrapper inputs were removed by `contrib/src/main.mak`'s cross-Meson
+`env -i` boundary. Revised patch 0038 at SHA-256
+`5f1a58d162c798b2d6f5c2a2fdac9f728279f195ef192405b80272bc2f164c59`
+adds only that missing environment bridge. A new detached replay of all 38
+hash-verified patches changed 105 upstream paths and passed `git diff --check`,
+the complete 0037 validator, post-pin linked/native proofs, and the revised
+0038 validator. Reversing 0038 reproduced the 0001–0037 full-index binary-diff
+SHA-256
+`4b2420a72eaeb0e5d790e1f945ccdfff6dd3463b98082f7bc51a377bd42f10dd`;
+that tree changed 98 upstream paths. Reversing 0037 then reproduced the
+current 0001–0036 full-index binary-diff SHA-256
+`0f081b4cf8888bf4b4afed5cda7a7e052775e6671540f059b16b8364691baf21`,
+also across 98 paths. A second fresh checkout replaying exactly 0001–0036
+independently reproduced that identity. Forward
+reapplication restored the corrective 0001–0038 full-index binary-diff
+SHA-256
+`ef189d468e0ed175050d471888fd5e6093f7200a48764c90791eb2d3b96c27fb`.
+The transient replay root was
+`<external-build-root>/Tmp/corrective-0038-replay.FWNAG4`; its complete log is
+retained at
+`<external-build-root>/Logs/native-build-a/corrective-0038-replay.log`.
+This addendum supersedes the historical cumulative identities and path count;
+patch 0037 and its source/protocol claims are unchanged.
 
 ## Build and release integration
 

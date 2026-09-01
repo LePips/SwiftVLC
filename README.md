@@ -262,6 +262,63 @@ assembled libraries all remain under `scripts/.build-libvlc/` on that volume.
 
 > `*-only` flags **replace** the xcframework; any slices already in `Vendor/` are lost.
 
+### Two-clean-build reproducibility proof
+
+A release needs two complete `--clean-build --all` invocations from the same
+committed SwiftVLC revision, on the same unchanged host toolchain and with the
+same `MAKEFLAGS`. Use separate checkouts on the external SSD: each build keeps
+its VLC source under that checkout, and a second build in the first checkout
+would replace both `Vendor/libvlc.xcframework` and its provenance.
+
+After build A completes, preserve and validate its actual artifact rather than
+copying only its JSON record:
+
+```bash
+mkdir -p /absolute/path/to/repro/run-a
+./scripts/canonical-libvlc-artifact.sh stage \
+  Vendor/libvlc.xcframework \
+  /absolute/path/to/repro/run-a/libvlc.xcframework \
+  Vendor/libvlc-provenance.json
+cp Vendor/libvlc-provenance.json \
+  /absolute/path/to/repro/run-a/libvlc-provenance.json
+```
+
+Run build B in a different clean checkout at the same commit. From build B's
+checkout, compare both retained artifacts and records, then retain A's record
+beside B's selected artifact:
+
+```bash
+python3 scripts/libvlc-provenance.py compare \
+  --first-provenance /absolute/path/to/repro/run-a/libvlc-provenance.json \
+  --first-xcframework /absolute/path/to/repro/run-a/libvlc.xcframework \
+  --second-provenance Vendor/libvlc-provenance.json \
+  --second-xcframework Vendor/libvlc.xcframework \
+  --output Vendor/libvlc-reproducibility.json
+
+cp /absolute/path/to/repro/run-a/libvlc-provenance.json \
+  Vendor/libvlc-provenance-a.json
+
+python3 scripts/libvlc-provenance.py verify-proof \
+  --proof Vendor/libvlc-reproducibility.json \
+  --first-provenance Vendor/libvlc-provenance-a.json \
+  --second-provenance Vendor/libvlc-provenance.json \
+  --current-provenance Vendor/libvlc-provenance.json \
+  --xcframework Vendor/libvlc.xcframework
+```
+
+The comparison hashes both full provenance records, verifies each actual
+XCFramework against its record, and requires the same full 40-character
+SwiftVLC commit plus ordered, distinct clean-build UUIDs and UTC completion
+timestamps. Starting any new native build removes the retained A record and old
+proof, so evidence from a previous commit cannot silently survive beside a new
+artifact. The prepared candidate and GitHub release retain both records plus the
+proof. This closes accidental reuse and the former "copy JSON, edit UUID"
+shortcut. It is still local operator evidence, not a cryptographic attestation
+that two commands physically executed: someone able to fabricate all artifacts
+and records on the release Mac can fabricate the local evidence too. Preserve
+both build logs, or use independently attested builders when that stronger
+supply-chain claim is required.
+
 ### Build adjustments and source patches
 
 VLC master requires several build adjustments for SwiftVLC's supported Apple
@@ -292,7 +349,7 @@ previously prepared and device-qualified candidate. `setup-dev.sh` flips a
 working checkout back to local sources for day-to-day development.
 
 ```bash
-./scripts/build-libvlc.sh --all          # produces Vendor/libvlc.xcframework
+./scripts/build-libvlc.sh --clean-build --all  # run twice; retain proof above
 ./scripts/release.sh X.Y.Z --dry-run     # strip + zip + checksum, no push
 ./scripts/release.sh X.Y.Z --prepare /absolute/path/to/candidate
 ./scripts/check-qualification.sh X.Y.Z /absolute/path/to/candidate/libvlc.xcframework
@@ -311,8 +368,9 @@ What `release.sh` does:
 
 1. Verifies all eight platform slices are present in the xcframework.
 2. In `--prepare` mode, strips and zips once, then records complete-tree, zip,
-   provenance, qualification-matrix, and feature-policy digests in an immutable
-   candidate directory.
+   both clean-build provenance records, reproducibility-proof,
+   qualification-matrix, and feature-policy digests in an immutable candidate
+   directory.
 3. Requires physical-device qualification to name that complete post-strip
    tree and satisfy the versioned feature policy; a stable run refuses to
    rebuild, mutate, or substitute the policy bound to the candidate.
@@ -320,7 +378,8 @@ What `release.sh` does:
    candidate/provenance checksums still match.
 5. Rewrites `Package.swift` to the remote URL and checksum, pins the Showcase
    app to exact version `X.Y.Z`, commits, and tags the result.
-6. Uploads the zip, provenance, and candidate manifest to a draft release.
+6. Uploads the zip, both provenance records, reproducibility proof, and candidate
+   manifest to a draft release.
 7. Advances `origin/main`; only after that succeeds does it publish the draft.
 
 Candidate preparation and publishing refuse non-`main` branches, any dirty

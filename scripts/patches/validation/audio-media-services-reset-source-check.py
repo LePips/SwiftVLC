@@ -23,6 +23,9 @@ class ProofFailure(AssertionError):
     pass
 
 
+EXPECTED_STRUCTURAL_GATE_COUNT = 130
+
+
 def compact(value: str) -> str:
     return " ".join(value.split())
 
@@ -39,6 +42,208 @@ def forbid(value: str, *needles: str) -> None:
     for needle in map(compact, needles):
         if needle in haystack:
             raise ProofFailure(f"forbidden invariant: {needle}")
+
+
+def objective_c_tokens(source: str) -> list[tuple[str, int]]:
+    """Lex the Objective-C tokens needed by the ARC ownership proof.
+
+    Comments and quoted literals are discarded before selector inspection.
+    This deliberately stays smaller than a compiler lexer, but it observes C's
+    line-splicing rule inside // comments and strings so dead text cannot look
+    like a live ownership message (or hide one by changing whitespace).
+    """
+    tokens: list[tuple[str, int]] = []
+    index = 0
+    line = 1
+    length = len(source)
+
+    while index < length:
+        character = source[index]
+        if character == "\\" and index + 1 < length \
+                and source[index + 1] == "\n":
+            line += 1
+            index += 2
+            continue
+        if character.isspace():
+            if character == "\n":
+                line += 1
+            index += 1
+            continue
+
+        if source.startswith("//", index):
+            index += 2
+            while index < length:
+                if source[index] == "\\" and index + 1 < length \
+                        and source[index + 1] == "\n":
+                    line += 1
+                    index += 2
+                    continue
+                if source[index] == "\n":
+                    break
+                index += 1
+            continue
+
+        if source.startswith("/*", index):
+            comment_line = line
+            closing = source.find("*/", index + 2)
+            if closing < 0:
+                raise ProofFailure(
+                    f"unterminated Objective-C block comment at line {comment_line}"
+                )
+            line += source.count("\n", index, closing + 2)
+            index = closing + 2
+            continue
+
+        if character in ('"', "'"):
+            quote = character
+            literal_line = line
+            index += 1
+            while index < length:
+                character = source[index]
+                if character == "\\":
+                    if index + 1 >= length:
+                        raise ProofFailure(
+                            f"unterminated Objective-C literal at line {literal_line}"
+                        )
+                    if source[index + 1] == "\n":
+                        line += 1
+                    index += 2
+                    continue
+                if character == quote:
+                    index += 1
+                    break
+                if character == "\n":
+                    line += 1
+                index += 1
+            else:
+                raise ProofFailure(
+                    f"unterminated Objective-C literal at line {literal_line}"
+                )
+            tokens.append(("<literal>", literal_line))
+            continue
+
+        if character.isalpha() or character == "_":
+            start = index
+            token_line = line
+            identifier: list[str] = []
+            while index < length:
+                if source[index].isalnum() or source[index] == "_":
+                    identifier.append(source[index])
+                    index += 1
+                    continue
+                if source[index] == "\\" and index + 1 < length \
+                        and source[index + 1] == "\n":
+                    line += 1
+                    index += 2
+                    continue
+                break
+            if not identifier:
+                raise ProofFailure(
+                    f"empty Objective-C identifier at source offset {start}"
+                )
+            tokens.append(("".join(identifier), token_line))
+            continue
+
+        if source.startswith("->", index):
+            tokens.append(("->", line))
+            index += 2
+            continue
+
+        tokens.append((character, line))
+        index += 1
+
+    return tokens
+
+
+@dataclass
+class ObjectiveCBracketFrame:
+    tokens: list[tuple[str, int]]
+    parentheses: int = 0
+    braces: int = 0
+    array_literal: bool = False
+
+
+def forbidden_arc_ownership_messages(source: str) -> list[tuple[str, int]]:
+    """Return live zero-argument ownership messages forbidden under ARC."""
+    frames: list[ObjectiveCBracketFrame] = []
+    violations: list[tuple[str, int]] = []
+    previous = ""
+
+    for token, line in objective_c_tokens(source):
+        if token == "[":
+            frames.append(ObjectiveCBracketFrame(
+                tokens=[], array_literal=previous == "@"
+            ))
+            previous = token
+            continue
+
+        if token == "]" and frames:
+            frame = frames.pop()
+            top_level = frame.tokens
+            if not frame.array_literal and len(top_level) >= 2:
+                selector, selector_line = top_level[-1]
+                preceding = top_level[-2][0]
+                if selector in {"release", "retain", "autorelease"} \
+                        and preceding not in {":", ".", "->"}:
+                    violations.append((selector, selector_line))
+                elif selector == "dealloc" and preceding == "super":
+                    violations.append(("super dealloc", selector_line))
+            if frames:
+                parent = frames[-1]
+                if parent.parentheses == 0 and parent.braces == 0:
+                    parent.tokens.append(("<bracket-expression>", line))
+            previous = token
+            continue
+
+        if not frames:
+            previous = token
+            continue
+
+        frame = frames[-1]
+        if token == "(":
+            if frame.parentheses == 0 and frame.braces == 0:
+                frame.tokens.append(("<parenthesized-expression>", line))
+            frame.parentheses += 1
+        elif token == ")" and frame.parentheses:
+            frame.parentheses -= 1
+        elif token == "{":
+            if frame.parentheses == 0 and frame.braces == 0:
+                frame.tokens.append(("<braced-expression>", line))
+            frame.braces += 1
+        elif token == "}" and frame.braces:
+            frame.braces -= 1
+        elif frame.parentheses == 0 and frame.braces == 0:
+            frame.tokens.append((token, line))
+        previous = token
+
+    return violations
+
+
+def validate_arc_ownership_lexer() -> None:
+    harmless = r'''
+        const char *documentation = "[value release]";
+        // [value retain] \
+           [value autorelease]
+        /* [super dealloc] */
+        SEL selector = @selector(release);
+        id indexed = values[release];
+        id literal = @[@"[value retain]"];
+    '''
+    if forbidden_arc_ownership_messages(harmless):
+        raise ProofFailure("ARC ownership lexer treated dead text as a message")
+
+    cases = {
+        "release": "[value release /* trailing comment */];",
+        "retain": "[value /* selector gap */ retain];",
+        "autorelease": "[value autore" + "\\" + "\nlease];",
+        "super dealloc": "[super /* selector gap */ dealloc];",
+    }
+    for expected, source in cases.items():
+        actual = [name for name, _ in forbidden_arc_ownership_messages(source)]
+        if actual != [expected]:
+            raise ProofFailure(
+                f"ARC ownership lexer missed {expected}: found {actual}"
+            )
 
 
 def block_span(source: str, marker: str) -> tuple[int, int]:
@@ -202,21 +407,38 @@ def build_gates() -> list[Gate]:
         must=("libvlccore_objc_la_SOURCES =",
               "darwin/apple_audio_session.m")))
     add(source_gate(
-        "broker.meson_target_uses_arc", "src_meson",
+        "broker.meson_arc_flag_defined", "src_meson",
         "vlccore_objcargs += '-fobjc-arc'",
-        must=("'darwin/apple_audio_session.m'",)))
+        must=("vlccore_objcargs = []",
+              "'darwin/apple_audio_session.m'",)))
+    add(source_gate(
+        "broker.meson_target_consumes_arc_args", "src_meson",
+        "objc_args: vlccore_objcargs,",
+        must=("libvlccore = library(",
+              "'darwin/apple_audio_session.m'",)))
 
     def broker_uses_arc_ownership(sources: Mapping[str, str]) -> None:
-        forbid(sources["broker"], " release]", " retain]", " autorelease]",
-               "[super dealloc]")
+        violations = forbidden_arc_ownership_messages(sources["broker"])
+        if violations:
+            details = ", ".join(
+                f"[{selector}] at line {line}" for selector, line in violations
+            )
+            raise ProofFailure(f"manual ownership under ARC: {details}")
 
     copied_audio_units = (
         "NSArray<NSValue *> *audioUnits = [_orphanedAudioUnits copy];"
     )
-    add(custom_gate(
-        "broker.arc_forbids_manual_object_ownership",
-        broker_uses_arc_ownership, "broker", "drainOrphansOnEventQueue",
-        copied_audio_units, copied_audio_units + "\n    [audioUnits release];"))
+    ownership_mutations = (
+        ("release", "[audioUnits release /* trailing comment */];"),
+        ("retain", "[audioUnits /* selector gap */ retain];"),
+        ("autorelease", "[\n        audioUnits\n        autorelease\n    ];"),
+        ("super_dealloc", "[super /* selector gap */ dealloc];"),
+    )
+    for name, statement in ownership_mutations:
+        add(custom_gate(
+            f"broker.arc_forbids_manual_{name}",
+            broker_uses_arc_ownership, "broker", "drainOrphansOnEventQueue",
+            copied_audio_units, copied_audio_units + f"\n    {statement}"))
 
     add(source_gate(
         "broker.initial_epoch_nonzero", "broker",
@@ -1377,6 +1599,12 @@ def main(argv: list[str]) -> int:
     try:
         sources = read_sources(vlc_root, repository_root)
         gates = build_gates()
+        if len(gates) != EXPECTED_STRUCTURAL_GATE_COUNT:
+            raise ProofFailure(
+                "structural gate inventory drifted: "
+                f"{len(gates)} != {EXPECTED_STRUCTURAL_GATE_COUNT}"
+            )
+        validate_arc_ownership_lexer()
         validate_abi_model()
         validate_all(gates, sources)
         mutations = run_negative_mutations(gates, sources)

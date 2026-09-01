@@ -154,6 +154,66 @@ printf 'changed header' > "$temp_dir/tree-b/Headers/libvlc.h"
 digest_b=$("$SCRIPT_DIR/artifact-tree-digest.py" "$temp_dir/tree-b")
 [[ "$digest_a" != "$digest_b" ]] || fail "header changes do not affect the digest"
 
+# Both digest implementations must preserve valid internal symlinks while
+# refusing links whose bytes are hashed but whose effective content lives
+# outside the artifact (or does not exist at all).
+python3 - \
+  "$SCRIPT_DIR/artifact-tree-digest.py" \
+  "$SCRIPT_DIR/libvlc-provenance.py" \
+  "$temp_dir" <<'PY'
+import importlib.util
+import os
+import sys
+from pathlib import Path
+
+
+def load_module(name, path):
+    specification = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(specification)
+    specification.loader.exec_module(module)
+    return module
+
+
+standalone = load_module("swiftvlc_artifact_digest", sys.argv[1])
+provenance = load_module("swiftvlc_provenance", sys.argv[2])
+root = Path(sys.argv[3]) / "symlink-confinement"
+outside = root.parent / "symlink-outside.h"
+outside.write_text("outside\n")
+
+valid = root / "valid"
+valid.mkdir(parents=True)
+(valid / "target.h").write_text("inside\n")
+(valid / "current.h").symlink_to("target.h")
+valid_digests = [
+    implementation.tree_digest(valid)
+    for implementation in (standalone, provenance)
+]
+if valid_digests[0] != valid_digests[1]:
+    raise SystemExit("tree-digest implementations disagree on an internal symlink")
+
+fixtures = {
+    "absolute-escape": str(outside),
+    "relative-escape": os.path.relpath(outside, root / "relative-escape"),
+    "broken": "missing-target.h",
+}
+for name, target in fixtures.items():
+    fixture = root / name
+    fixture.mkdir()
+    (fixture / "link.h").symlink_to(target)
+    for implementation in (standalone, provenance):
+        try:
+            implementation.tree_digest(fixture)
+        except SystemExit as error:
+            if "escapes the tree or is broken" not in str(error):
+                raise SystemExit(
+                    f"{implementation.__name__} misdiagnosed {name}: {error}"
+                )
+        else:
+            raise SystemExit(
+                f"{implementation.__name__} accepted artifact symlink {name}"
+            )
+PY
+
 # Complete engine provenance records exact slices, SDK/toolchain inputs, patch
 # order, contrib checksums, and two-build reproducibility. Exercise it with a
 # minimal valid XCFramework so release integrity does not depend on a 368 MB
@@ -164,6 +224,7 @@ printf '%064d  0001-example.patch\n' 0 > "$temp_dir/patch-manifest.sha256"
 printf '#!/bin/sh\necho fixture\n' > "$temp_dir/build-config.sh"
 printf '#!/bin/sh\necho validator fixture\n' > "$temp_dir/validator-config.sh"
 fixture_source_date_epoch=1700000000
+fixture_swiftvlc_revision=2222222222222222222222222222222222222222
 mkdir -p "$temp_dir/build-a/macos-arm64/Headers"
 printf 'header\n' > "$temp_dir/build-a/macos-arm64/Headers/libvlc.h"
 ln -s libvlc.h "$temp_dir/build-a/macos-arm64/Headers/current.h"
@@ -213,9 +274,15 @@ chmod +a "user:$(id -un) allow read" \
 build_index=0
 for build_name in a b; do
   build_index=$((build_index + 1))
+  # Provenance records canonical second-resolution UTC completion times. A real
+  # clean Apple build takes many minutes; keep the compact fixture ordered too.
+  if [[ "$build_name" == b ]]; then
+    sleep 1
+  fi
   "$SCRIPT_DIR/libvlc-provenance.py" create \
     --xcframework "$temp_dir/build-$build_name" \
     --output "$temp_dir/provenance-$build_name.json" \
+    --swiftvlc-revision "$fixture_swiftvlc_revision" \
     --vlc-source "$temp_dir/fake-vlc" \
     --source-revision 1111111111111111111111111111111111111111 \
     --pinned-revision 111111111 \
@@ -229,21 +296,85 @@ for build_name in a b; do
     --deployment-target macos=15.0
 done
 "$SCRIPT_DIR/libvlc-provenance.py" compare \
-  --first "$temp_dir/provenance-a.json" \
-  --second "$temp_dir/provenance-b.json" \
+  --first-provenance "$temp_dir/provenance-a.json" \
+  --first-xcframework "$temp_dir/build-a" \
+  --second-provenance "$temp_dir/provenance-b.json" \
+  --second-xcframework "$temp_dir/build-b" \
   --output "$temp_dir/reproducibility.json" >/dev/null
+
+# Creating evidence inside the tree it authenticates would make a successful
+# command invalidate its own digest. Resolve parent symlinks as well as direct
+# paths before any create/compare work or output write occurs.
+ln -s "$temp_dir/build-a" "$temp_dir/build-a-output-alias"
+create_outputs=(
+  "$temp_dir/build-a/forbidden-provenance.json"
+  "$temp_dir/build-a-output-alias/forbidden-provenance-alias.json"
+)
+for forbidden_output in "${create_outputs[@]}"; do
+  if "$SCRIPT_DIR/libvlc-provenance.py" create \
+    --xcframework "$temp_dir/build-a" \
+    --output "$forbidden_output" \
+    --swiftvlc-revision "$fixture_swiftvlc_revision" \
+    --vlc-source "$temp_dir/fake-vlc" \
+    --source-revision 1111111111111111111111111111111111111111 \
+    --pinned-revision 111111111 \
+    --source-date-epoch "$fixture_source_date_epoch" \
+    --patch-manifest "$temp_dir/patch-manifest.sha256" \
+    --build-configuration-file "build-script=$temp_dir/build-config.sh" \
+    --build-configuration-file "0037-validator=$temp_dir/validator-config.sh" \
+    --build-invocation-id 00000000-0000-0000-0000-000000000099 \
+    --clean-build \
+    --make-flags=-j1 \
+    --deployment-target macos=15.0 >/dev/null 2>&1; then
+    fail "provenance create wrote evidence inside its XCFramework"
+  fi
+  [[ ! -e "$forbidden_output" ]] || \
+    fail "rejected in-artifact provenance output was still written"
+done
+
+compare_outputs=(
+  "$temp_dir/build-a/forbidden-proof.json"
+  "$temp_dir/build-a-output-alias/forbidden-proof-alias.json"
+)
+for forbidden_output in "${compare_outputs[@]}"; do
+  if "$SCRIPT_DIR/libvlc-provenance.py" compare \
+    --first-provenance "$temp_dir/provenance-a.json" \
+    --first-xcframework "$temp_dir/build-a" \
+    --second-provenance "$temp_dir/provenance-b.json" \
+    --second-xcframework "$temp_dir/build-b" \
+    --output "$forbidden_output" >/dev/null 2>&1; then
+    fail "provenance compare wrote proof inside a compared XCFramework"
+  fi
+  [[ ! -e "$forbidden_output" ]] || \
+    fail "rejected in-artifact proof output was still written"
+done
+
 "$SCRIPT_DIR/libvlc-provenance.py" verify \
   --provenance "$temp_dir/provenance-b.json" \
   --xcframework "$temp_dir/build-b" \
+  --swiftvlc-revision "$fixture_swiftvlc_revision" \
   --pinned-revision 111111111 \
   --patch-manifest "$temp_dir/patch-manifest.sha256" \
   --build-configuration-file "build-script=$temp_dir/build-config.sh" \
   --build-configuration-file "0037-validator=$temp_dir/validator-config.sh" >/dev/null
 
+if "$SCRIPT_DIR/libvlc-provenance.py" verify \
+  --provenance "$temp_dir/provenance-b.json" \
+  --xcframework "$temp_dir/build-b" \
+  --swiftvlc-revision 3333333333333333333333333333333333333333 \
+  --pinned-revision 111111111 \
+  --patch-manifest "$temp_dir/patch-manifest.sha256" \
+  --build-configuration-file "build-script=$temp_dir/build-config.sh" \
+  --build-configuration-file "0037-validator=$temp_dir/validator-config.sh" \
+  >/dev/null 2>&1; then
+  fail "provenance verification accepted a different SwiftVLC commit"
+fi
+
 # Every named validator is part of the exact build-configuration inventory.
 if "$SCRIPT_DIR/libvlc-provenance.py" verify \
   --provenance "$temp_dir/provenance-b.json" \
   --xcframework "$temp_dir/build-b" \
+  --swiftvlc-revision "$fixture_swiftvlc_revision" \
   --pinned-revision 111111111 \
   --patch-manifest "$temp_dir/patch-manifest.sha256" \
   --build-configuration-file "build-script=$temp_dir/build-config.sh" >/dev/null 2>&1; then
@@ -251,7 +382,10 @@ if "$SCRIPT_DIR/libvlc-provenance.py" verify \
 fi
 "$SCRIPT_DIR/libvlc-provenance.py" verify-proof \
   --proof "$temp_dir/reproducibility.json" \
-  --provenance "$temp_dir/provenance-b.json" >/dev/null
+  --first-provenance "$temp_dir/provenance-a.json" \
+  --second-provenance "$temp_dir/provenance-b.json" \
+  --current-provenance "$temp_dir/provenance-b.json" \
+  --xcframework "$temp_dir/build-b" >/dev/null
 
 # Every field in the proof's per-slice output block is authoritative. Reject
 # value, shape, and type mutations cleanly instead of treating it as display
@@ -265,8 +399,9 @@ from pathlib import Path
 source_path = Path(sys.argv[1])
 output_root = Path(sys.argv[2])
 source = json.loads(source_path.read_text())
-slice_identifier = next(iter(source["slices"]))
-slice_record = source["slices"][slice_identifier]
+slices = source["artifactIdentity"]["slices"]
+slice_identifier = next(iter(slices))
+slice_record = slices[slice_identifier]
 
 
 def write(name, value):
@@ -276,38 +411,79 @@ def write(name, value):
 
 
 changed = copy.deepcopy(source)
-changed["slices"][slice_identifier]["librarySha256"] = "0" * 64
+changed["artifactIdentity"]["slices"][slice_identifier]["librarySha256"] = "0" * 64
 write("changed-slice-value", changed)
 
 missing_slice = copy.deepcopy(source)
-del missing_slice["slices"][slice_identifier]
+del missing_slice["artifactIdentity"]["slices"][slice_identifier]
 write("missing-slice", missing_slice)
 
 extra_slice = copy.deepcopy(source)
-extra_slice["slices"]["unexpected-slice"] = copy.deepcopy(slice_record)
+extra_slice["artifactIdentity"]["slices"]["unexpected-slice"] = copy.deepcopy(
+    slice_record
+)
 write("extra-slice", extra_slice)
 
 missing_key = copy.deepcopy(source)
-del missing_key["slices"][slice_identifier]["memberCount"]
+del missing_key["artifactIdentity"]["slices"][slice_identifier]["memberCount"]
 write("missing-slice-key", missing_key)
 
 extra_key = copy.deepcopy(source)
-extra_key["slices"][slice_identifier]["uncheckedDisplayField"] = "not-bound"
+extra_key["artifactIdentity"]["slices"][slice_identifier][
+    "uncheckedDisplayField"
+] = "not-bound"
 write("extra-slice-key", extra_key)
 
 wrong_type = copy.deepcopy(source)
-wrong_type["slices"][slice_identifier]["memberCount"] = True
+wrong_type["artifactIdentity"]["slices"][slice_identifier]["memberCount"] = True
 write("wrong-slice-value-type", wrong_type)
 
 non_object_slices = copy.deepcopy(source)
-non_object_slices["slices"] = []
+non_object_slices["artifactIdentity"]["slices"] = []
 write("non-object-slices", non_object_slices)
+
+changed_provenance_hash = copy.deepcopy(source)
+changed_provenance_hash["firstBuild"]["provenanceSha256"] = "0" * 64
+write("changed-provenance-hash", changed_provenance_hash)
+
+missing_timestamp = copy.deepcopy(source)
+del missing_timestamp["firstBuild"]["builtAt"]
+write("missing-build-timestamp", missing_timestamp)
+
+extra_top_level = copy.deepcopy(source)
+extra_top_level["unverifiedDisplayField"] = True
+write("extra-top-level", extra_top_level)
 
 write("non-object-proof", [])
 
 unsupported_schema = copy.deepcopy(source)
-unsupported_schema["schemaVersion"] = 3
+unsupported_schema["schemaVersion"] = source["schemaVersion"] + 1
 write("unsupported-schema", unsupported_schema)
+
+schema_float = copy.deepcopy(source)
+schema_float["schemaVersion"] = float(source["schemaVersion"])
+write("schema-float", schema_float)
+
+wrong_build_input_type = copy.deepcopy(source)
+wrong_build_input_type["buildInputs"]["sourceDateEpoch"] = True
+write("wrong-build-input-type", wrong_build_input_type)
+
+raw = source_path.read_text()
+(output_root / "proof-duplicate-key.json").write_text(
+    raw.replace(
+        f'"schemaVersion": {source["schemaVersion"]},',
+        f'"schemaVersion": {source["schemaVersion"]},\n'
+        f'  "schemaVersion": {source["schemaVersion"]},',
+        1,
+    )
+)
+(output_root / "proof-non-finite.json").write_text(
+    raw.replace(
+        f'"sourceDateEpoch": {source["buildInputs"]["sourceDateEpoch"]}',
+        '"sourceDateEpoch": NaN',
+        1,
+    )
+)
 PY
 proof_mutations=(
   changed-slice-value
@@ -317,14 +493,24 @@ proof_mutations=(
   extra-slice-key
   wrong-slice-value-type
   non-object-slices
+  changed-provenance-hash
+  missing-build-timestamp
+  extra-top-level
   non-object-proof
   unsupported-schema
+  schema-float
+  wrong-build-input-type
+  duplicate-key
+  non-finite
 )
 for mutation in "${proof_mutations[@]}"; do
   error_log="$temp_dir/proof-$mutation.stderr"
   if "$SCRIPT_DIR/libvlc-provenance.py" verify-proof \
     --proof "$temp_dir/proof-$mutation.json" \
-    --provenance "$temp_dir/provenance-b.json" \
+    --first-provenance "$temp_dir/provenance-a.json" \
+    --second-provenance "$temp_dir/provenance-b.json" \
+    --current-provenance "$temp_dir/provenance-b.json" \
+    --xcframework "$temp_dir/build-b" \
     >/dev/null 2>"$error_log"; then
     fail "reproducibility proof accepted mutation: $mutation"
   fi
@@ -484,6 +670,7 @@ printf '#!/bin/sh\necho changed\n' > "$temp_dir/build-config.sh"
 if "$SCRIPT_DIR/libvlc-provenance.py" verify \
   --provenance "$temp_dir/provenance-b.json" \
   --xcframework "$temp_dir/build-b" \
+  --swiftvlc-revision "$fixture_swiftvlc_revision" \
   --pinned-revision 111111111 \
   --patch-manifest "$temp_dir/patch-manifest.sha256" \
   --build-configuration-file "build-script=$temp_dir/build-config.sh" \
@@ -496,6 +683,7 @@ printf '#!/bin/sh\necho changed validator\n' > "$temp_dir/validator-config.sh"
 if "$SCRIPT_DIR/libvlc-provenance.py" verify \
   --provenance "$temp_dir/provenance-b.json" \
   --xcframework "$temp_dir/build-b" \
+  --swiftvlc-revision "$fixture_swiftvlc_revision" \
   --pinned-revision 111111111 \
   --patch-manifest "$temp_dir/patch-manifest.sha256" \
   --build-configuration-file "build-script=$temp_dir/build-config.sh" \
@@ -516,10 +704,232 @@ second["build"]["invocationId"] = first["build"]["invocationId"]
 json.dump(second, open(sys.argv[2], "w"), indent=2, sort_keys=True)
 PY
 if "$SCRIPT_DIR/libvlc-provenance.py" compare \
-  --first "$temp_dir/provenance-a.json" \
-  --second "$temp_dir/provenance-same-invocation.json" >/dev/null 2>&1; then
+  --first-provenance "$temp_dir/provenance-a.json" \
+  --first-xcframework "$temp_dir/build-a" \
+  --second-provenance "$temp_dir/provenance-same-invocation.json" \
+  --second-xcframework "$temp_dir/build-b" >/dev/null 2>&1; then
   fail "reproducibility accepted the same build invocation twice"
 fi
+
+# Copying one provenance record and editing only its UUID is not evidence of a
+# second build. Missing or equal timestamps are rejected before a proof exists.
+python3 - "$temp_dir/provenance-a.json" "$temp_dir/provenance-b.json" "$temp_dir" <<'PY'
+import copy
+import json
+import sys
+from pathlib import Path
+
+first = json.load(open(sys.argv[1]))
+second = json.load(open(sys.argv[2]))
+output = Path(sys.argv[3])
+
+uuid_only = copy.deepcopy(first)
+uuid_only["build"]["invocationId"] = "00000000-0000-0000-0000-000000000091"
+
+missing_timestamp = copy.deepcopy(second)
+del missing_timestamp["build"]["builtAt"]
+
+equal_timestamp = copy.deepcopy(second)
+equal_timestamp["build"]["builtAt"] = first["build"]["builtAt"]
+
+noncanonical_timestamp = copy.deepcopy(second)
+noncanonical_timestamp["build"]["builtAt"] = "2099-1-1T1:1:1Z"
+
+coerced_build_input = copy.deepcopy(second)
+coerced_build_input["build"]["assertionsEnabled"] = 0
+
+coerced_both_first = copy.deepcopy(first)
+coerced_both_first["build"]["assertionsEnabled"] = 0
+coerced_both_second = copy.deepcopy(second)
+coerced_both_second["build"]["assertionsEnabled"] = 0
+
+schema_float_first = copy.deepcopy(first)
+schema_float_first["schemaVersion"] = 4.0
+schema_float_second = copy.deepcopy(second)
+schema_float_second["schemaVersion"] = 4.0
+
+cross_swiftvlc_revision = copy.deepcopy(second)
+cross_swiftvlc_revision["swiftVLCRevision"] = "3" * 40
+
+coerced_member_count = copy.deepcopy(second)
+coerced_member_count["slices"][0]["memberCount"] = True
+
+metadata_mismatch = copy.deepcopy(second)
+metadata_mismatch["slices"][0]["architectures"] = ["x86_64"]
+
+tampered_first = copy.deepcopy(first)
+tampered_first["unboundAfterComparison"] = "tampered"
+
+for name, value in (
+    ("uuid-only", uuid_only),
+    ("missing-timestamp", missing_timestamp),
+    ("equal-timestamp", equal_timestamp),
+    ("noncanonical-timestamp", noncanonical_timestamp),
+    ("coerced-build-input", coerced_build_input),
+    ("coerced-both-a", coerced_both_first),
+    ("coerced-both-b", coerced_both_second),
+    ("schema-float-a", schema_float_first),
+    ("schema-float-b", schema_float_second),
+    ("cross-swiftvlc-revision", cross_swiftvlc_revision),
+    ("coerced-member-count", coerced_member_count),
+    ("metadata-mismatch", metadata_mismatch),
+    ("tampered-a", tampered_first),
+):
+    (output / f"provenance-{name}.json").write_text(
+        json.dumps(value, indent=2, sort_keys=True) + "\n"
+    )
+
+raw = Path(sys.argv[2]).read_text()
+(output / "provenance-duplicate-key.json").write_text(
+    raw.replace(
+        f'"schemaVersion": {second["schemaVersion"]},',
+        f'"schemaVersion": {second["schemaVersion"]},\n'
+        f'  "schemaVersion": {second["schemaVersion"]},',
+        1,
+    )
+)
+(output / "provenance-non-finite.json").write_text(
+    raw.replace(
+        f'"sourceDateEpoch": {second["build"]["sourceDateEpoch"]}',
+        '"sourceDateEpoch": Infinity',
+        1,
+    )
+)
+PY
+
+for forged_provenance in \
+  uuid-only \
+  missing-timestamp \
+  equal-timestamp \
+  noncanonical-timestamp \
+  coerced-build-input \
+  cross-swiftvlc-revision \
+  duplicate-key \
+  non-finite; do
+  if "$SCRIPT_DIR/libvlc-provenance.py" compare \
+    --first-provenance "$temp_dir/provenance-a.json" \
+    --first-xcframework "$temp_dir/build-a" \
+    --second-provenance "$temp_dir/provenance-$forged_provenance.json" \
+    --second-xcframework "$temp_dir/build-b" >/dev/null 2>&1; then
+    fail "reproducibility accepted forged provenance: $forged_provenance"
+  fi
+done
+
+for malformed_pair in coerced-both schema-float; do
+  if "$SCRIPT_DIR/libvlc-provenance.py" compare \
+    --first-provenance "$temp_dir/provenance-$malformed_pair-a.json" \
+    --first-xcframework "$temp_dir/build-a" \
+    --second-provenance "$temp_dir/provenance-$malformed_pair-b.json" \
+    --second-xcframework "$temp_dir/build-b" >/dev/null 2>&1; then
+    fail "reproducibility accepted identically malformed A/B records: $malformed_pair"
+  fi
+done
+
+# Provenance must match both byte content and the XCFramework's declared slice
+# identity. JSON booleans must not compare equal to integer archive counts.
+for mismatched_provenance in coerced-member-count metadata-mismatch; do
+  if "$SCRIPT_DIR/libvlc-provenance.py" verify \
+    --provenance "$temp_dir/provenance-$mismatched_provenance.json" \
+    --xcframework "$temp_dir/build-b" \
+    --swiftvlc-revision "$fixture_swiftvlc_revision" \
+    --pinned-revision 111111111 \
+    --patch-manifest "$temp_dir/patch-manifest.sha256" \
+    --build-configuration-file "build-script=$temp_dir/build-config.sh" \
+    --build-configuration-file "0037-validator=$temp_dir/validator-config.sh" \
+    >/dev/null 2>&1; then
+    fail "artifact verification accepted mismatched provenance: $mismatched_provenance"
+  fi
+done
+
+if "$SCRIPT_DIR/libvlc-provenance.py" verify-proof \
+  --proof "$temp_dir/reproducibility.json" \
+  --first-provenance "$temp_dir/provenance-tampered-a.json" \
+  --second-provenance "$temp_dir/provenance-b.json" \
+  --current-provenance "$temp_dir/provenance-b.json" \
+  --xcframework "$temp_dir/build-b" >/dev/null 2>&1; then
+  fail "reproducibility proof accepted tampered retained provenance"
+fi
+
+for mismatched_build in a b; do
+  cp -R "$temp_dir/build-$mismatched_build" \
+    "$temp_dir/build-$mismatched_build-artifact-mismatch"
+  printf 'mismatched header\n' > \
+    "$temp_dir/build-$mismatched_build-artifact-mismatch/macos-arm64/Headers/libvlc.h"
+  first_xcframework="$temp_dir/build-a"
+  second_xcframework="$temp_dir/build-b"
+  if [[ "$mismatched_build" == a ]]; then
+    first_xcframework="$temp_dir/build-a-artifact-mismatch"
+  else
+    second_xcframework="$temp_dir/build-b-artifact-mismatch"
+  fi
+  if "$SCRIPT_DIR/libvlc-provenance.py" compare \
+    --first-provenance "$temp_dir/provenance-a.json" \
+    --first-xcframework "$first_xcframework" \
+    --second-provenance "$temp_dir/provenance-b.json" \
+    --second-xcframework "$second_xcframework" >/dev/null 2>&1; then
+    fail "reproducibility comparison accepted an artifact/provenance mismatch: build $mismatched_build"
+  fi
+done
+
+# Info.plist paths are untrusted artifact metadata. A path outside its slice and
+# duplicate slice identifiers must fail even when a forged tree digest would
+# otherwise make the record self-consistent.
+cp -R "$temp_dir/build-b" "$temp_dir/build-b-escaping-path"
+cp -R "$temp_dir/build-b/macos-arm64/Headers" "$temp_dir/outside-headers"
+cp -R "$temp_dir/build-b" "$temp_dir/build-b-duplicate-identifier"
+python3 - \
+  "$temp_dir/build-b-escaping-path/Info.plist" \
+  "$temp_dir/build-b-duplicate-identifier/Info.plist" <<'PY'
+import copy
+import plistlib
+import sys
+
+escaping_path, duplicate_path = sys.argv[1:]
+with open(escaping_path, "rb") as source:
+    escaping = plistlib.load(source)
+escaping["AvailableLibraries"][0]["HeadersPath"] = "../../outside-headers"
+with open(escaping_path, "wb") as output:
+    plistlib.dump(escaping, output, sort_keys=True)
+
+with open(duplicate_path, "rb") as source:
+    duplicate = plistlib.load(source)
+duplicate["AvailableLibraries"].append(
+    copy.deepcopy(duplicate["AvailableLibraries"][0])
+)
+with open(duplicate_path, "wb") as output:
+    plistlib.dump(duplicate, output, sort_keys=True)
+PY
+
+for malformed_artifact in escaping-path duplicate-identifier; do
+  cp "$temp_dir/provenance-b.json" \
+    "$temp_dir/provenance-$malformed_artifact.json"
+  malformed_digest=$("$SCRIPT_DIR/artifact-tree-digest.py" \
+    "$temp_dir/build-b-$malformed_artifact")
+  python3 - \
+    "$temp_dir/provenance-$malformed_artifact.json" \
+    "$malformed_digest" <<'PY'
+import json
+import sys
+
+path, digest = sys.argv[1:]
+value = json.load(open(path))
+value["xcframeworkTreeDigest"] = digest
+with open(path, "w") as output:
+    json.dump(value, output, indent=2, sort_keys=True)
+    output.write("\n")
+PY
+  if "$SCRIPT_DIR/libvlc-provenance.py" verify \
+    --provenance "$temp_dir/provenance-$malformed_artifact.json" \
+    --xcframework "$temp_dir/build-b-$malformed_artifact" \
+    --swiftvlc-revision "$fixture_swiftvlc_revision" \
+    --pinned-revision 111111111 \
+    --patch-manifest "$temp_dir/patch-manifest.sha256" \
+    --build-configuration-file "build-script=$temp_dir/build-config.sh" \
+    --build-configuration-file "0037-validator=$temp_dir/validator-config.sh" \
+    >/dev/null 2>&1; then
+    fail "artifact verification accepted malformed Info.plist: $malformed_artifact"
+  fi
+done
 
 # An incremental build cannot participate even when its output is identical.
 cp "$temp_dir/provenance-b.json" "$temp_dir/provenance-incremental.json"
@@ -534,8 +944,10 @@ value["build"]["invocationId"] = "00000000-0000-0000-0000-000000000003"
 json.dump(value, open(path, "w"), indent=2, sort_keys=True)
 PY
 if "$SCRIPT_DIR/libvlc-provenance.py" compare \
-  --first "$temp_dir/provenance-a.json" \
-  --second "$temp_dir/provenance-incremental.json" >/dev/null 2>&1; then
+  --first-provenance "$temp_dir/provenance-a.json" \
+  --first-xcframework "$temp_dir/build-a" \
+  --second-provenance "$temp_dir/provenance-incremental.json" \
+  --second-xcframework "$temp_dir/build-b" >/dev/null 2>&1; then
   fail "reproducibility accepted an incremental build"
 fi
 
@@ -550,6 +962,7 @@ ar rcs "$temp_dir/mutated-build/macos-arm64/libvlc.a" "$temp_dir/member.o"
 "$SCRIPT_DIR/libvlc-provenance.py" create \
   --xcframework "$temp_dir/mutated-build" \
   --output "$temp_dir/mutated-provenance.json" \
+  --swiftvlc-revision "$fixture_swiftvlc_revision" \
   --vlc-source "$temp_dir/fake-vlc" \
   --source-revision 1111111111111111111111111111111111111111 \
   --pinned-revision 111111111 \
@@ -563,7 +976,10 @@ ar rcs "$temp_dir/mutated-build/macos-arm64/libvlc.a" "$temp_dir/member.o"
   --deployment-target macos=15.0
 if "$SCRIPT_DIR/libvlc-provenance.py" verify-proof \
   --proof "$temp_dir/reproducibility.json" \
-  --provenance "$temp_dir/mutated-provenance.json" >/dev/null 2>&1; then
+  --first-provenance "$temp_dir/provenance-a.json" \
+  --second-provenance "$temp_dir/provenance-b.json" \
+  --current-provenance "$temp_dir/mutated-provenance.json" \
+  --xcframework "$temp_dir/mutated-build" >/dev/null 2>&1; then
   fail "reproducibility proof accepted a mutated post-build tree"
 fi
 
@@ -615,7 +1031,8 @@ python3 - \
   "$SCRIPT_DIR/validate-post-pin-stability.sh" \
   "$SCRIPT_DIR/native-validator-assets.sha256" \
   "$SCRIPT_DIR/verify-native-validator-assets.py" \
-  "$SCRIPT_DIR/validate-audio-media-services-reset.sh" <<'PY'
+  "$SCRIPT_DIR/validate-audio-media-services-reset.sh" \
+  "$SCRIPT_DIR/libvlc-provenance.py" <<'PY'
 import ast
 import re
 import sys
@@ -631,12 +1048,13 @@ validator_asset_manifest = [
 ]
 validator_asset_verifier = open(sys.argv[8]).read()
 audio_reset_validator = open(sys.argv[9]).read()
+provenance_tool = open(sys.argv[10]).read()
 manifest_lines = [
     line.strip() for line in open(sys.argv[3]) if line.strip() and not line.lstrip().startswith("#")
 ]
 expected_manifest_tail = [
     "dd3c672da9b7a6fcd82e6eadd298d1c5f86ce75e55d86800de8fd83683461105  0037-chromecast-load-transition-correctness.patch",
-    "402b7ca09aab50fe89391ea22b8b96113b899bce3028406a3293d574eb706beb  0038-apple-assembly-metadata.patch",
+    "5f1a58d162c798b2d6f5c2a2fdac9f728279f195ef192405b80272bc2f164c59  0038-apple-assembly-metadata.patch",
 ]
 if manifest_lines[-2:] != expected_manifest_tail:
     sys.exit(
@@ -922,8 +1340,21 @@ build_metadata_verification = build.index(
 provenance = build.index('python3 "${SCRIPT_DIR}/libvlc-provenance.py" create')
 if provenance < build_metadata_verification:
     sys.exit("provenance is written before per-object Mach-O verification")
-if 'rm -f "${OUTPUT_DIR}/libvlc-provenance.json"' not in build:
-    sys.exit("a failed rebuild can leave stale provenance beside its artifact")
+startup_evidence_invalidation = (
+    'rm -f "${OUTPUT_DIR}/libvlc-provenance-a.json" \\\n'
+    '    "${OUTPUT_DIR}/libvlc-provenance.json" \\\n'
+    '    "${OUTPUT_DIR}/libvlc-reproducibility.json" \\\n'
+    '    "${OUTPUT_DIR}/libvlc-macho-metadata.json"'
+)
+if build.count(startup_evidence_invalidation) != 1:
+    sys.exit(
+        "native build startup does not invalidate A/B provenance, proof, and "
+        "Mach-O evidence as one exact set"
+    )
+if build.index(startup_evidence_invalidation) > build.index(
+    'info "Setting up VLC source..."'
+):
+    sys.exit("native build invalidates stale two-build evidence after source setup")
 
 build_validator_asset_verification = build.index(
     'if ! python3 "${SCRIPT_DIR}/verify-native-validator-assets.py"; then'
@@ -1063,7 +1494,7 @@ release_validator_asset_verification = release.index(
     'if ! python3 "$SCRIPT_DIR/verify-native-validator-assets.py"; then'
 )
 release_provenance_verification = release.index(
-    'if ! verify_artifact_provenance; then'
+    'if ! verify_artifact_provenance "$EXPECTED_ARTIFACT_SWIFTVLC_REVISION"; then'
 )
 if release_validator_asset_verification > release_provenance_verification:
     sys.exit("release verifies native validator assets after artifact provenance")
@@ -1095,6 +1526,31 @@ if release_configurations != build_configurations:
         "build/release provenance configuration sets differ: "
         f"build={sorted(build_configurations)}, release={sorted(release_configurations)}"
     )
+
+for marker in (
+    'compare_parser.add_argument("--first-xcframework", type=Path, required=True)',
+    'compare_parser.add_argument("--second-xcframework", type=Path, required=True)',
+    'verify_recorded_artifact(first, first_xcframework, "first XCFramework")',
+    'verify_recorded_artifact(second, second_xcframework, "second XCFramework")',
+    'write_json_atomic(arguments.output, proof)',
+    'os.replace(temporary_path, path)',
+    '"provenanceSha256": first_provenance_sha256',
+    '"provenanceSha256": second_provenance_sha256',
+):
+    if marker not in provenance_tool:
+        sys.exit(f"reproducibility implementation is missing: {marker}")
+
+for marker in (
+    'libvlc-provenance-a.json',
+    '"firstProvenanceChecksum"',
+    '--first-provenance "$RELEASE_FIRST_PROVENANCE"',
+    '--second-provenance "$RELEASE_PROVENANCE"',
+    '--current-provenance "$RELEASE_PROVENANCE"',
+    '--xcframework "$WORK_XCFW"',
+    '"$RELEASE_FIRST_PROVENANCE"',
+):
+    if marker not in release:
+        sys.exit(f"release does not retain both build records: {marker}")
 
 deployment_constants = {
     "SWIFTVLC_MIN_IOS": "18.0",
@@ -1130,7 +1586,9 @@ release_metadata_report_removal = release.index(
 release_metadata_verification = release.index(
     'echo "Verifying release artifact Mach-O platform metadata and section alignment..."'
 )
-release_provenance = release.index('if ! verify_artifact_provenance; then')
+release_provenance = release.index(
+    'if ! verify_artifact_provenance "$EXPECTED_ARTIFACT_SWIFTVLC_REVISION"; then'
+)
 if not (
     release_member_manifest
     < release_native_extension_contract
@@ -2076,6 +2534,472 @@ for scenario in matrix["scenarios"]:
                 f"issue 88 scenario {scenario['id']} does not enforce control outcomes"
             )
 PY
+
+# Exercise the production release shell in an isolated repository with local
+# command doubles. Static source markers cannot prove candidate field ordering,
+# private snapshot use, or the exact bytes handed to `gh release create`.
+release_flow_root="$temp_dir/release-flow"
+release_flow_repo="$release_flow_root/repository"
+release_flow_origin="$release_flow_root/origin.git"
+release_flow_candidate="$release_flow_root/candidate"
+release_flow_expected="$release_flow_root/expected-upload"
+release_flow_capture="$release_flow_root/captured-upload"
+release_flow_fake_bin="$release_flow_root/fake-bin"
+release_flow_tmp="$release_flow_root/tmp"
+mkdir -p \
+  "$release_flow_repo/scripts/patches/validation" \
+  "$release_flow_repo/scripts/qualification" \
+  "$release_flow_repo/Showcase/SwiftVLCShowcase.xcodeproj" \
+  "$release_flow_repo/Vendor" \
+  "$release_flow_expected" \
+  "$release_flow_capture" \
+  "$release_flow_fake_bin" \
+  "$release_flow_tmp"
+
+cp "$SCRIPT_DIR/release.sh" "$release_flow_repo/scripts/release.sh"
+cp "$SCRIPT_DIR/artifact-tree-digest.py" \
+  "$release_flow_repo/scripts/artifact-tree-digest.py"
+cp "$ROOT_DIR/Package.swift" "$release_flow_repo/Package.swift"
+cp "$ROOT_DIR/Showcase/SwiftVLCShowcase.xcodeproj/project.pbxproj" \
+  "$release_flow_repo/Showcase/SwiftVLCShowcase.xcodeproj/project.pbxproj"
+printf 'Vendor/\n' > "$release_flow_repo/.gitignore"
+printf '{"fixture":true}\n' > \
+  "$release_flow_repo/scripts/qualification/matrix.json"
+printf '{"fixture":true}\n' > \
+  "$release_flow_repo/scripts/qualification/feature-manifest-v1.json"
+printf '%064d  0001-fixture.patch\n' 0 > \
+  "$release_flow_repo/scripts/patches/manifest.sha256"
+printf 'fixture native probe\n' > \
+  "$release_flow_repo/scripts/patches/validation/native-extension-version-probe.c"
+printf 'fixture extension parser\n' > \
+  "$release_flow_repo/scripts/patches/validation/pip_extension_version.py"
+
+cat > "$release_flow_repo/scripts/release-version-policy.py" <<'PY'
+#!/usr/bin/env python3
+import sys
+
+if len(sys.argv) != 4 or sys.argv[2:] != ["--field", "kind"]:
+    raise SystemExit(2)
+print("stable")
+PY
+cat > "$release_flow_repo/scripts/verify-native-validator-assets.py" <<'PY'
+#!/usr/bin/env python3
+raise SystemExit(0)
+PY
+cat > "$release_flow_repo/scripts/validate-libvlc-macho-metadata.py" <<'PY'
+#!/usr/bin/env python3
+import json
+import sys
+from pathlib import Path
+
+arguments = sys.argv[1:]
+output = Path(arguments[arguments.index("--json-output") + 1])
+output.write_text(json.dumps({"fixture": True}) + "\n")
+PY
+cat > "$release_flow_repo/scripts/libvlc-provenance.py" <<'PY'
+#!/usr/bin/env python3
+import os
+import sys
+from pathlib import Path
+
+arguments = sys.argv[1:]
+command = arguments[0]
+
+
+def value(flag):
+    return Path(arguments[arguments.index(flag) + 1]).resolve()
+
+
+def require_private_snapshot(paths):
+    parents = {path.parent for path in paths}
+    if len(parents) != 1 or next(iter(parents)).name != "release-assets":
+        raise SystemExit(
+            "Error: release provenance verification bypassed its private snapshot"
+        )
+    if any(not path.exists() for path in paths):
+        raise SystemExit("Error: snapshotted release input is missing")
+
+
+if command == "verify":
+    require_private_snapshot([value("--provenance"), value("--xcframework")])
+    expected_revision = os.environ["SWIFTVLC_RELEASE_TEST_EXPECTED_REVISION"]
+    actual_revision = arguments[arguments.index("--swiftvlc-revision") + 1]
+    if actual_revision != expected_revision:
+        raise SystemExit(
+            "Error: release verified provenance against the wrong SwiftVLC "
+            f"revision: {actual_revision} != {expected_revision}"
+        )
+elif command == "verify-proof":
+    require_private_snapshot(
+        [
+            value("--proof"),
+            value("--first-provenance"),
+            value("--second-provenance"),
+            value("--current-provenance"),
+            value("--xcframework"),
+        ]
+    )
+else:
+    raise SystemExit(f"Error: unexpected provenance command: {command}")
+PY
+cat > "$release_flow_repo/scripts/release-source-digest.py" <<'PY'
+#!/usr/bin/env python3
+print("a" * 64)
+PY
+
+cat > "$release_flow_repo/scripts/canonical-libvlc-artifact.sh" <<'SH'
+#!/bin/sh
+set -eu
+
+command_name=$1
+source_path=$2
+output_path=$3
+case "$command_name" in
+  stage)
+    [ ! -e "$output_path" ]
+    mkdir -p "$(dirname "$output_path")"
+    cp -R "$source_path" "$output_path"
+    ;;
+  archive)
+    [ ! -e "$output_path" ]
+    source_parent=$(cd "$(dirname "$source_path")" && pwd)
+    source_name=$(basename "$source_path")
+    output_parent=$(dirname "$output_path")
+    mkdir -p "$output_parent"
+    output_path=$(cd "$output_parent" && pwd)/$(basename "$output_path")
+    (
+      cd "$source_parent"
+      COPYFILE_DISABLE=1 LC_ALL=C TZ=UTC \
+        /usr/bin/zip -q -r -X -y "$output_path" "$source_name"
+    )
+    ;;
+  *)
+    exit 2
+    ;;
+esac
+SH
+
+cat > "$release_flow_repo/scripts/check-libvlc-manifest.sh" <<'SH'
+#!/bin/sh
+set -eu
+
+if [ -n "${SWIFTVLC_RELEASE_TEST_MUTATE_VENDOR:-}" ]; then
+  for name in \
+    libvlc-provenance-a.json \
+    libvlc-provenance.json \
+    libvlc-reproducibility.json; do
+    printf 'mutated after private snapshot\n' >> \
+      "$SWIFTVLC_RELEASE_TEST_MUTATE_VENDOR/$name"
+  done
+  printf 'mutated after private snapshot\n' > \
+    "$SWIFTVLC_RELEASE_TEST_MUTATE_VENDOR/libvlc.xcframework/ios-arm64/libvlc.a"
+fi
+SH
+
+cat > "$release_flow_repo/scripts/check-qualification.sh" <<'SH'
+#!/bin/sh
+set -eu
+
+case "$2" in
+  */swiftvlc-release.*/release-assets/libvlc.xcframework) ;;
+  *)
+    echo "qualification did not receive the private XCFramework snapshot: $2" >&2
+    exit 1
+    ;;
+esac
+if [ -n "${SWIFTVLC_RELEASE_TEST_MUTATE_CANDIDATE:-}" ]; then
+  for name in \
+    libvlc.xcframework.zip \
+    libvlc-provenance-a.json \
+    libvlc-provenance.json \
+    libvlc-reproducibility.json \
+    release-candidate.json; do
+    printf 'mutated after private snapshot\n' >> \
+      "$SWIFTVLC_RELEASE_TEST_MUTATE_CANDIDATE/$name"
+  done
+fi
+SH
+
+for release_flow_stub in \
+  fix-duplicate-symbols.sh \
+  validate-native-extension-contract.sh \
+  validate-apple-assembly-metadata-patch.sh \
+  validate-chromecast-load-transition.sh \
+  validate-post-pin-stability.sh \
+  verify-patch-manifest.sh; do
+  printf '#!/bin/sh\nexit 0\n' > \
+    "$release_flow_repo/scripts/$release_flow_stub"
+done
+printf '#!/bin/sh\nVLC_HASH="111111111"\n' > \
+  "$release_flow_repo/scripts/build-libvlc.sh"
+
+cat > "$release_flow_fake_bin/swift" <<'SH'
+#!/bin/sh
+set -eu
+
+if [ "$#" -eq 3 ] && [ "$1" = package ] && \
+    [ "$2" = compute-checksum ]; then
+  shasum -a 256 "$3" | cut -d' ' -f1
+  exit 0
+fi
+exit 2
+SH
+cat > "$release_flow_fake_bin/git" <<'SH'
+#!/bin/sh
+set -eu
+
+if [ "${1:-}" = push ]; then
+  printf '%s\n' "$*" >> "$SWIFTVLC_RELEASE_TEST_GIT_LOG"
+  exit 0
+fi
+exec /usr/bin/git "$@"
+SH
+cat > "$release_flow_fake_bin/gh" <<'SH'
+#!/bin/sh
+set -eu
+
+if [ "${1:-}" = auth ] && [ "${2:-}" = status ]; then
+  exit 0
+fi
+if [ "${1:-}" = release ] && [ "${2:-}" = view ]; then
+  exit 1
+fi
+if [ "${1:-}" = release ] && [ "${2:-}" = edit ]; then
+  exit 0
+fi
+if [ "${1:-}" = release ] && [ "${2:-}" = create ]; then
+  shift 3
+  : > "$SWIFTVLC_RELEASE_TEST_CAPTURE/assets.paths"
+  while [ "$#" -gt 0 ] && [ "${1#--}" = "$1" ]; do
+    source_path=$1
+    output_path="$SWIFTVLC_RELEASE_TEST_CAPTURE/$(basename "$source_path")"
+    [ ! -e "$output_path" ] || exit 3
+    cp "$source_path" "$output_path"
+    printf '%s\n' "$source_path" >> \
+      "$SWIFTVLC_RELEASE_TEST_CAPTURE/assets.paths"
+    shift
+  done
+  exit 0
+fi
+echo "unexpected gh invocation: $*" >&2
+exit 2
+SH
+chmod +x \
+  "$release_flow_repo/scripts/"*.sh \
+  "$release_flow_repo/scripts/"*.py \
+  "$release_flow_fake_bin/git" \
+  "$release_flow_fake_bin/gh" \
+  "$release_flow_fake_bin/swift"
+
+for slice in \
+  ios-arm64 \
+  ios-arm64_x86_64-simulator \
+  tvos-arm64 \
+  tvos-arm64_x86_64-simulator \
+  xros-arm64 \
+  xros-arm64_x86_64-simulator \
+  macos-arm64_x86_64 \
+  ios-arm64_x86_64-maccatalyst; do
+  mkdir -p "$release_flow_repo/Vendor/libvlc.xcframework/$slice"
+  printf 'fixture archive for %s\n' "$slice" > \
+    "$release_flow_repo/Vendor/libvlc.xcframework/$slice/libvlc.a"
+done
+printf 'fixture first provenance\n' > \
+  "$release_flow_repo/Vendor/libvlc-provenance-a.json"
+printf 'fixture second provenance\n' > \
+  "$release_flow_repo/Vendor/libvlc-provenance.json"
+printf 'fixture reproducibility proof\n' > \
+  "$release_flow_repo/Vendor/libvlc-reproducibility.json"
+
+git -C "$release_flow_repo" init -q
+git -C "$release_flow_repo" branch -M main
+git -C "$release_flow_repo" config user.name "SwiftVLC Release Test"
+git -C "$release_flow_repo" config user.email \
+  "swiftvlc-release-test@example.invalid"
+git -C "$release_flow_repo" add .
+git -C "$release_flow_repo" commit -qm "release fixture"
+release_flow_source_commit=$(git -C "$release_flow_repo" rev-parse HEAD)
+git clone -q --bare "$release_flow_repo" "$release_flow_origin"
+git -C "$release_flow_repo" remote add origin "$release_flow_origin"
+git -C "$release_flow_repo" fetch -q origin main
+
+release_flow_vendor_digest=$(
+  "$release_flow_repo/scripts/artifact-tree-digest.py" \
+    "$release_flow_repo/Vendor/libvlc.xcframework"
+)
+for release_flow_sidecar in \
+  libvlc-provenance-a.json \
+  libvlc-provenance.json \
+  libvlc-reproducibility.json; do
+  cp "$release_flow_repo/Vendor/$release_flow_sidecar" \
+    "$release_flow_expected/$release_flow_sidecar"
+done
+
+release_flow_git_log="$release_flow_root/git-pushes.log"
+: > "$release_flow_git_log"
+(
+  cd "$release_flow_repo"
+  PATH="$release_flow_fake_bin:$PATH" \
+    TMPDIR="$release_flow_tmp" \
+    SWIFTVLC_RELEASE_TEST_EXPECTED_REVISION="$release_flow_source_commit" \
+    SWIFTVLC_RELEASE_TEST_GIT_LOG="$release_flow_git_log" \
+    SWIFTVLC_RELEASE_TEST_MUTATE_VENDOR="$release_flow_repo/Vendor" \
+    ./scripts/release.sh 1.1.0 --prepare "$release_flow_candidate" \
+    > "$release_flow_root/prepare.log"
+)
+
+for release_flow_sidecar in \
+  libvlc-provenance-a.json \
+  libvlc-provenance.json \
+  libvlc-reproducibility.json; do
+  cmp -s "$release_flow_expected/$release_flow_sidecar" \
+    "$release_flow_candidate/$release_flow_sidecar" || \
+    fail "prepared candidate used a post-snapshot $release_flow_sidecar"
+done
+release_flow_candidate_digest=$(
+  "$release_flow_repo/scripts/artifact-tree-digest.py" \
+    "$release_flow_candidate/libvlc.xcframework"
+)
+[[ "$release_flow_candidate_digest" == "$release_flow_vendor_digest" ]] || \
+  fail "prepared candidate used a post-snapshot XCFramework"
+
+python3 - \
+  "$release_flow_candidate/release-candidate.json" \
+  "$release_flow_candidate" \
+  "$release_flow_repo/scripts/artifact-tree-digest.py" \
+  "$release_flow_source_commit" \
+  "$release_flow_repo/scripts/qualification/matrix.json" \
+  "$release_flow_repo/scripts/qualification/feature-manifest-v1.json" <<'PY'
+import hashlib
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+(
+    manifest_path_value,
+    candidate_root_value,
+    digest_tool_value,
+    source_commit,
+    matrix_path_value,
+    feature_path_value,
+) = sys.argv[1:]
+manifest_path = Path(manifest_path_value)
+candidate_root = Path(candidate_root_value)
+
+
+def sha256(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+candidate = json.loads(manifest_path.read_text())
+expected = {
+    "version": "1.1.0",
+    "artifactDigestAlgorithm": "swiftvlc-tree-v1",
+    "artifactDigest": subprocess.check_output(
+        [digest_tool_value, candidate_root / "libvlc.xcframework"], text=True
+    ).strip(),
+    "zipChecksum": sha256(candidate_root / "libvlc.xcframework.zip"),
+    "firstProvenanceChecksum": sha256(
+        candidate_root / "libvlc-provenance-a.json"
+    ),
+    "provenanceChecksum": sha256(candidate_root / "libvlc-provenance.json"),
+    "reproducibilityChecksum": sha256(
+        candidate_root / "libvlc-reproducibility.json"
+    ),
+    "sourceCommit": source_commit,
+    "releaseSourceDigestAlgorithm": "swiftvlc-git-tree-v1",
+    "releaseSourceDigest": "a" * 64,
+    "qualificationMatrixChecksum": sha256(matrix_path_value),
+    "featureManifestChecksum": sha256(feature_path_value),
+}
+if candidate != expected:
+    raise SystemExit(
+        "release candidate field/checksum mapping differs:\n"
+        f"expected={expected}\nactual={candidate}"
+    )
+PY
+
+for release_flow_asset in \
+  libvlc.xcframework.zip \
+  libvlc-provenance-a.json \
+  libvlc-provenance.json \
+  libvlc-reproducibility.json \
+  release-candidate.json; do
+  cp "$release_flow_candidate/$release_flow_asset" \
+    "$release_flow_expected/$release_flow_asset"
+done
+
+# Candidate consumption may happen after qualification evidence advances main.
+# The artifact must still be checked against the candidate's source commit, not
+# the newer checkout HEAD, while the candidate source remains an ancestor.
+mkdir -p "$release_flow_repo/scripts/qualification/evidence/1.1.0"
+printf '{"fixture":"qualified"}\n' > \
+  "$release_flow_repo/scripts/qualification/evidence/1.1.0/device.json"
+git -C "$release_flow_repo" add \
+  scripts/qualification/evidence/1.1.0/device.json
+git -C "$release_flow_repo" commit -qm "Record qualification evidence"
+/usr/bin/git -C "$release_flow_repo" push -q origin main
+release_flow_origin_before_release=$(
+  git --git-dir="$release_flow_origin" rev-parse refs/heads/main
+)
+[[ "$release_flow_origin_before_release" != "$release_flow_source_commit" ]] || \
+  fail "release revision fixture did not advance main after preparation"
+
+(
+  cd "$release_flow_repo"
+  PATH="$release_flow_fake_bin:$PATH" \
+    TMPDIR="$release_flow_tmp" \
+    SWIFTVLC_RELEASE_TEST_EXPECTED_REVISION="$release_flow_source_commit" \
+    SWIFTVLC_RELEASE_TEST_CAPTURE="$release_flow_capture" \
+    SWIFTVLC_RELEASE_TEST_GIT_LOG="$release_flow_git_log" \
+    SWIFTVLC_RELEASE_TEST_MUTATE_CANDIDATE="$release_flow_candidate" \
+    ./scripts/release.sh 1.1.0 --candidate "$release_flow_candidate" \
+    > "$release_flow_root/release.log"
+)
+
+expected_release_assets=(
+  libvlc.xcframework.zip
+  libvlc-provenance-a.json
+  libvlc-provenance.json
+  libvlc-reproducibility.json
+  release-candidate.json
+)
+captured_release_count=0
+while IFS= read -r captured_release_path; do
+  captured_release_paths[$captured_release_count]="$captured_release_path"
+  captured_release_count=$((captured_release_count + 1))
+done < "$release_flow_capture/assets.paths"
+[[ $captured_release_count -eq ${#expected_release_assets[@]} ]] || \
+  fail "release uploaded the wrong number of assets"
+for ((release_flow_index = 0;
+      release_flow_index < ${#expected_release_assets[@]};
+      release_flow_index++)); do
+  release_flow_asset=${expected_release_assets[$release_flow_index]}
+  release_flow_path=${captured_release_paths[$release_flow_index]}
+  [[ $(basename "$release_flow_path") == "$release_flow_asset" ]] || \
+    fail "release asset order/name drifted: expected $release_flow_asset, got $release_flow_path"
+  case "$release_flow_path" in
+    "$release_flow_tmp"/swiftvlc-release.*/release-assets/*) ;;
+    *) fail "release uploaded an asset outside its private snapshot: $release_flow_path" ;;
+  esac
+  cmp -s "$release_flow_expected/$release_flow_asset" \
+    "$release_flow_capture/$release_flow_asset" || \
+    fail "release uploaded changed bytes for $release_flow_asset"
+  if cmp -s "$release_flow_expected/$release_flow_asset" \
+    "$release_flow_candidate/$release_flow_asset"; then
+    fail "release TOCTOU fixture did not mutate original $release_flow_asset"
+  fi
+done
+[[ $(wc -l < "$release_flow_git_log" | tr -d ' ') == 2 ]] || \
+  fail "mock release did not reach both production push boundaries"
+[[ $(git --git-dir="$release_flow_origin" rev-parse refs/heads/main) == \
+  "$release_flow_origin_before_release" ]] || \
+  fail "mock release changed its local origin/main"
+if git --git-dir="$release_flow_origin" rev-parse refs/tags/v1.1.0 \
+  >/dev/null 2>&1; then
+  fail "mock release pushed a tag to its local origin"
+fi
 
 cd "$ROOT_DIR"
 bash -n \

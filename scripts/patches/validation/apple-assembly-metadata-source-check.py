@@ -18,6 +18,7 @@ from typing import Mapping
 PATHS = {
     "gcrypt_patch": "contrib/src/gcrypt/rijndael-aesni-apple-alignment.patch",
     "gcrypt_rules": "contrib/src/gcrypt/rules.mak",
+    "contrib_main": "contrib/src/main.mak",
     "apple_build": "extras/package/apple/build.sh",
     "nasm_wrapper": "extras/package/apple/nasm-wrapper.sh",
     "tool_sums": "extras/tools/SHA512SUMS",
@@ -28,6 +29,7 @@ PATHS = {
 PATCH_PATHS = (
     PATHS["gcrypt_patch"],
     PATHS["gcrypt_rules"],
+    PATHS["contrib_main"],
     PATHS["apple_build"],
     PATHS["nasm_wrapper"],
     PATHS["tool_sums"],
@@ -36,7 +38,7 @@ PATCH_PATHS = (
 )
 
 EXPECTED_PATCH_SHA256 = (
-    "402b7ca09aab50fe89391ea22b8b96113b899bce3028406a3293d574eb706beb"
+    "5f1a58d162c798b2d6f5c2a2fdac9f728279f195ef192405b80272bc2f164c59"
 )
 EXPECTED_WRAPPER_SHA256 = (
     "531c0d99e01e0c6e04af9d28c6a04121264d240242ae9d5905f014243eb33282"
@@ -53,6 +55,28 @@ EXPECTED_INSTALL_FUNCTION_SHA256 = (
 EXPECTED_NASM_SHA512 = (
     "2971e17bad24127149c53fec5b7f28b32811d19c3f4b3fe9fff7f44df9e6c78f"
     "0a7dc3b30cb2257317ce8faa96c6063dad785250104c670ed7bb14651c1c8437"
+)
+
+MESON_ENVIRONMENT_ASSIGNMENT = (
+    'MESON = env -i PATH="$(PATH)" \\\n'
+    '\tVLC_APPLE_NASM_REAL="$(VLC_APPLE_NASM_REAL)" \\\n'
+    '\tVLC_APPLE_NASM_PLATFORM="$(VLC_APPLE_NASM_PLATFORM)" \\\n'
+    '\tVLC_APPLE_NASM_MIN_OS_VERSION="$(VLC_APPLE_NASM_MIN_OS_VERSION)" \\\n'
+    '\tVLC_APPLE_NASM_SDK_VERSION="$(VLC_APPLE_NASM_SDK_VERSION)" \\\n'
+    '\tmeson setup -Dpkg_config_path="$(PKG_CONFIG_PATH)" \\\n'
+    '\t$(MESONFLAGS)'
+)
+
+MESON_BUILD_ASSIGNMENT = (
+    "MESONBUILD = meson compile -C $(BUILD_DIR) $(MESON_BUILD) "
+    "$(MESONCOMPILEFLAGS) && meson install -C $(BUILD_DIR)"
+)
+
+MESON_FORWARDED_NASM_VARIABLES = (
+    "VLC_APPLE_NASM_REAL",
+    "VLC_APPLE_NASM_PLATFORM",
+    "VLC_APPLE_NASM_MIN_OS_VERSION",
+    "VLC_APPLE_NASM_SDK_VERSION",
 )
 
 PLATFORMS = {
@@ -140,6 +164,34 @@ def validate_tools(sources: Mapping[str, str]) -> None:
             f"NASM bootstrap minimum is not exactly 3.02: {minimum_lines}"
         )
     require_count(bootstrap, "check_nasm $MIN_NASM", 1, "NASM minimum probe")
+
+
+def validate_contrib_meson_environment(source: str) -> None:
+    require_count(
+        source,
+        MESON_ENVIRONMENT_ASSIGNMENT,
+        1,
+        "cross-Meson fail-closed Apple NASM environment forwarding",
+    )
+    for variable in MESON_FORWARDED_NASM_VARIABLES:
+        require_count(
+            MESON_ENVIRONMENT_ASSIGNMENT,
+            f'{variable}="$({variable})"',
+            1,
+            f"cross-Meson forwarding for {variable}",
+        )
+    require_count(
+        source,
+        "# command, except PATH and the fail-closed Apple NASM wrapper inputs.",
+        1,
+        "cross-Meson environment policy",
+    )
+    require_count(
+        source,
+        MESON_BUILD_ASSIGNMENT,
+        1,
+        "cross-Meson compile/install environment inheritance",
+    )
 
 
 def validate_apple_build(source: str) -> None:
@@ -275,6 +327,7 @@ def validate_sources(sources: Mapping[str, str], root: Path | None = None) -> No
     if set(sources) != set(PATHS):
         raise AssertionError("0038 source inventory is not exact")
     validate_tools(sources)
+    validate_contrib_meson_environment(sources["contrib_main"])
     validate_apple_build(sources["apple_build"])
     validate_gcrypt(sources)
     if root is not None:
@@ -343,6 +396,24 @@ def validate_mutations(sources: Mapping[str, str], patch: str) -> int:
         ("tool_packages", "NASM_VERSION=3.02", "NASM_VERSION=3.01"),
         ("tool_sums", EXPECTED_NASM_SHA512, "0" + EXPECTED_NASM_SHA512[1:]),
         ("tool_bootstrap", "MIN_NASM=3.02", "MIN_NASM=2.14"),
+    ) + tuple(
+        (
+            "contrib_main",
+            f'\t{variable}="$({variable})" \\\n',
+            "",
+        )
+        for variable in MESON_FORWARDED_NASM_VARIABLES
+    ) + (
+        (
+            "contrib_main",
+            'MESON = env -i PATH="$(PATH)"',
+            'MESON = env PATH="$(PATH)"',
+        ),
+        (
+            "contrib_main",
+            "MESONBUILD = meson compile",
+            'MESONBUILD = env -i PATH="$(PATH)" meson compile',
+        ),
         (
             "apple_build",
             "macCatalyst) VLC_APPLE_NASM_PLATFORM=macCatalyst ;;",
@@ -596,6 +667,125 @@ def validate_install_runtime(
     return len(cases)
 
 
+def validate_cross_meson_environment_runtime(
+    contrib_main_source: str,
+    work_root: Path | None,
+) -> int:
+    validate_contrib_meson_environment(contrib_main_source)
+    with tempfile.TemporaryDirectory(
+        prefix="swiftvlc-apple-meson-env-", dir=work_root
+    ) as temporary:
+        temporary_path = Path(temporary)
+        fake_bin = temporary_path / "fake-bin"
+        fake_bin.mkdir()
+        record = temporary_path / "meson-environment.json"
+        fake_meson = fake_bin / "meson"
+        fake_meson.write_text(
+            f"#!{sys.executable}\n"
+            "import json\n"
+            "import os\n"
+            "from pathlib import Path\n"
+            "import sys\n"
+            f"with Path({str(record)!r}).open(\"a\", encoding=\"utf-8\") "
+            "as stream:\n"
+            "    stream.write(json.dumps({\"arguments\": sys.argv[1:], "
+            "\"environment\": dict(os.environ)}) + \"\\n\")\n",
+            encoding="utf-8",
+        )
+        fake_meson.chmod(0o755)
+
+        expected_values = {
+            "VLC_APPLE_NASM_REAL": str(temporary_path / "pinned-nasm"),
+            "VLC_APPLE_NASM_PLATFORM": "iossimulator",
+            "VLC_APPLE_NASM_MIN_OS_VERSION": "18.0",
+            "VLC_APPLE_NASM_SDK_VERSION": "26.5",
+        }
+        makefile = temporary_path / "Makefile"
+        makefile.write_text(
+            f"PATH := {fake_bin}:/usr/bin:/bin\n"
+            "PKG_CONFIG_PATH := /explicit/pkg-config\n"
+            "MESONFLAGS := -Dswiftvlc_probe=true\n"
+            "BUILD_DIR := probe-build\n"
+            "MESON_BUILD :=\n"
+            "MESONCOMPILEFLAGS :=\n"
+            f"{MESON_ENVIRONMENT_ASSIGNMENT}\n"
+            f"{MESON_BUILD_ASSIGNMENT}\n"
+            ".PHONY: all\n"
+            "all:\n"
+            "\t@$(MESON)\n"
+            "\t@$(MESONBUILD)\n",
+            encoding="utf-8",
+        )
+
+        environment = os.environ.copy()
+        environment.update(expected_values)
+        scrubbed_values = {
+            "HOME": "/poison/home",
+            "CC": "/poison/cc",
+            "CFLAGS": "-DPOISON",
+            "NASMENV": "-f macho64",
+        }
+        environment.update(scrubbed_values)
+        result = subprocess.run(
+            ["make", "-f", str(makefile)],
+            cwd=temporary_path,
+            env=environment,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=10,
+        )
+        if result.returncode != 0:
+            raise AssertionError(
+                "cross-Meson environment harness failed: "
+                f"stdout={result.stdout!r}; stderr={result.stderr!r}"
+            )
+        if not record.is_file():
+            raise AssertionError("cross-Meson environment did not invoke meson")
+        payloads = [
+            json.loads(line)
+            for line in record.read_text(encoding="utf-8").splitlines()
+        ]
+        expected_arguments = [
+            [
+                "setup",
+                "-Dpkg_config_path=/explicit/pkg-config",
+                "-Dswiftvlc_probe=true",
+            ],
+            ["compile", "-C", "probe-build"],
+            ["install", "-C", "probe-build"],
+        ]
+        if [payload["arguments"] for payload in payloads] != expected_arguments:
+            raise AssertionError(
+                "cross-Meson arguments changed: "
+                f"{[payload['arguments'] for payload in payloads]!r}"
+            )
+        for phase, payload in zip(("setup", "compile", "install"), payloads):
+            observed_environment = payload["environment"]
+            for key, value in expected_values.items():
+                if observed_environment.get(key) != value:
+                    raise AssertionError(
+                        f"cross-Meson {phase} lost {key}: "
+                        f"{observed_environment.get(key)!r}"
+                    )
+        setup_environment = payloads[0]["environment"]
+        for forbidden in scrubbed_values:
+            if forbidden in setup_environment:
+                raise AssertionError(
+                    "cross-Meson setup retained scrubbed environment key "
+                    f"{forbidden}"
+                )
+        for phase, payload in zip(("compile", "install"), payloads[1:]):
+            observed_environment = payload["environment"]
+            for key, value in scrubbed_values.items():
+                if observed_environment.get(key) != value:
+                    raise AssertionError(
+                        f"cross-Meson {phase} did not inherit {key}: "
+                        f"{observed_environment.get(key)!r}"
+                    )
+    return 3
+
+
 def validate_wrapper_runtime(wrapper: Path, work_root: Path | None) -> int:
     with tempfile.TemporaryDirectory(
         prefix="swiftvlc-apple-nasm-", dir=work_root
@@ -804,11 +994,15 @@ def main() -> int:
         source_paths["nasm_wrapper"],
         arguments.work_root,
     )
+    meson_environment_cases = validate_cross_meson_environment_runtime(
+        sources["contrib_main"], arguments.work_root
+    )
 
     print(
         "PASS Apple assembly metadata source proof: "
         f"paths={len(PATHS)} mutations={mutation_count} "
         f"wrapper_cases={wrapper_cases} install_cases={install_cases} "
+        f"meson_environment_cases={meson_environment_cases} "
         f"patch_sha={EXPECTED_PATCH_SHA256}"
     )
     return 0
