@@ -17,11 +17,6 @@ extension PiPController {
   struct PlaybackStateObservationState {
     private(set) var durationMilliseconds: Int64?
     private(set) var isSeekable: Bool
-    /// Media generation this observer has adopted from event provenance.
-    /// Unlike the capability generation below, this is available even when a
-    /// native handle was populated before its event manager was attached and
-    /// therefore never emits `MediaChanged`.
-    private var playbackGeneration: PlaybackGeneration?
     /// The capability generation current when this media was adopted.
     private var generationAtReset: UInt64?
     /// Whether `Player`'s capability values are known to describe *this*
@@ -34,33 +29,9 @@ extension PiPController {
     private var hasDurationPayload = false
     private var hasSeekablePayload = false
 
-    init(
-      duration: Duration?,
-      isSeekable: Bool,
-      playbackGeneration: PlaybackGeneration? = nil
-    ) {
+    init(duration: Duration?, isSeekable: Bool) {
       durationMilliseconds = duration?.milliseconds
       self.isSeekable = isSeekable
-      self.playbackGeneration = playbackGeneration
-    }
-
-    /// Adopts a successor session before consuming its first event.
-    ///
-    /// Active drawable playback creates a new native player, installs its
-    /// media, and only then attaches the event bridge. That ordering is needed
-    /// for transactional replacement but means the successor can legitimately
-    /// have no native `MediaChanged` callback. Its first `.opening`,
-    /// `.playing`, or clock envelope still carries the new playback generation,
-    /// so use that provenance as the authoritative reset boundary.
-    mutating func adoptPlaybackGeneration(
-      _ generation: PlaybackGeneration,
-      capability: PlayerCapabilitySnapshot
-    ) -> PlaybackStateUpdate? {
-      if let playbackGeneration {
-        guard generation > playbackGeneration else { return nil }
-      }
-      playbackGeneration = generation
-      return resetForMediaChange(capability: capability)
     }
 
     mutating func consume(
@@ -69,7 +40,24 @@ extension PiPController {
     ) -> PlaybackStateUpdate {
       switch event {
       case .mediaChanged:
-        return resetForMediaChange(capability: capability)
+        // The new input's duration/seekability have not been reported yet.
+        // Reset conservatively even if Player's event consumer still exposes
+        // the previous media's values.
+        durationMilliseconds = nil
+        isSeekable = false
+        hasDurationPayload = false
+        hasSeekablePayload = false
+        generationAtReset = capability.generation
+        // If the snapshot already holds the reset values, `Player` has
+        // processed this same media change and its capability can be trusted
+        // straight away — the common case, since `load(_:)` resets
+        // synchronously. Otherwise the snapshot still describes the outgoing
+        // media and must be ignored until the generation moves on.
+        trustsPolledCapability = capability.isReset
+        return PlaybackStateUpdate(
+          invalidatesPlaybackState: true,
+          requiresLinearPlayback: true
+        )
 
       case .lengthChanged(let duration):
         hasDurationPayload = true
@@ -111,29 +99,6 @@ extension PiPController {
       }
     }
 
-    private mutating func resetForMediaChange(
-      capability: PlayerCapabilitySnapshot
-    ) -> PlaybackStateUpdate {
-      // The new input's duration/seekability have not been reported yet.
-      // Reset conservatively even if Player's event consumer still exposes
-      // the previous media's values.
-      durationMilliseconds = nil
-      isSeekable = false
-      hasDurationPayload = false
-      hasSeekablePayload = false
-      generationAtReset = capability.generation
-      // If the snapshot already holds the reset values, `Player` has
-      // processed this same media change and its capability can be trusted
-      // straight away — the common case, since `load(_:)` resets
-      // synchronously. Otherwise the snapshot still describes the outgoing
-      // media and must be ignored until the generation moves on.
-      trustsPolledCapability = capability.isReset
-      return PlaybackStateUpdate(
-        invalidatesPlaybackState: true,
-        requiresLinearPlayback: true
-      )
-    }
-
     /// Folds `Player`'s polled capability into this snapshot, when it can be
     /// shown to describe the same media.
     private mutating func reconcile(
@@ -169,6 +134,33 @@ extension PiPController {
     }
   }
 
+  @MainActor struct PlaybackStateEventSuppression: Equatable {
+    private(set) var suppressedLengthEventCount = 0
+    private(set) var suppressedSeekableEventCount = 0
+
+    mutating func shouldObserve(
+      _ event: PlayerEvent,
+      suppressingRawCapabilityEvents: Bool
+    ) -> Bool {
+      guard
+        !PiPController.shouldObservePlaybackStateEvent(
+          event,
+          suppressingRawCapabilityEvents: suppressingRawCapabilityEvents
+        )
+      else { return true }
+
+      switch event {
+      case .lengthChanged:
+        suppressedLengthEventCount += 1
+      case .seekableChanged:
+        suppressedSeekableEventCount += 1
+      default:
+        break
+      }
+      return false
+    }
+  }
+
   /// Qualification fault injection must drop raw capability callbacks from
   /// this observer as well as from Player's observable mirror. The two own
   /// independent subscriptions to the same event bridge; suppressing only the
@@ -185,27 +177,6 @@ extension PiPController {
     default:
       return true
     }
-  }
-
-  /// Whether a sourced event can still describe the player the PiP controller
-  /// currently owns.
-  ///
-  /// A native media change can reach this controller before `Player`'s own
-  /// main-actor consumer publishes the successor generation, so that one event
-  /// may legitimately be newer. Every other event must match exactly. Native
-  /// handle identity is always exact: callbacks from a retired handle cannot
-  /// describe the installed player even when the event bridge has already
-  /// stamped them with the successor playback generation.
-  static func shouldObservePlaybackStateEnvelope(
-    _ envelope: PlayerEventEnvelope,
-    nativeGeneration: NativePlayerGeneration,
-    playbackGeneration: PlaybackGeneration
-  ) -> Bool {
-    guard envelope.nativeGeneration == nativeGeneration else { return false }
-    if case .mediaChanged = envelope.event {
-      return envelope.playbackGeneration >= playbackGeneration
-    }
-    return envelope.playbackGeneration == playbackGeneration
   }
 
   static func applyPlaybackStateUpdate(
@@ -225,15 +196,16 @@ extension PiPController {
   /// integer conversion for invalid, infinite, or out-of-range `CMTime`s.
   static func skipOffsetMilliseconds(_ interval: CMTime) -> Int64? {
     guard interval.isNumeric else { return nil }
-    let milliseconds = interval.seconds * 1000
-    guard milliseconds.isFinite else { return nil }
-    if milliseconds >= Double(Int64.max) {
-      return .max
-    }
-    if milliseconds <= Double(Int64.min) {
-      return .min
-    }
-    return Int64(milliseconds)
+    let milliseconds = CMTimeConvertScale(
+      interval,
+      timescale: 1000,
+      method: .roundTowardZero
+    )
+    guard
+      milliseconds.isNumeric,
+      LibVLCTimeMilliseconds.contains(milliseconds.value)
+    else { return nil }
+    return milliseconds.value
   }
 
   /// Saturating addition followed by clamping to the playable timeline.

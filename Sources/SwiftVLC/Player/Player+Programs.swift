@@ -52,7 +52,7 @@ extension Player {
   /// > reach — applying a renderer there does not produce remote output.
   ///
   /// - Parameter renderer: A ``RendererItem`` discovered by ``RendererDiscoverer``, or `nil`.
-  /// - Throws: ``VLCError/rendererFailed`` if the renderer cannot be set,
+  /// - Throws: ``VLCError/rendererFailed-enum.case`` if the renderer cannot be set,
   ///   or ``VLCError/invalidState(_:)`` if the player has already started
   ///   playback or isn't in an idle-like state.
   public func setRenderer(_ renderer: RendererItem?) throws(VLCError) {
@@ -108,7 +108,7 @@ extension Player {
   /// > Note: On tvOS the bundled libVLC ships no renderer output
   /// > backends — see ``setRenderer(_:)``.
   ///
-  /// - Throws: ``VLCError/rendererFailed`` if the renderer is
+  /// - Throws: ``VLCError/rendererFailed-enum.case`` if the renderer is
   ///   rejected (prior renderer and local playback left intact),
   ///   ``VLCError/playbackFailed(reason:)`` if the replacement session
   ///   cannot be started (the renderer is applied at that point — the

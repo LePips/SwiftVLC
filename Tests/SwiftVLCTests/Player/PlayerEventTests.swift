@@ -16,6 +16,7 @@ extension Logic {
         .mediaChanged,
         .encounteredError,
         .volumeChanged(0.5),
+        .rateChanged(1.25),
         .muted,
         .unmuted,
         .corked,
@@ -35,7 +36,7 @@ extension Logic {
         .programSelected(unselectedId: 0, selectedId: 1),
         .programUpdated(1)
       ]
-      #expect(events.count == 28)
+      #expect(events.count == 29)
     }
 
     @Test

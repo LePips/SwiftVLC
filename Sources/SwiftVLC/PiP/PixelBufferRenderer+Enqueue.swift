@@ -28,9 +28,10 @@ struct PixelBufferEnqueueState: @unchecked Sendable {
   /// scoped to it so a replacement cannot inherit the retry budget and turn
   /// the next generation's plain backpressure into retention.
   var flushRecoveryGeneration: UInt64?
-  /// Times flush recovery exhausted its budget and dropped the frame. A
-  /// non-zero value is the explicit terminal failure the display never
-  /// repainted from.
+  /// Unrecoverable display transitions. This includes a flush recovery that
+  /// exhausted its retry budget and a renderer whose `.failed` state did not
+  /// explicitly advertise `requiresFlushToResumeDecoding`. A non-zero value
+  /// is an observable terminal failure, never a successful frame delivery.
   var flushRecoveryFailureCount: UInt64 = 0
   var flushRecoveryTotalRetryCount: UInt64 = 0
   var enqueuedFrameCount: UInt64 = 0
@@ -152,6 +153,18 @@ enum PixelBufferSampleDisposition: Equatable {
   case deferred
 }
 
+private enum PixelBufferDeferredRegistration {
+  case rejected
+  case installed(shouldSchedule: Bool)
+  case needsSerializedVoutTransition
+}
+
+private enum PixelBufferDisplayRecoveryDecision: Equatable {
+  case usable
+  case flushRequired
+  case permanentlyFailed
+}
+
 /// Injectable display-layer operations make queue saturation, backpressure,
 /// flush, and delivery ordering deterministic in tests.
 struct PixelBufferDisplayLayerAPI: @unchecked Sendable {
@@ -179,14 +192,16 @@ extension PixelBufferRenderer {
     playbackGeneration: UInt64? = nil,
     voutGeneration: UInt64? = nil
   ) -> Bool {
-    let acceptsRendererIdentity = state.withLock { state in
-      state.renderGeneration == generation
-        && state.displayLayer.layer === layer
-        && playbackGeneration.map { $0 == (state.playbackGeneration ?? 0) } != false
-    }
-    guard acceptsRendererIdentity else { return false }
-    return enqueueState.withLock { state in
-      voutGeneration.map { $0 == state.latestVoutGeneration } != false
+    withOutputSubmissionSerialization {
+      let acceptsRendererIdentity = state.withLock { state in
+        state.renderGeneration == generation
+          && state.displayLayer.layer === layer
+          && playbackGeneration.map { $0 == (state.playbackGeneration ?? 0) } != false
+      }
+      guard acceptsRendererIdentity else { return false }
+      return enqueueState.withLock { state in
+        voutGeneration.map { $0 == state.latestVoutGeneration } != false
+      }
     }
   }
 
@@ -207,43 +222,161 @@ extension PixelBufferRenderer {
       playbackGeneration: playbackGeneration,
       voutGeneration: voutGeneration
     )
-    // `beginPlaybackGeneration` publishes the new identity and clears the
-    // pending slot under this same mutex. A producer therefore either claims
-    // the slot first and is cleared by the boundary, or observes the new
-    // generation and is rejected. It never waits behind AVFoundation's
-    // potentially slow enqueue operation.
-    let shouldSchedule = enqueueState.withLock { state -> Bool? in
+    // Same-vout producers can replace the bounded slot while a slow output
+    // call is in flight. A monotonic vout transition is rarer and must share
+    // the final-output gate so a retired drain cannot cross the publication.
+    let registration: PixelBufferDeferredRegistration = switch installDeferredSample(pending, allowingVoutTransition: false) {
+    case .needsSerializedVoutTransition:
+      withOutputSubmissionSerialization {
+        installDeferredSample(pending, allowingVoutTransition: true)
+      }
+    case let result:
+      result
+    }
+
+    guard case .installed(let shouldSchedule) = registration, shouldSchedule else { return }
+    enqueueQueue.async { [self] in
+      drainPendingSamples()
+    }
+  }
+
+  /// Submits one exact frame before returning. Unlike ``enqueue``, this path
+  /// never schedules, retains, retries or defers the sample. `true` therefore
+  /// means the final display-layer enqueue closure was invoked synchronously.
+  func enqueueSynchronously(
+    _ sample: CMSampleBuffer,
+    generation: UInt64,
+    on layer: AVSampleBufferDisplayLayer,
+    playbackGeneration: UInt64,
+    voutGeneration: UInt64
+  ) -> Bool {
+    let pending = EnqueuedSampleBuffer(
+      layer: layer,
+      sample: sample,
+      generation: generation,
+      playbackGeneration: playbackGeneration,
+      voutGeneration: voutGeneration
+    )
+
+    return withOutputSubmissionSerialization {
+      guard acceptsRendererIdentity(pending) else { return false }
+      let accepted = enqueueState.withLock { state -> Bool in
+        guard registerIncomingSample(pending, state: &state) else { return false }
+        // This exact synchronous frame supersedes any queued or retained
+        // predecessor. Keep an existing drain gate owned: when that closure
+        // runs it will observe the empty slot and release the gate.
+        if state.pending != nil {
+          state.replacementCount &+= 1
+          state.pending = nil
+        }
+        state.flushRecoveryRetryCount = 0
+        state.flushRecoveryGeneration = nil
+        return true
+      }
+      guard accepted else { return false }
+
+      let recoveryDecision = displayRecoveryDecision(for: layer)
+      if recoveryDecision == .permanentlyFailed {
+        recordPermanentDisplayFailure()
+        return false
+      }
+      if recoveryDecision == .flushRequired {
+        guard acceptsFullIdentity(pending) else { return false }
+        displayLayerAPI.flush(layer)
+        guard acceptsFullIdentity(pending) else { return false }
+        enqueueState.withLock {
+          $0.flushCount &+= 1
+          $0.status = .recovering
+        }
+      }
+
+      guard displayLayerAPI.isReadyForMoreMediaData(layer) else {
+        if acceptsFullIdentity(pending) {
+          enqueueState.withLock {
+            $0.backpressureDropCount &+= 1
+            $0.status = .backpressured
+          }
+        }
+        return false
+      }
+      guard acceptsFullIdentity(pending) else { return false }
+
+      // No renderer mutex is held across this potentially reentrant framework
+      // operation. Re-entry remains in the recursive submission domain and
+      // can mutate lifecycle state without a self-deadlock.
+      displayLayerAPI.enqueue(layer, sample)
+      recordDeliveredSample(pending)
+      return true
+    }
+  }
+
+  private func registerIncomingSample(
+    _ pending: EnqueuedSampleBuffer,
+    state: inout PixelBufferEnqueueState
+  ) -> Bool {
+    if
+      let latestPlaybackGeneration = state.latestPlaybackGeneration,
+      latestPlaybackGeneration != pending.playbackGeneration {
+      return false
+    }
+    // Vout generations are issued monotonically. Once a successor appears,
+    // a delayed callback from a retired vout can never regress the identity.
+    if let latest = state.latestVoutGeneration, pending.voutGeneration < latest {
+      return false
+    }
+    state.enqueuedFrameCount &+= 1
+    state.lastEnqueuedAt = .now
+    state.latestPlaybackGeneration = pending.playbackGeneration
+    if state.latestVoutGeneration != pending.voutGeneration {
+      state.voutTransitionCount &+= 1
+      state.latestVoutGeneration = pending.voutGeneration
+    }
+    return true
+  }
+
+  private func installDeferredSample(
+    _ pending: EnqueuedSampleBuffer,
+    allowingVoutTransition: Bool
+  ) -> PixelBufferDeferredRegistration {
+    enqueueState.withLock { state in
       if
         let latestPlaybackGeneration = state.latestPlaybackGeneration,
-        latestPlaybackGeneration != playbackGeneration {
-        return nil
+        latestPlaybackGeneration != pending.playbackGeneration {
+        return .rejected
       }
-      // Vout generations are issued monotonically. Once a successor has
-      // appeared, a delayed callback from the retired vout is stale even if
-      // it has the same media and render generation.
-      if let latest = state.latestVoutGeneration, voutGeneration < latest {
-        return nil
+      if let latest = state.latestVoutGeneration, pending.voutGeneration < latest {
+        return .rejected
       }
-      state.enqueuedFrameCount &+= 1
-      state.lastEnqueuedAt = .now
-      state.latestPlaybackGeneration = playbackGeneration
-      if state.latestVoutGeneration != voutGeneration {
-        state.voutTransitionCount &+= 1
-        state.latestVoutGeneration = voutGeneration
+      if state.latestVoutGeneration != pending.voutGeneration, !allowingVoutTransition {
+        return .needsSerializedVoutTransition
       }
+      guard registerIncomingSample(pending, state: &state) else { return .rejected }
       if state.pending != nil {
         state.replacementCount &+= 1
       }
       state.pending = pending
-      guard !state.isDrainScheduled else { return false }
+      guard !state.isDrainScheduled else {
+        return .installed(shouldSchedule: false)
+      }
       state.isDrainScheduled = true
       state.scheduledDrainCount &+= 1
-      return true
+      return .installed(shouldSchedule: true)
     }
+  }
 
-    guard shouldSchedule == true else { return }
-    enqueueQueue.async { [self] in
-      drainPendingSamples()
+  private func acceptsRendererIdentity(_ pending: EnqueuedSampleBuffer) -> Bool {
+    state.withLock { state in
+      state.renderGeneration == pending.generation
+        && state.displayLayer.layer === pending.layer
+        && (state.playbackGeneration ?? 0) == pending.playbackGeneration
+    }
+  }
+
+  private func acceptsFullIdentity(_ pending: EnqueuedSampleBuffer) -> Bool {
+    guard acceptsRendererIdentity(pending) else { return false }
+    return enqueueState.withLock {
+      $0.latestPlaybackGeneration == pending.playbackGeneration
+        && $0.latestVoutGeneration == pending.voutGeneration
     }
   }
 
@@ -360,14 +493,16 @@ extension PixelBufferRenderer {
   /// slot before this check or observes the cleared flag and schedules the
   /// successor drain; there is no lost-wakeup window.
   private func takePendingSampleOrFinishDrain() -> EnqueuedSampleBuffer? {
-    enqueueState.withLock { state in
-      guard let pending = state.pending else {
-        state.isDrainScheduled = false
-        return nil
+    withOutputSubmissionSerialization {
+      enqueueState.withLock { state in
+        guard let pending = state.pending else {
+          state.isDrainScheduled = false
+          return nil
+        }
+        state.pending = nil
+        state.drainedSampleCount &+= 1
+        return pending
       }
-      state.pending = nil
-      state.drainedSampleCount &+= 1
-      return pending
     }
   }
 
@@ -375,20 +510,7 @@ extension PixelBufferRenderer {
     _ pending: EnqueuedSampleBuffer
   )
     -> PixelBufferSampleDisposition {
-    guard
-      canEnqueueFrame(
-        generation: pending.generation,
-        on: pending.layer,
-        playbackGeneration: pending.playbackGeneration,
-        voutGeneration: pending.voutGeneration
-      )
-    else {
-      return endFlushRecovery()
-    }
-
-    let shouldFlush = displayLayerAPI.status(pending.layer) == .failed
-      || displayLayerAPI.requiresFlush(pending.layer)
-    if shouldFlush {
+    withOutputSubmissionSerialization {
       guard
         canEnqueueFrame(
           generation: pending.generation,
@@ -399,73 +521,110 @@ extension PixelBufferRenderer {
       else {
         return endFlushRecovery()
       }
-      displayLayerAPI.flush(pending.layer)
-      enqueueState.withLock {
-        $0.flushCount &+= 1
-        $0.status = .recovering
-      }
-    }
 
-    guard displayLayerAPI.isReadyForMoreMediaData(pending.layer) else {
-      // Recovery is sticky once entered. The flush above clears
-      // `requiresFlushToResumeDecoding`, so a re-offer of the same frame sees
-      // `shouldFlush == false` and would otherwise fall into the backpressure
-      // drop below — losing the frame on the very first retry, which is the
-      // bug this is meant to fix.
-      let isRecovering = enqueueState.withLock {
-        $0.flushRecoveryRetryCount > 0 && $0.flushRecoveryGeneration == pending.generation
-      }
-      // Plain backpressure keeps dropping: the decoder is still producing, so
-      // a successor frame is already on its way and the newest one wins.
-      guard shouldFlush || isRecovering else {
-        enqueueState.withLock {
-          $0.backpressureDropCount &+= 1
-          $0.status = .backpressured
-        }
+      let recoveryDecision = displayRecoveryDecision(for: pending.layer)
+      if recoveryDecision == .permanentlyFailed {
+        recordPermanentDisplayFailure()
         return .handled
       }
-      // Flush recovery has no such guarantee. A paused seek, a final frame or
-      // a foreground repaint may have no successor at all, so the frame that
-      // triggered the flush is the only thing that can repaint the display —
-      // dropping it here is what leaves PiP black with audio still running.
-      return retainForFlushRecovery(pending)
-    }
-
-    // The final validation and enqueue share one state-lock linearization
-    // point. A generation/layer mutation either happens first and rejects this
-    // sample, or happens after this enqueue; stale work cannot cross it.
-    let delivered = state.withLock { state -> Bool in
-      guard
-        state.renderGeneration == pending.generation,
-        state.displayLayer.layer === pending.layer,
-        (state.playbackGeneration ?? 0) == pending.playbackGeneration
-      else { return false }
-      let acceptsVoutGeneration = enqueueState.withLock {
-        $0.latestVoutGeneration == pending.voutGeneration
-      }
-      guard acceptsVoutGeneration else { return false }
-      displayLayerAPI.enqueue(pending.layer, pending.sample)
-      return true
-    }
-    if delivered {
-      let presentationTime = CMSampleBufferGetPresentationTimeStamp(pending.sample)
-      enqueueState.withLock {
+      let shouldFlush = recoveryDecision == .flushRequired
+      if shouldFlush {
         guard
-          $0.latestPlaybackGeneration == pending.playbackGeneration,
-          $0.latestVoutGeneration == pending.voutGeneration
-        else { return }
-        $0.flushRecoveryRetryCount = 0
-        $0.flushRecoveryGeneration = nil
-        $0.presentedFrameCount &+= 1
-        $0.lastPresentedAt = .now
-        $0.lastPresentedSampleTimeSeconds = presentationTime.isNumeric
-          ? presentationTime.seconds
-          : nil
-        $0.lastPresentedSamplePlaybackGeneration = pending.playbackGeneration
-        $0.status = .rendering
+          canEnqueueFrame(
+            generation: pending.generation,
+            on: pending.layer,
+            playbackGeneration: pending.playbackGeneration,
+            voutGeneration: pending.voutGeneration
+          )
+        else {
+          return endFlushRecovery()
+        }
+        displayLayerAPI.flush(pending.layer)
+        enqueueState.withLock {
+          $0.flushCount &+= 1
+          $0.status = .recovering
+        }
       }
+
+      guard displayLayerAPI.isReadyForMoreMediaData(pending.layer) else {
+        // Recovery is sticky once entered. The flush above clears
+        // `requiresFlushToResumeDecoding`, so a re-offer of the same frame sees
+        // `shouldFlush == false` and would otherwise fall into the backpressure
+        // drop below — losing the frame on the very first retry, which is the
+        // bug this is meant to fix.
+        let isRecovering = enqueueState.withLock {
+          $0.flushRecoveryRetryCount > 0 && $0.flushRecoveryGeneration == pending.generation
+        }
+        // Plain backpressure keeps dropping: the decoder is still producing, so
+        // a successor frame is already on its way and the newest one wins.
+        guard shouldFlush || isRecovering else {
+          enqueueState.withLock {
+            $0.backpressureDropCount &+= 1
+            $0.status = .backpressured
+          }
+          return .handled
+        }
+        // Flush recovery has no such guarantee. A paused seek, a final frame or
+        // a foreground repaint may have no successor at all, so the frame that
+        // triggered the flush is the only thing that can repaint the display —
+        // dropping it here is what leaves PiP black with audio still running.
+        return retainForFlushRecovery(pending)
+      }
+
+      guard acceptsFullIdentity(pending) else {
+        return endFlushRecovery()
+      }
+      // Identity mutations are serialized by the recursive submission gate,
+      // so the framework call needs no renderer mutex. A synchronous re-entry
+      // can safely mutate lifecycle state.
+      displayLayerAPI.enqueue(pending.layer, pending.sample)
+      recordDeliveredSample(pending)
+      return .handled
     }
-    return .handled
+  }
+
+  private func recordDeliveredSample(_ pending: EnqueuedSampleBuffer) {
+    let presentationTime = CMSampleBufferGetPresentationTimeStamp(pending.sample)
+    enqueueState.withLock {
+      guard
+        $0.latestPlaybackGeneration == pending.playbackGeneration,
+        $0.latestVoutGeneration == pending.voutGeneration
+      else { return }
+      $0.flushRecoveryRetryCount = 0
+      $0.flushRecoveryGeneration = nil
+      $0.presentedFrameCount &+= 1
+      $0.lastPresentedAt = .now
+      $0.lastPresentedSampleTimeSeconds = presentationTime.isNumeric
+        ? presentationTime.seconds
+        : nil
+      $0.lastPresentedSamplePlaybackGeneration = pending.playbackGeneration
+      $0.status = .rendering
+    }
+  }
+
+  /// AVFoundation distinguishes decoder-resource revocation from a permanent
+  /// renderer failure with `requiresFlushToResumeDecoding`. Flushing every
+  /// `.failed` renderer erases that distinction and can turn an exact frame
+  /// step into a false success after an unrecoverable output error.
+  private func displayRecoveryDecision(
+    for layer: AVSampleBufferDisplayLayer
+  ) -> PixelBufferDisplayRecoveryDecision {
+    let status = displayLayerAPI.status(layer)
+    if displayLayerAPI.requiresFlush(layer) {
+      return .flushRequired
+    }
+    return status == .failed ? .permanentlyFailed : .usable
+  }
+
+  private func recordPermanentDisplayFailure() {
+    enqueueState.withLock { state in
+      state.flushRecoveryRetryCount = 0
+      state.flushRecoveryGeneration = nil
+      if state.status != .failed {
+        state.flushRecoveryFailureCount &+= 1
+      }
+      state.status = .failed
+    }
   }
 
   /// Clears any in-progress recovery and drops the sample.

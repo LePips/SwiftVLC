@@ -109,6 +109,11 @@ final class PixelBufferRenderer: Sendable {
   let enqueueQueue: DispatchQueue
   let enqueueState = Mutex(PixelBufferEnqueueState())
   let displayLayerAPI: PixelBufferDisplayLayerAPI
+  let displayPreparationAPI: PixelBufferDisplayPreparationAPI
+  /// Recursive because AVFoundation or an injected test backend may re-enter
+  /// a lifecycle method synchronously from the final output call. Renderer
+  /// mutexes are always released before this gate spans framework code.
+  private let outputSubmissionLock = NSRecursiveLock()
 
   /// How long to wait before re-offering a frame the renderer was not ready
   /// for after a flush. Injectable so recovery tests do not sleep a real
@@ -119,6 +124,7 @@ final class PixelBufferRenderer: Sendable {
     displayLayer: AVSampleBufferDisplayLayer? = nil,
     enqueueQueue: DispatchQueue? = nil,
     displayLayerAPI: PixelBufferDisplayLayerAPI = .live,
+    displayPreparationAPI: PixelBufferDisplayPreparationAPI = .live,
     flushRecoveryRetryDelay: DispatchTimeInterval = .milliseconds(16)
   ) {
     state = Mutex(State(displayLayer: displayLayer))
@@ -126,26 +132,52 @@ final class PixelBufferRenderer: Sendable {
       label: "org.swiftvlc.pixel-buffer-renderer.enqueue"
     )
     self.displayLayerAPI = displayLayerAPI
+    self.displayPreparationAPI = displayPreparationAPI
     self.flushRecoveryRetryDelay = flushRecoveryRetryDelay
   }
 
   func setDisplayLayer(_ layer: AVSampleBufferDisplayLayer?) {
-    state.withLock { $0.displayLayer.layer = layer }
+    withOutputSubmissionSerialization {
+      state.withLock { $0.displayLayer.layer = layer }
+    }
   }
 
   /// Starts a new media generation and makes every frame captured before the boundary stale.
-  /// Counters stay cumulative for generation-local health deltas without resetting the hot path.
+  /// The old display is flushed synchronously before the new identity is
+  /// published, so a successful new-generation submission cannot be erased by
+  /// a delayed boundary flush. Counters stay cumulative for health deltas.
   func beginPlaybackGeneration(_ generation: UInt64) {
-    let changed = state.withLock { state -> Bool in
-      guard state.playbackGeneration != generation else { return false }
-      state.playbackGeneration = generation
-      state.lastDecodedFrameMediaTimeSeconds = nil
-      state.advanceRenderGeneration()
+    _ = withOutputSubmissionSerialization {
+      let transition = state.withLock { state -> (changed: Bool, layer: AVSampleBufferDisplayLayer?) in
+        guard state.playbackGeneration != generation else { return (false, nil) }
+        state.displayLayerFlushRequestCount &+= 1
+        return (true, state.displayLayer.layer)
+      }
+      guard transition.changed else { return false }
+      if let layer = transition.layer {
+        displayLayerAPI.flush(layer)
+      }
+      state.withLock { state in
+        state.playbackGeneration = generation
+        state.lastDecodedFrameMediaTimeSeconds = nil
+        state.advanceRenderGeneration()
+      }
+      enqueueState.withLock { $0.beginPlaybackGeneration(generation) }
       return true
     }
-    guard changed else { return }
-    enqueueState.withLock { $0.beginPlaybackGeneration(generation) }
-    flushDisplayLayer()
+  }
+
+  /// Serializes final identity checks and output calls without holding a
+  /// renderer mutex across AVFoundation. The recursive gate makes synchronous
+  /// framework re-entry safe while successor vouts and lifecycle mutations
+  /// wait for the exact in-flight output operation to return.
+  func withOutputSubmissionSerialization<T>(
+    _ operation: () throws -> T
+  )
+    rethrows -> T {
+    outputSubmissionLock.lock()
+    defer { outputSubmissionLock.unlock() }
+    return try operation()
   }
 
   func setTimebase(_ tb: CMTimebase?) {
@@ -239,22 +271,35 @@ final class PixelBufferRenderer: Sendable {
   /// duration leaves scheduling to the presentation timestamp.
   static let sampleDuration: CMTime = .invalid
 
-  /// Returns whether the target actually moved, so callers can skip work that
-  /// is only warranted by a real change — a display-layer flush, in
-  /// particular, which AVKit can otherwise be made to do for every redundant
-  /// render-size callback.
+  /// Returns whether the target actually moved. A real transition flushes the
+  /// old display synchronously before publishing its render generation; a
+  /// redundant callback performs neither mutation nor flush.
   @discardableResult
   func setRenderSize(_ size: CMVideoDimensions?) -> Bool {
-    state.withLock {
-      guard $0.renderSize?.width != size?.width || $0.renderSize?.height != size?.height else {
-        return false
+    withOutputSubmissionSerialization {
+      let transition = state.withLock { state -> (changed: Bool, layer: AVSampleBufferDisplayLayer?) in
+        guard
+          state.renderSize?.width != size?.width
+          || state.renderSize?.height != size?.height
+        else { return (false, nil) }
+        state.displayLayerFlushRequestCount &+= 1
+        return (true, state.displayLayer.layer)
       }
-      $0.renderSize = size
-      $0.renderPool = nil
-      $0.renderPoolWidth = 0
-      $0.renderPoolHeight = 0
-      $0.advanceRenderGeneration()
-      return true
+      guard transition.changed else { return false }
+      if let layer = transition.layer {
+        displayLayerAPI.flush(layer)
+      }
+      return state.withLock {
+        guard $0.renderSize?.width != size?.width || $0.renderSize?.height != size?.height else {
+          return false
+        }
+        $0.renderSize = size
+        $0.renderPool = nil
+        $0.renderPoolWidth = 0
+        $0.renderPoolHeight = 0
+        $0.advanceRenderGeneration()
+        return true
+      }
     }
   }
 
@@ -267,13 +312,18 @@ final class PixelBufferRenderer: Sendable {
     state.withLock { $0.presentationCopyRequired = required }
   }
 
+  /// Flushes in the same domain as output submission. This is intentionally
+  /// synchronous: queueing a flush after a reported exact submission would
+  /// erase the very frame native code just accepted as displayed.
   func flushDisplayLayer() {
-    let layer = state.withLock { state in
-      state.displayLayerFlushRequestCount &+= 1
-      return state.displayLayer.layer
-    }
-    DispatchQueue.main.async { [layer] in
-      layer?.sampleBufferRenderer.flush()
+    withOutputSubmissionSerialization {
+      let layer = state.withLock { state in
+        state.displayLayerFlushRequestCount &+= 1
+        return state.displayLayer.layer
+      }
+      if let layer {
+        displayLayerAPI.flush(layer)
+      }
     }
   }
 

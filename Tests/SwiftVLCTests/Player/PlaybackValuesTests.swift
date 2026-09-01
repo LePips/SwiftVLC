@@ -213,11 +213,10 @@ extension Integration {
       #expect(player.subtitleScale == .halfSize)
     }
 
-    @Test func `setPlaybackRate typed throwing variant accepts a clamped rate`() throws {
+    @Test func `setPlaybackRate immediate API accepts a clamped request`() throws {
       let player = Player(instance: TestInstance.shared)
-      // Without media loaded libVLC returns 0 from set_rate, which is
-      // mapped to a no-op success — the call must not throw and must not
-      // mutate state in surprising ways.
+      // Pinned libVLC returns 0 after queuing/saving the request. Application
+      // by an active input is asynchronous and is outside this host-only test.
       try player.setPlaybackRate(.normal)
       try player.setPlaybackRate(PlaybackRate(8.0)) // clamps to 4.0 in init
     }

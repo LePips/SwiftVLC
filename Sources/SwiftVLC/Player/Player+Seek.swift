@@ -2,9 +2,13 @@ import CLibVLC
 
 #if DEBUG
 struct PlayerSeekTestOverrides {
+  var setTime: ((Int64, Bool) -> Int32)?
   var jumpTime: ((Int64) -> Int32)?
   var setPosition: ((Double, Bool) -> Int32)?
+  var readBaseline: (() -> (timeMilliseconds: Int64, position: Double))?
   var readLanding: (() -> (timeMilliseconds: Int64, position: Double))?
+  var nextFrame: ((UInt64) -> NativeFrameRequestDispatch)?
+  var cancelNextFrame: ((UInt64) -> Bool)?
 }
 #endif
 
@@ -14,13 +18,133 @@ struct PlayerSeekTestOverrides {
 extension Player {
   struct PendingSeekSettlement {
     let playbackGeneration: UInt64
-    let timelineRevision: UInt64
+    var timelineRevision: UInt64?
     let nativeSeekToken: UInt64
     let resolver: SeekOutcomeResolver
+    var baselineTimeMilliseconds: Int64?
+    var baselinePosition: Double?
+    var requestedTimeMilliseconds: Int64?
+    var requestedPosition: Double?
+    var firstPostEndTimeMilliseconds: Int64?
+    var firstPostEndPosition: Double?
+    var allowsPausedFallback: Bool
+    var deadlinePhase: SeekSettlementDeadlinePhase
+    var timeoutTask: Task<Void, Never>?
+    var pollingTask: Task<Void, Never>?
+  }
+
+  enum NativeSeekOperation {
+    case time(milliseconds: Int64, fast: Bool)
+    case position(Double, fast: Bool)
+    case relative(milliseconds: Int64)
+    /// One or more strict `seek(by:)` commands anchored to the observable
+    /// timeline at acceptance. Keeping the offsets as intent (rather than
+    /// replacing them with identical absolute snapshots) lets a rapid skip
+    /// burst aggregate while it waits behind the sole native seek owner.
+    case strictRelative(StrictRelativeSeekIntent)
+    /// A queued absolute/fractional intent followed by one or more relative
+    /// commands. It is deliberately unresolved until native dispatch so the
+    /// duration used for fractional conversion and final clamping is current.
+    case composed(DeferredSeekComposition)
+  }
+
+  struct StrictRelativeSeekIntent {
+    let baseMilliseconds: Int64
+    var offsetsMilliseconds: [Int64]
+    var fast: Bool
+  }
+
+  enum DeferredSeekCompositionBase {
+    case absoluteMilliseconds(Int64)
+    case position(Double)
+    case invalid
+  }
+
+  struct DeferredSeekComposition {
+    let base: DeferredSeekCompositionBase
+    var relativeOffsetsMilliseconds: [Int64]
+  }
+
+  enum SeekOptimisticPublication {
+    case time(milliseconds: Int64)
+    case position(Double, timeMilliseconds: Int64?)
+    case revisionOnly
+  }
+
+  enum SeekSettlementDeadlinePhase: Equatable {
+    case queued
+    case dispatched
+  }
+
+  struct NativeSeekCommand {
+    let nativeSeekToken: UInt64
+    let playbackGeneration: UInt64
+    let externalEpoch: UInt64
+    var timelineRevision: UInt64?
+    var dispatchEmissionSequence: UInt64?
+    var operation: NativeSeekOperation
+    var evidence: SeekSettlementEvidence
+    var publication: SeekOptimisticPublication
+    let resolver: SeekOutcomeResolver
+  }
+
+  struct ActiveNativeSeek {
+    var command: NativeSeekCommand
+    var firstPostEndTimeMilliseconds: Int64?
+    var firstPostEndPosition: Double?
+    var allowsPausedFallback: Bool
+    var isTombstoned: Bool
+    var deadlineTask: Task<Void, Never>?
+    var pollingTask: Task<Void, Never>?
+  }
+
+  struct QuarantinedSeekTimeline {
+    let nativeSeekToken: UInt64
+    let playbackGeneration: UInt64
+    var time: Duration?
+    var timeEmissionSequence: UInt64?
+    var position: Double?
+    var positionEmissionSequence: UInt64?
+  }
+
+  enum PendingFrameStepPhase: Equatable {
+    case awaitingPause
+    case awaitingFrame
+  }
+
+  struct PendingFrameStep {
+    let requestToken: UInt64
+    let playbackGeneration: UInt64
+    let nativeFrameGeneration: UInt64
+    let resolver: FrameStepOutcomeResolver
+    var phase: PendingFrameStepPhase
+    var didDispatchNativeRequest: Bool
+    var nativeRequestInFlight: Bool
     var timeoutTask: Task<Void, Never>?
   }
 
+  /// A cancellation raced a strict native request whose output commitment
+  /// may already own the terminal. It no longer blocks the wrapper FIFO, but
+  /// its resolver remains pending until the sole ID-matched event arrives.
+  struct CommittedFrameStepAwaitingTerminal {
+    var frame: PendingFrameStep
+    let fallbackOutcome: FrameStepOutcome
+    let allowsTimelineMutation: Bool
+  }
+
+  struct SeekSettlementEvidence {
+    let baselineTimeMilliseconds: Int64?
+    let baselinePosition: Double?
+    let requestedTimeMilliseconds: Int64?
+    let requestedPosition: Double?
+  }
+
   #if DEBUG
+  var _nativeSetTimeOverrideForTesting: ((Int64, Bool) -> Int32)? {
+    get { _seekOverridesForTesting.setTime }
+    set { _seekOverridesForTesting.setTime = newValue }
+  }
+
   var _nativeJumpTimeOverrideForTesting: ((Int64) -> Int32)? {
     get { _seekOverridesForTesting.jumpTime }
     set { _seekOverridesForTesting.jumpTime = newValue }
@@ -37,6 +161,23 @@ extension Player {
     set { _seekOverridesForTesting.readLanding = newValue }
   }
 
+  var _nativeSeekBaselineOverrideForTesting:
+    (() -> (timeMilliseconds: Int64, position: Double))? {
+    get { _seekOverridesForTesting.readBaseline }
+    set { _seekOverridesForTesting.readBaseline = newValue }
+  }
+
+  var _nativeNextFrameOverrideForTesting:
+    ((UInt64) -> NativeFrameRequestDispatch)? {
+    get { _seekOverridesForTesting.nextFrame }
+    set { _seekOverridesForTesting.nextFrame = newValue }
+  }
+
+  var _nativeCancelNextFrameOverrideForTesting: ((UInt64) -> Bool)? {
+    get { _seekOverridesForTesting.cancelNextFrame }
+    set { _seekOverridesForTesting.cancelNextFrame = newValue }
+  }
+
   #endif
 
   func configureNativeSeekMonitor() {
@@ -45,9 +186,39 @@ extension Player {
         self?.nativeSeekDidLand(landing)
       }
     }
+    nativeSeekMonitor.setSeekStartedHandler { [weak self] start in
+      Task { @MainActor [weak self] in
+        self?.nativeSeekDidStart(start)
+      }
+    }
+    nativeSeekMonitor.setExternalSeekLandingHandler { [weak self] landing in
+      Task { @MainActor [weak self] in
+        self?.nativeExternalSeekDidLand(landing)
+      }
+    }
     nativeSeekMonitor.setSeekEndedHandler { [weak self] token in
       Task { @MainActor [weak self] in
         self?.nativeSeekDidEnd(token: token)
+      }
+    }
+    nativeSeekMonitor.setSeekDrainAvailabilityHandler { [weak self] in
+      Task { @MainActor [weak self] in
+        self?.nativeSeekDrainDidClear()
+      }
+    }
+    nativeSeekMonitor.setFrameHandler { [weak self] result in
+      Task { @MainActor [weak self] in
+        self?.nativeFrameStepDidComplete(result)
+      }
+    }
+    nativeSeekMonitor.setFrameInvalidationHandler { [weak self] frameGeneration in
+      Task { @MainActor [weak self] in
+        self?.cancelPendingFrameSteps(beforeFrameGeneration: frameGeneration)
+      }
+    }
+    nativeSeekMonitor.setFrameAvailabilityHandler { [weak self] in
+      Task { @MainActor [weak self] in
+        self?.dispatchNextPendingFrameStepIfNeeded()
       }
     }
   }
@@ -58,10 +229,15 @@ extension Player {
   ///
   /// Throws instead of silently ignoring invalid requests. Check
   /// ``isSeekable`` before exposing scrub controls. The native seek is
-  /// asynchronous; SwiftVLC publishes the requested time and the derived
-  /// fractional ``position`` immediately after validation so paused
-  /// players update their UI even if libVLC does not emit a follow-up
-  /// `timeChanged` event.
+  /// asynchronous; after the native call accepts, SwiftVLC publishes the
+  /// requested time and derived fractional ``position`` so paused players
+  /// update even if libVLC emits no follow-up `timeChanged` event. That value
+  /// is optimistic and is reconciled with the authoritative time-watch landing.
+  /// libVLC 4 exposes no request ID, so a call made while another seek is
+  /// active replaces the one queued intent and returns after local acceptance;
+  /// while queued it adopts no timeline revision and publishes no target. A
+  /// defensive rejection discovered when it later dispatches cannot be thrown
+  /// retroactively.
   ///
   /// - Parameters:
   ///   - time: The absolute target time.
@@ -72,23 +248,44 @@ extension Player {
   ///   seekable, or ``VLCError/invalidInput(_:)`` if `time` is negative,
   ///   outside libVLC's millisecond range, or beyond known duration.
   public func seek(to time: Duration, fast: Bool = false) throws(VLCError) {
+    _ = try requestSeek(to: time, fast: fast)
+  }
+
+  /// Requests an absolute-time seek and exposes its authoritative settlement.
+  ///
+  /// This completion-reporting counterpart to ``seek(to:fast:)-(Duration,_)``
+  /// performs the same strict validation. A pending request may wait behind
+  /// one active libVLC 4 seek. Await ``SeekRequest/outcome`` before treating
+  /// the requested timeline as landed; synchronous acceptance alone does not
+  /// prove that the demuxer honored it.
+  ///
+  /// - Parameters:
+  ///   - time: The absolute target time.
+  ///   - fast: Prefer fast (keyframe) seeking over precise seeking.
+  /// - Returns: The accepted request and its eventual authoritative outcome.
+  /// - Throws: ``VLCError/invalidState(_:)`` if the player is shut down or the
+  ///   current media is not seekable; ``VLCError/invalidInput(_:)`` for an
+  ///   invalid target; or ``VLCError/operationFailed(_:)`` for an immediate
+  ///   native rejection.
+  public func requestSeek(
+    to time: Duration,
+    fast: Bool = false
+  )
+    throws(VLCError) -> SeekRequest {
+    guard !isShutdown else {
+      throw .invalidState("requestSeek(to:fast:) called on a player that has been shut down")
+    }
     let milliseconds = try checkedSeekMilliseconds(for: time, parameter: "time")
-    // Reserve before native dispatch so synchronous seek callbacks carry the
-    // revision this accepted command can adopt. Rejection leaves the existing
-    // accepted revision and pending request untouched.
-    let revision = eventBridge.advanceTimelineRevision()
-    let nativeSeekToken = nativeSeekMonitor.stageCommand()
-    let pipRebuildPermit = stageNativePiPVideoOutputRebuildPermit()
-    // Publishing before checking the result reported a target libVLC had
-    // refused, leaving the observable timeline describing a position playback
-    // never reached.
-    guard libvlc_media_player_set_time(pointer, milliseconds, fast) == 0 else {
-      nativeSeekMonitor.cancelStagedCommand(nativeSeekToken)
-      cancelNativePiPVideoOutputRebuildPermit(pipRebuildPermit)
+    let evidence = makeSeekSettlementEvidence(requestedTimeMilliseconds: milliseconds)
+    guard
+      let request = submitNativeSeek(
+        operation: .time(milliseconds: milliseconds, fast: fast),
+        evidence: evidence,
+        publication: .time(milliseconds: milliseconds)
+      ) else {
       throw .operationFailed("Seek to \(milliseconds) ms")
     }
-    supersedePendingSeekSettlement()
-    commitSeekTarget(milliseconds: milliseconds, revision: revision)
+    return request
   }
 
   /// Seeks to a fractional position in the current media.
@@ -97,6 +294,9 @@ extension Player {
   /// method still throws if the player does not yet know media duration or
   /// if the current media is not seekable. For live or unknown-duration
   /// media use the non-throwing ``seek(toPosition:fast:)`` instead.
+  /// A valid call can be accepted behind one active libVLC 4 seek; in that
+  /// case this method returns before the native position call is made and the
+  /// observable timeline remains at the active seek until dispatch succeeds.
   ///
   /// - Parameters:
   ///   - position: The fractional target in the current media.
@@ -108,12 +308,29 @@ extension Player {
     fast: Bool = false
   )
     throws(VLCError) {
+    _ = try requestSeek(to: position, fast: fast)
+  }
+
+  /// Requests a strict fractional seek and exposes its authoritative
+  /// settlement.
+  ///
+  /// The current duration is required to convert the fraction into one stable
+  /// absolute target. For live and unknown-duration media, use
+  /// ``requestSeek(toPosition:fast:)`` instead.
+  public func requestSeek(
+    to position: PlaybackPosition,
+    fast: Bool = false
+  )
+    throws(VLCError) -> SeekRequest {
+    guard !isShutdown else {
+      throw .invalidState("requestSeek(to:fast:) called on a player that has been shut down")
+    }
     guard let duration else {
       throw .invalidState("duration is not known")
     }
     let durationMs = try duration.checkedNonnegativeMilliseconds(parameter: "duration")
     let target = checkedMilliseconds(for: position, durationMs: durationMs)
-    try seek(to: .milliseconds(target), fast: fast)
+    return try requestSeek(to: .milliseconds(target), fast: fast)
   }
 
   /// Seeks by a relative offset from the current position.
@@ -123,6 +340,9 @@ extension Player {
   /// Because the target is derived from ``currentTime`` and ``duration``,
   /// this only works for media with a known timeline; use ``jump(by:)``
   /// for live or unknown-duration media.
+  /// A valid target can be accepted behind one active libVLC 4 seek; in that
+  /// case this method returns before the native time call is made and does not
+  /// publish the queued target prematurely.
   ///
   /// - Parameters:
   ///   - offset: The relative offset to seek by.
@@ -133,12 +353,30 @@ extension Player {
   ///   seekable, or ``VLCError/invalidInput(_:)`` if the offset/current
   ///   time cannot be represented in libVLC's millisecond unit.
   public func seek(by offset: Duration, fast: Bool = false) throws(VLCError) {
+    _ = try requestSeek(by: offset, fast: fast)
+  }
+
+  /// Requests a strict relative seek and exposes its authoritative settlement.
+  ///
+  /// Rapid calls accepted while another native seek owns libVLC's watcher are
+  /// combined as relative intent and dispatched once. Each public request is
+  /// still terminal: an earlier request becomes ``SeekOutcome/superseded``;
+  /// the newest request settles normally, or becomes ``SeekOutcome/rejected``
+  /// if the aggregate cannot fit VLC's native time domain at dispatch.
+  public func requestSeek(
+    by offset: Duration,
+    fast: Bool = false
+  )
+    throws(VLCError) -> SeekRequest {
+    guard !isShutdown else {
+      throw .invalidState("requestSeek(by:fast:) called on a player that has been shut down")
+    }
     guard isSeekable else {
       throw .invalidState("current media is not seekable")
     }
 
     let currentMs = try currentTime.checkedMilliseconds(parameter: "currentTime")
-    let offsetMs = try offset.checkedMilliseconds(parameter: "offset")
+    let offsetMs = try offset.checkedLibVLCTimeMilliseconds(parameter: "offset")
     let targetResult = currentMs.addingReportingOverflow(offsetMs)
     guard !targetResult.overflow else {
       throw .invalidInput("offset is outside the supported millisecond range")
@@ -149,20 +387,26 @@ extension Player {
       let durationMs = try duration.checkedNonnegativeMilliseconds(parameter: "duration")
       targetMs = Swift.min(targetMs, durationMs)
     }
-
-    let revision = eventBridge.advanceTimelineRevision()
-    let nativeSeekToken = nativeSeekMonitor.stageCommand()
-    let pipRebuildPermit = stageNativePiPVideoOutputRebuildPermit()
-    guard libvlc_media_player_set_time(pointer, targetMs, fast) == 0 else {
-      nativeSeekMonitor.cancelStagedCommand(nativeSeekToken)
-      cancelNativePiPVideoOutputRebuildPermit(pipRebuildPermit)
+    guard LibVLCTimeMilliseconds.contains(targetMs) else {
+      throw .invalidInput("offset produces a time outside libVLC's supported range")
+    }
+    let evidence = makeSeekSettlementEvidence(requestedTimeMilliseconds: targetMs)
+    guard
+      let request = submitNativeSeek(
+        operation: .strictRelative(StrictRelativeSeekIntent(
+          baseMilliseconds: currentMs,
+          offsetsMilliseconds: [offsetMs],
+          fast: fast
+        )),
+        evidence: evidence,
+        publication: .time(milliseconds: targetMs)
+      ) else {
       throw .operationFailed("Jump to \(targetMs) ms")
     }
-    supersedePendingSeekSettlement()
-    commitSeekTarget(milliseconds: targetMs, revision: revision)
+    return request
   }
 
-  /// Publishes an accepted seek target and marks `revision` as the
+  /// Publishes a dispatched seek target and marks `revision` as the
   /// authoritative timeline.
   ///
   /// Advancing the revision is what lets the event consumer discard clock
@@ -171,13 +415,20 @@ extension Player {
   /// while paused no later native event is guaranteed to repair it.
   ///
   /// `revision` is reserved before native dispatch, then adopted only after
-  /// libVLC accepts. A rejected seek therefore leaves
+  /// the call reports successful dispatch. A defensive nonzero result leaves
   /// `acceptedTimelineRevision` and any older pending request alone.
-  func commitSeekTarget(milliseconds: Int64, revision: UInt64) {
+  func commitSeekTarget(
+    milliseconds: Int64,
+    revision: UInt64,
+    emissionSequence: UInt64 = 0
+  ) {
     acceptedTimelineRevision = revision
     currentTime = .milliseconds(milliseconds)
     let position = publishPosition(forTargetMilliseconds: milliseconds)
-    recordAuthoritativeTimeline(position: position)
+    recordAuthoritativeTimeline(
+      position: position,
+      emissionSequence: emissionSequence
+    )
     markPlaybackHealthSeek()
   }
 
@@ -186,44 +437,57 @@ extension Player {
   /// Requests a fractional position without validating against media
   /// properties — the API for live, timeshift, and unknown-duration media.
   ///
-  /// Unlike the throwing ``seek(to:)-(PlaybackPosition)`` (strict, built
+  /// Unlike the throwing ``seek(to:fast:)-(PlaybackPosition,_)`` (strict, built
   /// for VOD scrubbers), this is a best-effort raw request: it never
   /// throws, does not require a known ``duration``, and simply forwards
   /// the fraction to libVLC. Whether a timeshift input actually accepts
   /// the request is a runtime property of its demuxer, so a `true`
-  /// return only means libVLC queued the seek.
+  /// return only means SwiftVLC accepted the seek into its single-flight lane.
+  /// It may wait behind one active libVLC 4 seek and does not prove the input
+  /// honored it; the observable timeline is reconciled if libVLC later
+  /// publishes native landing evidence.
   ///
   /// - Parameters:
   ///   - position: The fractional target, clamped to `0.0 ... 1.0` on
   ///     construction.
   ///   - fast: Prefer fast (keyframe) seeking over precise seeking.
   /// - Returns: `false` when there is no playback session to seek in
-  ///   (idle, stopped, or errored player) or libVLC rejects the request;
-  ///   the call is then a no-op.
+  ///   (idle, stopped, or errored player) or an immediate native dispatch
+  ///   reports a failure; the call is then a no-op. A queued command can only
+  ///   encounter a defensive native rejection later.
   @discardableResult
   public func seek(toPosition position: PlaybackPosition, fast: Bool = false) -> Bool {
-    guard hasLenientSeekSession else { return false }
-    let revision = eventBridge.advanceTimelineRevision()
-    let nativeSeekToken = nativeSeekMonitor.stageCommand()
-    let pipRebuildPermit = stageNativePiPVideoOutputRebuildPermit()
-    guard issueNativeSeek(toPosition: position.rawValue, fast: fast) == 0 else {
-      nativeSeekMonitor.cancelStagedCommand(nativeSeekToken)
-      cancelNativePiPVideoOutputRebuildPermit(pipRebuildPermit)
-      return false
-    }
-    supersedePendingSeekSettlement()
-    acceptedTimelineRevision = revision
-    withMutation(keyPath: \.position) {
-      _position = position.rawValue
-    }
-    if
-      let duration,
-      let durationMs = try? duration.checkedNonnegativeMilliseconds(parameter: "duration") {
-      currentTime = .milliseconds(checkedMilliseconds(for: position, durationMs: durationMs))
-    }
-    recordAuthoritativeTimeline(position: position.rawValue)
-    markPlaybackHealthSeek()
-    return true
+    requestSeek(toPosition: position, fast: fast).initialOutcome == .pending
+  }
+
+  /// Requests a best-effort fractional seek and exposes its authoritative
+  /// settlement.
+  ///
+  /// Unlike the strict ``requestSeek(to:fast:)-(PlaybackPosition,_)`` overload,
+  /// this method works without a known duration and never throws. A pending
+  /// result means the request entered SwiftVLC's serialized native seek lane;
+  /// await ``SeekRequest/outcome`` to learn whether it landed, timed out, or
+  /// was superseded.
+  public func requestSeek(
+    toPosition position: PlaybackPosition,
+    fast: Bool = false
+  ) -> SeekRequest {
+    guard hasLenientSeekSession else { return SeekRequest(resolved: .rejected) }
+    let requestedTimeMilliseconds = duration.flatMap {
+      try? $0.checkedNonnegativeMilliseconds(parameter: "duration")
+    }.map { checkedMilliseconds(for: position, durationMs: $0) }
+    let evidence = makeSeekSettlementEvidence(
+      requestedTimeMilliseconds: requestedTimeMilliseconds,
+      requestedPosition: position.rawValue
+    )
+    return submitNativeSeek(
+      operation: .position(position.rawValue, fast: fast),
+      evidence: evidence,
+      publication: .position(
+        position.rawValue,
+        timeMilliseconds: requestedTimeMilliseconds
+      )
+    ) ?? SeekRequest(resolved: .rejected)
   }
 
   /// Jumps by a relative offset without validating against media
@@ -235,111 +499,127 @@ extension Player {
   /// derive a
   /// target from ``currentTime``/``duration``. Best-effort: never throws.
   ///
-  /// After an accepted jump, ``currentTime`` (and ``position``, when
+  /// After a dispatched jump, ``currentTime`` (and ``position``, when
   /// ``duration`` is known) are updated to the best-effort estimate
   /// `currentTime + offset`, clamped to the known playable range, so a
   /// paused player's UI moves immediately. The native jump itself is
-  /// asynchronous and the estimate is corrected by the next native time
-  /// event; live streams have no duration, so their ``position`` stays
-  /// purely event-driven.
+  /// asynchronous and the estimate is reconciled from the landed point of the
+  /// sole serialized native seek episode (or a newer native time event). Live
+  /// streams have no duration, so their ``position`` stays event-driven.
+  /// If a relative command replaces a queued absolute or fractional command,
+  /// SwiftVLC preserves that base plus the relative offset and resolves the
+  /// combined target against the duration current at native dispatch. It then
+  /// clamps once to that playable range; metadata growth or shrink while the
+  /// command waits therefore cannot freeze an enqueue-time target.
   ///
   /// - Returns: `false` when there is no playback session to seek in
   ///   (idle, stopped, or errored player), the offset does not fit
-  ///   libVLC's millisecond unit, or libVLC rejects the request; the
-  ///   call is then a no-op.
+  ///   libVLC's millisecond unit, or native dispatch reports a failure; the
+  ///   call is then a no-op. A `true` result means local acceptance, not
+  ///   necessarily immediate native dispatch or eventual landing.
   @discardableResult
   public func jump(by offset: Duration) -> Bool {
-    issueRelativeJump(by: offset, publishesEstimate: true, nativeSeekToken: nil) != nil
+    guard let prepared = prepareRelativeSeek(by: offset, publishesEstimate: true) else {
+      return false
+    }
+    return submitNativeSeek(
+      operation: .relative(milliseconds: prepared.offsetMilliseconds),
+      evidence: prepared.evidence,
+      publication: prepared.publication
+    ) != nil
   }
 
   /// Requests a relative jump and exposes when it actually lands.
   ///
-  /// This is the authoritative counterpart to ``jump(by:)``. The synchronous
-  /// ``SeekRequest/initialOutcome`` reports native acceptance. Await
+  /// This is the completion-reporting counterpart to ``jump(by:)``. The
+  /// synchronous ``SeekRequest/initialOutcome`` reports whether SwiftVLC
+  /// accepted the command; on libVLC 4 it may still be queued behind one active
+  /// seek. Await
   /// ``SeekRequest/outcome`` before telling an asynchronous transport client
   /// (such as AVKit Picture in Picture) that the operation finished.
   ///
-  /// Native landing evidence after libVLC's matching seek-end callback settles
-  /// the request: normally a watched timer point, or a direct post-end clock
-  /// read for paused audio-only playback. A newer seek, media replacement,
-  /// terminal playback state, or player teardown supersedes it. If libVLC
-  /// accepts the command but publishes no authoritative landing, SwiftVLC
-  /// returns ``SeekOutcome/timedOut`` after a bounded interval.
+  /// Landing evidence from its sole serialized native seek episode settles the
+  /// request: normally a watched timer point, or a direct post-end clock read
+  /// for paused audio-only playback. A newer seek, media replacement, terminal
+  /// playback state, or player teardown supersedes it. If the request waits too
+  /// long for native dispatch, or libVLC dispatches it but publishes no
+  /// authoritative landing, SwiftVLC returns ``SeekOutcome/timedOut`` after a
+  /// bounded interval. Native dispatch restarts that interval so queue time
+  /// never consumes the landing budget.
   ///
   /// - Parameter offset: The native relative offset. Negative values rewind;
   ///   positive values fast-forward.
   /// - Returns: A request whose initial result is either pending or rejected.
   public func requestJump(by offset: Duration) -> SeekRequest {
-    let nativeSeekToken = nativeSeekMonitor.stageCommand()
-    guard
-      let revision = issueRelativeJump(
-        by: offset,
-        publishesEstimate: false,
-        nativeSeekToken: nativeSeekToken
-      ) else {
-      nativeSeekMonitor.cancelStagedCommand(nativeSeekToken)
+    guard !isShutdown else { return SeekRequest(resolved: .rejected) }
+    guard let prepared = prepareRelativeSeek(by: offset, publishesEstimate: false) else {
       return SeekRequest(resolved: .rejected)
     }
-    return registerPendingSeekSettlement(
-      playbackGeneration: sessionGeneration,
-      timelineRevision: revision,
-      nativeSeekToken: nativeSeekToken
-    )
+    return submitNativeSeek(
+      operation: .relative(milliseconds: prepared.offsetMilliseconds),
+      evidence: prepared.evidence,
+      publication: prepared.publication
+    ) ?? SeekRequest(resolved: .rejected)
   }
 
-  /// One native relative-jump path shared by the legacy acceptance-only API
-  /// and the authoritative request API. Keeping settlement allocation out of
-  /// ``jump(by:)`` preserves its lightweight behavior for callers that only
-  /// need dispatch acceptance.
-  private func issueRelativeJump(
+  func prepareRelativeSeek(
     by offset: Duration,
-    publishesEstimate: Bool,
-    nativeSeekToken: UInt64?
-  ) -> UInt64? {
+    publishesEstimate: Bool
+  ) -> (
+    offsetMilliseconds: Int64,
+    evidence: SeekSettlementEvidence,
+    publication: SeekOptimisticPublication
+  )? {
     guard hasLenientSeekSession else { return nil }
-    guard let offsetMs = try? offset.checkedMilliseconds(parameter: "offset") else {
+    guard let offsetMs = try? offset.checkedLibVLCTimeMilliseconds(parameter: "offset") else {
       return nil
     }
-    let revision = eventBridge.advanceTimelineRevision()
-    let commandToken = nativeSeekToken ?? nativeSeekMonitor.stageCommand()
-    let pipRebuildPermit = stageNativePiPVideoOutputRebuildPermit()
-    guard issueNativeJump(byMilliseconds: offsetMs) == 0 else {
-      nativeSeekMonitor.cancelStagedCommand(commandToken)
-      cancelNativePiPVideoOutputRebuildPermit(pipRebuildPermit)
-      return nil
-    }
-    #if DEBUG
-    if nativeSeekToken != nil, _nativeJumpTimeOverrideForTesting != nil {
-      nativeSeekMonitor._noteSeekStartedForTesting()
-    }
-    #endif
-    // Only an accepted replacement supersedes the prior request. If libVLC
-    // rejects this jump, the earlier accepted command can still land and must
-    // retain both its timeline authority and its terminal result.
-    supersedePendingSeekSettlement()
-    acceptedTimelineRevision = revision
-    if
-      publishesEstimate,
-      let currentMs = try? currentTime.checkedMilliseconds(parameter: "currentTime") {
-      let targetResult = currentMs.addingReportingOverflow(offsetMs)
-      if !targetResult.overflow {
-        var targetMs = Swift.max(0, targetResult.partialValue)
+    let baselineTimeMilliseconds = seekBaselineTimeMilliseconds
+    let requestedTimeMilliseconds: Int64?
+    if let baselineTimeMilliseconds {
+      let result = baselineTimeMilliseconds.addingReportingOverflow(offsetMs)
+      if result.overflow {
+        requestedTimeMilliseconds = nil
+      } else {
+        var target = max(0, result.partialValue)
         if
           let duration,
-          let durationMs = try? duration.checkedNonnegativeMilliseconds(parameter: "duration") {
-          targetMs = Swift.min(targetMs, durationMs)
+          let durationMilliseconds = try? duration.checkedNonnegativeMilliseconds(
+            parameter: "duration"
+          ) {
+          target = min(target, durationMilliseconds)
         }
-        currentTime = .milliseconds(targetMs)
-        let position = publishPosition(forTargetMilliseconds: targetMs)
-        recordAuthoritativeTimeline(position: position)
+        requestedTimeMilliseconds = target
       }
+    } else {
+      requestedTimeMilliseconds = nil
     }
-    markPlaybackHealthSeek()
-    return revision
+    let evidence = makeSeekSettlementEvidence(
+      requestedTimeMilliseconds: requestedTimeMilliseconds
+    )
+    let publication: SeekOptimisticPublication = if
+      publishesEstimate,
+      let requestedTimeMilliseconds {
+      .time(milliseconds: requestedTimeMilliseconds)
+    } else {
+      .revisionOnly
+    }
+    return (offsetMs, evidence, publication)
+  }
+
+  /// Calls libVLC's absolute-time seek through a deterministic test seam.
+  func issueNativeSeek(toMilliseconds milliseconds: Int64, fast: Bool) -> Int32 {
+    guard LibVLCTimeMilliseconds.contains(milliseconds) else { return -1 }
+    #if DEBUG
+    if let _nativeSetTimeOverrideForTesting {
+      return _nativeSetTimeOverrideForTesting(milliseconds, fast)
+    }
+    #endif
+    return libvlc_media_player_set_time(pointer, milliseconds, fast)
   }
 
   /// Calls libVLC through a narrow deterministic test seam.
-  private func issueNativeSeek(toPosition position: Double, fast: Bool) -> Int32 {
+  func issueNativeSeek(toPosition position: Double, fast: Bool) -> Int32 {
     #if DEBUG
     if let _nativeSetPositionOverrideForTesting {
       return _nativeSetPositionOverrideForTesting(position, fast)
@@ -349,7 +629,8 @@ extension Player {
   }
 
   /// Calls libVLC through a narrow deterministic test seam.
-  private func issueNativeJump(byMilliseconds offset: Int64) -> Int32 {
+  func issueNativeJump(byMilliseconds offset: Int64) -> Int32 {
+    guard LibVLCTimeMilliseconds.contains(offset) else { return -1 }
     #if DEBUG
     if let _nativeJumpTimeOverrideForTesting {
       return _nativeJumpTimeOverrideForTesting(offset)
@@ -358,7 +639,7 @@ extension Player {
     return libvlc_media_player_jump_time(pointer, offset)
   }
 
-  private func stageNativePiPVideoOutputRebuildPermit() -> UInt64? {
+  func stageNativePiPVideoOutputRebuildPermit() -> UInt64? {
     #if os(iOS)
     return nativePiPVideoOutputRebuildPermit.stage(for: generation)
     #else
@@ -366,7 +647,7 @@ extension Player {
     #endif
   }
 
-  private func cancelNativePiPVideoOutputRebuildPermit(_ token: UInt64?) {
+  func cancelNativePiPVideoOutputRebuildPermit(_ token: UInt64?) {
     #if os(iOS)
     if let token {
       nativePiPVideoOutputRebuildPermit.cancel(token)
@@ -374,255 +655,12 @@ extension Player {
     #endif
   }
 
-  /// Creates the single pending request and starts its bounded timeout.
-  private func registerPendingSeekSettlement(
-    playbackGeneration: UInt64,
-    timelineRevision: UInt64,
-    nativeSeekToken: UInt64
-  ) -> SeekRequest {
-    let resolver = SeekOutcomeResolver()
-    pendingSeekSettlement = PendingSeekSettlement(
-      playbackGeneration: playbackGeneration,
-      timelineRevision: timelineRevision,
-      nativeSeekToken: nativeSeekToken,
-      resolver: resolver,
-      timeoutTask: nil
-    )
-    let timeoutTask = Task { @MainActor [weak self, weak resolver] in
-      do {
-        try await Task.sleep(for: .seconds(2))
-      } catch {
-        return
-      }
-      guard let resolver else { return }
-      self?.resolvePendingSeekSettlement(resolver: resolver, as: .timedOut)
-    }
-    pendingSeekSettlement?.timeoutTask = timeoutTask
-    return SeekRequest(resolver: resolver)
-  }
-
-  /// Applies libVLC's authoritative landed point after the matching seek ends.
-  /// Ordinary pre-seek and in-flight time callbacks cannot produce this token.
-  func nativeSeekDidLand(_ landing: NativeSeekLanding) {
-    guard
-      let pendingSeekSettlement,
-      pendingSeekSettlement.nativeSeekToken == landing.token,
-      pendingSeekSettlement.playbackGeneration == sessionGeneration
-    else { return }
-
-    let nativeTime = landing.timeMilliseconds
-    guard nativeTime >= 0 else { return }
-    // The landing itself is a new authority boundary. Native event callbacks
-    // that entered after dispatch but before seek-start still carry the
-    // accepted request revision; advancing here prevents those queued old
-    // clock samples from overwriting the landed point after settlement.
-    acceptedTimelineRevision = eventBridge.advanceTimelineRevision()
-    currentTime = .milliseconds(nativeTime)
-    let nativePosition = landing.position
-    let authoritativePosition: Double?
-    if nativePosition.isFinite, (0.0...1.0).contains(nativePosition) {
-      withMutation(keyPath: \.position) {
-        _position = nativePosition
-      }
-      authoritativePosition = nativePosition
-    } else {
-      authoritativePosition = publishPosition(forTargetMilliseconds: nativeTime)
-    }
-    eventBridge.updateAuthoritativeTimeline(
-      time: currentTime,
-      position: authoritativePosition,
-      playbackGeneration: sessionGeneration,
-      timelineRevision: acceptedTimelineRevision
-    )
-    resolvePendingSeekSettlement(
-      resolver: pendingSeekSettlement.resolver,
-      as: .settled
-    )
-  }
-
-  /// A paused audio-only input may emit seek-end without another watched time
-  /// point. Read the authoritative native clock after leaving the C callback,
-  /// on the main actor, so those requests can settle without waiting for
-  /// playback to resume. Video and actively playing sessions may still settle
-  /// through the watched point first; token matching makes the paths idempotent.
-  func nativeSeekDidEnd(token: UInt64) {
-    guard
-      let pendingSeekSettlement,
-      pendingSeekSettlement.nativeSeekToken == token,
-      pendingSeekSettlement.playbackGeneration == sessionGeneration,
-      nativePlaybackState == .paused
-    else { return }
-
-    let landing: NativeSeekLanding
-    #if DEBUG
-    if let override = _nativeSeekLandingOverrideForTesting {
-      let point = override()
-      landing = NativeSeekLanding(
-        token: token,
-        timeMilliseconds: point.timeMilliseconds,
-        position: point.position
-      )
-    } else {
-      landing = NativeSeekLanding(
-        token: token,
-        timeMilliseconds: libvlc_media_player_get_time(pointer),
-        position: libvlc_media_player_get_position(pointer)
-      )
-    }
-    #else
-    landing = NativeSeekLanding(
-      token: token,
-      timeMilliseconds: libvlc_media_player_get_time(pointer),
-      position: libvlc_media_player_get_position(pointer)
-    )
-    #endif
-    nativeSeekDidLand(landing)
-  }
-
-  /// Invalidates the current request before another timeline owner is
-  /// established.
-  func supersedePendingSeekSettlement(ifNotPredating timelineRevision: UInt64? = nil) {
-    guard let pendingSeekSettlement else { return }
-    if let timelineRevision, timelineRevision < pendingSeekSettlement.timelineRevision {
-      return
-    }
-    resolvePendingSeekSettlement(resolver: pendingSeekSettlement.resolver, as: .superseded)
-  }
-
-  private func resolvePendingSeekSettlement(
-    resolver: SeekOutcomeResolver,
-    as outcome: SeekOutcome
-  ) {
-    guard
-      let pendingSeekSettlement,
-      pendingSeekSettlement.resolver === resolver
-    else { return }
-    self.pendingSeekSettlement = nil
-    pendingSeekSettlement.timeoutTask?.cancel()
-    resolver.resolve(outcome)
-  }
-
-  #if DEBUG
-  /// Deterministic timeout seam; production uses the bounded task above.
-  func _expirePendingSeekForTesting() {
-    guard let resolver = pendingSeekSettlement?.resolver else { return }
-    resolvePendingSeekSettlement(resolver: resolver, as: .timedOut)
-  }
-
-  func _completePendingSeekForTesting(
-    time: Duration,
-    position: Double? = nil,
-    token: UInt64? = nil
-  ) {
-    guard let pendingSeekSettlement else { return }
-    let milliseconds = try? time.checkedMilliseconds(parameter: "time")
-    nativeSeekDidLand(NativeSeekLanding(
-      token: token ?? pendingSeekSettlement.nativeSeekToken,
-      timeMilliseconds: milliseconds ?? -1,
-      position: position ?? -.infinity
-    ))
-  }
-  #endif
-
-  /// Whether the player is in a lifecycle state where a lenient seek can
-  /// take effect. libVLC 4's seek entry points queue the request under
-  /// the player lock and report success even when no media is loaded, so
-  /// the no-op `false` contract needs this state gate in front of the
-  /// native call. The event-fed ``state`` mirror lags one main-actor
-  /// turn, so the gate reads the synchronous signals instead: the
-  /// playback-intent flag (set by `play()`/`resume()` before this can
-  /// run) covers a seek issued in the same turn as the play call, and
-  /// the native state read covers paused sessions — a paused session
-  /// still has an input to seek in — while rejecting terminal native
-  /// states the mirror has not caught up with yet.
-  private var hasLenientSeekSession: Bool {
-    if isPlaybackRequestedActive {
-      return true
-    }
-    switch nativePlaybackState {
-    case .opening, .buffering, .playing, .paused:
-      return true
-    case .idle, .stopped, .stopping, .error:
-      return false
-    }
-  }
-
-  // MARK: - Frame Stepping
-
-  /// Pauses playback and advances one video frame.
-  ///
-  /// Requires the current media to be pausable (see ``isPausable``).
-  /// Calling repeatedly yields frame-by-frame stepping.
-  public func nextFrame() {
-    supersedePendingSeekSettlement()
-    libvlc_media_player_next_frame(pointer)
-    // libVLC doesn't emit `MediaPlayerTimeChanged` after a next-frame
-    // step while paused: the decoder advances one frame but the event
-    // thread stays quiescent. Read the authoritative time directly so
-    // `currentTime` reflects the step.
-    let ms = libvlc_media_player_get_time(pointer)
-    if ms >= 0 {
-      // The direct read is the frame step's authority boundary. Reject clock
-      // callbacks that entered before it and could otherwise overwrite the
-      // stepped point after this main-actor turn.
-      acceptedTimelineRevision = eventBridge.advanceTimelineRevision()
-      currentTime = .milliseconds(ms)
-      recordAuthoritativeTimeline(position: nil)
-    }
-  }
-
-  // MARK: - Validation
-
-  private func checkedSeekMilliseconds(for time: Duration, parameter: String) throws(VLCError) -> Int64 {
-    guard isSeekable else {
-      throw .invalidState("current media is not seekable")
-    }
-
-    let milliseconds = try time.checkedNonnegativeMilliseconds(parameter: parameter)
-    if let duration {
-      let durationMs = try duration.checkedNonnegativeMilliseconds(parameter: "duration")
-      guard milliseconds <= durationMs else {
-        throw .invalidInput("\(parameter) must not exceed current media duration")
-      }
-    }
-    return milliseconds
-  }
-
-  private func checkedMilliseconds(for position: PlaybackPosition, durationMs: Int64) -> Int64 {
-    guard position.rawValue > 0 else { return 0 }
-    guard position.rawValue < 1 else { return durationMs }
-
-    let scaled = (Double(durationMs) * position.rawValue).rounded()
-    guard scaled.isFinite, scaled > 0 else { return 0 }
-    guard scaled < Double(Int64.max) else { return durationMs }
-    return Swift.min(Int64(scaled), durationMs)
-  }
-
-  /// Publishes the fractional position derived from a just-issued seek
-  /// target. libVLC emits no `positionChanged` while paused, so without
-  /// this the ``position`` shadow would stay stale until playback resumes.
-  @discardableResult
-  func publishPosition(forTargetMilliseconds targetMs: Int64) -> Double? {
-    guard
-      let duration,
-      let durationMs = try? duration.checkedNonnegativeMilliseconds(parameter: "duration"),
-      durationMs > 0
-    else { return nil }
-    let fraction = Swift.min(1.0, Swift.max(0.0, Double(targetMs) / Double(durationMs)))
-    withMutation(keyPath: \.position) {
-      _position = fraction
-    }
-    return fraction
-  }
-
-  /// Keeps terminal outcomes aligned with synchronous timeline mutations for
-  /// which libVLC does not guarantee a corresponding event.
-  private func recordAuthoritativeTimeline(position: Double?) {
-    eventBridge.updateAuthoritativeTimeline(
-      time: currentTime,
-      position: position,
-      playbackGeneration: sessionGeneration,
-      timelineRevision: acceptedTimelineRevision
-    )
-  }
+  // Accepts one logical seek into the media-player-local single-flight lane.
+  //
+  // libVLC 4's watcher has no request ID, so only the active command enters
+  // native code. A later command is accepted as the latest queued intent and
+  // supersedes the previous public resolver without releasing the active
+  // native ownership. A queued command owns only a public reservation: it
+  // receives no timeline revision and publishes no target until its native
+  // call is actually accepted.
 }

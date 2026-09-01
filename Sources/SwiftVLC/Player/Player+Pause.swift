@@ -76,12 +76,46 @@ extension Player {
   /// beyond zero; pausing before that point can leave libVLC's aout
   /// stream with stale pause timing.
   public func pause() {
+    guard !isShutdown else { return }
     _ = issuePause()
   }
 
   /// Resumes playback from pause.
   public func resume() {
-    _ = issueResume()
+    guard !isShutdown else { return }
+    _ = issueResume(authorizesPlaybackAfterMediaServicesReset: true)
+  }
+
+  /// Toggles between playing and paused, or starts playback from an
+  /// idle or stopped state. Pause requests during opening or buffering
+  /// are queued until libVLC reaches a stable pausable state. No-op in
+  /// terminal or invalid transient states (`.stopping`, `.error`).
+  ///
+  /// Dispatches through explicit pause/resume requests using the
+  /// observed ``state`` and the current playback intent, rather than
+  /// calling `libvlc_media_player_pause` (which is itself a toggle). The
+  /// raw toggle is unsafe mid-transition: interleaving a pause-toggle
+  /// with the audio output's opening path corrupts
+  /// `stream->timing.pause_date` and trips the upstream assertion
+  /// `stream->timing.pause_date == VLC_TICK_INVALID` in
+  /// `src/audio_output/dec.c:876`, killing the process. This can happen
+  /// when a user taps Play/Pause immediately after a
+  /// `.task { try? player.play(url:) }` begins.
+  public func togglePlayPause() {
+    guard !isShutdown else { return }
+    switch state {
+    case .idle, .stopped:
+      try? play()
+    case .playing, .opening, .buffering, .paused:
+      if isPlaybackRequestedActive {
+        pause()
+      } else {
+        resume()
+      }
+    case .stopping, .error:
+      // There is no stable playback target for a pause/resume command.
+      break
+    }
   }
 
   /// Issues a native pause owned by managed audio lifecycle while keeping the
@@ -337,7 +371,10 @@ extension Player {
         // last check and `set_pause`. Undo a pause that may have reached the
         // successor, retire only the outgoing transition, and let the latest
         // persistent intent decide whether a fresh successor pause is queued.
-        libvlc_media_player_set_pause(pointer, 0)
+        swiftvlc_libvlc_media_player_set_pause_without_reset_authorization(
+          pointer,
+          0
+        )
         clearPauseControlState(for: playbackGeneration)
         if recordsPlaybackControlIntent {
           playbackControlIntent = previousPlaybackControlIntent
@@ -393,8 +430,14 @@ extension Player {
   @discardableResult
   func issueResume(
     playbackGeneration requestedGeneration: UInt64? = nil,
-    recordsPlaybackControlIntent: Bool = true
+    recordsPlaybackControlIntent: Bool = true,
+    authorizesPlaybackAfterMediaServicesReset: Bool = false
   ) -> Bool {
+    // Every accepted public/AVKit Resume must remain an engine-visible
+    // command. The first attempt can clear Swift's intent quarantine while
+    // native AVAudioSession activation still fails and retains its own latch;
+    // a later user retry must therefore cross the same boundary again.
+    let issuesExplicitNativeResumeCommand = authorizesPlaybackAfterMediaServicesReset
     if recordsPlaybackControlIntent {
       clearManagedAudioSuspensionForExplicitControl()
     }
@@ -421,7 +464,12 @@ extension Player {
           ? eventBridge.currentPlaybackGeneration
           : playbackGeneration
         setDeferredPauseCommand(.resume, playbackGeneration: generation)
+        acceptExplicitResumeCommand(
+          issuesExplicitNativeResumeCommand,
+          issuesNativeResumeCommand: true
+        )
         publishPlaybackIntent(true)
+        prepareForPlaybackResumeBoundary()
         return true
       }
 
@@ -443,7 +491,12 @@ extension Player {
           continue
         }
         setDeferredPauseCommand(.resume, playbackGeneration: playbackGeneration)
+        acceptExplicitResumeCommand(
+          issuesExplicitNativeResumeCommand,
+          issuesNativeResumeCommand: true
+        )
         publishPlaybackIntent(true)
+        prepareForPlaybackResumeBoundary()
         return true
       }
 
@@ -457,10 +510,20 @@ extension Player {
               nativeState: nativeState,
               playbackGeneration: playbackGeneration
             ) {
+            acceptExplicitResumeCommand(
+              issuesExplicitNativeResumeCommand,
+              issuesNativeResumeCommand: true
+            )
             publishPlaybackIntent(true)
+            prepareForPlaybackResumeBoundary()
             return true
           }
+          acceptExplicitResumeCommand(
+            issuesExplicitNativeResumeCommand,
+            issuesNativeResumeCommand: true
+          )
           publishPlaybackIntent(true)
+          prepareForPlaybackResumeBoundary()
           return true
         }
       }
@@ -471,18 +534,33 @@ extension Player {
             nativeState: nativeState,
             playbackGeneration: playbackGeneration
           ) {
+          acceptExplicitResumeCommand(
+            issuesExplicitNativeResumeCommand,
+            issuesNativeResumeCommand: true
+          )
           publishPlaybackIntent(true)
+          prepareForPlaybackResumeBoundary()
           return true
         }
         if state == .paused, nativeState.isActive {
           if playbackGeneration == sessionGeneration {
             publishPlaybackState(nativeState)
           }
+          acceptExplicitResumeCommand(
+            issuesExplicitNativeResumeCommand,
+            issuesNativeResumeCommand: true
+          )
           publishPlaybackIntent(true)
+          prepareForPlaybackResumeBoundary()
           return true
         }
-        if state.isActive {
+        if state.isActive, state != .paused {
+          acceptExplicitResumeCommand(
+            issuesExplicitNativeResumeCommand,
+            issuesNativeResumeCommand: true
+          )
           publishPlaybackIntent(true)
+          prepareForPlaybackResumeBoundary()
           return true
         }
         if followsCurrentGeneration {
@@ -505,12 +583,20 @@ extension Player {
         return false
       }
 
+      acceptExplicitResumeCommand(
+        issuesExplicitNativeResumeCommand,
+        issuesNativeResumeCommand: false
+      )
+      prepareForPlaybackResumeBoundary()
       setPauseTransition(.resuming, playbackGeneration: playbackGeneration)
       if deferredPauseCommandPlaybackGeneration == playbackGeneration {
         deferredPauseCommand = nil
       }
       publishPlaybackIntent(true)
-      libvlc_media_player_set_pause(pointer, 0)
+      issueNativeResumeCommand(
+        authorizesPlaybackAfterMediaServicesReset:
+        authorizesPlaybackAfterMediaServicesReset
+      )
 
       if followsCurrentGeneration {
         let generationAfterResume = eventBridge.currentPlaybackGeneration
@@ -521,6 +607,56 @@ extension Player {
       return true
     }
     return false
+  }
+
+  /// Completes the Swift half of an accepted post-reset Resume command. The
+  /// native audio output has its own reset latch, so every accepted path must
+  /// also cross an engine-visible command boundary even when libVLC still
+  /// reports Playing/Opening and an ordinary resume would be optimized away.
+  private func acceptExplicitResumeCommand(
+    _ isRequired: Bool,
+    issuesNativeResumeCommand: Bool
+  ) {
+    guard isRequired else { return }
+    acknowledgeMediaServicesResetWithFreshPlaybackIntent()
+    if issuesNativeResumeCommand {
+      issueNativeResumeCommand(
+        authorizesPlaybackAfterMediaServicesReset: true
+      )
+    }
+  }
+
+  private func issueNativeResumeCommand(
+    authorizesPlaybackAfterMediaServicesReset: Bool
+  ) {
+    #if DEBUG
+    if let override = _nativeResumeAuthorizationOverrideForTesting {
+      override(authorizesPlaybackAfterMediaServicesReset)
+      return
+    }
+    if let override = _nativeResumeCommandOverrideForTesting {
+      override()
+      return
+    }
+    #endif
+    if authorizesPlaybackAfterMediaServicesReset {
+      libvlc_media_player_set_pause(pointer, 0)
+    } else {
+      swiftvlc_libvlc_media_player_set_pause_without_reset_authorization(
+        pointer,
+        0
+      )
+    }
+  }
+
+  /// Retires paused-only wrapper work before playback resumes. Ordinary
+  /// resumed clock progress is not seek landing evidence, so an unresolved
+  /// native seek keeps its single-flight lease until its watched terminal
+  /// point or an actual timeline-replacement boundary arrives.
+  func prepareForPlaybackResumeBoundary() {
+    disablePendingPausedSeekFallback()
+    cancelPendingFrameSteps()
+    nativeSeekMonitor.clearFrameQuarantineForCausalBoundary()
   }
 
   /// A resume observed while the successor is still opening is not complete:
@@ -607,6 +743,9 @@ extension Player {
   /// native handle accepts a stop. A stale deferred command must not survive
   /// until a later list adoption and become authoritative again.
   func clearPlaybackControlForExternalStop() {
+    eventBridge.beginExplicitStopBarrier(
+      playbackGeneration: eventBridge.currentPlaybackGeneration
+    )
     pauseTransition = nil
     deferredPauseCommand = nil
     playbackControlIntent = nil
@@ -624,5 +763,34 @@ extension Player {
     isManagedAudioMediaServicesSuspended = false
     isManagedAudioResumeDeniedByInterruption = false
     isManagedAudioResumePendingActivation = false
+  }
+
+  /// Installs the durable playback boundary required after the media server
+  /// restarts. This is stronger than publishing `false` once: it retires any
+  /// pre-reset resume work, records a pause that follows playlist adoption,
+  /// and makes every later native active-state reconciliation remain inactive
+  /// until an explicit playback-enabling API acknowledges the reset.
+  func beginMediaServicesResetPlaybackQuarantine() {
+    requiresFreshPlaybackIntentAfterMediaServicesReset = true
+    // Mirror the revoked intent to the nonisolated AVKit snapshot first. The
+    // remaining command cleanup is main-actor synchronous, but PiP state
+    // queries can arrive concurrently on an arbitrary callback thread.
+    publishPlaybackIntent(false)
+    clearManagedAudioSuspensionForExplicitControl()
+    if pauseTransition == .resuming {
+      pauseTransition = nil
+    }
+    if deferredPauseCommand == .resume {
+      deferredPauseCommand = nil
+    }
+    if playbackControlIntent != .pause {
+      playbackControlIntent = .pause
+    }
+  }
+
+  /// Marks a new, playback-enabling command as the user's post-reset action.
+  /// Bare state/intent observations deliberately cannot call this method.
+  func acknowledgeMediaServicesResetWithFreshPlaybackIntent() {
+    requiresFreshPlaybackIntentAfterMediaServicesReset = false
   }
 }

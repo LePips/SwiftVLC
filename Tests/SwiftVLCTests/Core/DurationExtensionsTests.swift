@@ -102,6 +102,37 @@ extension Logic {
     }
 
     @Test
+    func `Pinned VLC tick conversion accepts exact millisecond boundaries`() throws {
+      #expect(
+        try Duration.milliseconds(LibVLCTimeMilliseconds.minimum)
+          .checkedLibVLCTimeMilliseconds(parameter: "time")
+          == LibVLCTimeMilliseconds.minimum
+      )
+      #expect(
+        try Duration.milliseconds(LibVLCTimeMilliseconds.maximum)
+          .checkedLibVLCTimeMilliseconds(parameter: "time")
+          == LibVLCTimeMilliseconds.maximum
+      )
+      #expect(
+        try Duration.milliseconds(LibVLCTimeMilliseconds.maximum)
+          .checkedNonnegativeLibVLCTimeMilliseconds(parameter: "time")
+          == LibVLCTimeMilliseconds.maximum
+      )
+    }
+
+    @Test
+    func `Pinned VLC tick conversion rejects one millisecond beyond either boundary`() {
+      #expect(throws: VLCError.self) {
+        _ = try Duration.milliseconds(LibVLCTimeMilliseconds.minimum - 1)
+          .checkedLibVLCTimeMilliseconds(parameter: "time")
+      }
+      #expect(throws: VLCError.self) {
+        _ = try Duration.milliseconds(LibVLCTimeMilliseconds.maximum + 1)
+          .checkedLibVLCTimeMilliseconds(parameter: "time")
+      }
+    }
+
+    @Test
     func `Checked microsecond conversion rejects overflow`() {
       #expect(throws: VLCError.self) {
         _ = try Duration.seconds(Int64.max).checkedMicroseconds(parameter: "audioDelay")

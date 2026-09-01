@@ -1,4 +1,5 @@
 @testable import SwiftVLC
+import CustomDump
 import Synchronization
 import Testing
 
@@ -152,6 +153,94 @@ extension Integration {
       #expect(broadcaster.hasSubscriber(atOrBelow: .warning))
       #expect(broadcaster.hasSubscriber(atOrBelow: .error))
       _ = stream
+    }
+
+    @Test
+    func `Qualification subscription returns only after native bridge installation`() {
+      let installed = Mutex(false)
+      let broadcaster = LogBroadcaster(
+        instancePointer: VLCInstance.shared.pointer,
+        installBridge: { _, _ in
+          installed.withLock { $0 = true }
+          return UnsafeMutableRawPointer(bitPattern: 0x1)!
+        },
+        uninstallBridge: { _, _ in }
+      )
+      defer { broadcaster.invalidate() }
+
+      let stream = broadcaster.subscribeAndWaitForInstallation(minimumLevel: .debug)
+
+      #expect(installed.withLock { $0 })
+      #expect(stream != nil)
+    }
+
+    @Test
+    func `Qualification subscription rejects a missing native bridge`() {
+      let attempts = Mutex(0)
+      let broadcaster = LogBroadcaster(
+        instancePointer: VLCInstance.shared.pointer,
+        installBridge: { _, _ in
+          attempts.withLock { $0 += 1 }
+          return nil
+        },
+        uninstallBridge: { _, _ in }
+      )
+      defer { broadcaster.invalidate() }
+
+      let stream = broadcaster.subscribeAndWaitForInstallation(minimumLevel: .debug)
+
+      #expect(attempts.withLock { $0 } == 1)
+      #expect(stream == nil)
+    }
+
+    @Test(.tags(.async))
+    func `Ordinary log subscription keeps only newest 128 queued entries`() async {
+      let broadcaster = LogBroadcaster(
+        instancePointer: VLCInstance.shared.pointer,
+        installBridge: { _, _ in nil },
+        uninstallBridge: { _, _ in }
+      )
+      let stream = broadcaster.subscribe(minimumLevel: .debug)
+
+      for index in 0..<200 {
+        broadcaster._broadcasterForTesting.broadcast(
+          LogEntry(level: .debug, message: String(index), module: "burst")
+        )
+      }
+      broadcaster.invalidate()
+
+      var received: [String] = []
+      for await entry in stream {
+        received.append(entry.message)
+      }
+
+      expectNoDifference(received, (72..<200).map(String.init))
+    }
+
+    @Test(.tags(.async))
+    func `Qualification log subscription retains burst beyond 128 entries`() async throws {
+      let broadcaster = LogBroadcaster(
+        instancePointer: VLCInstance.shared.pointer,
+        installBridge: { _, _ in UnsafeMutableRawPointer(bitPattern: 0x1)! },
+        uninstallBridge: { _, _ in }
+      )
+      let stream = try #require(
+        broadcaster.subscribeAndWaitForInstallation(minimumLevel: .debug)
+      )
+
+      for index in 0..<200 {
+        broadcaster._broadcasterForTesting.broadcast(
+          LogEntry(level: .debug, message: String(index), module: "qualification-burst")
+        )
+      }
+      broadcaster.invalidate()
+
+      var received: [String] = []
+      for await entry in stream {
+        received.append(entry.message)
+      }
+
+      expectNoDifference(received, (0..<200).map(String.init))
     }
 
     @Test

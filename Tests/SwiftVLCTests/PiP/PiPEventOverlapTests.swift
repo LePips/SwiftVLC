@@ -279,7 +279,7 @@ extension Integration {
       let attachment = backend.attach(to: player)
       _ = try #require(backend.callbackGenerations.reserveReadyCallback(for: attachment))
       var original: PiPController? = PiPController(player: player, nativeBackend: backend)
-      weak var releasedOriginal = original
+      weak let releasedOriginal = original
       let acceptedMediaGeneration = player.generation
       #expect(backend.callbackGenerations.recordAcceptedStart(
         mediaGeneration: acceptedMediaGeneration

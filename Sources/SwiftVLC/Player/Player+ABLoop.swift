@@ -7,11 +7,7 @@ extension Player {
   ///   non-increasing boundaries, and ``VLCError/operationFailed(_:)`` if
   ///   libVLC rejects the loop.
   public func setABLoop(a: Duration, b: Duration) throws(VLCError) {
-    let aMilliseconds = try a.checkedNonnegativeMilliseconds(parameter: "a")
-    let bMilliseconds = try b.checkedNonnegativeMilliseconds(parameter: "b")
-    guard aMilliseconds < bMilliseconds else {
-      throw .invalidInput("A-B loop requires a < b")
-    }
+    let (aMilliseconds, bMilliseconds) = try checkedABLoopMilliseconds(a: a, b: b)
     guard libvlc_media_player_set_abloop_time(pointer, aMilliseconds, bMilliseconds) == 0 else {
       throw .operationFailed("Set A-B loop by time")
     }
@@ -50,5 +46,20 @@ extension Player {
     var bPos: Double = 0
     let state = libvlc_media_player_get_abloop(pointer, &aTime, &aPos, &bTime, &bPos)
     return ABLoopState(from: state)
+  }
+
+  /// Shared validation seam: every returned value can safely cross the pinned
+  /// VLC build's public-millisecond to internal-tick conversion.
+  func checkedABLoopMilliseconds(
+    a: Duration,
+    b: Duration
+  )
+    throws(VLCError) -> (a: Int64, b: Int64) {
+    let aMilliseconds = try a.checkedNonnegativeLibVLCTimeMilliseconds(parameter: "a")
+    let bMilliseconds = try b.checkedNonnegativeLibVLCTimeMilliseconds(parameter: "b")
+    guard aMilliseconds < bMilliseconds else {
+      throw .invalidInput("A-B loop requires a < b")
+    }
+    return (aMilliseconds, bMilliseconds)
   }
 }

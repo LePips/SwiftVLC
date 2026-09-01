@@ -93,6 +93,7 @@ extension Integration {
     }
 
     @Test
+    @available(*, deprecated, message: "Exercises the pre-1.1 compatibility initializer")
     func `Init with policy knobs does not crash`() {
       let player = Player(instance: TestInstance.shared)
       _ = PiPVideoView(
@@ -674,7 +675,7 @@ extension Integration {
       let backend = MacNativePiPBackend()
 
       backend.attach(to: player)
-      backend.start()
+      _ = backend.start()
       backend.invalidatePlaybackState()
       backend.stop()
 
@@ -713,7 +714,7 @@ extension Integration {
       let backend = MacNativePiPBackend()
 
       backend.attach(to: player)
-      backend.start()
+      _ = backend.start()
 
       #expect(backend.isPossible == false)
       #expect(backend.isActive == false)

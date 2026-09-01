@@ -84,6 +84,9 @@ func mapEvent(_ event: libvlc_event_t) -> PlayerEvent? {
     let vol = event.u.media_player_audio_volume.volume
     return .volumeChanged(vol)
 
+  case libvlc_MediaPlayerRateChanged:
+    return .rateChanged(event.u.media_player_rate_changed.new_rate)
+
   case libvlc_MediaPlayerAudioDevice:
     let device = event.u.media_player_audio_device.device.map { String(cString: $0) }
     return .audioDeviceChanged(device)

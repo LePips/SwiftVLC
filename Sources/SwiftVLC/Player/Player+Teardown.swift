@@ -39,6 +39,16 @@ extension Player {
   ///   returned value as a success flag.
   @discardableResult
   public func stopAndWait() async -> PlayerStopOutcome {
+    // Shutdown already owns the stronger drain. Join it before reporting the
+    // only output-safe result; starting a second stop while teardown is between
+    // its synchronous shutdown flag and native-handle replacement would either
+    // race the retiring handle or wait for an event shutdown deliberately ends.
+    if isShutdown {
+      if let shutdownTask {
+        await shutdownTask.value
+      }
+      return .stopped
+    }
     // Concurrent callers join one in-flight stop and all observe the same
     // outcome; a second caller must not be told the outputs are released
     // just because someone else asked first.
@@ -264,6 +274,8 @@ extension Player {
     let resumeBeforeRelease = shouldResumeNativePlayerBeforeStop
     publishPlaybackIntent(false)
     supersedePendingSeekSettlement()
+    cancelPendingFrameSteps()
+    closeNativeFrameResultLaneForTeardown()
     #if os(iOS)
     nativePiPVideoOutputRebuildPermit.invalidate()
     #endif
@@ -304,6 +316,8 @@ extension Player {
     #endif
     let replacement = Self.makeNativePlayer(instance: instance)
     let replacementLifetime = NativePlayerHandleLifetime(pointer: replacement)
+    _ = relinquishManagedAppleAudioSessionLeaseForHandleReplacement()
+    invalidateManagedAppleAudioSessionActivationLatches()
     pointer = replacement
     nativeHandleLifetime = replacementLifetime
     #if os(iOS) || os(macOS)

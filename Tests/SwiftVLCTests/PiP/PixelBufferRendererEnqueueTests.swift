@@ -230,7 +230,7 @@ extension Integration {
     func `Required flush does not strand the pending gate`() throws {
       let queue = DispatchQueue(label: "org.swiftvlc.tests.enqueue-flush")
       let layer = AVSampleBufferDisplayLayer()
-      let probe = DisplayLayerProbe(requiresFlush: true)
+      let probe = DisplayLayerProbe(status: .failed, requiresFlush: true)
       let renderer = PixelBufferRenderer(
         displayLayer: layer,
         enqueueQueue: queue,
@@ -249,6 +249,33 @@ extension Integration {
 
       expectNoDifference(probe.snapshot.flushCount, 1)
       expectNoDifference(probe.snapshot.enqueuedPresentationValues, [7])
+      #expect(!renderer.enqueueSnapshotForTesting.isDrainScheduled)
+    }
+
+    @Test
+    func `Permanent display failure is terminal and is never flushed`() throws {
+      let queue = DispatchQueue(label: "org.swiftvlc.tests.enqueue-permanent-failure")
+      let layer = AVSampleBufferDisplayLayer()
+      let probe = DisplayLayerProbe(status: .failed)
+      let renderer = PixelBufferRenderer(
+        displayLayer: layer,
+        enqueueQueue: queue,
+        displayLayerAPI: probe.api
+      )
+      let generation = renderer.state.withLock { $0.renderGeneration }
+
+      _ = try submitFrame(
+        index: 8,
+        renderer: renderer,
+        generation: generation,
+        layer: layer
+      )
+      #expect(waitUntilIdle(queue) == .success)
+
+      expectNoDifference(probe.snapshot.flushCount, 0)
+      expectNoDifference(probe.snapshot.enqueuedPresentationValues, [])
+      expectNoDifference(renderer.telemetrySnapshot.status, .failed)
+      expectNoDifference(renderer.telemetrySnapshot.flushRecoveryFailureCount, UInt64(1))
       #expect(!renderer.enqueueSnapshotForTesting.isDrainScheduled)
     }
 
@@ -673,12 +700,14 @@ private final class DisplayLayerProbe: @unchecked Sendable {
   private let readinessCheck = DispatchSemaphore(value: 0)
 
   init(
+    status: AVQueuedSampleBufferRenderingStatus = .rendering,
     requiresFlush: Bool = false,
     isReady: Bool = true,
     blockFirstEnqueue: Bool = false
   ) {
     state = Mutex(
       State(
+        status: status,
         requiresFlush: requiresFlush,
         isReady: isReady,
         shouldBlockNextEnqueue: blockFirstEnqueue
@@ -694,6 +723,7 @@ private final class DisplayLayerProbe: @unchecked Sendable {
         state.withLock {
           $0.flushCount += 1
           $0.requiresFlush = false
+          $0.status = .rendering
         }
       },
       isReadyForMoreMediaData: { [self] _ in

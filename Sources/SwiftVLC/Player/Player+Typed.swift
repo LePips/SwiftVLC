@@ -12,7 +12,7 @@
 extension Player {
   /// Fractional playback position, clamped to `0.0 ... 1.0`.
   ///
-  /// Use ``seek(to:)-(PlaybackPosition)`` to change the position with validation.
+  /// Use ``seek(to:fast:)-(PlaybackPosition,_)`` to change the position with validation.
   public var playbackPosition: PlaybackPosition {
     PlaybackPosition(position)
   }
@@ -38,11 +38,16 @@ extension Player {
     SubtitleScale(subtitleTextScale)
   }
 
-  /// Sets the playback rate with rejection awareness.
+  /// Submits a typed playback-rate request.
   ///
-  /// libVLC may reject rate changes for some media (e.g. live streams).
-  /// The throwing variant lets callers distinguish "rejected" from
-  /// "applied".
+  /// A successful return means libVLC accepted the command into its control
+  /// path, not that the active input ultimately applied it. Unsupported media
+  /// can asynchronously fall back to another ``Player/rate``. Observe
+  /// ``PlayerEvent/rateChanged(_:)`` for effective resolutions when
+  /// ``Player/supportsEffectivePlaybackRateEvents`` is true. The native event
+  /// has no request identifier. An unchanged queued active-input resolution is
+  /// omitted, while an idle or failed-queue notification can repeat the
+  /// current value, so this method does not promise request correlation.
   public func setPlaybackRate(_ newRate: PlaybackRate) throws(VLCError) {
     try setRate(newRate)
   }

@@ -96,8 +96,61 @@ extension Player {
       return
     }
     guard sourcedEvent.playbackGeneration == sessionGeneration else { return }
+    guard isLifecycleControlEventCurrent(sourcedEvent) else { return }
     guard isTimelineSampleCurrent(sourcedEvent) else { return }
+    guard !quarantineSeekTimelineSampleIfNeeded(sourcedEvent) else { return }
+    if
+      case .timeChanged = sourcedEvent.event,
+      let stamp = sourcedEvent.nativeSeekEmissionStamp {
+      commitNativeTimelineEmission(stamp.timelineEmissionSequence)
+    } else if
+      case .positionChanged = sourcedEvent.event,
+      let stamp = sourcedEvent.nativeSeekEmissionStamp {
+      commitNativeTimelineEmission(stamp.timelineEmissionSequence)
+    }
     handleEvent(sourcedEvent.event, sourceTimelineRevision: sourcedEvent.timelineRevision)
+    switch sourcedEvent.event {
+    case .timeChanged, .positionChanged:
+      recordAuthoritativeTimeline(
+        position: position,
+        emissionSequence: sourcedEvent.nativeSeekEmissionStamp?
+          .timelineEmissionSequence
+      )
+    default:
+      break
+    }
+  }
+
+  /// Same-generation native state can still be stale across Stop/Play because
+  /// libVLC delivers callbacks asynchronously. Real bridge events carry the
+  /// control epoch frozen at callback entry; directly-constructed unit events
+  /// omit it and preserve their historical behavior.
+  private func isLifecycleControlEventCurrent(
+    _ sourcedEvent: SourcedPlayerEvent
+  ) -> Bool {
+    let isActiveStateEvidence = switch sourcedEvent.event {
+    case .stateChanged(let state):
+      switch state {
+      case .opening, .buffering, .playing, .paused:
+        true
+      case .idle, .stopped, .stopping, .error:
+        false
+      }
+    case .bufferingProgress:
+      true
+    default:
+      false
+    }
+    guard isActiveStateEvidence else { return true }
+    guard let lifecycleControlEpoch = sourcedEvent.lifecycleControlEpoch else {
+      return true
+    }
+    guard lifecycleControlEpoch == eventBridge.currentLifecycleControlEpoch else {
+      return false
+    }
+    return !eventBridge.hasExplicitStopBarrier(
+      playbackGeneration: sourcedEvent.playbackGeneration
+    )
   }
 
   /// Whether a clock sample still describes the authoritative timeline.
@@ -113,9 +166,24 @@ extension Player {
   private func isTimelineSampleCurrent(_ sourcedEvent: SourcedPlayerEvent) -> Bool {
     switch sourcedEvent.event {
     case .timeChanged, .positionChanged:
-      sourcedEvent.timelineRevision >= acceptedTimelineRevision
+      guard
+        let stamp = sourcedEvent.nativeSeekEmissionStamp
+      else {
+        // Directly-constructed unit events retain their historical revision-
+        // only semantics. Every real EventBridge callback carries a stamp.
+        return sourcedEvent.timelineRevision >= acceptedTimelineRevision
+      }
+      return stamp.timelineGeneration == nativeSeekMonitor.timelineGeneration
+        && stamp.externalEpoch == nativeSeekMonitor.externalSeekEpoch
+        && !stamp.externalDrainPending
+        && !stamp.externalOverlapAmbiguous
+        && canCommitNativeTimelineEmission(stamp.timelineEmissionSequence)
+        && (
+          sourcedEvent.timelineRevision >= acceptedTimelineRevision
+            || stamp.timelineEmissionSequence > acceptedNativeTimelineEmissionSequence
+        )
     default:
-      true
+      return true
     }
   }
 
@@ -131,15 +199,21 @@ extension Player {
     defer { Signposts.signposter.endInterval("Player.handleEvent", interval) }
     switch event {
     case .stateChanged(let newState):
+      let previousState = state
       publishPlaybackState(newState)
+      if previousState == .paused, newState == .playing {
+        prepareForPlaybackResumeBoundary()
+      }
       switch newState {
       case .stopped, .error:
-        supersedePendingSeekSettlement(ifNotPredating: sourceTimelineRevision)
+        supersedeSeekWorkForTerminalBoundary()
+        cancelPendingFrameSteps()
         #if os(iOS)
         nativePiPVideoOutputRebuildPermit.invalidate()
         #endif
       case .idle, .stopping:
-        supersedePendingSeekSettlement(ifNotPredating: sourceTimelineRevision)
+        supersedeSeekWorkForTerminalBoundary()
+        cancelPendingFrameSteps()
       case .opening, .buffering, .playing, .paused:
         break
       }
@@ -163,6 +237,9 @@ extension Player {
       // idempotent when the events do fire.
       refreshNativeStateIfNeeded()
       performDeferredPauseCommandIfNeeded()
+      if case .paused = newState {
+        dispatchNextPendingFrameStepIfNeeded()
+      }
 
     case .timeChanged(let time):
       currentTime = time
@@ -266,7 +343,8 @@ extension Player {
 
     case .encounteredError:
       publishPlaybackState(.error)
-      supersedePendingSeekSettlement(ifNotPredating: sourceTimelineRevision)
+      supersedeSeekWorkForTerminalBoundary()
+      cancelPendingFrameSteps()
       #if os(iOS)
       nativePiPVideoOutputRebuildPermit.invalidate()
       #endif
@@ -296,6 +374,12 @@ extension Player {
     // the observers stay pinned to their last read.
     case .volumeChanged:
       withMutation(keyPath: \.volume) {}
+
+    case .rateChanged:
+      // The getter reads VLC's effective control state. The event payload is
+      // intentionally not shadowed: invalidating here makes observers re-read
+      // the same authoritative native state that produced the callback.
+      withMutation(keyPath: \.rate) {}
 
     case .muted, .unmuted:
       withMutation(keyPath: \.isMuted) {}
@@ -373,14 +457,15 @@ extension Player {
   }
 
   func publishPlaybackIntent(_ active: Bool) {
-    guard isPlaybackRequestedActive != active else { return }
-    isPlaybackRequestedActive = active
+    let effectiveActive = active && !requiresFreshPlaybackIntentAfterMediaServicesReset
+    guard isPlaybackRequestedActive != effectiveActive else { return }
+    isPlaybackRequestedActive = effectiveActive
     // Mirrored synchronously so off-main callers — AVKit and AppKit PiP
     // callbacks, which must answer immediately — can read the current intent
     // without hopping to the main actor.
-    nonisolatedPlaybackIntent.store(active, ordering: .releasing)
+    nonisolatedPlaybackIntent.store(effectiveActive, ordering: .releasing)
     withMutation(keyPath: \.isPlaying) {}
-    playbackIntentBridge.broadcast(active)
+    playbackIntentBridge.broadcast(effectiveActive)
   }
 
   func setPlaybackIntentFromExternalControl(_ active: Bool) {
@@ -388,6 +473,11 @@ extension Player {
   }
 
   func setPlaybackControlIntent(_ command: DeferredPauseCommand) {
+    if command == .resume {
+      eventBridge.acceptExternalPlaybackActivation(
+        playbackGeneration: eventBridge.currentPlaybackGeneration
+      )
+    }
     playbackControlIntent = command
     publishPlaybackIntent(command == .resume)
   }
@@ -489,10 +579,11 @@ extension Player {
   /// is loaded or replaced.
   func resetMediaDerivedState(preservingPlaybackIntent: Bool = false) {
     supersedePendingSeekSettlement()
+    cancelPendingFrameSteps()
     #if os(iOS)
     nativePiPVideoOutputRebuildPermit.invalidate()
     #endif
-    nativeSeekMonitor.resetForTimelineReplacement()
+    resetNativeSeekMonitorForCausalBoundary()
     // New media, new timeline: clock samples still queued from the previous
     // one describe a media that is no longer loaded and must not be applied.
     acceptedTimelineRevision = eventBridge.advanceTimelineRevision()
@@ -565,12 +656,11 @@ extension Player {
     performDeferredPauseCommandIfNeeded()
   }
 
-  /// Signals every observable whose value is read live from libVLC and
-  /// can change when a new media is loaded. libVLC emits no standalone
-  /// events for most of these (no `RateChanged`, no `AudioDelayChanged`,
-  /// etc. on the player's event manager), so SwiftUI would otherwise
-  /// keep showing the pre-swap value. Empty `withMutation` calls force
-  /// the getters to re-run next frame.
+  /// Signals every observable whose value is read live from libVLC and can
+  /// change when a new media is loaded. Most have no standalone native event;
+  /// rate-resolution events require extension v7 and do not replace the media
+  /// boundary refresh. SwiftUI could otherwise keep showing the pre-swap
+  /// value. Empty `withMutation` calls force the getters to re-run next frame.
   func notifyMediaDependentObservables() {
     withMutation(keyPath: \.rate) {}
     withMutation(keyPath: \.audioDelay) {}
@@ -680,6 +770,7 @@ extension Player {
 
   func _setStateForTesting(
     state: PlayerState? = nil,
+    nativeState: PlayerState? = nil,
     isPlaybackRequestedActive: Bool? = nil,
     currentTime: Duration? = nil,
     duration: Duration? = nil,
@@ -689,8 +780,18 @@ extension Player {
   ) {
     if let state {
       self.state = state
+      #if DEBUG
+      _nativePlaybackStateOverrideForTesting = nativeState ?? state
+      #endif
       publishPlaybackIntent(state.isActive)
     }
+    #if DEBUG
+    if state == nil, let nativeState {
+      _nativePlaybackStateOverrideForTesting = nativeState
+    }
+    #else
+    _ = nativeState
+    #endif
     if let isPlaybackRequestedActive {
       publishPlaybackIntent(isPlaybackRequestedActive)
     }

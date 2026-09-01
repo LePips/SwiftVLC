@@ -61,8 +61,10 @@ extension Media {
     instance: VLCInstance = .shared
   )
     async throws(VLCError) -> Data {
-    let timeMs = try time.checkedNonnegativeMilliseconds(parameter: "time")
-    let timeoutMs = try timeout.checkedNonnegativeMilliseconds(parameter: "timeout")
+    let (timeMs, timeoutMs) = try checkedThumbnailRequestMilliseconds(
+      time: time,
+      timeout: timeout
+    )
     let width = try checkedUInt32(width, parameter: "width")
     let height = try checkedUInt32(height, parameter: "height")
 
@@ -166,6 +168,19 @@ extension Media {
     await coordinator.release()
     return try result.get()
   }
+}
+
+/// Validates both `libvlc_time_t` values used by the thumbnailer before the
+/// pinned VLC build expands public milliseconds into internal clock ticks.
+func checkedThumbnailRequestMilliseconds(
+  time: Duration,
+  timeout: Duration
+)
+  throws(VLCError) -> (time: Int64, timeout: Int64) {
+  try (
+    time.checkedNonnegativeLibVLCTimeMilliseconds(parameter: "time"),
+    timeout.checkedNonnegativeLibVLCTimeMilliseconds(parameter: "timeout")
+  )
 }
 
 // MARK: - Internals

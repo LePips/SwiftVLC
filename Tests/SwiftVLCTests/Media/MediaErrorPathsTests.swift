@@ -158,6 +158,39 @@ extension Integration {
       }
     }
 
+    @Test
+    func `thumbnail time validation accepts exact pinned VLC boundary`() throws {
+      let boundary = try checkedThumbnailRequestMilliseconds(
+        time: .milliseconds(LibVLCTimeMilliseconds.maximum),
+        timeout: .milliseconds(LibVLCTimeMilliseconds.maximum)
+      )
+
+      #expect(boundary.time == LibVLCTimeMilliseconds.maximum)
+      #expect(boundary.timeout == LibVLCTimeMilliseconds.maximum)
+    }
+
+    @Test
+    func `thumbnail rejects time and timeout beyond pinned VLC boundary`() async throws {
+      let media = try Media(url: URL(fileURLWithPath: "/tmp/swiftvlc-test.mp4"))
+      for request in [
+        (time: LibVLCTimeMilliseconds.maximum + 1, timeout: Int64(1000)),
+        (time: Int64(0), timeout: LibVLCTimeMilliseconds.maximum + 1)
+      ] {
+        do {
+          _ = try await media.thumbnail(
+            at: .milliseconds(request.time),
+            width: 1,
+            timeout: .milliseconds(request.timeout)
+          )
+          Issue.record("Expected thumbnail millisecond validation to reject the request")
+        } catch .invalidInput {
+          // Expected before libVLC request creation.
+        } catch {
+          Issue.record("Expected invalidInput, got \(error)")
+        }
+      }
+    }
+
     /// `Media.mrl` returns the URI libVLC normalized.
     @Test
     func `mrl returns a non-nil URI`() throws {

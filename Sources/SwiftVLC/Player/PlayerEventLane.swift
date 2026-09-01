@@ -46,6 +46,7 @@ extension PlayerEvent {
          .pausableChanged,
          .tracksChanged,
          .volumeChanged,
+         .rateChanged,
          .muted,
          .unmuted,
          .corked,

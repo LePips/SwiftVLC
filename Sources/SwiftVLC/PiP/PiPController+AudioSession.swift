@@ -1,5 +1,4 @@
 #if os(iOS) || os(macOS)
-import AVFoundation
 #if os(iOS)
 import UIKit
 #endif
@@ -11,41 +10,27 @@ extension PiPController {
   private static let managedAudioSessionControllers = NSHashTable<PiPController>.weakObjects()
   #endif
 
-  /// Live operation for deferred managed-session activation. Kept separate
-  /// from the one-shot state machine so native-route tests can inject a
-  /// deterministic failure/success sequence.
-  static func liveAudioSessionActivation() throws {
-    #if os(iOS)
-    let session = AVAudioSession.sharedInstance()
-    // Category setup can fail transiently too. Repeat it inside the same
-    // retryable operation so a swallowed init-time failure cannot leave an
-    // otherwise successful activation in the wrong audio category.
-    try session.setCategory(.playback, mode: .moviePlayback)
-    try session.setActive(true)
-    #endif
-  }
-
-  /// Sets the shared audio session's category for movie playback when
-  /// ``managesAudioSession`` is enabled. Activation is intentionally
-  /// **not** done here: `setActive(true)` steals audio focus from other
-  /// apps, and controllers are constructed at view-lifecycle times the
-  /// app does not control. See ``activateAudioSessionIfNeeded()``.
-  ///
-  /// No-op on macOS, which has no `AVAudioSession`.
-  func configureAudioSession() {
-    #if os(iOS)
-    guard managesAudioSession else { return }
-    let session = AVAudioSession.sharedInstance()
-    try? session.setCategory(.playback, mode: .moviePlayback)
-    #endif
-  }
-
-  /// Issues the deferred `AVAudioSession.setActive(true)` the first
-  /// time PiP is started or playback becomes actively requested.
+  /// Acquires the Player's deferred native audio-session lease the first time
+  /// PiP is started or playback becomes actively requested.
   /// No-op when ``managesAudioSession`` is `false`, after the first
   /// activation, and on platforms without `AVAudioSession`.
   func activateAudioSessionIfNeeded() {
-    activateAudioSessionIfNeeded(using: audioSessionActivation)
+    if let audioSessionActivation {
+      activateAudioSessionIfNeeded(using: audioSessionActivation)
+      return
+    }
+
+    guard managesAudioSession else { return }
+    if hasActivatedAudioSession {
+      resumeManagedAudioSuspensionAfterActivationIfNeeded()
+      return
+    }
+
+    #if os(iOS)
+    guard player.acquireManagedAppleAudioSessionLeaseIfNeeded() else { return }
+    #endif
+    hasActivatedAudioSession = true
+    resumeManagedAudioSuspensionAfterActivationIfNeeded()
   }
 
   /// Runs the platform activation operation at most once after it succeeds.
@@ -125,8 +110,6 @@ extension PiPController {
     /// Clear ``hasActivatedAudioSession`` so a later signal can reactivate.
     /// Without this the latch is permanent and audio never returns.
     var clearsActivationLatch = false
-    /// Reconfigure the category before reactivating.
-    var reconfiguresCategory = false
     /// Reactivate the session now.
     var reactivates = false
     /// Pause playback, because continuing would be wrong rather than merely
@@ -152,6 +135,10 @@ extension PiPController {
     var deniesManagedResume = false
     /// A positive system decision or a new user intent clears the denial.
     var clearsManagedResumeDenial = false
+    /// Publish an inactive playback intent even if the native pause cannot be
+    /// issued while media services are rebuilding. The next Play/Resume is
+    /// then an observable, post-disruption user action.
+    var requiresFreshPlaybackIntent = false
   }
 
   /// Decides the response to a session disruption.
@@ -170,8 +157,11 @@ extension PiPController {
   /// - Losing the output route pauses. This is the headphone-unplug rule —
   ///   continuing would move the audio to the speaker, which is the one
   ///   outcome the user certainly did not ask for.
-  /// - A media-services reset invalidates everything, so the category must be
-  ///   set again before activation, and only if playback was wanted.
+  /// - A media-services reset invalidates every audio object and the current
+  ///   broker lease. Playback remains paused and inactive until a new user
+  ///   action acquires a freshly configured lease. Apple's reset contract
+  ///   explicitly forbids treating the intent that existed before the reset
+  ///   as permission to restart playback.
   ///
   /// With ``managesAudioSession`` disabled every reaction is empty: a library
   /// that was told not to touch the session must not touch it on the way out
@@ -222,18 +212,18 @@ extension PiPController {
       )
 
     case .mediaServicesReset:
-      let resumes = isPlaybackIntentActive
-        && wasPlaybackSuspendedForMediaServices
-        && !wasPlaybackSuspendedForLifecycle
-        && !wasManagedResumeDenied
       return AudioSessionReaction(
-        clearsActivationLatch: !isPlaybackIntentActive || wasManagedResumeDenied,
-        reconfiguresCategory: true,
-        reactivates: isPlaybackIntentActive
-          && !wasPlaybackSuspendedForLifecycle
-          && !wasManagedResumeDenied,
-        resumesManagedSuspendedPlayback: resumes,
-        clearsMediaServicesSuspension: wasPlaybackSuspendedForMediaServices
+        // AVAudioSession and the AudioUnit graph were invalidated even if the
+        // system did not deliver the earlier `mediaServicesLost` notification.
+        clearsActivationLatch: true,
+        // Always install a native pause barrier. Public intent can already be
+        // inactive while VLC is still playing (for example during PiP's pause
+        // debounce), and relying on the Boolean would let that playback cross
+        // the reset boundary unnoticed.
+        pausesPlayback: true,
+        clearsLifecycleSuspension: wasPlaybackSuspendedForLifecycle,
+        clearsMediaServicesSuspension: wasPlaybackSuspendedForMediaServices,
+        requiresFreshPlaybackIntent: true
       )
 
     case .enteredBackground(let isPictureInPictureActive),
@@ -265,6 +255,14 @@ extension PiPController {
   /// Applies a decided reaction. Split from ``reaction(to:isPlaybackIntentActive:managesAudioSession:)``
   /// so the rules stay testable and only the effects need a live session.
   func apply(_ reaction: AudioSessionReaction) {
+    let wasAlreadySuspended = isPlaybackSuspendedForManagedAudioLifecycle
+      || isPlaybackSuspendedForMediaServices
+    if reaction.requiresFreshPlaybackIntent {
+      // Install the quarantine before touching the native player. A queued
+      // `.playing` callback can arrive synchronously with audio graph rebuild;
+      // it must already be unable to republish the pre-reset intent.
+      player.beginMediaServicesResetPlaybackQuarantine()
+    }
     var pauseAccepted = !reaction.pausesPlayback
     if reaction.pausesPlayback {
       let attempt = playbackDriver.pause(
@@ -273,8 +271,6 @@ extension PiPController {
       )
       pauseAccepted = attempt.accepted
     }
-    let wasAlreadySuspended = isPlaybackSuspendedForManagedAudioLifecycle
-      || isPlaybackSuspendedForMediaServices
     if pauseAccepted || wasAlreadySuspended {
       if reaction.marksLifecycleSuspension {
         isPlaybackSuspendedForManagedAudioLifecycle = true
@@ -297,13 +293,14 @@ extension PiPController {
       deactivateAudioSessionIfNeeded()
     }
     if reaction.clearsActivationLatch {
+      #if os(iOS)
+      _ = player.releaseManagedAppleAudioSessionLeaseIfNeeded()
+      player.invalidateManagedAppleAudioSessionActivationLatches()
+      #endif
       hasActivatedAudioSession = false
       if !reaction.reactivates {
         isManagedAudioResumePendingActivation = false
       }
-    }
-    if reaction.reconfiguresCategory {
-      configureAudioSession()
     }
     if reaction.reactivates {
       // Reactivation goes through the same one-shot machine as the first
@@ -355,10 +352,14 @@ extension PiPController {
     #if os(iOS)
     guard managesAudioSession, hasActivatedAudioSession else { return }
     guard !hasAnotherManagedAudioSessionUser() else { return }
-    try? AVAudioSession.sharedInstance().setActive(
-      false,
-      options: .notifyOthersOnDeactivation
-    )
+    if audioSessionActivation == nil {
+      _ = player.releaseManagedAppleAudioSessionLeaseIfNeeded()
+      player.invalidateManagedAppleAudioSessionActivationLatches()
+    } else {
+      hasActivatedAudioSession = false
+    }
+    #else
+    hasActivatedAudioSession = false
     #endif
   }
 
@@ -366,6 +367,7 @@ extension PiPController {
   func hasAnotherManagedAudioSessionUser() -> Bool {
     Self.managedAudioSessionControllers.allObjects.contains {
       $0 !== self
+        && $0.player === player
         && $0.managesAudioSession
         && $0.hasActivatedAudioSession
         && ($0.isActive || (
@@ -381,13 +383,15 @@ extension PiPController {
   /// Subscribes to the session disruptions the managed path reacts to.
   ///
   /// Only when ``managesAudioSession`` is set: with it clear the library must
-  /// not observe the session either, since reacting would mean mutating a
-  /// session the host app owns.
+  /// not perform PiP-owned session activation or lifecycle mutation. The
+  /// player independently observes route loss and media-services reset in
+  /// both ownership modes because those are VLC transport-safety boundaries,
+  /// not `AVAudioSession` configuration.
   func startAudioSessionObservers() {
     guard managesAudioSession else { return }
     Self.managedAudioSessionControllers.add(self)
+    player.registerManagedAppleAudioSessionController(self)
     let center = NotificationCenter.default
-    let session = AVAudioSession.sharedInstance()
 
     // A controller can be constructed by a background task after UIKit has
     // already posted didEnterBackground. Seed the current state so that path
@@ -398,45 +402,6 @@ extension PiPController {
     }
 
     audioSessionObservers = [
-      center.addObserver(
-        forName: AVAudioSession.interruptionNotification,
-        object: session,
-        queue: .main
-      ) { [weak self] notification in
-        let raw = notification.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt
-        let options = notification.userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt
-        MainActor.assumeIsolated {
-          self?.handleInterruption(rawType: raw, rawOptions: options)
-        }
-      },
-      center.addObserver(
-        forName: AVAudioSession.routeChangeNotification,
-        object: session,
-        queue: .main
-      ) { [weak self] notification in
-        let raw = notification.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt
-        MainActor.assumeIsolated {
-          self?.handleRouteChange(rawReason: raw)
-        }
-      },
-      center.addObserver(
-        forName: AVAudioSession.mediaServicesWereLostNotification,
-        object: session,
-        queue: .main
-      ) { [weak self] _ in
-        MainActor.assumeIsolated {
-          self?.react(to: .mediaServicesLost)
-        }
-      },
-      center.addObserver(
-        forName: AVAudioSession.mediaServicesWereResetNotification,
-        object: session,
-        queue: .main
-      ) { [weak self] _ in
-        MainActor.assumeIsolated {
-          self?.react(to: .mediaServicesReset)
-        }
-      },
       center.addObserver(
         forName: UIApplication.didEnterBackgroundNotification,
         object: nil,
@@ -474,28 +439,7 @@ extension PiPController {
     }
     audioSessionObservers.removeAll()
     Self.managedAudioSessionControllers.remove(self)
-  }
-
-  private func handleInterruption(rawType: UInt?, rawOptions: UInt?) {
-    guard let rawType, let type = AVAudioSession.InterruptionType(rawValue: rawType) else { return }
-    switch type {
-    case .began:
-      react(to: .interruptionBegan)
-    case .ended:
-      let options = AVAudioSession.InterruptionOptions(rawValue: rawOptions ?? 0)
-      react(to: .interruptionEnded(shouldResume: options.contains(.shouldResume)))
-    @unknown default:
-      break
-    }
-  }
-
-  private func handleRouteChange(rawReason: UInt?) {
-    guard
-      let rawReason,
-      let reason = AVAudioSession.RouteChangeReason(rawValue: rawReason),
-      reason == .oldDeviceUnavailable
-    else { return }
-    react(to: .routeLost)
+    player.unregisterManagedAppleAudioSessionController(self)
   }
   #endif
 

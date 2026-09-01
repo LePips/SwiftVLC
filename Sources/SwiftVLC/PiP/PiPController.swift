@@ -103,7 +103,7 @@ public final class PiPController: NSObject {
         },
         resume: {
           $0
-            ? player.issueResume()
+            ? player.issueResume(authorizesPlaybackAfterMediaServicesReset: true)
             : player.issueManagedAudioResume()
         },
         cancelPendingPause: {
@@ -171,6 +171,10 @@ public final class PiPController: NSObject {
   /// interleave between events rather than racing within one.
   @ObservationIgnored
   var playbackStateObservation = PlaybackStateObservationState(duration: nil, isSeekable: false)
+  /// Counts raw capability callbacks rejected by this controller's independent
+  /// event subscriptions while the qualification suppression seam is active.
+  @ObservationIgnored
+  var playbackStateEventSuppression = PlaybackStateEventSuppression()
   /// Last native-active and rate values the observer acted on, for the same
   /// reason: the comparison has to survive across events from either lane.
   @ObservationIgnored
@@ -202,11 +206,11 @@ public final class PiPController: NSObject {
   let startsAutomaticallyFromInline: Bool
 
   /// Whether this controller configures and activates the shared
-  /// `AVAudioSession` (iOS only). Set by ``PiPVideoView``'s
-  /// `managesAudioSession` knob; the direct public ``init(player:)``
-  /// path uses `true`. When `true`, the
-  /// `.playback` category is set at init but `setActive(true)` is
-  /// deferred to ``start()`` or an active-playback signal. Direct
+  /// `AVAudioSession` (iOS only). Both public construction routes inherit
+  /// this value from the player's ``Player/appleAudioSessionPolicy``. When
+  /// `true`, native broker acquisition configures `.playback` /
+  /// `.moviePlayback` and activates as one serialized operation, deferred to
+  /// ``start()`` or an active-playback signal. Direct
   /// controller construction and inactive native-view construction do
   /// not take audio focus. A native view adopting a Player whose playback
   /// intent is already active activates immediately so automatic PiP cannot
@@ -215,13 +219,19 @@ public final class PiPController: NSObject {
   @ObservationIgnored
   let managesAudioSession: Bool
 
-  /// Operation used by the deferred audio-session activation state machine.
-  /// The native iOS initializer accepts an override so lifecycle ordering and
-  /// retry behavior can be proven without depending on process-wide audio
-  /// state. Every public/direct initializer uses the live AVAudioSession
-  /// operation.
+  /// Records a source-compatible legacy PiP override that disagreed with the
+  /// instance-scoped owner. The instance policy always wins; this value makes
+  /// that non-fatal resolution directly testable instead of relying on an
+  /// assertion or a UI label.
   @ObservationIgnored
-  let audioSessionActivation: @MainActor () throws -> Void
+  let audioSessionPolicyDiagnostic: AppleAudioSessionPolicyDiagnostic?
+
+  /// Optional operation used to test the deferred audio-session activation
+  /// state machine without mutating process-wide audio state. Production
+  /// controllers leave this nil and acquire the player's unique native broker
+  /// lease instead.
+  @ObservationIgnored
+  let audioSessionActivation: (@MainActor () throws -> Void)?
 
   /// Whether the latest deferred `AVAudioSession.setActive(true)` succeeded.
   /// The latch is cleared after interruptions, media-services loss, and
@@ -478,15 +488,17 @@ public final class PiPController: NSObject {
 
   /// Creates a PiP controller for the given player.
   ///
-  /// Configures the audio session and hooks up vmem rendering callbacks.
+  /// Hooks up vmem rendering callbacks and follows the player's inherited
+  /// ``Player/appleAudioSessionPolicy`` for audio-session ownership.
   /// - Parameter player: The player to control.
   public init(player: Player) {
     self.player = player
     playbackDriver = .live(player: player)
     pauseDebounce = .milliseconds(250)
     startsAutomaticallyFromInline = true
-    managesAudioSession = true
-    audioSessionActivation = Self.liveAudioSessionActivation
+    managesAudioSession = player.appleAudioSessionPolicy.managesAudioSession
+    audioSessionPolicyDiagnostic = nil
+    audioSessionActivation = nil
     displayLayer = AVSampleBufferDisplayLayer()
     renderer = PixelBufferRenderer(displayLayer: displayLayer)
     playbackDelegateProxy = PiPPlaybackDelegateProxy()
@@ -500,7 +512,6 @@ public final class PiPController: NSObject {
     displayLayer.videoGravity = .resizeAspect
     displayLayer.backgroundColor = CGColor(red: 0, green: 0, blue: 0, alpha: 1)
 
-    configureAudioSession()
     startAudioSessionObserversIfManaged()
     setupControlTimebase()
     attachCallbacks()
@@ -516,6 +527,7 @@ public final class PiPController: NSObject {
     nativeBackend: IOSNativePiPBackend,
     startsAutomaticallyFromInline: Bool = true,
     managesAudioSession: Bool = true,
+    audioSessionPolicyDiagnostic: AppleAudioSessionPolicyDiagnostic? = nil,
     audioSessionActivation: (@MainActor () throws -> Void)? = nil
   ) {
     self.player = player
@@ -523,8 +535,8 @@ public final class PiPController: NSObject {
     pauseDebounce = .milliseconds(250)
     self.startsAutomaticallyFromInline = startsAutomaticallyFromInline
     self.managesAudioSession = managesAudioSession
+    self.audioSessionPolicyDiagnostic = audioSessionPolicyDiagnostic
     self.audioSessionActivation = audioSessionActivation
-      ?? Self.liveAudioSessionActivation
     displayLayer = AVSampleBufferDisplayLayer()
     renderer = PixelBufferRenderer(displayLayer: displayLayer)
     playbackDelegateProxy = PiPPlaybackDelegateProxy()
@@ -537,7 +549,6 @@ public final class PiPController: NSObject {
     publishPiPSnapshot()
 
     playbackDelegateProxy.owner = self
-    configureAudioSession()
     startAudioSessionObserversIfManaged()
     nativeBackend.setStartsAutomaticallyFromInline(startsAutomaticallyFromInline)
 
@@ -574,14 +585,16 @@ public final class PiPController: NSObject {
     player: Player,
     nativeBackend: MacNativePiPBackend,
     startsAutomaticallyFromInline: Bool = true,
-    managesAudioSession: Bool = true
+    managesAudioSession: Bool = true,
+    audioSessionPolicyDiagnostic: AppleAudioSessionPolicyDiagnostic? = nil
   ) {
     self.player = player
     playbackDriver = .live(player: player)
     pauseDebounce = .milliseconds(250)
     self.startsAutomaticallyFromInline = startsAutomaticallyFromInline
     self.managesAudioSession = managesAudioSession
-    audioSessionActivation = Self.liveAudioSessionActivation
+    self.audioSessionPolicyDiagnostic = audioSessionPolicyDiagnostic
+    audioSessionActivation = nil
     displayLayer = AVSampleBufferDisplayLayer()
     renderer = PixelBufferRenderer(displayLayer: displayLayer)
     playbackDelegateProxy = PiPPlaybackDelegateProxy()
@@ -620,7 +633,8 @@ public final class PiPController: NSObject {
     self.pauseDebounce = pauseDebounce
     self.startsAutomaticallyFromInline = startsAutomaticallyFromInline
     self.managesAudioSession = managesAudioSession
-    audioSessionActivation = Self.liveAudioSessionActivation
+    audioSessionPolicyDiagnostic = nil
+    audioSessionActivation = nil
     displayLayer = AVSampleBufferDisplayLayer()
     renderer = PixelBufferRenderer(displayLayer: displayLayer)
     playbackDelegateProxy = PiPPlaybackDelegateProxy()
@@ -634,7 +648,6 @@ public final class PiPController: NSObject {
     displayLayer.videoGravity = .resizeAspect
     displayLayer.backgroundColor = CGColor(red: 0, green: 0, blue: 0, alpha: 1)
 
-    configureAudioSession()
     startAudioSessionObserversIfManaged()
     setupControlTimebase()
     attachCallbacks()
@@ -659,6 +672,7 @@ public final class PiPController: NSObject {
     audioSessionBackgroundPauseTask?.cancel()
     possibleObservation = nil
     activeObservation = nil
+    deactivateAudioSessionIfNeeded()
     stopAudioSessionObserversIfManaged()
     // No explicit native-backend relinquish: the backend holds its `owner`
     // weakly, so ARC clears the back-reference as this controller is torn
@@ -712,6 +726,7 @@ public final class PiPController: NSObject {
       return noteAcceptedPiPStartRequest(nativeBackend.start())
     }
     #endif
+    guard callbackRegistration?.isBound == true else { return .backendUnavailable }
     guard let pipController else { return .backendUnavailable }
     guard isPossible else { return .notPossible }
     activateAudioSessionIfNeeded()
@@ -788,7 +803,10 @@ public final class PiPController: NSObject {
       playbackGeneration: { bridge.currentPlaybackGeneration }
     )
     callbackRegistration = registration
-    player.claimDirectPiPVideoCallbacks(registration)
+    guard player.claimDirectPiPVideoCallbacks(registration) else {
+      invalidateCallbackSnapshot()
+      return
+    }
     // Publish the handle the AVKit callback threads will interrogate. Until
     // this runs the snapshot reports "not attached" and the synchronous
     // queries answer with their stable defaults.
@@ -796,6 +814,7 @@ public final class PiPController: NSObject {
   }
 
   private func setupPiPController() {
+    guard callbackRegistration?.isBound == true else { return }
     guard AVPictureInPictureController.isPictureInPictureSupported() else { return }
 
     // `AVPictureInPictureController.ContentSource` declares its
@@ -859,8 +878,10 @@ public final class PiPController: NSObject {
   }
 
   func updatePiPPossible(_ isPossible: Bool) {
-    guard self.isPossible != isPossible else { return }
-    self.isPossible = isPossible
+    let hasRenderableBackend = callbackRegistration?.isBound ?? (nativeBackend != nil)
+    let effectiveValue = isPossible && hasRenderableBackend
+    guard self.isPossible != effectiveValue else { return }
+    self.isPossible = effectiveValue
     publishPiPSnapshot()
   }
 
@@ -954,6 +975,10 @@ public final class PiPController: NSObject {
   }
 
   func handlePlaybackIntentChanged(_ active: Bool) {
+    // AsyncStream delivery can trail a media-services reset. Revalidate an
+    // active sample against the Player-owned intent before it can reactivate
+    // audio focus or cancel the reset's pause barrier.
+    guard !active || player.isPlaybackRequestedActive else { return }
     if active {
       // Lifecycle and media-services suspension preserve active playback
       // intent on purpose. A queued copy of that intent is therefore not a
@@ -993,6 +1018,8 @@ public final class PiPController: NSObject {
 
   func handleSetPlaying(_ playing: Bool) {
     cancelDeferredPause()
+    let requiresFreshPlaybackIntent = playing
+      && player.requiresFreshPlaybackIntentAfterMediaServicesReset
 
     // Set immediately so isPlaybackPaused returns the correct value
     // when PiP queries it right after this call (before VLC catches up).
@@ -1001,7 +1028,7 @@ public final class PiPController: NSObject {
 
     if playing {
       playbackDriver.cancelPendingPause(nil, nil, .resume)
-      let resumeRequest = requestResumeIfNeeded()
+      let resumeRequest = requestResumeIfNeeded(force: requiresFreshPlaybackIntent)
       if resumeRequest.needed, !resumeRequest.accepted {
         pendingPiPPlaybackState = nil
         player.setPlaybackIntentFromExternalControl(player.isActive)

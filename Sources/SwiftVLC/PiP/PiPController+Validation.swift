@@ -1,6 +1,7 @@
 #if os(iOS)
 
 import AVKit
+import CLibVLC
 import CoreMedia
 import Synchronization
 
@@ -69,10 +70,95 @@ public struct NativePiPPlaybackQualificationSnapshot: Sendable, Equatable {
   public let isSeekable: Bool
 }
 
+/// Coherent counters from libVLC's native Apple sample-buffer renderer.
+///
+/// The counters are qualification evidence for renderer recovery mechanics.
+/// They prove postflight-validated enqueue calls; the legacy AVFoundation API
+/// has no per-sample acceptance result, and these counters deliberately do not
+/// claim that a submission became visible pixels. The device harness pairs
+/// this snapshot with an independent screenshot/motion oracle.
+@_spi(Qualification)
+public struct NativeSampleBufferRendererQualificationSnapshot: Sendable, Equatable {
+  public let abiVersion: UInt32
+  public let rawFlags: UInt32
+  public let displayGeneration: UInt64
+  public let recoveryEpisodeCount: UInt64
+  public let recoveredEpisodeCount: UInt64
+  public let requirementNotificationCount: UInt64
+  public let revocationNotificationCount: UInt64
+  public let decodeFailureNotificationCount: UInt64
+  public let foregroundCheckCount: UInt64
+  public let recoveryFlushCount: UInt64
+  public let revocationFlushCount: UInt64
+  public let failureFlushCount: UInt64
+  public let discontinuityFlushCount: UInt64
+  public let successfulSubmissionCount: UInt64
+  public let recoverySubmissionCount: UInt64
+  public let retryableSubmissionCount: UInt64
+  public let recoverySampleFailureCount: UInt64
+  public let permanentFailureCount: UInt64
+
+  public var isCurrent: Bool {
+    contains(flag: swiftvlc_sample_buffer_renderer_current.rawValue)
+  }
+
+  public var requiresFlush: Bool {
+    contains(flag: swiftvlc_sample_buffer_renderer_requires_flush.rawValue)
+  }
+
+  public var isFailed: Bool {
+    contains(flag: swiftvlc_sample_buffer_renderer_failed.rawValue)
+  }
+
+  public var isRecoveryInProgress: Bool {
+    contains(flag: swiftvlc_sample_buffer_renderer_recovery_in_progress.rawValue)
+  }
+
+  public var hasRecoverySample: Bool {
+    contains(flag: swiftvlc_sample_buffer_renderer_recovery_sample_available.rawValue)
+  }
+
+  init?(_ native: swiftvlc_sample_buffer_renderer_snapshot_t) {
+    guard native.abi_version == 1 else { return nil }
+    abiVersion = native.abi_version
+    rawFlags = native.flags
+    displayGeneration = native.display_generation
+    recoveryEpisodeCount = native.recovery_episode_count
+    recoveredEpisodeCount = native.recovered_episode_count
+    requirementNotificationCount = native.requirement_notification_count
+    revocationNotificationCount = native.revocation_notification_count
+    decodeFailureNotificationCount = native.decode_failure_notification_count
+    foregroundCheckCount = native.foreground_check_count
+    recoveryFlushCount = native.recovery_flush_count
+    revocationFlushCount = native.revocation_flush_count
+    failureFlushCount = native.failure_flush_count
+    discontinuityFlushCount = native.discontinuity_flush_count
+    successfulSubmissionCount = native.successful_submission_count
+    recoverySubmissionCount = native.recovery_submission_count
+    retryableSubmissionCount = native.retryable_submission_count
+    recoverySampleFailureCount = native.recovery_sample_failure_count
+    permanentFailureCount = native.permanent_failure_count
+  }
+
+  private func contains(flag: UInt32) -> Bool {
+    rawFlags & flag != 0
+  }
+}
+
 /// State from the qualification-only fault injector that drops raw libVLC
 /// length and seekability callbacks while preserving native polling.
 @_spi(Qualification)
 public struct RawCapabilityEventSuppressionSnapshot: Sendable, Equatable {
+  public let isEnabled: Bool
+  public let suppressedLengthEventCount: Int
+  public let suppressedSeekableEventCount: Int
+}
+
+/// Counters from PiPController's independent event subscriptions. Player and
+/// PiPController each consume the bridge separately, so both seams must prove
+/// that raw capability callbacks were actually rejected.
+@_spi(Qualification)
+public struct PiPObserverRawCapabilityEventSuppressionSnapshot: Sendable, Equatable {
   public let isEnabled: Bool
   public let suppressedLengthEventCount: Int
   public let suppressedSeekableEventCount: Int
@@ -129,6 +215,8 @@ public struct PiPRenderPerformanceSnapshot: Sendable, Equatable {
   public let lastRenderPoolAllocationStatus: Int32?
   public let deliveredFrameCount: UInt64
   public let droppedFrameCount: UInt64
+  public let sourceIntervalCounts: PiPSourceIntervalCounts?
+  public let sourceTimestampProvenance: String?
 }
 
 extension PlaybackGeneration {
@@ -148,6 +236,7 @@ extension PiPController {
   public var renderPerformanceQualificationSnapshot: PiPRenderPerformanceSnapshot? {
     guard nativeBackend == nil else { return nil }
     let source = callbackRegistration?.sourceDeliverySnapshot
+    let sourceTimestamps = callbackRegistration?.sourceTimestampTelemetrySnapshot
     let telemetry = callbackRegistration?.telemetrySnapshot ?? renderer.telemetrySnapshot
     return renderer.state.withLock { state in
       PiPRenderPerformanceSnapshot(
@@ -173,7 +262,9 @@ extension PiPController {
         renderPoolAllocationFailureCount: telemetry.renderPoolAllocationFailureCount,
         lastRenderPoolAllocationStatus: telemetry.lastRenderPoolAllocationStatus,
         deliveredFrameCount: telemetry.presentedFrameCount,
-        droppedFrameCount: telemetry.droppedFrameCount
+        droppedFrameCount: telemetry.droppedFrameCount,
+        sourceIntervalCounts: sourceTimestamps?.sourceIntervalCounts,
+        sourceTimestampProvenance: sourceTimestamps?.sourceTimestampProvenance
       )
     }
   }
@@ -221,6 +312,20 @@ extension PiPController {
     )
   }
 
+  /// Raw length/seekability callbacks rejected by this controller's own event
+  /// subscriptions, independently of Player's observable-mirror consumer.
+  @_spi(Qualification)
+  public var rawCapabilityObserverEventSuppressionSnapshot:
+    PiPObserverRawCapabilityEventSuppressionSnapshot {
+    PiPObserverRawCapabilityEventSuppressionSnapshot(
+      isEnabled: player.isSuppressingRawCapabilityEvents,
+      suppressedLengthEventCount:
+      playbackStateEventSuppression.suppressedLengthEventCount,
+      suppressedSeekableEventCount:
+      playbackStateEventSuppression.suppressedSeekableEventCount
+    )
+  }
+
   /// The exact atomic length/time/seekability query exported to libVLC's
   /// native PiP module, paired with its current media identity.
   @_spi(Qualification)
@@ -244,6 +349,31 @@ extension PiPController {
       currentTimeMilliseconds: time,
       isSeekable: seekable.boolValue
     )
+  }
+
+  /// Native Apple renderer recovery evidence for this controller's player.
+  ///
+  /// A direct sample-buffer controller returns `nil`, as do older libVLC
+  /// archives and native players that do not currently own a supported
+  /// display. Submission counters are never interpreted as visible frames.
+  @_spi(Qualification)
+  public var nativeRendererRecoveryQualificationSnapshot:
+    NativeSampleBufferRendererQualificationSnapshot? {
+    guard nativeBackend != nil else { return nil }
+    var native = swiftvlc_sample_buffer_renderer_snapshot_t()
+    guard
+      swiftvlc_media_player_get_sample_buffer_renderer_snapshot_if_available(
+        player.pointer,
+        &native
+      )
+    else { return nil }
+    return NativeSampleBufferRendererQualificationSnapshot(native)
+  }
+
+  /// Whether the exact linked libVLC binary exports renderer recovery evidence.
+  @_spi(Qualification)
+  public var isNativeRendererRecoveryQualificationAvailable: Bool {
+    swiftvlc_sample_buffer_renderer_snapshot_available()
   }
 
   /// Exercises the exact relative-skip path AVKit uses and waits for its

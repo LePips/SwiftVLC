@@ -1,5 +1,6 @@
 #if os(iOS) || os(macOS)
 
+import AVKit
 import CoreMedia
 import Synchronization
 
@@ -61,6 +62,17 @@ extension PiPController: NativeHandleSnapshotObserver {
   /// the playback flag changes. Cheap enough to call unconditionally: it is a
   /// handful of field writes under an uncontended lock.
   func refreshCallbackSnapshot() {
+    if let callbackRegistration, !callbackRegistration.isBound {
+      // A direct callback installation failed during initial attachment or a
+      // native-handle replacement. Never publish the unrenderable successor
+      // to AVKit's callback threads. If PiP was already active, ask AVKit to
+      // close it rather than leaving a frozen last frame presented as live.
+      invalidateCallbackSnapshot()
+      pipController?.stopPictureInPicture()
+      updatePiPPossible(false)
+      return
+    }
+
     let pointer: OpaquePointer? = player.pointer
     let timebase = controlTimebase
     let active = pipPlaybackActive

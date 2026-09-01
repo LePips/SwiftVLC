@@ -299,6 +299,15 @@ final class Broadcaster<Element: Sendable>: Sendable {
     reconciliation.drain()
   }
 
+  /// Waits until lifecycle work queued before this call has converged.
+  ///
+  /// Most event streams intentionally attach their upstream producer
+  /// asynchronously. Evidence capture is different: it must not announce
+  /// itself as healthy until the native callback is actually installed.
+  func waitForLifecycleCallbacks() {
+    reconciliation.drain()
+  }
+
   private func unsubscribe(id: Int) {
     state.withLock { state in
       let wasEmpty = state.subscribers.isEmpty

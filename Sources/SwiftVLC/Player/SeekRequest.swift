@@ -2,21 +2,30 @@ import Synchronization
 
 /// The lifecycle state of an authoritative seek request.
 ///
-/// A native seek is asynchronous. ``pending`` means libVLC accepted the
-/// command but SwiftVLC has not yet published authoritative native landing
-/// evidence. This is normally the first watched timer point after seek end;
-/// paused audio-only input instead uses a direct post-end clock read because
-/// it may not produce another point until playback resumes. Every request
-/// eventually reaches one of the other, terminal cases.
+/// A native seek is asynchronous. ``pending`` means SwiftVLC accepted the
+/// command into its media-player-local seek lane but has not yet published
+/// authoritative native landing evidence. On libVLC 4, a newer command may be
+/// waiting behind one active untagged native seek rather than dispatched yet.
+/// libVLC 4 retains an integer result for ABI compatibility, but its current
+/// seek entry points return zero after dispatch without reporting whether the
+/// demuxer can honor the request. This is normally resolved by the first
+/// watched timer point after seek end; paused audio-only input instead uses a
+/// direct post-end clock read because it may not produce another point until
+/// playback resumes. Every request eventually reaches one of the other,
+/// terminal cases.
 public enum SeekOutcome: Hashable, Sendable {
-  /// libVLC accepted the request and it is waiting for native landing evidence.
+  /// The request was accepted and is waiting for native dispatch or landing evidence.
   case pending
-  /// The request was invalid for the current playback session or libVLC
-  /// refused it. The observable timeline was not changed.
+  /// The request was invalid for the current playback session or its native
+  /// dispatch reported a failure. An immediately rejected command does not
+  /// change the observable timeline. A command rejected after waiting in the
+  /// lane also publishes no target because timeline authority is adopted only
+  /// after native dispatch accepts it.
   case rejected
-  /// The accepted seek ended and its authoritative landed clock reached the mirror.
+  /// The dispatched seek ended and its authoritative landed clock reached the mirror.
   case settled
-  /// No authoritative landed clock arrived within SwiftVLC's bounded settlement window.
+  /// Native dispatch or authoritative landing did not arrive within its
+  /// bounded phase window. Dispatch refreshes the window after any queued wait.
   case timedOut
   /// A newer seek, media replacement, terminal playback state, or teardown
   /// made this request no longer authoritative.
@@ -25,17 +34,19 @@ public enum SeekOutcome: Hashable, Sendable {
 
 /// An accepted-or-rejected seek together with its authoritative result.
 ///
-/// Inspect ``initialOutcome`` synchronously to learn whether libVLC accepted
-/// the command. If it is ``SeekOutcome/pending``, await ``outcome`` for the
-/// eventual landing, timeout, or supersession. Waiting is cancellation-safe:
-/// cancelling one waiter does not cancel or reclassify the underlying seek.
+/// Inspect ``initialOutcome`` synchronously to learn whether SwiftVLC accepted
+/// the command into its seek lane. It does not prove native dispatch has begun
+/// or that the input honored the command. If it is
+/// ``SeekOutcome/pending``, await ``outcome`` for the eventual landing, timeout,
+/// or supersession. Waiting is cancellation-safe: cancelling one waiter does
+/// not cancel or reclassify the underlying seek.
 public struct SeekRequest: Sendable {
   private enum Resolution: Sendable {
     case resolved(SeekOutcome)
     case pending(SeekOutcomeResolver)
   }
 
-  /// The result known when the native seek call returns.
+  /// The result known when SwiftVLC accepts or rejects the command.
   ///
   /// This is either ``SeekOutcome/pending`` or ``SeekOutcome/rejected``.
   public let initialOutcome: SeekOutcome
@@ -44,9 +55,10 @@ public struct SeekRequest: Sendable {
 
   /// The authoritative terminal result.
   ///
-  /// Rejected requests return immediately. Accepted requests suspend until
-  /// the matching seek publishes its native landing, the request times out, or
-  /// newer work supersedes it.
+  /// Rejected requests return immediately. Accepted requests suspend until the
+  /// sole serialized native episode publishes a landing, native dispatch
+  /// later rejects a queued command, the request times out, or newer work
+  /// supersedes it.
   public var outcome: SeekOutcome {
     get async {
       switch resolution {

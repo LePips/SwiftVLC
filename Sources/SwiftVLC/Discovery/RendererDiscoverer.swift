@@ -19,7 +19,11 @@ import CLibVLC
 ///     switch event {
 ///     case let .itemAdded(renderer):
 ///         do {
-///             try await player.recast(to: renderer)
+///             let outcome = try await player.recast(to: renderer)
+///             guard outcome.isSettled else {
+///                 print("Cast did not settle:", outcome)
+///                 continue
+///             }
 ///         } catch {
 ///             print("Cast failed:", error)
 ///         }

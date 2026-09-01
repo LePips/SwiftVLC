@@ -158,6 +158,24 @@ extension Integration {
       #expect(controller.start() == .backendUnavailable)
     }
 
+    @Test
+    func `A direct controller with a revoked callback route fails closed`() throws {
+      let player = Player(instance: TestInstance.shared)
+      try player.load(Media(url: TestMedia.twosecURL))
+      let controller = PiPController(player: player)
+      let registration = try #require(controller.callbackRegistration)
+
+      // This is the stable state produced when an atomic callback install on a
+      // replacement handle fails: the controller remains alive, but its direct
+      // callback registration is no longer bound to any native handle.
+      player.relinquishDirectPiPVideoCallbacks(registration)
+      controller.updatePiPPossible(true)
+
+      #expect(!registration.isBound)
+      #expect(!controller.isPossible)
+      #expect(controller.start() == .backendUnavailable)
+    }
+
     #if os(macOS)
     /// A controller that owns a native backend must delegate to it rather than
     /// answering from its own AVKit controller, or the two could disagree about

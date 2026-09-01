@@ -22,8 +22,9 @@ extension PiPController {
   /// same-format sample buffers while system PiP is presenting, and otherwise
   /// retains its zero-copy video path. The private macOS backend reparents the
   /// complete VLC drawable. All bundled backends therefore report
-  /// ``PiPOverlaySupport/composited`` when the matching bundled engine is
-  /// linked. A stale local engine remains detectable as ``unavailable``.
+  /// ``PiPOverlaySupport/composited-enum.case`` when the matching bundled engine is
+  /// linked. A stale local engine remains detectable as
+  /// ``PiPOverlaySupport/unavailable-enum.case``.
   /// Check this value before offering overlay controls in a PiP-only UI.
   public var overlaySupport: PiPOverlaySupport {
     #if os(iOS)

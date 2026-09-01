@@ -95,8 +95,12 @@ public struct Volume: Sendable, Hashable, Comparable, ExpressibleByFloatLiteral 
 /// for some media but audio/video sync degrades; SwiftVLC clamps to
 /// keep observable behavior predictable.
 ///
-/// Live streams (HLS, UDP) often reject any rate other than `1.0`.
-/// Use `Player.setPlaybackRate(_:)` so the UI can react to rejection.
+/// Live streams (HLS, UDP) often fall back to `1.0` after a different rate is
+/// requested. `Player.setPlaybackRate(_:)` submits the request; a successful
+/// return is not proof that the active input applied it. When supported by the
+/// linked native extension, `PlayerEvent.rateChanged(_:)` reports effective
+/// state resolutions without claiming request correlation or measured
+/// throughput. An idle notification can repeat an already-reported value.
 ///
 /// ```swift
 /// try player.setPlaybackRate(.normal)     // 1.0

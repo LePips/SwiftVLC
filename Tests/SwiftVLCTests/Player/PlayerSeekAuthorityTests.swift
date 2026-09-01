@@ -65,10 +65,10 @@ extension Integration {
       #expect(player.position == published, "a pre-seek position sample won over the seek target")
     }
 
-    /// A sample produced *after* the seek is the newer truth and must still be
-    /// applied — the filter must not freeze the timeline.
+    /// A raw sample produced after native dispatch is retained, but cannot
+    /// outrank the landing attributed to the sole serialized v4 episode.
     @Test
-    func `A clock sample after an accepted seek still updates the timeline`() throws {
+    func `A clock sample after an accepted seek waits for exact landing`() throws {
       let player = Player(instance: TestInstance.makeAudioOnly())
       try player.load(Media(url: TestMedia.twosecURL))
       player._setStateForTesting(state: .paused, duration: .seconds(100), isSeekable: true)
@@ -83,18 +83,25 @@ extension Integration {
       )
       player.handleSourcedEvent(fresh)
 
+      #expect(player.currentTime == .seconds(42))
+      #expect(player.quarantinedSeekTimeline?.time == .seconds(43))
+
+      player._completePendingSeekForTesting(time: .seconds(43), position: 0.43)
+      #expect(player.pendingSeekSettlement == nil)
       #expect(player.currentTime == .seconds(43))
     }
 
     /// Rapid seeks: only the newest target survives, and a sample stamped for
     /// the earlier one cannot resurrect it.
     @Test
-    func `A superseded seek's clock samples cannot resurrect its target`() throws {
+    func `A superseded seek's clock samples cannot resurrect its target`() async throws {
       let player = Player(instance: TestInstance.makeAudioOnly())
       try player.load(Media(url: TestMedia.twosecURL))
       player._setStateForTesting(state: .paused, duration: .seconds(100), isSeekable: true)
 
+      player._nativeSetTimeOverrideForTesting = { _, _ in 0 }
       try player.seek(to: .seconds(10))
+      player.nativeSeekMonitor._noteSeekStartedForTesting()
       let firstRevision = player.acceptedTimelineRevision
       try player.seek(to: .seconds(80))
 
@@ -106,6 +113,15 @@ extension Integration {
       )
       player.handleSourcedEvent(supersededSample)
 
+      #expect(player.currentTime == .seconds(10))
+      #expect(player.acceptedTimelineRevision == firstRevision)
+
+      player.nativeSeekMonitor._noteSeekEndedForTesting()
+      player.nativeSeekMonitor._noteTimeUpdatedForTesting(
+        timeMilliseconds: 10000,
+        position: 0.1
+      )
+      await drainMainActor()
       #expect(player.currentTime == .seconds(80))
     }
 
@@ -130,14 +146,10 @@ extension Integration {
       #expect(player.state == .playing, "a one-shot transition was dropped by the clock filter")
     }
 
-    /// A sample carrying the seek's own revision is current, not stale, so it
-    /// must be applied. After a fast (keyframe) seek this is the position
-    /// playback actually landed on, which is not the requested one.
-    ///
-    /// This pins the boundary condition of the filter — that the comparison is
-    /// `>=` and not `>`.
+    /// Even a raw sample carrying the seek's revision cannot impersonate its
+    /// exact watcher landing. The sample is retained until that landing wins.
     @Test
-    func `A sample carrying the seek's own revision is applied`() throws {
+    func `A sample carrying the seek revision is quarantined`() throws {
       let player = Player(instance: TestInstance.makeAudioOnly())
       try player.load(Media(url: TestMedia.twosecURL))
       player._setStateForTesting(state: .paused, duration: .seconds(100), isSeekable: true)
@@ -153,10 +165,10 @@ extension Integration {
       )
       player.handleSourcedEvent(landed)
 
-      #expect(
-        player.currentTime == .seconds(40),
-        "the landed position was discarded as stale; the timeline is stuck on the requested target"
-      )
+      #expect(player.currentTime == .seconds(42))
+      #expect(player.quarantinedSeekTimeline?.time == .seconds(40))
+      player._completePendingSeekForTesting(time: .seconds(40), position: 0.4)
+      #expect(player.currentTime == .seconds(40))
     }
 
     /// A rejected seek must not consume the timeline: clock samples keep
@@ -218,6 +230,7 @@ extension Integration {
         duration: .seconds(100),
         isSeekable: true
       )
+      player._nativeSeekBaselineOverrideForTesting = { (10000, 0.1) }
 
       // Produced by libVLC before the jump, still queued behind it.
       let stale = SourcedPlayerEvent(
@@ -273,8 +286,8 @@ extension Integration {
       #expect(player.acceptedTimelineRevision == before)
     }
 
-    /// Native dispatch is only the pending state. Ordinary clock samples can
-    /// update the mirror, but settlement needs seek end followed by a timer point.
+    /// Native dispatch is only the pending state. Raw clock samples remain
+    /// quarantined; settlement needs seek end followed by its timer point.
     @Test
     func `An accepted jump settles after its post-seek timer point`() async {
       let player = Player(instance: TestInstance.makeAudioOnly())
@@ -300,7 +313,8 @@ extension Integration {
         timelineRevision: revision
       ))
 
-      #expect(player.currentTime == .seconds(41))
+      #expect(player.currentTime == .seconds(10))
+      #expect(player.quarantinedSeekTimeline?.time == .seconds(41))
       #expect(player.pendingSeekSettlement?.resolver.resolvedOutcome == nil)
 
       player.nativeSeekMonitor._noteTimeUpdatedForTesting(
@@ -326,17 +340,22 @@ extension Integration {
       #expect(abs(player.position - 0.41) < 0.000_001)
     }
 
-    /// libVLC permits an unknown clock sentinel for live inputs. That point
-    /// proves only that seeking ended, not where the relative jump landed.
+    /// libVLC permits an unknown clock sentinel for live inputs. A valid
+    /// fraction beside it proves the episode ended and must free the v4 lane,
+    /// but cannot truthfully settle a time-relative request.
     @Test
-    func `An unknown post-seek clock does not settle the jump`() async throws {
+    func `An unknown post-seek clock times out the jump and frees the lane`() async {
       let player = Player(instance: TestInstance.makeAudioOnly())
       player._setStateForTesting(
         state: .playing,
         isPlaybackRequestedActive: true,
         currentTime: .seconds(10)
       )
-      player._nativeJumpTimeOverrideForTesting = { _ in 0 }
+      var dispatchedOffsets: [Int64] = []
+      player._nativeJumpTimeOverrideForTesting = { offset in
+        dispatchedOffsets.append(offset)
+        return 0
+      }
 
       let request = player.requestJump(by: .seconds(30))
       player.nativeSeekMonitor._noteSeekEndedForTesting()
@@ -344,25 +363,25 @@ extension Integration {
         timeMilliseconds: -1,
         position: 0.63
       )
-      await Task.yield()
+      for _ in 0..<20 {
+        await Task.yield()
+      }
 
-      #expect(player.pendingSeekSettlement?.resolver.resolvedOutcome == nil)
+      #expect(await request.outcome == .timedOut)
+      #expect(player.pendingSeekSettlement == nil)
+      #expect(player.activeNativeSeek == nil)
+      #expect(!player.nativeSeekMonitor.hasSeekDrainPending)
       #expect(player.currentTime == .seconds(10))
 
-      let token = try #require(player.pendingSeekSettlement?.nativeSeekToken)
-      player.nativeSeekDidLand(NativeSeekLanding(
-        token: token,
-        timeMilliseconds: -1,
-        position: 0.63
-      ))
-      #expect(player.pendingSeekSettlement?.resolver.resolvedOutcome == nil)
-
+      let successor = player.requestJump(by: .seconds(5))
+      #expect(dispatchedOffsets == [30000, 5000])
+      player.nativeSeekMonitor._noteSeekEndedForTesting()
       player.nativeSeekMonitor._noteTimeUpdatedForTesting(
-        timeMilliseconds: 41000,
-        position: 0.63
+        timeMilliseconds: 15000,
+        position: 0.15
       )
-      #expect(await request.outcome == .settled)
-      #expect(player.currentTime == .seconds(41))
+      #expect(await successor.outcome == .settled)
+      #expect(player.currentTime == .seconds(15))
     }
 
     /// Paused audio has no decoded video frame to produce a watched timer
@@ -374,10 +393,13 @@ extension Integration {
       player._setStateForTesting(
         state: .paused,
         isPlaybackRequestedActive: true,
-        currentTime: .seconds(10)
+        currentTime: .seconds(10),
+        duration: .seconds(100),
+        position: 0.1
       )
       player._nativeJumpTimeOverrideForTesting = { _ in 0 }
       player._nativePlaybackStateOverrideForTesting = .paused
+      player._nativeSeekBaselineOverrideForTesting = { (10000, 0.1) }
       player._nativeSeekLandingOverrideForTesting = { (40000, 0.4) }
 
       let request = player.requestJump(by: .seconds(30))
@@ -482,11 +504,10 @@ extension Integration {
       #expect(await request.outcome == .settled)
     }
 
-    /// Acceptance-only jumps still occupy their native callback slot. A
-    /// delayed start for one must not consume the later request's token and
-    /// let the legacy landing settle that request against the wrong timeline.
+    /// Both jump surfaces serialize through one watcher owner. A's landing can
+    /// update observable truth, but cannot settle the queued request B.
     @Test
-    func `A legacy jump cannot steal a later request token`() async {
+    func `An overlapping synchronous jump cannot settle a later request`() async {
       let player = Player(instance: TestInstance.makeAudioOnly())
       player._setStateForTesting(
         state: .playing,
@@ -498,25 +519,19 @@ extension Integration {
       #expect(player.jump(by: .seconds(5)))
       let request = player.requestJump(by: .seconds(30))
 
-      // requestJump's deterministic test seam emits one seek-start. It must
-      // consume the older legacy slot, so that landing cannot resolve the
-      // tracked request.
-      player.nativeSeekMonitor._noteSeekEndedForTesting()
-      player.nativeSeekMonitor._noteTimeUpdatedForTesting(
-        timeMilliseconds: 15000,
-        position: 0.15
-      )
-      await Task.yield()
-      #expect(player.pendingSeekSettlement?.resolver.resolvedOutcome == nil)
-
-      player.nativeSeekMonitor._noteSeekStartedForTesting()
+      // B is still only a reservation, so this terminal point belongs to A.
       player.nativeSeekMonitor._noteSeekEndedForTesting()
       player.nativeSeekMonitor._noteTimeUpdatedForTesting(
         timeMilliseconds: 45000,
         position: 0.45
       )
+      await Task.yield()
 
-      #expect(await request.outcome == .settled)
+      #expect(player.pendingSeekSettlement?.resolver.resolvedOutcome == nil)
+      #expect(player.currentTime == .seconds(45))
+
+      player._expirePendingSeekForTesting()
+      #expect(await request.outcome == .timedOut)
       #expect(player.currentTime == .seconds(45))
     }
 
@@ -565,7 +580,7 @@ extension Integration {
     }
 
     /// A synchronous callback emitted by the native call belongs to the new
-    /// timeline and must not be discarded, but it also cannot prove landing.
+    /// timeline, but is retained until exact watcher evidence proves landing.
     @Test
     func `A clock callback racing native dispatch cannot settle the jump`() async {
       let player = Player(instance: TestInstance.makeAudioOnly())
@@ -600,7 +615,8 @@ extension Integration {
       }
 
       #expect(player.state == .playing, "the event-lane sentinel did not drain")
-      #expect(player.currentTime == .seconds(11))
+      #expect(player.currentTime == .seconds(10))
+      #expect(player.quarantinedSeekTimeline?.time == .seconds(11))
       #expect(player.pendingSeekSettlement?.resolver.resolvedOutcome == nil)
 
       player.handleSourcedEvent(SourcedPlayerEvent(
@@ -610,7 +626,8 @@ extension Integration {
         timelineRevision: revision
       ))
 
-      #expect(player.currentTime == .seconds(41))
+      #expect(player.currentTime == .seconds(10))
+      #expect(player.quarantinedSeekTimeline?.time == .seconds(41))
       #expect(player.pendingSeekSettlement?.resolver.resolvedOutcome == nil)
       player._completePendingSeekForTesting(time: .seconds(41), position: 0.41)
       #expect(await request.outcome == .settled)
@@ -664,47 +681,65 @@ extension Integration {
       #expect(await request.outcome == .settled)
     }
 
-    /// A terminal event queued before the command cannot terminate a newer
-    /// request merely because the main actor applies it after native dispatch.
+    /// Native-handle and playback generation establish terminal identity. Once
+    /// those match, an old clock revision cannot keep the retired watcher alive.
     @Test
-    func `A stale terminal event does not supersede a newer jump`() async {
+    func `A sourced terminal clears drain regardless of timeline revision`() async {
       let player = Player(instance: TestInstance.makeAudioOnly())
       player._setStateForTesting(state: .playing, isPlaybackRequestedActive: true)
       player._nativeJumpTimeOverrideForTesting = { _ in 0 }
-      let staleRevision = player.acceptedTimelineRevision
-
       let request = player.requestJump(by: .seconds(10))
-      player.handleSourcedEvent(SourcedPlayerEvent(
+      let monitorGeneration = player.nativeSeekMonitor._timelineGenerationForTesting
+
+      player.eventBridge._broadcastForTesting(
+        .stateChanged(.stopped),
         nativeHandleGeneration: player.eventBridge.currentNativeHandleGeneration,
         playbackGeneration: player.sessionGeneration,
-        event: .stateChanged(.stopped),
-        timelineRevision: staleRevision
-      ))
+        emittedTimelineRevision: 0
+      )
+      await drainMainActor()
 
-      #expect(player.pendingSeekSettlement?.resolver.resolvedOutcome == nil)
-      player._completePendingSeekForTesting(time: .seconds(10))
-      #expect(await request.outcome == .settled)
+      #expect(await request.outcome == .superseded)
+      #expect(player.pendingSeekSettlement == nil)
+      #expect(player.activeNativeSeek == nil)
+      #expect(player.nativeSeekMonitor._timelineGenerationForTesting > monitorGeneration)
+      #expect(!player.nativeSeekMonitor.hasSeekDrainPending)
+
+      let next = player.requestJump(by: .seconds(20))
+      #expect(next.initialOutcome == .pending)
+      player._completePendingSeekForTesting(time: .seconds(20), position: 0.2)
+      #expect(await next.outcome == .settled)
     }
 
-    /// An error callback can enter before a seek and wait in the control lane
-    /// until afterwards. Its older revision cannot cancel the newer command.
+    /// Terminal envelopes from either a retired native handle or a retired
+    /// playback episode cannot rotate the current seek lease.
     @Test
-    func `A stale encountered error does not supersede a newer jump`() async {
+    func `Sourced terminal identity rejects retired handle and playback generations`() async {
       let player = Player(instance: TestInstance.makeAudioOnly())
       player._setStateForTesting(state: .playing, isPlaybackRequestedActive: true)
       player._nativeJumpTimeOverrideForTesting = { _ in 0 }
-      let staleRevision = player.acceptedTimelineRevision
-
       let request = player.requestJump(by: .seconds(10))
-      player.handleSourcedEvent(SourcedPlayerEvent(
-        nativeHandleGeneration: player.eventBridge.currentNativeHandleGeneration,
-        playbackGeneration: player.sessionGeneration,
-        event: .encounteredError,
-        timelineRevision: staleRevision
-      ))
+      let monitorGeneration = player.nativeSeekMonitor._timelineGenerationForTesting
+      let nativeGeneration = player.eventBridge.currentNativeHandleGeneration
+      let playbackGeneration = player.sessionGeneration
 
-      #expect(player.pendingSeekSettlement?.resolver.resolvedOutcome == nil)
-      player._completePendingSeekForTesting(time: .seconds(20), position: 0.2)
+      player.eventBridge._broadcastForTesting(
+        .encounteredError,
+        nativeHandleGeneration: nativeGeneration &+ 1,
+        playbackGeneration: playbackGeneration
+      )
+      player.eventBridge._broadcastForTesting(
+        .stateChanged(.stopped),
+        nativeHandleGeneration: nativeGeneration,
+        playbackGeneration: playbackGeneration &+ 1
+      )
+      await drainMainActor()
+
+      #expect(request.initialOutcome == .pending)
+      #expect(player.activeNativeSeek != nil)
+      #expect(player.nativeSeekMonitor._timelineGenerationForTesting == monitorGeneration)
+      #expect(player.nativeSeekMonitor.hasSeekDrainPending)
+      player._completePendingSeekForTesting(time: .seconds(10), position: 0.1)
       #expect(await request.outcome == .settled)
     }
 
@@ -737,243 +772,10 @@ extension Integration {
       #expect(abs(player.position - 0.4) < 0.000_001)
     }
 
-    /// Native completion is scoped to the exact wrapper-issued seek token.
-    @Test
-    func `Settlement ignores a different native seek token`() async throws {
-      let player = Player(instance: TestInstance.makeAudioOnly())
-      player._setStateForTesting(state: .playing, isPlaybackRequestedActive: true)
-      player._nativeJumpTimeOverrideForTesting = { _ in 0 }
-
-      let request = player.requestJump(by: .seconds(10))
-      let token = try #require(player.pendingSeekSettlement?.nativeSeekToken)
-
-      player._completePendingSeekForTesting(time: .seconds(10), token: token &+ 1)
-      #expect(player.pendingSeekSettlement?.resolver.resolvedOutcome == nil)
-
-      player._completePendingSeekForTesting(time: .seconds(10), token: token)
-      #expect(await request.outcome == .settled)
-    }
-
-    /// Rapid alternating skip controls must give every displaced request an
-    /// explicit result while leaving only the newest one able to settle.
-    @Test
-    func `A newer jump supersedes the previous request`() async {
-      let player = Player(instance: TestInstance.makeAudioOnly())
-      player._setStateForTesting(
-        state: .buffering,
-        isPlaybackRequestedActive: true,
-        currentTime: .seconds(50),
-        duration: .seconds(100)
-      )
-      player._nativeJumpTimeOverrideForTesting = { _ in 0 }
-
-      let first = player.requestJump(by: .seconds(10))
-      let firstRevision = player.acceptedTimelineRevision
-      let second = player.requestJump(by: .seconds(-20))
-      let secondRevision = player.acceptedTimelineRevision
-
-      #expect(await first.outcome == .superseded)
-
-      player.handleSourcedEvent(SourcedPlayerEvent(
-        nativeHandleGeneration: player.eventBridge.currentNativeHandleGeneration,
-        playbackGeneration: player.sessionGeneration,
-        event: .timeChanged(.seconds(60)),
-        timelineRevision: firstRevision
-      ))
-      #expect(player.pendingSeekSettlement?.resolver.resolvedOutcome == nil)
-
-      player.handleSourcedEvent(SourcedPlayerEvent(
-        nativeHandleGeneration: player.eventBridge.currentNativeHandleGeneration,
-        playbackGeneration: player.sessionGeneration,
-        event: .timeChanged(.seconds(40)),
-        timelineRevision: secondRevision
-      ))
-      #expect(player.pendingSeekSettlement?.resolver.resolvedOutcome == nil)
-
-      player._completePendingSeekForTesting(time: .seconds(40), position: 0.4)
-      #expect(await second.outcome == .settled)
-      #expect(player.currentTime == .seconds(40))
-    }
-
-    /// A rejected replacement changes no native timeline. The previous
-    /// accepted request remains authoritative and can still settle normally.
-    @Test
-    func `A rejected newer jump preserves the previous request`() async {
-      let player = Player(instance: TestInstance.makeAudioOnly())
-      player._setStateForTesting(state: .playing, isPlaybackRequestedActive: true)
-      player._nativeJumpTimeOverrideForTesting = { _ in 0 }
-
-      let first = player.requestJump(by: .seconds(10))
-      let firstRevision = player.acceptedTimelineRevision
-      player._nativeJumpTimeOverrideForTesting = { _ in -1 }
-      let rejected = player.requestJump(by: .seconds(20))
-
-      #expect(rejected.initialOutcome == .rejected)
-      #expect(await rejected.outcome == .rejected)
-      #expect(player.pendingSeekSettlement?.resolver.resolvedOutcome == nil)
-      #expect(player.acceptedTimelineRevision == firstRevision)
-
-      player.nativeSeekMonitor._noteSeekEndedForTesting()
-      player.nativeSeekMonitor._noteTimeUpdatedForTesting(
-        timeMilliseconds: 10000,
-        position: -.infinity
-      )
-      #expect(await first.outcome == .settled)
-    }
-
-    /// Position seeking follows the same transactional replacement rule as a
-    /// relative jump: rejection preserves the old request; acceptance owns the
-    /// new timeline and only then supersedes it.
-    @Test
-    func `A position seek supersedes pending work only after native acceptance`() async {
-      let player = Player(instance: TestInstance.makeAudioOnly())
-      player._setStateForTesting(state: .playing, isPlaybackRequestedActive: true)
-      player._nativeJumpTimeOverrideForTesting = { _ in 0 }
-
-      let first = player.requestJump(by: .seconds(10))
-      let firstRevision = player.acceptedTimelineRevision
-      player._nativeSetPositionOverrideForTesting = { _, _ in -1 }
-
-      #expect(!player.seek(toPosition: PlaybackPosition(0.4)))
-      #expect(player.acceptedTimelineRevision == firstRevision)
-      #expect(player.pendingSeekSettlement?.resolver.resolvedOutcome == nil)
-
-      player._nativeSetPositionOverrideForTesting = { _, _ in 0 }
-      #expect(player.seek(toPosition: PlaybackPosition(0.5)))
-      #expect(await first.outcome == .superseded)
-      #expect(player.acceptedTimelineRevision > firstRevision)
-      #expect(player.position == 0.5)
-    }
-
-    /// The native return code is authoritative. A refusal is typed and does
-    /// not publish either the requested estimate or a new accepted revision.
-    @Test
-    func `A native-rejected jump leaves the timeline unchanged`() async {
-      let player = Player(instance: TestInstance.makeAudioOnly())
-      player._setStateForTesting(
-        state: .playing,
-        isPlaybackRequestedActive: true,
-        currentTime: .seconds(12),
-        duration: .seconds(100)
-      )
-      player._nativeJumpTimeOverrideForTesting = { _ in -1 }
-      let acceptedRevision = player.acceptedTimelineRevision
-
-      let request = player.requestJump(by: .seconds(30))
-
-      #expect(request.initialOutcome == .rejected)
-      #expect(await request.outcome == .rejected)
-      #expect(player.acceptedTimelineRevision == acceptedRevision)
-      #expect(player.currentTime == .seconds(12))
-    }
-
-    /// An accepted command that never produces native completion cannot leave an
-    /// AVKit completion suspended indefinitely.
-    @Test
-    func `An accepted jump has a bounded timeout result`() async {
-      let player = Player(instance: TestInstance.makeAudioOnly())
-      player._setStateForTesting(
-        state: .playing,
-        isPlaybackRequestedActive: true,
-        currentTime: .seconds(12),
-        duration: .seconds(100),
-        position: 0.12
-      )
-      player._nativeJumpTimeOverrideForTesting = { _ in 0 }
-
-      let request = player.requestJump(by: .seconds(30))
-      player._expirePendingSeekForTesting()
-
-      #expect(await request.outcome == .timedOut)
-      #expect(player.pendingSeekSettlement == nil)
-      #expect(player.currentTime == .seconds(12))
-      #expect(abs(player.position - 0.12) < 0.000_001)
-    }
-
-    /// Media replacement establishes a new generation and makes the outgoing
-    /// request explicitly superseded, even if its old event arrives later.
-    @Test
-    func `A media reset supersedes a pending jump`() async {
-      let player = Player(instance: TestInstance.makeAudioOnly())
-      player._setStateForTesting(state: .playing, isPlaybackRequestedActive: true)
-      player._nativeJumpTimeOverrideForTesting = { _ in 0 }
-
-      let request = player.requestJump(by: .seconds(10))
-      player.resetMediaDerivedState()
-
-      #expect(await request.outcome == .superseded)
-    }
-
-    /// Renderer recast establishes a successor playback generation without a
-    /// media reset. That generation boundary must terminate the outgoing seek
-    /// immediately rather than leaving it to time out.
-    @Test
-    func `A playback generation change supersedes a pending jump`() async {
-      let player = Player(instance: TestInstance.makeAudioOnly())
-      player._setStateForTesting(state: .playing, isPlaybackRequestedActive: true)
-      player._nativeJumpTimeOverrideForTesting = { _ in 0 }
-
-      let request = player.requestJump(by: .seconds(10))
-      player.sessionGeneration &+= 1
-
-      #expect(await request.outcome == .superseded)
-    }
-
-    /// An explicit stop is authoritative immediately; completion does not
-    /// wait for libVLC's asynchronous stopped event before discharging a skip.
-    @Test
-    func `Stopping supersedes a pending jump synchronously`() async {
-      let player = Player(instance: TestInstance.makeAudioOnly())
-      player._setStateForTesting(state: .playing, isPlaybackRequestedActive: true)
-      player._nativeJumpTimeOverrideForTesting = { _ in 0 }
-
-      let request = player.requestJump(by: .seconds(10))
-      player._nativePlaybackStateOverrideForTesting = .idle
-      player.stop()
-
-      #expect(await request.outcome == .superseded)
-    }
-
-    /// Cancelling an observer does not cancel or misclassify the shared seek.
-    @Test
-    func `Cancelling one waiter does not cancel the seek`() async {
-      let player = Player(instance: TestInstance.makeAudioOnly())
-      player._setStateForTesting(state: .playing, isPlaybackRequestedActive: true)
-      player._nativeJumpTimeOverrideForTesting = { _ in 0 }
-      let request = player.requestJump(by: .seconds(10))
-      let waiter = Task { await request.outcome }
-
-      waiter.cancel()
-      await Task.yield()
-      #expect(player.pendingSeekSettlement?.resolver.resolvedOutcome == nil)
-
-      player._completePendingSeekForTesting(time: .seconds(10))
-
-      #expect(await waiter.value == .settled)
-    }
-
-    /// Relative jumping changes only the timeline; it does not synthesize the
-    /// pause/mute transport sequence that previously left PiP playback stuck.
-    @Test
-    func `A jump preserves pause intent and mute state`() async {
-      let player = Player(instance: TestInstance.makeAudioOnly())
-      player._setStateForTesting(
-        state: .paused,
-        isPlaybackRequestedActive: false,
-        currentTime: .seconds(5),
-        duration: .seconds(100)
-      )
-      player.isMuted = true
-      player._nativePlaybackStateOverrideForTesting = .paused
-      player._nativeJumpTimeOverrideForTesting = { _ in 0 }
-
-      let request = player.requestJump(by: .seconds(5))
-      player._completePendingSeekForTesting(time: .seconds(10), position: 0.1)
-
-      #expect(await request.outcome == .settled)
-      #expect(player.state == .paused)
-      #expect(player.isPlaybackRequestedActive == false)
-      #expect(player.isMuted)
+    private func drainMainActor() async {
+      for _ in 0..<30 {
+        await Task.yield()
+      }
     }
   }
 }

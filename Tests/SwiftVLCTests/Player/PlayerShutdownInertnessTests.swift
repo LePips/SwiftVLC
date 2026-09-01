@@ -62,6 +62,22 @@ extension Integration {
       #expect(player.state == .idle)
     }
 
+    @Test
+    func `Stop and wait joins an in-progress shutdown instead of starting another drain`() async {
+      let player = Player(instance: TestInstance.makeAudioOnly())
+      let teardown = Task { @MainActor in
+        await player.shutdown()
+      }
+      await Task.yield()
+
+      let outcome = await player.stopAndWait()
+      await teardown.value
+
+      #expect(outcome == .stopped)
+      #expect(player.currentMedia == nil)
+      #expect(player.state == .idle)
+    }
+
     /// A shut-down player must not adopt media: the handle it would attach to
     /// is the inert replacement.
     @Test
@@ -177,6 +193,63 @@ extension Integration {
 
       await player.shutdown()
       _ = await drained.value
+    }
+
+    @Test
+    func `Pending seek waiter is superseded and stale landings stay inert through shutdown`() async throws {
+      let player = Player(instance: TestInstance.makeAudioOnly())
+      player._setStateForTesting(
+        state: .playing,
+        isPlaybackRequestedActive: true,
+        currentTime: .seconds(10),
+        duration: .seconds(100),
+        position: 0.1,
+        isSeekable: true
+      )
+      player._nativeJumpTimeOverrideForTesting = { _ in 0 }
+
+      let request = player.requestJump(by: .seconds(20))
+      let token = try #require(player.activeNativeSeek?.command.nativeSeekToken)
+      let callbackTimeline = player.nativeSeekMonitor.timelineGeneration
+      let waiter = Task { await request.outcome }
+      await Task.yield()
+
+      await player.shutdown()
+
+      #expect(await waiter.value == .superseded)
+      #expect(request.initialOutcome == .pending)
+      #expect(player.pendingSeekSettlement == nil)
+      #expect(player.activeNativeSeek == nil)
+      #expect(player.queuedNativeSeek == nil)
+      let timeAfterShutdown = player.currentTime
+      let positionAfterShutdown = player.position
+
+      // Model callbacks which had already borrowed the outgoing attachment
+      // when teardown began. The waiter is complete and shutdown's inertness
+      // guard prevents either the monitor delivery or a direct delayed
+      // landing from publishing into the replacement handle.
+      player.nativeSeekMonitor._noteSeekStartedForTesting(
+        timelineGeneration: callbackTimeline
+      )
+      player.nativeSeekMonitor._noteSeekEndedForTesting(
+        timelineGeneration: callbackTimeline
+      )
+      player.nativeSeekMonitor._noteTimeUpdatedForTesting(
+        timeMilliseconds: 30000,
+        position: 0.3,
+        timelineGeneration: callbackTimeline
+      )
+      player.nativeSeekDidLand(NativeSeekLanding(
+        token: token,
+        timeMilliseconds: 99000,
+        position: 0.99
+      ))
+      await Task.yield()
+
+      #expect(player.currentTime == timeAfterShutdown)
+      #expect(player.position == positionAfterShutdown)
+      #expect(player.pendingSeekSettlement == nil)
+      #expect(player.activeNativeSeek == nil)
     }
   }
 }

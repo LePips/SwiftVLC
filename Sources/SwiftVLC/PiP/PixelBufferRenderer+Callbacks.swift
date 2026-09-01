@@ -1,3 +1,4 @@
+// swiftlint:disable file_length
 #if os(iOS) || os(macOS)
 import AVFoundation
 import CLibVLC
@@ -7,16 +8,111 @@ import Foundation
 import os
 import Synchronization
 
-/// Injectable native registration operations. Production uses libVLC; tests
-/// record the exact handle each install/clear targets without requiring a
-/// timing-sensitive video output.
-struct DirectPiPVideoCallbackAPI {
-  let install: @MainActor (OpaquePointer, UnsafeMutableRawPointer) -> Void
-  let clear: @MainActor (OpaquePointer) -> Void
+/// Injectable frame-construction operations for the synchronous vmem display
+/// result. Keeping these seams above the final output submission lets tests
+/// prove that every preparation failure remains a negative callback result.
+struct PixelBufferDisplayPreparationAPI: @unchecked Sendable {
+  let outputPixelBuffer:
+    (PixelBufferRenderer, CVPixelBuffer) -> (buffer: CVPixelBuffer, generation: UInt64)?
+  let formatDescription: (PixelBufferRenderer, CVPixelBuffer, UInt64) -> CMVideoFormatDescription?
+  let makeSampleBuffer:
+    (CVPixelBuffer, CMVideoFormatDescription, CMSampleTimingInfo) -> CMSampleBuffer?
 
   static var live: Self {
     Self(
-      install: { player, opaque in
+      outputPixelBuffer: { renderer, source in
+        renderer.outputPixelBuffer(from: source)
+      },
+      formatDescription: { renderer, buffer, generation in
+        renderer.formatDescription(for: buffer, generation: generation)
+      },
+      makeSampleBuffer: { buffer, description, timing in
+        var timing = timing
+        var sampleBuffer: CMSampleBuffer?
+        let status = CMSampleBufferCreateReadyWithImageBuffer(
+          allocator: kCFAllocatorDefault,
+          imageBuffer: buffer,
+          formatDescription: description,
+          sampleTiming: &timing,
+          sampleBufferOut: &sampleBuffer
+        )
+        return status == noErr ? sampleBuffer : nil
+      }
+    )
+  }
+}
+
+/// The native operations needed to select the callback-registration ABI.
+/// Keeping both atomic versions and the legacy path injectable lets tests prove
+/// that an authoritative atomic publication failure never falls through to a
+/// different setter that could expose a mixed generation to a racing vout.
+struct DirectPiPVideoCallbackNativeAPI {
+  let atomicV2CallbacksAvailable: @MainActor () -> Bool
+  let publishAtomicV2: @MainActor (OpaquePointer, UnsafeMutableRawPointer?) -> Int32
+  let atomicCallbacksAvailable: @MainActor () -> Bool
+  let publishAtomic: @MainActor (OpaquePointer, UnsafeMutableRawPointer?) -> Int32
+  let installLegacy: @MainActor (OpaquePointer, UnsafeMutableRawPointer) -> Void
+  let clearLegacy: @MainActor (OpaquePointer) -> Void
+
+  static var live: Self {
+    Self(
+      atomicV2CallbacksAvailable: {
+        swiftvlc_video_callbacks_atomic_v2_available()
+      },
+      publishAtomicV2: { player, opaque in
+        if let opaque {
+          swiftvlc_video_set_callbacks_atomic_v2_if_available(
+            player,
+            pixelBufferLockCallback,
+            pixelBufferUnlockCallback,
+            pixelBufferDisplayCallback,
+            pixelBufferDisplayStatusV2Callback,
+            pixelBufferFormatCallbackEx,
+            pixelBufferCleanupCallback,
+            opaque
+          )
+        } else {
+          swiftvlc_video_set_callbacks_atomic_v2_if_available(
+            player,
+            nil,
+            nil,
+            nil,
+            nil,
+            nil,
+            nil,
+            nil
+          )
+        }
+      },
+      atomicCallbacksAvailable: {
+        swiftvlc_video_callbacks_atomic_available()
+      },
+      publishAtomic: { player, opaque in
+        if let opaque {
+          swiftvlc_video_set_callbacks_atomic_if_available(
+            player,
+            pixelBufferLockCallback,
+            pixelBufferUnlockCallback,
+            pixelBufferDisplayCallback,
+            pixelBufferDisplayStatusCallback,
+            pixelBufferFormatCallbackEx,
+            pixelBufferCleanupCallback,
+            opaque
+          )
+        } else {
+          swiftvlc_video_set_callbacks_atomic_if_available(
+            player,
+            nil,
+            nil,
+            nil,
+            nil,
+            nil,
+            nil,
+            nil
+          )
+        }
+      },
+      installLegacy: { player, opaque in
         libvlc_video_set_callbacks(
           player,
           pixelBufferLockCallback,
@@ -40,10 +136,75 @@ struct DirectPiPVideoCallbackAPI {
           )
         }
       },
-      clear: { player in
+      clearLegacy: { player in
         libvlc_video_set_callbacks(player, nil, nil, nil, nil)
         if !swiftvlc_video_set_format_callbacks_ex_if_available(player, nil, nil) {
           libvlc_video_set_format_callbacks(player, nil, nil)
+        }
+      }
+    )
+  }
+}
+
+enum DirectPiPVideoCallbackABI: Sendable, Equatable {
+  case atomicV2
+  case atomicV1
+  case legacy
+
+  var suppliesNativePictureTimestamps: Bool {
+    self == .atomicV2
+  }
+}
+
+/// Injectable complete callback mutations. Production selects v6 atomic-v2,
+/// then v4 atomic-v1, and only then a genuinely old legacy path. The selected
+/// install ABI is retained for its matching clear; a failed atomic publish is
+/// authoritative and never triggers a mixed-generation fallback.
+struct DirectPiPVideoCallbackAPI {
+  let preferredABI: @MainActor () -> DirectPiPVideoCallbackABI
+  let install:
+    @MainActor (
+      OpaquePointer,
+      UnsafeMutableRawPointer,
+      DirectPiPVideoCallbackABI
+    ) -> Bool
+  let clear: @MainActor (OpaquePointer, DirectPiPVideoCallbackABI) -> Bool
+
+  static var live: Self {
+    resolving(native: .live)
+  }
+
+  static func resolving(native: DirectPiPVideoCallbackNativeAPI) -> Self {
+    Self(
+      preferredABI: {
+        if native.atomicV2CallbacksAvailable() {
+          return .atomicV2
+        }
+        if native.atomicCallbacksAvailable() {
+          return .atomicV1
+        }
+        return .legacy
+      },
+      install: { player, opaque, abi in
+        switch abi {
+        case .atomicV2:
+          return native.publishAtomicV2(player, opaque) == 0
+        case .atomicV1:
+          return native.publishAtomic(player, opaque) == 0
+        case .legacy:
+          native.installLegacy(player, opaque)
+          return true
+        }
+      },
+      clear: { player, abi in
+        switch abi {
+        case .atomicV2:
+          return native.publishAtomicV2(player, nil) == 0
+        case .atomicV1:
+          return native.publishAtomic(player, nil) == 0
+        case .legacy:
+          native.clearLegacy(player)
+          return true
         }
       }
     )
@@ -64,7 +225,7 @@ final class DirectPiPVideoCallbackSlot {
   let context: PixelBufferRendererCallbackContext
   let opaque: UnsafeMutableRawPointer
   private let api: DirectPiPVideoCallbackAPI
-  private var callbacksInstalled = false
+  private var installedABI: DirectPiPVideoCallbackABI?
   private(set) var isRetired = false
 
   init(
@@ -98,13 +259,37 @@ final class DirectPiPVideoCallbackSlot {
   /// the same handle opaque into the media-player variables for future vouts.
   /// An already-open vout owns a child opaque that resolves through this same
   /// handle context and observes the handoff on its next display callback.
-  func activate(renderer: PixelBufferRenderer) {
+  @discardableResult
+  func activate(renderer: PixelBufferRenderer) -> Bool {
     precondition(!isRetired && !lifetime.isReleased)
-    precondition(context.setDisplayRenderer(renderer))
-    if !callbacksInstalled {
-      api.install(lifetime.pointer, opaque)
-      callbacksInstalled = true
+    if installedABI != nil {
+      return context.setDisplayRenderer(renderer)
     }
+
+    // Keep an already-open dormant vout fail-closed until the complete native
+    // tuple has actually published. The timestamp gate is armed before that
+    // publication so a racing v6 callback cannot escape post-filter,
+    // vout-selected vmem output-attempt PTS accounting.
+    precondition(context.setDisplayRenderer(nil))
+    let selectedABI = api.preferredABI()
+    context.setNativePictureTimestampCallbacksAvailable(
+      selectedABI.suppliesNativePictureTimestamps
+    )
+    guard api.install(lifetime.pointer, opaque, selectedABI) else {
+      // Atomic publication leaves the previous native generation unchanged on
+      // failure. Do not advertise a renderer target for a tuple we failed to
+      // install; a later claim may retry this dormant same-handle slot.
+      return false
+    }
+    installedABI = selectedABI
+    guard context.setDisplayRenderer(renderer) else {
+      // Native publication won but exact-handle retirement raced activation.
+      // Clear with the same ABI; a failed clear deliberately preserves the
+      // lifetime-bound opaque until native handle release.
+      _ = clearCallbacksIfInstalled()
+      return false
+    }
+    return true
   }
 
   /// Removes the controller target while preserving the per-handle slot.
@@ -112,26 +297,42 @@ final class DirectPiPVideoCallbackSlot {
   /// already-open vout still holds it. The media-player variables are cleared
   /// while the slot is dormant and reinstalled with this same opaque on the
   /// next activation.
-  func deactivate() {
-    guard !isRetired else { return }
+  @discardableResult
+  func deactivate() -> Bool {
+    guard !isRetired else { return true }
     _ = context.setDisplayRenderer(nil)
-    clearCallbacksIfInstalled()
+    return clearCallbacksIfInstalled()
   }
 
   /// Permanently retires the slot because its exact handle is being replaced
   /// or released. The opaque remains retained by `lifetime` until native
   /// teardown has joined that handle's vout.
-  func retire() {
-    guard !isRetired else { return }
+  @discardableResult
+  func retire() -> Bool {
+    guard !isRetired else { return true }
     isRetired = true
     context.requestRetirement()
-    clearCallbacksIfInstalled()
+    return clearCallbacksIfInstalled()
   }
 
-  private func clearCallbacksIfInstalled() {
-    guard callbacksInstalled else { return }
-    callbacksInstalled = false
-    api.clear(lifetime.pointer)
+  private func clearCallbacksIfInstalled() -> Bool {
+    guard let installedABI else { return true }
+    guard api.clear(lifetime.pointer, installedABI) else {
+      // The immutable native generation still contains `opaque`. Keep both the
+      // installed-state bit and the lifetime-bound retain until a later clear
+      // succeeds or this exact native handle finishes releasing.
+      return false
+    }
+    self.installedABI = nil
+    return true
+  }
+
+  var callbacksInstalledForTesting: Bool {
+    installedABI != nil
+  }
+
+  var installedABIForTesting: DirectPiPVideoCallbackABI? {
+    installedABI
   }
 }
 
@@ -171,11 +372,12 @@ final class DirectPiPVideoCallbackRegistration {
     )
   }
 
-  func bind(to slot: DirectPiPVideoCallbackSlot, generation: UInt64) {
+  @discardableResult
+  func bind(to slot: DirectPiPVideoCallbackSlot, generation: UInt64) -> Bool {
     let playbackGeneration = playbackGeneration()
     slot.context.beginPlaybackGeneration(playbackGeneration)
     renderer.beginPlaybackGeneration(playbackGeneration)
-    slot.activate(renderer: renderer)
+    guard slot.activate(renderer: renderer) else { return false }
     slot.context.setQualificationTelemetryEnabled(
       renderer.contentDiagnosticsEnabled.load(ordering: .acquiring)
     )
@@ -183,6 +385,7 @@ final class DirectPiPVideoCallbackRegistration {
       renderer.presentationCopyEnabled.load(ordering: .acquiring)
     )
     current = Binding(slot: slot, generation: generation)
+    return true
   }
 
   func setQualificationTelemetryEnabled(_ enabled: Bool) {
@@ -200,6 +403,10 @@ final class DirectPiPVideoCallbackRegistration {
 
   var currentGeneration: UInt64? {
     current?.generation
+  }
+
+  var isBound: Bool {
+    current != nil
   }
 
   var currentLifetime: NativePlayerHandleLifetime? {
@@ -224,6 +431,10 @@ final class DirectPiPVideoCallbackRegistration {
 
   var sourceDeliverySnapshot: PixelBufferVoutSourceSnapshot? {
     current?.slot.context.latestSourceDeliverySnapshot
+  }
+
+  var sourceTimestampTelemetrySnapshot: NativePictureTimestampTelemetrySnapshot? {
+    current?.slot.context.sourceTimestampTelemetrySnapshot
   }
 
   func beginPlaybackGeneration(_ generation: UInt64) {
@@ -270,6 +481,7 @@ final class PixelBufferRendererCallbackContext: Sendable {
   private let nativePlayerAddress: UInt
   private let playbackGeneration: Mutex<UInt64>
   private let voutGenerationCounter: PixelBufferVoutGenerationCounter
+  private let sourceTimestampTelemetry: NativePictureTimestampTelemetry
 
   init(
     renderer: PixelBufferRenderer,
@@ -287,13 +499,56 @@ final class PixelBufferRendererCallbackContext: Sendable {
     nativePlayerAddress = nativePlayer.map(UInt.init(bitPattern:)) ?? 0
     self.playbackGeneration = Mutex(playbackGeneration)
     self.voutGenerationCounter = voutGenerationCounter
+    sourceTimestampTelemetry = NativePictureTimestampTelemetry(
+      playbackGeneration: playbackGeneration
+    )
   }
 
   /// Advances the generation captured by subsequently negotiated vouts.
   /// Already-open vouts retain their original value and are therefore rejected
   /// by the display renderer after a media boundary.
   func beginPlaybackGeneration(_ generation: UInt64) {
-    playbackGeneration.withLock { $0 = generation }
+    let advanced = playbackGeneration.withLock { current -> Bool in
+      guard generation > current else { return false }
+      current = generation
+      return true
+    }
+    if advanced {
+      sourceTimestampTelemetry.beginPlaybackGeneration(generation)
+    }
+  }
+
+  func setNativePictureTimestampCallbacksAvailable(_ available: Bool) {
+    sourceTimestampTelemetry.setAvailable(available)
+  }
+
+  var sourceTimestampTelemetrySnapshot: NativePictureTimestampTelemetrySnapshot {
+    sourceTimestampTelemetry.snapshot
+  }
+
+  @discardableResult
+  func recordNativePictureTimestamp(
+    _ picturePTSUS: Int64,
+    playbackGeneration: UInt64,
+    voutGeneration: UInt64
+  ) -> Bool {
+    sourceTimestampTelemetry.record(
+      picturePTSUS: picturePTSUS,
+      playbackGeneration: playbackGeneration,
+      voutGeneration: voutGeneration
+    )
+  }
+
+  func recordNativePictureSubmissionResult(
+    submitted: Bool,
+    playbackGeneration: UInt64,
+    voutGeneration: UInt64
+  ) {
+    sourceTimestampTelemetry.recordSubmissionResult(
+      submitted: submitted,
+      playbackGeneration: playbackGeneration,
+      voutGeneration: voutGeneration
+    )
   }
 
   var hasOpenVoutForTesting: Bool {
@@ -553,6 +808,27 @@ final class PixelBufferRendererVoutCallbackContext: @unchecked Sendable {
     handleContext.qualificationMediaTimeSeconds
   }
 
+  /// Records the v6 callback argument before picture validation or output
+  /// submission. The handle-level accumulator enforces playback/vout identity.
+  @discardableResult
+  func recordNativePictureTimestamp(_ picturePTSUS: Int64) -> Bool {
+    handleContext.recordNativePictureTimestamp(
+      picturePTSUS,
+      playbackGeneration: playbackGeneration,
+      voutGeneration: voutGeneration
+    )
+  }
+
+  /// Closes the exact callback's output-attempt accounting after Swift has
+  /// either synchronously submitted the sample or explicitly rejected it.
+  func recordNativePictureSubmissionResult(submitted: Bool) {
+    handleContext.recordNativePictureSubmissionResult(
+      submitted: submitted,
+      playbackGeneration: playbackGeneration,
+      voutGeneration: voutGeneration
+    )
+  }
+
   /// Pins one callback picture until display consumes it, a later lock
   /// supersedes it, or vout cleanup drains it. Pinned vmem exposes only one
   /// `pic_opaque` slot, so a second successful lock proves the predecessor can
@@ -734,30 +1010,89 @@ func pixelBufferUnlockCallback(
   context.unlockPendingPicture(matching: picture)
 }
 
-/// Display callback. Wraps the `CVPixelBuffer` in a `CMSampleBuffer`
-/// and enqueues it onto the `AVSampleBufferDisplayLayer`.
+private enum PixelBufferDisplaySubmissionMode {
+  case legacyDeferred
+  case synchronousStatus
+}
+
+private let pixelBufferDisplaySubmitted: CInt = 0
+private let pixelBufferDisplayNotSubmitted: CInt = -1
+
+/// Legacy display callback retained for pre-v4 libVLC binaries. Its bounded
+/// async queue cannot make an exact synchronous submission claim, so the
+/// shared implementation's result is deliberately ignored.
 func pixelBufferDisplayCallback(
   opaque: UnsafeMutableRawPointer?,
   picture: UnsafeMutableRawPointer?
 ) {
+  _ = submitPixelBufferDisplay(
+    opaque: opaque,
+    picture: picture,
+    mode: .legacyDeferred
+  )
+}
+
+/// Result-bearing v4 callback. Zero is returned only by the branch that calls
+/// the final `AVSampleBufferVideoRenderer.enqueue` operation before returning.
+func pixelBufferDisplayStatusCallback(
+  opaque: UnsafeMutableRawPointer?,
+  picture: UnsafeMutableRawPointer?
+) -> CInt {
+  submitPixelBufferDisplay(
+    opaque: opaque,
+    picture: picture,
+    mode: .synchronousStatus
+  )
+}
+
+/// Result-bearing v6 callback. The native picture date is captured at the
+/// callback seam before any picture validation or presentation work, while the
+/// v4 callback remains ABI-identical for older archives.
+func pixelBufferDisplayStatusV2Callback(
+  opaque: UnsafeMutableRawPointer?,
+  picture: UnsafeMutableRawPointer?,
+  picturePTSUS: Int64
+) -> CInt {
+  guard let context = pixelBufferVoutCallbackContext(from: opaque) else {
+    return pixelBufferDisplayNotSubmitted
+  }
+  let recordsCurrentGeneration = context.recordNativePictureTimestamp(picturePTSUS)
+  let result = submitPixelBufferDisplay(
+    opaque: opaque,
+    picture: picture,
+    mode: .synchronousStatus
+  )
+  if recordsCurrentGeneration {
+    context.recordNativePictureSubmissionResult(
+      submitted: result == pixelBufferDisplaySubmitted
+    )
+  }
+  return result
+}
+
+private func submitPixelBufferDisplay(
+  opaque: UnsafeMutableRawPointer?,
+  picture: UnsafeMutableRawPointer?,
+  mode: PixelBufferDisplaySubmissionMode
+) -> CInt {
   guard
     let picture,
     let context = pixelBufferVoutCallbackContext(from: opaque)
-  else { return }
+  else { return pixelBufferDisplayNotSubmitted }
   context.recordQualificationCallback { $0.vmemDisplayCallbackCount &+= 1 }
   guard let consumed = context.consumePendingPicture(matching: picture) else {
     context.recordQualificationCallback { $0.vmemDisplayConsumeFailureCount &+= 1 }
-    return
+    return pixelBufferDisplayNotSubmitted
   }
 
   let pb = consumed.buffer
   let playbackGeneration = consumed.playbackGeneration
 
-  _ = context.withDisplayRenderer { renderer in
+  return context.withDisplayRenderer { renderer -> CInt in
     let acceptsPlaybackGeneration = renderer.state.withLock {
       $0.playbackGeneration == playbackGeneration
     }
-    guard acceptsPlaybackGeneration else { return }
+    guard acceptsPlaybackGeneration else { return pixelBufferDisplayNotSubmitted }
     let decodedMediaTimeSeconds = context.qualificationMediaTimeSeconds
     renderer.state.withLock {
       $0.decodedFrameCount &+= 1
@@ -768,7 +1103,9 @@ func pixelBufferDisplayCallback(
         $0.lastDecodedFrameMediaTimeSeconds = decodedMediaTimeSeconds
       }
     }
-    guard let output = renderer.outputPixelBuffer(from: pb) else { return }
+    guard
+      let output = renderer.displayPreparationAPI.outputPixelBuffer(renderer, pb)
+    else { return pixelBufferDisplayNotSubmitted }
     let outputBuffer = output.buffer
     let renderGeneration = output.generation
     renderer.recordContentFingerprintIfEnabled(of: outputBuffer)
@@ -777,19 +1114,21 @@ func pixelBufferDisplayCallback(
       ($0.timebase, $0.displayLayer.layer)
     }
 
-    guard let layer else { return }
+    guard let layer else { return pixelBufferDisplayNotSubmitted }
     guard
-      let desc = renderer.formatDescription(
-        for: outputBuffer,
-        generation: renderGeneration
+      let desc = renderer.displayPreparationAPI.formatDescription(
+        renderer,
+        outputBuffer,
+        renderGeneration
       )
-    else { return }
+    else { return pixelBufferDisplayNotSubmitted }
 
-    let pts: CMTime = if let timebase {
-      CMTimebaseGetTime(timebase)
-    } else {
-      CMClockGetTime(CMClockGetHostTimeClock())
-    }
+    let pts: CMTime =
+      if let timebase {
+        CMTimebaseGetTime(timebase)
+      } else {
+        CMClockGetTime(CMClockGetHostTimeClock())
+      }
 
     // When the control timebase is frozen (rate 0, i.e. paused), its time
     // does not advance, so a seek-while-paused frame carries a PTS no later
@@ -799,7 +1138,7 @@ func pixelBufferDisplayCallback(
     // host-clock-paced.
     let displayImmediately = timebase.map { CMTimebaseGetRate($0) == 0 } ?? false
 
-    var timingInfo = CMSampleTimingInfo(
+    let timingInfo = CMSampleTimingInfo(
       // vmem does not expose this source frame's duration. A track's reported
       // ratio may be nominal/average for VFR, so any constant would fabricate
       // timing; the presentation timestamp remains authoritative.
@@ -808,15 +1147,13 @@ func pixelBufferDisplayCallback(
       decodeTimeStamp: .invalid
     )
 
-    var sampleBuffer: CMSampleBuffer?
-    let sbStatus = CMSampleBufferCreateReadyWithImageBuffer(
-      allocator: kCFAllocatorDefault,
-      imageBuffer: outputBuffer,
-      formatDescription: desc,
-      sampleTiming: &timingInfo,
-      sampleBufferOut: &sampleBuffer
-    )
-    guard sbStatus == noErr, let sb = sampleBuffer else { return }
+    guard
+      let sb = renderer.displayPreparationAPI.makeSampleBuffer(
+        outputBuffer,
+        desc,
+        timingInfo
+      )
+    else { return pixelBufferDisplayNotSubmitted }
     if
       displayImmediately,
       let attachments = CMSampleBufferGetSampleAttachmentsArray(
@@ -827,14 +1164,26 @@ func pixelBufferDisplayCallback(
     }
     // CMSampleBuffer is a CF type that lacks Sendable conformance but is thread-safe for read access
     nonisolated(unsafe) let sample = sb
-    renderer.enqueue(
-      sample,
-      generation: renderGeneration,
-      on: layer,
-      playbackGeneration: playbackGeneration,
-      voutGeneration: context.voutGeneration
-    )
-  }
+    switch mode {
+    case .legacyDeferred:
+      renderer.enqueue(
+        sample,
+        generation: renderGeneration,
+        on: layer,
+        playbackGeneration: playbackGeneration,
+        voutGeneration: context.voutGeneration
+      )
+      return pixelBufferDisplayNotSubmitted
+    case .synchronousStatus:
+      return renderer.enqueueSynchronously(
+        sample,
+        generation: renderGeneration,
+        on: layer,
+        playbackGeneration: playbackGeneration,
+        voutGeneration: context.voutGeneration
+      ) ? pixelBufferDisplaySubmitted : pixelBufferDisplayNotSubmitted
+    }
+  } ?? pixelBufferDisplayNotSubmitted
 }
 
 /// Cleanup callback. Releases the pixel buffer pool.

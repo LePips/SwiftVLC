@@ -23,6 +23,15 @@ public enum PlayerEvent: Sendable, CustomStringConvertible {
   case encounteredError
   /// Audio volume changed. The value is normalized (0.0 = silent, 1.0 = 100%).
   case volumeChanged(Float)
+  /// VLC reported an effective player control-rate resolution.
+  ///
+  /// For a queued active-input request, this is the asynchronously resolved
+  /// input rate, not measured decoded or presented throughput. VLC suppresses
+  /// that notification when the resolved rate is unchanged. With no active
+  /// input, or if native control queuing fails, the authoritative effective
+  /// state is reported immediately and may repeat. Events do not carry request
+  /// identifiers and are not request completions.
+  case rateChanged(Float)
   /// Audio was muted.
   case muted
   /// Audio was unmuted.
@@ -88,6 +97,7 @@ public enum PlayerEvent: Sendable, CustomStringConvertible {
     case .mediaChanged: "mediaChanged"
     case .encounteredError: "encounteredError"
     case .volumeChanged(let volume): "volumeChanged(\(volume))"
+    case .rateChanged(let rate): "rateChanged(\(rate))"
     case .muted: "muted"
     case .unmuted: "unmuted"
     case .corked: "corked"
@@ -199,6 +209,15 @@ extension PlayerEvent {
   /// `Float` if this event is `.volumeChanged`, otherwise `nil`.
   public var volumeChanged: Float? {
     if case .volumeChanged(let value) = self {
+      value
+    } else {
+      nil
+    }
+  }
+
+  /// Effective control rate if this event is `.rateChanged`, otherwise `nil`.
+  public var rateChanged: Float? {
+    if case .rateChanged(let value) = self {
       value
     } else {
       nil

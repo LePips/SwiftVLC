@@ -1,6 +1,15 @@
 @testable import SwiftVLC
+import CustomDump
 import Foundation
 import Testing
+
+private struct LenientSeekGateMirror: Equatable {
+  let jumpAccepted: Bool
+  let requestOutcome: SeekOutcome
+  let positionAccepted: Bool
+  let jumpDispatches: Int
+  let positionDispatches: Int
+}
 
 /// Exercises the lenient seek surface (`seek(toPosition:fast:)`,
 /// `jump(by:)`) alongside the strict seeks' position publication.
@@ -34,13 +43,78 @@ extension Integration {
 
     // MARK: - Session gate timing
 
+    @Test
+    func `Terminal native state rejects every lenient surface despite active intent`() async {
+      for nativeState in [PlayerState.stopped, .stopping, .error] {
+        let player = Player(instance: TestInstance.makeAudioOnly())
+        player._setStateForTesting(
+          state: .playing,
+          isPlaybackRequestedActive: true,
+          currentTime: .seconds(10)
+        )
+        player._nativePlaybackStateOverrideForTesting = nativeState
+        var jumpDispatches = 0
+        var positionDispatches = 0
+        player._nativeJumpTimeOverrideForTesting = { _ in
+          jumpDispatches += 1
+          return 0
+        }
+        player._nativeSetPositionOverrideForTesting = { _, _ in
+          positionDispatches += 1
+          return 0
+        }
+
+        let jumpAccepted = player.jump(by: .seconds(5))
+        let request = player.requestJump(by: .seconds(5))
+        let positionAccepted = player.seek(toPosition: PlaybackPosition(0.5))
+        let requestOutcome = await request.outcome
+
+        expectNoDifference(
+          LenientSeekGateMirror(
+            jumpAccepted: jumpAccepted,
+            requestOutcome: requestOutcome,
+            positionAccepted: positionAccepted,
+            jumpDispatches: jumpDispatches,
+            positionDispatches: positionDispatches
+          ),
+          LenientSeekGateMirror(
+            jumpAccepted: false,
+            requestOutcome: .rejected,
+            positionAccepted: false,
+            jumpDispatches: 0,
+            positionDispatches: 0
+          )
+        )
+      }
+    }
+
+    @Test
+    func `Idle native state uses active intent fallback`() {
+      let player = Player(instance: TestInstance.makeAudioOnly())
+      player._setStateForTesting(
+        state: .idle,
+        isPlaybackRequestedActive: true,
+        currentTime: .seconds(10)
+      )
+      var dispatches = 0
+      player._nativeJumpTimeOverrideForTesting = { _ in
+        dispatches += 1
+        return 0
+      }
+
+      #expect(player.jump(by: .seconds(5)))
+      #expect(dispatches == 1)
+    }
+
     @Test(.enabled(if: TestCondition.canPlayMedia), .timeLimit(.minutes(1)))
     func `seek immediately after play succeeds`() throws {
       let player = Player(instance: TestInstance.makePlayback())
       try player.play(Media(url: TestMedia.twosecURL))
       // Same main-actor turn as play(): the event-fed `state` mirror is
-      // still `.idle`, but the synchronously published playback intent
-      // must already open the lenient-seek session.
+      // still `.idle`. Pin the synchronous native observation to that same
+      // ambiguous state: only `.idle` may use active playback intent as its
+      // same-turn fallback; terminal native states remain rejected.
+      player._nativePlaybackStateOverrideForTesting = .idle
       #expect(player.seek(toPosition: PlaybackPosition(0.1)) == true)
       player.stop()
     }

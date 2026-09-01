@@ -17,10 +17,17 @@ final class EventBridge: Sendable {
   private let nativeHandleGeneration = Mutex<UInt64>(1)
   private let invalidated = Mutex(false)
 
-  init(eventManager: OpaquePointer, endCoordinator: PlaybackEndCoordinator) {
+  init(
+    eventManager: OpaquePointer,
+    endCoordinator: PlaybackEndCoordinator,
+    nativeSeekEmissionAuthority: NativeSeekEmissionAuthority
+  ) {
     self.eventManager = eventManager
 
-    let context = EventBridgeCallbackContext(endCoordinator: endCoordinator)
+    let context = EventBridgeCallbackContext(
+      endCoordinator: endCoordinator,
+      nativeSeekEmissionAuthority: nativeSeekEmissionAuthority
+    )
     self.context = context
     let attachment = EventBridgeCallbackAttachment(
       context: context,
@@ -120,6 +127,15 @@ final class EventBridge: Sendable {
     context.currentPlaybackGeneration
   }
 
+  /// Playback-control boundary already accepted by the callback lane.
+  var currentLifecycleControlEpoch: UInt64 {
+    context.currentLifecycleControlEpoch
+  }
+
+  func hasExplicitStopBarrier(playbackGeneration: UInt64) -> Bool {
+    context.hasExplicitStopBarrier(playbackGeneration: playbackGeneration)
+  }
+
   /// Runs a main-actor mutation only if the callback lane is still on the
   /// expected playback generation. The comparison and mutation share the
   /// callback lane's lifecycle lock, giving callers a real linearization point
@@ -182,10 +198,49 @@ final class EventBridge: Sendable {
     )
   }
 
+  /// Starts a new playback episode for the media already installed on this
+  /// handle. Unlike `synchronizePlaybackGeneration`, no `MediaChanged` echo is
+  /// expected. Cold replay uses this boundary so already-sourced retiring
+  /// callbacks remain generation-stale.
+  @discardableResult
+  func beginPlaybackGeneration(
+    _ generation: UInt64,
+    media: OpaquePointer?
+  ) -> UInt64 {
+    context.beginPlaybackGeneration(
+      generation,
+      media: media,
+      nativeHandleGeneration: currentNativeHandleGeneration
+    )
+  }
+
   /// Records that the current generation is expected to stop because the
   /// wrapper issued an explicit stop request.
   func markRequestedStop(playbackGeneration: UInt64) {
     context.markRequestedStop(playbackGeneration: playbackGeneration)
+  }
+
+  func beginExplicitStopBarrier(playbackGeneration: UInt64) {
+    context.beginExplicitStopBarrier(playbackGeneration: playbackGeneration)
+  }
+
+  func beginPlaybackStartAttempt(
+    playbackGeneration: UInt64
+  ) -> EventBridgeCallbackContext.PlaybackStartAttempt? {
+    context.beginPlaybackStartAttempt(playbackGeneration: playbackGeneration)
+  }
+
+  func finishPlaybackStartAttempt(
+    _ attempt: EventBridgeCallbackContext.PlaybackStartAttempt?,
+    accepted: Bool
+  ) {
+    context.finishPlaybackStartAttempt(attempt, accepted: accepted)
+  }
+
+  func acceptExternalPlaybackActivation(playbackGeneration: UInt64) {
+    context.acceptExternalPlaybackActivation(
+      playbackGeneration: playbackGeneration
+    )
   }
 
   /// Records timeline facts learned synchronously by the wrapper rather than
@@ -200,13 +255,15 @@ final class EventBridge: Sendable {
     time: Duration,
     position: Double?,
     playbackGeneration: UInt64,
-    timelineRevision: UInt64
+    timelineRevision: UInt64,
+    timelineEmissionSequence: UInt64? = nil
   ) {
     context.updateAuthoritativeTimeline(
       time: time,
       position: position,
       playbackGeneration: playbackGeneration,
-      timelineRevision: timelineRevision
+      timelineRevision: timelineRevision,
+      timelineEmissionSequence: timelineEmissionSequence
     )
   }
 
@@ -232,6 +289,11 @@ final class EventBridge: Sendable {
     context.advanceTimelineRevision()
   }
 
+  @discardableResult
+  func advanceNativeTimelineEmissionSequence() -> UInt64 {
+    context.advanceNativeTimelineEmissionSequence()
+  }
+
   /// Pushes an event through the same fan-out path the C callback uses,
   /// including subscription buffering — unlike
   /// `Player._handleEventForTesting`, which bypasses the bridge entirely.
@@ -239,13 +301,17 @@ final class EventBridge: Sendable {
     _ event: PlayerEvent,
     nativeHandleGeneration: UInt64,
     playbackGeneration: UInt64? = nil,
-    emittedTimelineRevision: UInt64? = nil
+    emittedTimelineRevision: UInt64? = nil,
+    nativeSeekEmissionStamp: NativeSeekEmissionStamp? = nil,
+    lifecycleControlEpoch: UInt64? = nil
   ) {
     context.broadcast(
       event,
       nativeHandleGeneration: nativeHandleGeneration,
       playbackGeneration: playbackGeneration,
-      emittedTimelineRevision: emittedTimelineRevision
+      emittedTimelineRevision: emittedTimelineRevision,
+      nativeSeekEmissionStamp: nativeSeekEmissionStamp,
+      lifecycleControlEpoch: lifecycleControlEpoch
     )
   }
 
@@ -257,43 +323,99 @@ final class EventBridge: Sendable {
     }
   }
 
-  static let playerEventTypes: [Int32] = [
-    libvlc_MediaPlayerMediaChanged,
-    libvlc_MediaPlayerNothingSpecial,
-    libvlc_MediaPlayerOpening,
-    libvlc_MediaPlayerBuffering,
-    libvlc_MediaPlayerPlaying,
-    libvlc_MediaPlayerPaused,
-    libvlc_MediaPlayerStopped,
-    libvlc_MediaPlayerStopping,
-    libvlc_MediaPlayerMediaStopping,
-    libvlc_MediaPlayerEncounteredError,
-    libvlc_MediaPlayerTimeChanged,
-    libvlc_MediaPlayerPositionChanged,
-    libvlc_MediaPlayerSeekableChanged,
-    libvlc_MediaPlayerPausableChanged,
-    libvlc_MediaPlayerLengthChanged,
-    libvlc_MediaPlayerVout,
-    libvlc_MediaPlayerESAdded,
-    libvlc_MediaPlayerESDeleted,
-    libvlc_MediaPlayerESSelected,
-    libvlc_MediaPlayerESUpdated,
-    libvlc_MediaPlayerCorked,
-    libvlc_MediaPlayerUncorked,
-    libvlc_MediaPlayerMuted,
-    libvlc_MediaPlayerUnmuted,
-    libvlc_MediaPlayerAudioVolume,
-    libvlc_MediaPlayerAudioDevice,
-    libvlc_MediaPlayerChapterChanged,
-    libvlc_MediaPlayerRecordChanged,
-    libvlc_MediaPlayerTitleListChanged,
-    libvlc_MediaPlayerTitleSelectionChanged,
-    libvlc_MediaPlayerSnapshotTaken,
-    libvlc_MediaPlayerProgramAdded,
-    libvlc_MediaPlayerProgramDeleted,
-    libvlc_MediaPlayerProgramSelected,
-    libvlc_MediaPlayerProgramUpdated
-  ].map { Int32($0.rawValue) }
+  #if DEBUG
+  /// Pauses a synthetic native callback after a terminal has atomically
+  /// reserved playback ownership, cause, and timeline. MainActor mutations
+  /// made from this hook are therefore strictly post-entry.
+  func _setNativeEventCallbackBeforePlaybackClaimHookForTesting(
+    _ hook: (@Sendable () -> Void)?
+  ) {
+    context.setNativeEventCallbackBeforePlaybackClaimHookForTesting(hook)
+  }
+
+  /// Signals after native ordering is reserved but before a terminal attempts
+  /// the playback-lifecycle lock. Hooks installed here must not wait for work
+  /// that needs native emission; this seam exists only to release a deliberately
+  /// contended lifecycle lock in deterministic tests.
+  func _setNativeEventCallbackAfterNativeReservationHookForTesting(
+    _ hook: (@Sendable () -> Void)?
+  ) {
+    context.setNativeEventCallbackAfterNativeReservationHookForTesting(hook)
+  }
+
+  /// Deterministic entry to the external `MediaChanged` finalizer. The pointer
+  /// is identity-only and must remain valid for the duration of the test.
+  @discardableResult
+  func _noteExternalMediaChangedForTesting(_ media: OpaquePointer?) -> UInt64 {
+    context.noteExternalMediaChanged(
+      media,
+      nativeHandleGeneration: currentNativeHandleGeneration
+    )
+  }
+
+  /// Pauses a synthetic native callback after immutable entry attribution but
+  /// before mapping/lifecycle completion. This is intentionally below the
+  /// causal linearization point so tests can advance playback concurrently
+  /// without fabricating a sourced generation.
+  func _setNativeEventCallbackEntryHookForTesting(
+    _ hook: (@Sendable () -> Void)?
+  ) {
+    context.setNativeEventCallbackEntryHookForTesting(hook)
+  }
+  #endif
+
+  static func makePlayerEventTypes(
+    effectiveRateChangedEventAvailable: Bool
+  ) -> [Int32] {
+    var eventTypes: [Int32] = [
+      libvlc_MediaPlayerMediaChanged,
+      libvlc_MediaPlayerNothingSpecial,
+      libvlc_MediaPlayerOpening,
+      libvlc_MediaPlayerBuffering,
+      libvlc_MediaPlayerPlaying,
+      libvlc_MediaPlayerPaused,
+      libvlc_MediaPlayerStopped,
+      libvlc_MediaPlayerStopping,
+      libvlc_MediaPlayerMediaStopping,
+      libvlc_MediaPlayerEncounteredError,
+      libvlc_MediaPlayerTimeChanged,
+      libvlc_MediaPlayerPositionChanged,
+      libvlc_MediaPlayerSeekableChanged,
+      libvlc_MediaPlayerPausableChanged,
+      libvlc_MediaPlayerLengthChanged,
+      libvlc_MediaPlayerVout,
+      libvlc_MediaPlayerESAdded,
+      libvlc_MediaPlayerESDeleted,
+      libvlc_MediaPlayerESSelected,
+      libvlc_MediaPlayerESUpdated,
+      libvlc_MediaPlayerCorked,
+      libvlc_MediaPlayerUncorked,
+      libvlc_MediaPlayerMuted,
+      libvlc_MediaPlayerUnmuted,
+      libvlc_MediaPlayerAudioVolume,
+      libvlc_MediaPlayerAudioDevice,
+      libvlc_MediaPlayerChapterChanged,
+      libvlc_MediaPlayerRecordChanged,
+      libvlc_MediaPlayerTitleListChanged,
+      libvlc_MediaPlayerTitleSelectionChanged,
+      libvlc_MediaPlayerSnapshotTaken,
+      libvlc_MediaPlayerProgramAdded,
+      libvlc_MediaPlayerProgramDeleted,
+      libvlc_MediaPlayerProgramSelected,
+      libvlc_MediaPlayerProgramUpdated
+    ].map { Int32($0.rawValue) }
+    if effectiveRateChangedEventAvailable {
+      eventTypes.append(Int32(libvlc_MediaPlayerRateChanged.rawValue))
+    }
+    return eventTypes
+  }
+
+  static var playerEventTypes: [Int32] {
+    makePlayerEventTypes(
+      effectiveRateChangedEventAvailable:
+      swiftvlc_media_player_rate_changed_event_available()
+    )
+  }
 
   private static func attachEvents(
     to eventManager: OpaquePointer,
@@ -315,616 +437,5 @@ final class EventBridge: Sendable {
     for eventType in eventTypes {
       libvlc_event_detach(eventManager, eventType, playerEventCallback, opaque)
     }
-  }
-}
-
-struct SourcedPlayerEvent {
-  let nativeHandleGeneration: UInt64
-  let playbackGeneration: UInt64
-  let event: PlayerEvent
-  /// The timeline revision current when libVLC emitted this event.
-  ///
-  /// An accepted seek advances the revision, so a clock sample produced
-  /// before it carries a lower value and can be discarded instead of
-  /// overwriting the seek target. Defaults to zero, which is never newer
-  /// than an accepted seek, so a directly-constructed event is treated as
-  /// pre-seek rather than silently authoritative.
-  let timelineRevision: UInt64
-
-  init(
-    nativeHandleGeneration: UInt64,
-    playbackGeneration: UInt64,
-    event: PlayerEvent,
-    timelineRevision: UInt64 = 0
-  ) {
-    self.nativeHandleGeneration = nativeHandleGeneration
-    self.playbackGeneration = playbackGeneration
-    self.event = event
-    self.timelineRevision = timelineRevision
-  }
-}
-
-/// Immutable identity and shared fan-out context for one native attachment.
-/// A fresh retained token is passed to libVLC on every handle replacement;
-/// callbacks can therefore never acquire a successor's generation by reading
-/// mutable shared state after they were emitted by a predecessor.
-private final class EventBridgeCallbackAttachment: Sendable {
-  let context: EventBridgeCallbackContext
-  let nativeHandleGeneration: UInt64
-
-  init(context: EventBridgeCallbackContext, nativeHandleGeneration: UInt64) {
-    self.context = context
-    self.nativeHandleGeneration = nativeHandleGeneration
-  }
-}
-
-private final class EventBridgeCallbackContext: Sendable {
-  private let events = Broadcaster<PlayerEvent>(defaultBufferSize: 64)
-  private let eventEnvelopes = Broadcaster<PlayerEventEnvelope>(defaultBufferSize: 64)
-  private let sourcedEvents = Broadcaster<SourcedPlayerEvent>(defaultBufferSize: 64)
-  private let terminalOutcomes = Broadcaster<PlaybackTerminalOutcome>(defaultBufferSize: 16)
-  /// Stamped onto every sourced event so the consumer can tell clock samples
-  /// that predate an accepted seek from ones that follow it. Lives here
-  /// because the stamp has to be taken on libVLC's thread, at emission.
-  private let timelineRevision = Mutex<UInt64>(0)
-  private struct TimelineSnapshot: Sendable {
-    var time: Duration = .zero
-    var duration: Duration?
-    var position: Double = 0
-    var bufferFill: Float = 0
-    var activeVideoOutputs = 0
-    var timelineRevision: UInt64 = 0
-
-    var publicValue: PlaybackFinalTimeline {
-      PlaybackFinalTimeline(
-        time: time,
-        duration: duration,
-        position: position,
-        bufferFill: bufferFill,
-        activeVideoOutputs: activeVideoOutputs
-      )
-    }
-  }
-
-  private struct PlaybackLifecycleState: Sendable {
-    var currentGeneration: UInt64 = 0
-    var currentMediaIdentity: UInt?
-    var mediaGenerations: [UInt: UInt64] = [:]
-    /// Wrapper-initiated `set_media` calls echo through `MediaChanged`. This
-    /// token distinguishes that echo from an external change which happens to
-    /// reuse the same media pointer.
-    var pendingWrapperMediaChangedGeneration: UInt64?
-    /// Retired generations awaiting their ordered `MediaStopping` callback
-    /// when the successor reuses the exact same retained media pointer.
-    var retiredMediaGenerations: [UInt: [UInt64]] = [:]
-    var snapshots: [UInt64: TimelineSnapshot] = [:]
-    var terminalIntents: [UInt64: PlaybackTerminalCause] = [:]
-    /// Recent frozen outcomes retained for synchronous generation-scoped
-    /// attribution (for example a late PiP stop). Bounded in `makeOutcome` so
-    /// long-running playlist players do not accumulate one entry per item.
-    var terminalCauses: [UInt64: PlaybackTerminalCause] = [:]
-    var lastEmittedGeneration: UInt64 = 0
-    var pendingStoppedGeneration: UInt64?
-  }
-
-  private let playbackLifecycle = Mutex(PlaybackLifecycleState())
-  let endCoordinator: PlaybackEndCoordinator
-
-  init(endCoordinator: PlaybackEndCoordinator) {
-    self.endCoordinator = endCoordinator
-  }
-
-  func makeStream(
-    policy: EventBufferingPolicy?,
-    filter: (@Sendable (PlayerEvent) -> Bool)?
-  ) -> AsyncStream<PlayerEvent> {
-    events.subscribe(policy: policy, filter: filter)
-  }
-
-  func makeSourcedStream(policy: EventBufferingPolicy) -> AsyncStream<SourcedPlayerEvent> {
-    sourcedEvents.subscribe(policy: policy)
-  }
-
-  func makeEnvelopeStream(
-    policy: EventBufferingPolicy?,
-    filter: (@Sendable (PlayerEventEnvelope) -> Bool)?
-  ) -> AsyncStream<PlayerEventEnvelope> {
-    eventEnvelopes.subscribe(policy: policy, filter: filter)
-  }
-
-  func makeTerminalOutcomeStream() -> AsyncStream<PlaybackTerminalOutcome> {
-    terminalOutcomes.subscribe(policy: .unbounded)
-  }
-
-  func terminalCause(for playbackGeneration: UInt64) -> PlaybackTerminalCause? {
-    playbackLifecycle.withLock { $0.terminalCauses[playbackGeneration] }
-  }
-
-  func synchronizePlaybackGeneration(
-    _ generation: UInt64,
-    media: OpaquePointer?,
-    nativeHandleGeneration: UInt64,
-    retiringNativeHandle: Bool
-  ) -> UInt64 {
-    let result = playbackLifecycle.withLock { state -> (UInt64, PlaybackTerminalOutcome?) in
-      let outgoing = state.currentGeneration
-      let outgoingIdentity = state.currentMediaIdentity
-      let outcome = makeOutcome(
-        in: &state,
-        generation: outgoing,
-        cause: state.terminalIntents[outgoing] ?? .replacement,
-        nativeHandleGeneration: nativeHandleGeneration
-      )
-      precondition(state.currentGeneration < UInt64.max, "Playback generation exhausted")
-      let adoptedGeneration = max(generation, state.currentGeneration + 1)
-      state.currentGeneration = adoptedGeneration
-      state.currentMediaIdentity = Self.identity(of: media)
-      state.pendingWrapperMediaChangedGeneration = adoptedGeneration
-      if let identity = state.currentMediaIdentity {
-        if
-          !retiringNativeHandle,
-          outcome != nil,
-          outgoing > 0,
-          identity == outgoingIdentity {
-          state.retiredMediaGenerations[identity, default: []].append(outgoing)
-        }
-        state.mediaGenerations[identity] = adoptedGeneration
-      }
-      state.snapshots[adoptedGeneration] = TimelineSnapshot()
-      return (adoptedGeneration, outcome)
-    }
-    if let outcome = result.1 {
-      terminalOutcomes.broadcast(outcome)
-    }
-    return result.0
-  }
-
-  func markRequestedStop(playbackGeneration: UInt64) {
-    playbackLifecycle.withLock { state in
-      guard playbackGeneration > state.lastEmittedGeneration else { return }
-      state.terminalIntents[playbackGeneration] = .requestedStop
-      state.pendingStoppedGeneration = playbackGeneration
-      // An explicit stop applies to the session the caller can currently see.
-      // Prefer it over an unresolved same-pointer replacement callback; a late
-      // retiring callback is harmless because this generation is now ending
-      // too, while attributing the requested stop to the retired generation
-      // would leave the current one without an outcome.
-      if
-        playbackGeneration == state.currentGeneration,
-        let identity = state.currentMediaIdentity {
-        state.retiredMediaGenerations[identity] = nil
-      }
-    }
-  }
-
-  func updateKnownDuration(_ duration: Duration?, playbackGeneration: UInt64) {
-    playbackLifecycle.withLock { state in
-      guard
-        playbackGeneration == state.currentGeneration,
-        playbackGeneration > state.lastEmittedGeneration
-      else { return }
-      var snapshot = state.snapshots[playbackGeneration] ?? TimelineSnapshot()
-      snapshot.duration = duration
-      state.snapshots[playbackGeneration] = snapshot
-    }
-  }
-
-  func updateAuthoritativeTimeline(
-    time: Duration,
-    position: Double?,
-    playbackGeneration: UInt64,
-    timelineRevision: UInt64
-  ) {
-    playbackLifecycle.withLock { state in
-      guard
-        playbackGeneration == state.currentGeneration,
-        playbackGeneration > state.lastEmittedGeneration
-      else { return }
-      var snapshot = state.snapshots[playbackGeneration] ?? TimelineSnapshot()
-      guard timelineRevision >= snapshot.timelineRevision else { return }
-      snapshot.time = time
-      if let position {
-        snapshot.position = position
-      }
-      snapshot.timelineRevision = timelineRevision
-      state.snapshots[playbackGeneration] = snapshot
-    }
-  }
-
-  func finishPlaybackGeneration(
-    _ generation: UInt64,
-    cause: PlaybackTerminalCause,
-    nativeHandleGeneration: UInt64
-  ) {
-    let outcome = playbackLifecycle.withLock { state in
-      makeOutcome(
-        in: &state,
-        generation: generation,
-        cause: state.terminalIntents[generation] ?? cause,
-        nativeHandleGeneration: nativeHandleGeneration
-      )
-    }
-    if let outcome {
-      terminalOutcomes.broadcast(outcome)
-    }
-  }
-
-  func broadcast(
-    _ event: PlayerEvent,
-    nativeHandleGeneration: UInt64,
-    playbackGeneration: UInt64? = nil,
-    emittedTimelineRevision: UInt64? = nil
-  ) {
-    let playbackGeneration = playbackGeneration ?? currentPlaybackGeneration
-    let emittedTimelineRevision = emittedTimelineRevision ?? captureTimelineRevision()
-    recordTimeline(
-      event,
-      generation: playbackGeneration,
-      timelineRevision: emittedTimelineRevision
-    )
-    // Each broadcaster is gated on its own emptiness so a libVLC event
-    // with no consumers costs neither the lock-and-snapshot nor the
-    // sourced-wrapper construction. The sourced broadcast (the player's
-    // internal observable mirror; never carries user filters) runs
-    // first, so a slow user filter on the public stream can only delay
-    // public delivery — internal state is already on its way.
-    if !sourcedEvents.isEmpty {
-      sourcedEvents.broadcast(
-        SourcedPlayerEvent(
-          nativeHandleGeneration: nativeHandleGeneration,
-          playbackGeneration: playbackGeneration,
-          event: event,
-          timelineRevision: emittedTimelineRevision
-        )
-      )
-    }
-    if !eventEnvelopes.isEmpty {
-      eventEnvelopes.broadcast(
-        PlayerEventEnvelope(
-          event: event,
-          nativeGeneration: NativePlayerGeneration(nativeHandleGeneration),
-          playbackGeneration: PlaybackGeneration(playbackGeneration)
-        )
-      )
-    }
-    if !events.isEmpty {
-      events.broadcast(event)
-    }
-  }
-
-  func advanceTimelineRevision() -> UInt64 {
-    timelineRevision.withLock { revision in
-      revision &+= 1
-      return revision
-    }
-  }
-
-  /// Captures authority at native callback entry, before event classification
-  /// or lifecycle bookkeeping can delay delivery past a seek boundary.
-  func captureTimelineRevision() -> UInt64 {
-    timelineRevision.withLock { $0 }
-  }
-
-  /// Permanently closes both broadcasters, so streams handed out after this
-  /// point are already finished rather than waiting on a source that will
-  /// never emit again.
-  func terminate() {
-    events.terminate()
-    eventEnvelopes.terminate()
-    sourcedEvents.terminate()
-    terminalOutcomes.terminate()
-  }
-
-  var currentPlaybackGeneration: UInt64 {
-    playbackLifecycle.withLock { $0.currentGeneration }
-  }
-
-  @MainActor
-  func performIfCurrentPlaybackGeneration(
-    _ expectedGeneration: UInt64,
-    _ mutation: () -> Void
-  ) -> Bool {
-    playbackLifecycle.withLock { state in
-      guard state.currentGeneration == expectedGeneration else { return false }
-      mutation()
-      return true
-    }
-  }
-
-  func noteExternalMediaChanged(
-    _ media: OpaquePointer?,
-    nativeHandleGeneration: UInt64
-  ) -> UInt64 {
-    let result = playbackLifecycle.withLock { state -> (UInt64, PlaybackTerminalOutcome?) in
-      let identity = Self.identity(of: media)
-      if
-        state.pendingWrapperMediaChangedGeneration == state.currentGeneration,
-        identity == state.currentMediaIdentity {
-        state.pendingWrapperMediaChangedGeneration = nil
-        return (state.currentGeneration, nil)
-      }
-      state.pendingWrapperMediaChangedGeneration = nil
-      let outgoing = state.currentGeneration
-      let outgoingIdentity = state.currentMediaIdentity
-      let outcome = makeOutcome(
-        in: &state,
-        generation: outgoing,
-        cause: state.terminalIntents[outgoing] ?? .replacement,
-        nativeHandleGeneration: nativeHandleGeneration
-      )
-      precondition(state.currentGeneration < UInt64.max, "Playback generation exhausted")
-      state.currentGeneration += 1
-      state.currentMediaIdentity = identity
-      if let identity {
-        if outcome != nil, outgoing > 0, identity == outgoingIdentity {
-          state.retiredMediaGenerations[identity, default: []].append(outgoing)
-        }
-        state.mediaGenerations[identity] = state.currentGeneration
-      }
-      state.snapshots[state.currentGeneration] = TimelineSnapshot()
-      return (state.currentGeneration, outcome)
-    }
-    if let outcome = result.1 {
-      terminalOutcomes.broadcast(outcome)
-    }
-    return result.0
-  }
-
-  func noteMediaStopping(
-    media: OpaquePointer?,
-    reason: libvlc_stopping_reason_t,
-    nativeHandleGeneration: UInt64
-  ) -> UInt64 {
-    let result = playbackLifecycle.withLock { state -> (UInt64, PlaybackTerminalOutcome?) in
-      let identity = Self.identity(of: media)
-      let generation: UInt64
-      if
-        let identity,
-        var retired = state.retiredMediaGenerations[identity],
-        !retired.isEmpty {
-        generation = retired.removeFirst()
-        state.retiredMediaGenerations[identity] = retired.isEmpty ? nil : retired
-      } else {
-        generation = identity.flatMap { state.mediaGenerations[$0] }
-          ?? state.currentGeneration
-      }
-      state.pendingStoppedGeneration = generation
-      let engineCause: PlaybackTerminalCause = switch reason {
-      case libvlc_stopping_reason_eos: .naturalEnd
-      case libvlc_stopping_reason_user: .requestedStop
-      case libvlc_stopping_reason_error: .failure(.unknown)
-      default: .unknownNativeStop
-      }
-      let outcome = makeOutcome(
-        in: &state,
-        generation: generation,
-        cause: state.terminalIntents[generation] ?? engineCause,
-        nativeHandleGeneration: nativeHandleGeneration
-      )
-      return (generation, outcome)
-    }
-    if let outcome = result.1 {
-      terminalOutcomes.broadcast(outcome)
-    }
-    return result.0
-  }
-
-  func noteEncounteredError(
-    _ failure: PlaybackFailureKind,
-    nativeHandleGeneration: UInt64
-  ) -> UInt64 {
-    let result = playbackLifecycle.withLock { state -> (UInt64, PlaybackTerminalOutcome?) in
-      let generation = state.currentGeneration
-      guard generation > state.lastEmittedGeneration else {
-        return (generation, nil)
-      }
-      state.terminalIntents[generation] = .failure(failure)
-      let outcome = makeOutcome(
-        in: &state,
-        generation: generation,
-        cause: .failure(failure),
-        nativeHandleGeneration: nativeHandleGeneration
-      )
-      return (generation, outcome)
-    }
-    if let outcome = result.1 {
-      terminalOutcomes.broadcast(outcome)
-    }
-    return result.0
-  }
-
-  func consumeStoppedGeneration(nativeHandleGeneration: UInt64) -> UInt64 {
-    let result = playbackLifecycle.withLock { state -> (UInt64, PlaybackTerminalOutcome?) in
-      let generation = state.pendingStoppedGeneration ?? state.currentGeneration
-      state.pendingStoppedGeneration = nil
-      let outcome = makeOutcome(
-        in: &state,
-        generation: generation,
-        cause: state.terminalIntents[generation] ?? .unknownNativeStop,
-        nativeHandleGeneration: nativeHandleGeneration
-      )
-      return (generation, outcome)
-    }
-    if let outcome = result.1 {
-      terminalOutcomes.broadcast(outcome)
-    }
-    return result.0
-  }
-
-  func noteCurrentGenerationProgress(_ generation: UInt64) {
-    playbackLifecycle.withLock { state in
-      if generation == state.currentGeneration, let identity = state.currentMediaIdentity {
-        // Native callbacks are serialized. Once the successor opens or plays,
-        // every stopping callback ordered before that progress has arrived, so
-        // an unresolved same-pointer retirement can no longer be consumed by a
-        // future stop belonging to the successor.
-        state.retiredMediaGenerations[identity] = nil
-      }
-      if generation == state.currentGeneration {
-        state.pendingWrapperMediaChangedGeneration = nil
-      }
-      if
-        let pending = state.pendingStoppedGeneration,
-        pending < generation,
-        pending <= state.lastEmittedGeneration {
-        state.pendingStoppedGeneration = nil
-      }
-    }
-  }
-
-  func clearPendingStopForNativeHandleReplacement() {
-    playbackLifecycle.withLock { state in
-      state.pendingStoppedGeneration = nil
-      state.pendingWrapperMediaChangedGeneration = nil
-      state.retiredMediaGenerations.removeAll()
-    }
-  }
-
-  private func recordTimeline(
-    _ event: PlayerEvent,
-    generation: UInt64,
-    timelineRevision: UInt64
-  ) {
-    guard generation > 0 else { return }
-    playbackLifecycle.withLock { state in
-      guard generation > state.lastEmittedGeneration else { return }
-      var snapshot = state.snapshots[generation] ?? TimelineSnapshot()
-      switch event {
-      case .timeChanged(let time):
-        guard timelineRevision >= snapshot.timelineRevision else { return }
-        snapshot.time = time
-        snapshot.timelineRevision = timelineRevision
-      case .lengthChanged(let duration): snapshot.duration = duration
-      case .positionChanged(let position):
-        guard timelineRevision >= snapshot.timelineRevision else { return }
-        snapshot.position = position
-        snapshot.timelineRevision = timelineRevision
-      case .bufferingProgress(let fill): snapshot.bufferFill = fill
-      case .voutChanged(let count): snapshot.activeVideoOutputs = count
-      default: break
-      }
-      state.snapshots[generation] = snapshot
-    }
-  }
-
-  private func makeOutcome(
-    in state: inout PlaybackLifecycleState,
-    generation: UInt64,
-    cause: PlaybackTerminalCause,
-    nativeHandleGeneration: UInt64
-  ) -> PlaybackTerminalOutcome? {
-    guard generation > state.lastEmittedGeneration else { return nil }
-    state.lastEmittedGeneration = generation
-    let snapshot = state.snapshots[generation] ?? TimelineSnapshot()
-    state.terminalCauses[generation] = cause
-    let oldestRetainedGeneration = generation > 32 ? generation - 32 : 0
-    state.terminalCauses = state.terminalCauses.filter {
-      $0.key >= oldestRetainedGeneration
-    }
-    state.terminalIntents[generation] = nil
-    state.snapshots = state.snapshots.filter { $0.key >= generation }
-    state.mediaGenerations = state.mediaGenerations.filter { $0.value >= generation }
-    return PlaybackTerminalOutcome(
-      generation: PlaybackGeneration(generation),
-      nativeGeneration: NativePlayerGeneration(nativeHandleGeneration),
-      cause: cause,
-      finalTimeline: snapshot.publicValue
-    )
-  }
-
-  private static func identity(of media: OpaquePointer?) -> UInt? {
-    media.map { UInt(bitPattern: $0) }
-  }
-}
-
-// MARK: - C Callback (free function)
-
-/// Free function invoked on libVLC's internal event thread.
-/// `AsyncStream.Continuation.yield` is documented safe from any thread.
-private func playerEventCallback(
-  event: UnsafePointer<libvlc_event_t>?,
-  opaque: UnsafeMutableRawPointer?
-) {
-  guard let event, let opaque else { return }
-
-  let interval = Signposts.signposter.beginInterval("EventBridge.callback")
-  defer { Signposts.signposter.endInterval("EventBridge.callback", interval) }
-
-  let attachment = Unmanaged<EventBridgeCallbackAttachment>.fromOpaque(opaque)
-    .takeUnretainedValue()
-  let context = attachment.context
-  // This lock acquisition and `advanceTimelineRevision()` form the evidence
-  // boundary. A callback that entered before native dispatch returned keeps
-  // the outgoing stamp even if mapping or lifecycle bookkeeping finishes
-  // after the accepted seek publishes its revision.
-  let emittedTimelineRevision = context.captureTimelineRevision()
-
-  guard let mapped = mapEvent(event.pointee) else { return }
-  let coordinator = context.endCoordinator
-  // Record every terminal fact before exposing its raw event. Public filters
-  // run synchronously on this thread and may issue player commands, so doing
-  // this after broadcast lets reentrant work classify the stop without the
-  // engine's authoritative cause.
-  let playbackGeneration: UInt64
-  let shouldSynthesizeEnd: Bool
-  switch mapped {
-  case .mediaChanged:
-    playbackGeneration = context.noteExternalMediaChanged(
-      event.pointee.u.media_player_media_changed.new_media,
-      nativeHandleGeneration: attachment.nativeHandleGeneration
-    )
-    shouldSynthesizeEnd = false
-
-  case .mediaStopping:
-    let stopping = event.pointee.u.media_player_media_stopping
-    coordinator.noteStoppingReason(stopping.reason)
-    playbackGeneration = context.noteMediaStopping(
-      media: stopping.media,
-      reason: stopping.reason,
-      nativeHandleGeneration: attachment.nativeHandleGeneration
-    )
-    shouldSynthesizeEnd = false
-
-  case .encounteredError:
-    playbackGeneration = context.noteEncounteredError(
-      mapPlaybackFailureKind(
-        event.pointee.u.media_player_encountered_error.failure
-      ),
-      nativeHandleGeneration: attachment.nativeHandleGeneration
-    )
-    shouldSynthesizeEnd = false
-
-  case .stateChanged(.stopped):
-    playbackGeneration = context.consumeStoppedGeneration(
-      nativeHandleGeneration: attachment.nativeHandleGeneration
-    )
-    shouldSynthesizeEnd = coordinator.consumeStoppedShouldSynthesizeEnd()
-
-  case .stateChanged(.opening), .stateChanged(.playing):
-    playbackGeneration = context.currentPlaybackGeneration
-    context.noteCurrentGenerationProgress(playbackGeneration)
-    shouldSynthesizeEnd = false
-
-  default:
-    playbackGeneration = context.currentPlaybackGeneration
-    shouldSynthesizeEnd = false
-  }
-
-  // Both emissions are made from the same immutable attachment token. Every
-  // subscriber therefore observes `.stopped` then `.endReached` with one
-  // generation, independent of consumer lag or native pointer reuse.
-  context.broadcast(
-    mapped,
-    nativeHandleGeneration: attachment.nativeHandleGeneration,
-    playbackGeneration: playbackGeneration,
-    emittedTimelineRevision: emittedTimelineRevision
-  )
-  if shouldSynthesizeEnd {
-    context.broadcast(
-      .endReached,
-      nativeHandleGeneration: attachment.nativeHandleGeneration,
-      playbackGeneration: playbackGeneration,
-      emittedTimelineRevision: emittedTimelineRevision
-    )
   }
 }

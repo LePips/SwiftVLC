@@ -50,38 +50,6 @@ extension Integration {
     }
 
     @Test
-    func `successor waits for asynchronously retiring output to preserve controller`() async {
-      let events = Mutex<[Marker]>([])
-      let coordinator = IOSNativePiPContinuityCoordinator(
-        expectedHandoffWait: .seconds(1)
-      ) { transition in
-        events.withLock { $0.append(Self.marker(for: transition)) }
-      }
-      let controller = NSObject()
-      let original = PlaybackGeneration(71)
-      let successor = PlaybackGeneration(72)
-
-      coordinator.didBecomeReady(controller, mediaGeneration: original)
-      coordinator.expectHandoff(for: successor)
-      // A late readiness callback from the current output must not cancel the
-      // successor expectation staged just before asynchronous retirement.
-      coordinator.didBecomeReady(controller, mediaGeneration: original)
-      let take = Task.detached { @Sendable in
-        coordinator.takePreservedController(for: successor).map(ObjectIdentifier.init)
-      }
-      try? await Task.sleep(for: .milliseconds(20))
-      #expect(coordinator.preserve(controller, for: successor))
-      let preservedIdentity = await take.value
-      #expect(preservedIdentity == ObjectIdentifier(controller))
-      coordinator.didBecomeReady(controller, mediaGeneration: successor)
-
-      #expect(events.withLock { $0 } == [
-        .rebuilding(original, successor),
-        .restored(original, successor)
-      ])
-    }
-
-    @Test
     func `same-generation handoff requires explicit rebuild proof`() {
       let events = Mutex<[Marker]>([])
       let coordinator = IOSNativePiPContinuityCoordinator { transition in

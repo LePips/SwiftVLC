@@ -246,8 +246,7 @@ extension Player {
   func replaceNativePlayerForDrawablePlayback(
     target: AnyObject?,
     media: Media? = nil,
-    resumeBeforeRelease: Bool = false,
-    successorPlaybackGeneration: PlaybackGeneration? = nil
+    resumeBeforeRelease: Bool = false
   )
     throws(VLCError) {
     let oldPointer = pointer
@@ -301,8 +300,16 @@ extension Player {
 
     // Reattachment detaches the retiring generation, clears its pending
     // terminal cause, then installs the successor generation as one operation.
-    eventBridge.reattach(to: newEventManager)
-    nativeSeekMonitor.reattach(to: newPointer)
+    supersedeAllSeekWorkForCausalBoundary()
+    let nativeHandleGeneration = eventBridge.reattach(to: newEventManager)
+    let drainedFrameResults = nativeSeekMonitor.reattach(
+      to: newPointer,
+      nativeHandleGeneration: nativeHandleGeneration,
+      playbackGeneration: sessionGeneration
+    )
+    settleFrameStepsAfterAttachmentRetirement(
+      drainedResults: drainedFrameResults
+    )
     // The old handle's terminal events are unobservable from here on; a
     // pending stop/error cause would otherwise outlive its `Stopped` and
     // suppress the next genuine natural end. The same applies to its
@@ -313,8 +320,13 @@ extension Player {
     #if os(iOS) || os(macOS)
     moveDirectPiPVideoCallbacks(to: newLifetime)
     #endif
+    let transferredManagedAudioSessionLease =
+      transferManagedAppleAudioSessionLease(to: newPointer)
     pointer = newPointer
     nativeHandleLifetime = newLifetime
+    if transferredManagedAudioSessionLease == false {
+      invalidateManagedAppleAudioSessionActivationLatches()
+    }
     attachedMediaListPlayer?.rebindMediaPlayerHandle()
     applyAspectRatio()
 
@@ -330,16 +342,6 @@ extension Player {
     needsDrawableRebindForPlayback = false
     nativePlayerHasHostedDrawable = target != nil
     nativePlayerHasStartedPlayback = false
-
-    #if os(iOS)
-    if
-      let successorPlaybackGeneration,
-      let attachment = target as? IOSNativePiPDrawableAttachment {
-      attachment.expectPictureInPictureHandoff(
-        for: successorPlaybackGeneration
-      )
-    }
-    #endif
 
     releaseNativePlayer(
       oldPointer,

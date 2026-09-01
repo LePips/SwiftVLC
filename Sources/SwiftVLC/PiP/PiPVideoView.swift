@@ -20,13 +20,14 @@ public struct PiPVideoView: UIViewRepresentable {
   private let player: Player
   private let controllerBinding: Binding<PiPController?>?
   private let startsAutomaticallyFromInline: Bool
-  private let managesAudioSession: Bool
+  private let legacyManagesAudioSessionOverride: Bool?
 
   /// Creates a PiP-capable video view.
   ///
-  /// Both policy knobs are captured when the underlying view is built
-  /// (`makeUIView`); SwiftUI updates that merely re-render this struct
-  /// with different knob values do not reconfigure an existing view.
+  /// The automatic-start policy is captured when the underlying view is built
+  /// (`makeUIView`); SwiftUI updates that merely re-render this struct with a
+  /// different value do not reconfigure an existing view. Audio-session
+  /// ownership is inherited from ``Player/appleAudioSessionPolicy``.
   ///
   /// - Parameters:
   ///   - player: The player whose video output to display.
@@ -37,32 +38,42 @@ public struct PiPVideoView: UIViewRepresentable {
   ///     gate playback (parental controls, kiosk lockdowns, watch-time
   ///     policies) should pass `false` so video never escapes to an
   ///     OS-owned window.
-  ///   - managesAudioSession: Whether SwiftVLC configures the shared
-  ///     `AVAudioSession` (`.playback` category) and activates it on the
-  ///     first PiP start or active-playback signal. Defaults to `true`.
-  ///     Pass `false` if your app owns its audio-session policy; SwiftVLC
-  ///     then never touches the session. Constructing a view for an inactive
-  ///     Player does not activate the session. Recreating the native view for
-  ///     a Player whose playback intent is already active does activate it so
-  ///     automatic PiP cannot outrun the managed audio-session setup. Managed
-  ///     playback also observes interruptions, route loss, media-services
-  ///     restart, device lock, and app foreground/background transitions.
-  ///     Background playback without active PiP is paused after a one-second
-  ///     auto-PiP grace period and resumes on foreground only when SwiftVLC
-  ///     issued that pause and the user's playback intent remains active.
   public init(
     _ player: Player,
     controller: Binding<PiPController?>? = nil,
-    startsAutomaticallyFromInline: Bool = true,
-    managesAudioSession: Bool = true
+    startsAutomaticallyFromInline: Bool = true
   ) {
     self.player = player
     controllerBinding = controller
     self.startsAutomaticallyFromInline = startsAutomaticallyFromInline
-    self.managesAudioSession = managesAudioSession
+    legacyManagesAudioSessionOverride = nil
+  }
+
+  /// Creates a PiP-capable video view while preserving the pre-1.1 call shape.
+  ///
+  /// Audio-session ownership is now instance-scoped. If this legacy value
+  /// disagrees with ``Player/appleAudioSessionPolicy``, the instance policy
+  /// wins and the resulting controller records a diagnostic.
+  @available(
+    *,
+    deprecated,
+    message: "Set VLCInstance.appleAudioSessionPolicy; the Player instance policy wins conflicts."
+  )
+  public init(
+    _ player: Player,
+    controller: Binding<PiPController?>? = nil,
+    startsAutomaticallyFromInline: Bool = true,
+    managesAudioSession: Bool
+  ) {
+    self.player = player
+    controllerBinding = controller
+    self.startsAutomaticallyFromInline = startsAutomaticallyFromInline
+    legacyManagesAudioSessionOverride = managesAudioSession
   }
 
   public func makeUIView(context: Context) -> UIView {
+    let audioSessionPolicyResolution = player.appleAudioSessionPolicy
+      .resolvingLegacyPiPOverride(legacyManagesAudioSessionOverride)
     let container = IOSNativePiPHostView(
       startsAutomaticallyFromInline: startsAutomaticallyFromInline
     )
@@ -72,7 +83,8 @@ public struct PiPVideoView: UIViewRepresentable {
       player: player,
       nativeBackend: container.nativePiPBackend,
       startsAutomaticallyFromInline: startsAutomaticallyFromInline,
-      managesAudioSession: managesAudioSession
+      managesAudioSession: audioSessionPolicyResolution.managesAudioSession,
+      audioSessionPolicyDiagnostic: audioSessionPolicyResolution.diagnostic
     )
 
     context.coordinator.pipController = controller
@@ -88,6 +100,8 @@ public struct PiPVideoView: UIViewRepresentable {
   public func updateUIView(_ uiView: UIView, context: Context) {
     guard let container = uiView as? IOSNativePiPHostView else { return }
     if context.coordinator.player !== player {
+      let audioSessionPolicyResolution = player.appleAudioSessionPolicy
+        .resolvingLegacyPiPOverride(legacyManagesAudioSessionOverride)
       // `attach(to:)` performs an ownership-checked player handoff. Keeping
       // the transition in one operation is important: a representable
       // dismantle uses `detach()` as a same-player recreation lease when a
@@ -99,7 +113,8 @@ public struct PiPVideoView: UIViewRepresentable {
         player: player,
         nativeBackend: container.nativePiPBackend,
         startsAutomaticallyFromInline: startsAutomaticallyFromInline,
-        managesAudioSession: managesAudioSession
+        managesAudioSession: audioSessionPolicyResolution.managesAudioSession,
+        audioSessionPolicyDiagnostic: audioSessionPolicyResolution.diagnostic
       )
 
       context.coordinator.player = player
@@ -178,35 +193,53 @@ public struct PiPVideoView: NSViewRepresentable {
   private let player: Player
   private let controllerBinding: Binding<PiPController?>?
   private let startsAutomaticallyFromInline: Bool
-  private let managesAudioSession: Bool
+  private let legacyManagesAudioSessionOverride: Bool?
 
   /// Creates a PiP-capable video view.
   ///
-  /// Both policy knobs exist for API symmetry with the iOS overload and
-  /// are **inert on macOS**: auto-PiP-from-inline is an iOS AVKit
-  /// concept with no counterpart in the macOS backend, and macOS has no
-  /// `AVAudioSession` for SwiftVLC to manage.
+  /// The automatic-start knob exists for API symmetry with the iOS overload
+  /// and is inert on macOS. Audio-session ownership is still inherited from
+  /// ``Player/appleAudioSessionPolicy`` so cross-platform construction has one
+  /// source of truth, although macOS has no `AVAudioSession` to manage.
   ///
   /// - Parameters:
   ///   - player: The player whose video output to display.
   ///   - controller: Optional binding to receive the `PiPController` for external control.
   ///   - startsAutomaticallyFromInline: Accepted for cross-platform call
   ///     sites; no effect on macOS.
-  ///   - managesAudioSession: Accepted for cross-platform call sites; no
-  ///     effect on macOS.
   public init(
     _ player: Player,
     controller: Binding<PiPController?>? = nil,
-    startsAutomaticallyFromInline: Bool = true,
-    managesAudioSession: Bool = true
+    startsAutomaticallyFromInline: Bool = true
   ) {
     self.player = player
     controllerBinding = controller
     self.startsAutomaticallyFromInline = startsAutomaticallyFromInline
-    self.managesAudioSession = managesAudioSession
+    legacyManagesAudioSessionOverride = nil
+  }
+
+  /// Preserves the pre-1.1 cross-platform call shape. The inherited instance
+  /// policy wins if `managesAudioSession` disagrees with it.
+  @available(
+    *,
+    deprecated,
+    message: "Set VLCInstance.appleAudioSessionPolicy; the Player instance policy wins conflicts."
+  )
+  public init(
+    _ player: Player,
+    controller: Binding<PiPController?>? = nil,
+    startsAutomaticallyFromInline: Bool = true,
+    managesAudioSession: Bool
+  ) {
+    self.player = player
+    controllerBinding = controller
+    self.startsAutomaticallyFromInline = startsAutomaticallyFromInline
+    legacyManagesAudioSessionOverride = managesAudioSession
   }
 
   public func makeNSView(context: Context) -> NSView {
+    let audioSessionPolicyResolution = player.appleAudioSessionPolicy
+      .resolvingLegacyPiPOverride(legacyManagesAudioSessionOverride)
     let container = MacNativePiPHostView()
     container.attach(to: player)
 
@@ -214,7 +247,8 @@ public struct PiPVideoView: NSViewRepresentable {
       player: player,
       nativeBackend: container.nativePiPBackend,
       startsAutomaticallyFromInline: startsAutomaticallyFromInline,
-      managesAudioSession: managesAudioSession
+      managesAudioSession: audioSessionPolicyResolution.managesAudioSession,
+      audioSessionPolicyDiagnostic: audioSessionPolicyResolution.diagnostic
     )
 
     context.coordinator.pipController = controller
@@ -228,13 +262,16 @@ public struct PiPVideoView: NSViewRepresentable {
   public func updateNSView(_ nsView: NSView, context: Context) {
     guard let container = nsView as? MacNativePiPHostView else { return }
     if context.coordinator.player !== player {
+      let audioSessionPolicyResolution = player.appleAudioSessionPolicy
+        .resolvingLegacyPiPOverride(legacyManagesAudioSessionOverride)
       container.attach(to: player)
 
       let controller = PiPController(
         player: player,
         nativeBackend: container.nativePiPBackend,
         startsAutomaticallyFromInline: startsAutomaticallyFromInline,
-        managesAudioSession: managesAudioSession
+        managesAudioSession: audioSessionPolicyResolution.managesAudioSession,
+        audioSessionPolicyDiagnostic: audioSessionPolicyResolution.diagnostic
       )
 
       context.coordinator.player = player

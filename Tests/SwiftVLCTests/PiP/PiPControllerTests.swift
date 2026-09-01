@@ -410,8 +410,11 @@ extension Integration {
     @Test
     func `A newer app pause supersedes PiP cleanup without being erased`() async {
       let player = Player(instance: TestInstance.makeAudioOnly())
-      player._nativePlaybackStateOverrideForTesting = .opening
-      player._setStateForTesting(state: .opening, isPlaybackRequestedActive: true)
+      player._setStateForTesting(
+        state: .opening,
+        nativeState: .opening,
+        isPlaybackRequestedActive: true
+      )
       let controller = PiPController(
         player: player,
         playbackDriver: .live(player: player),
@@ -893,13 +896,16 @@ extension Integration {
       #expect(controller.hasActivatedAudioSession == false)
     }
 
-    /// With `managesAudioSession: true` the category is set at init but
-    /// activation is deferred: constructing the controller never grabs
-    /// audio focus. A start request activates only when AVKit supplied a
-    /// controller that can actually receive it; generic/simulator test
-    /// destinations legitimately have no PiP controller.
+    /// With `managesAudioSession: true`, both configuration and activation are
+    /// deferred into one native broker lease: constructing the controller
+    /// neither changes category nor grabs focus. A viable start performs the
+    /// atomic acquisition; generic/simulator destinations may have no PiP
+    /// controller to receive it.
     @Test
-    func `managesAudioSession true defers activation until a viable start`() throws {
+    func `managed audio configuration and activation wait for a viable start`() throws {
+      let session = AVAudioSession.sharedInstance()
+      let categoryBefore = session.category
+      let modeBefore = session.mode
       let player = Player(instance: TestInstance.shared)
       try player.load(Media(url: TestMedia.twosecURL))
       let recorder = PlaybackRecorder()
@@ -910,12 +916,17 @@ extension Integration {
         managesAudioSession: true
       )
 
-      #expect(AVAudioSession.sharedInstance().category == .playback)
+      #expect(session.category == categoryBefore)
+      #expect(session.mode == modeBefore)
       #expect(controller.hasActivatedAudioSession == false)
 
       let hasViableBackend = controller.pipController != nil
       controller.start()
       #expect(controller.hasActivatedAudioSession == hasViableBackend)
+      if hasViableBackend {
+        #expect(session.category == .playback)
+        #expect(session.mode == .moviePlayback)
+      }
     }
 
     @Test

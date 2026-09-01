@@ -271,7 +271,10 @@ extension Player {
     resumeBeforeStop: Bool
   ) {
     if resumeBeforeStop || PlayerState(from: libvlc_media_player_get_state(nativePlayer)) == .paused {
-      libvlc_media_player_set_pause(nativePlayer, 0)
+      swiftvlc_libvlc_media_player_set_pause_without_reset_authorization(
+        nativePlayer,
+        0
+      )
     }
     libvlc_media_player_stop_async(nativePlayer)
   }
@@ -300,31 +303,45 @@ extension Player {
   /// callback slot for the current native handle. Same-handle successors
   /// reuse its opaque so a vout that already copied the predecessor's value
   /// observes the new renderer target without reopening.
-  func claimDirectPiPVideoCallbacks(_ registration: DirectPiPVideoCallbackRegistration) {
+  @discardableResult
+  func claimDirectPiPVideoCallbacks(
+    _ registration: DirectPiPVideoCallbackRegistration
+  ) -> Bool {
     let previous = directPiPVideoCallbackRegistration
     let previousGeneration = directPiPVideoCallbackGeneration
 
-    directPiPVideoCallbackGeneration &+= 1
-    let generation = directPiPVideoCallbackGeneration
+    let generation = directPiPVideoCallbackGeneration &+ 1
     let slot: DirectPiPVideoCallbackSlot
+    let madeSlot: Bool
     if let existing = directPiPVideoCallbackSlot {
       precondition(existing.lifetime === nativeHandleLifetime && !existing.isRetired)
       slot = existing
+      madeSlot = false
     } else {
       slot = registration.makeSlot(on: nativeHandleLifetime)
-      directPiPVideoCallbackSlot = slot
+      madeSlot = true
     }
-    registration.bind(to: slot, generation: generation)
+    guard registration.bind(to: slot, generation: generation) else {
+      if madeSlot {
+        slot.retire()
+      }
+      return false
+    }
+
+    directPiPVideoCallbackGeneration = generation
+    directPiPVideoCallbackSlot = slot
     directPiPVideoCallbackRegistration = registration
 
     if let previous, previous !== registration {
       previous.unbind(generation: previousGeneration)
     }
+    return true
   }
 
   /// Creates a fresh slot for a replacement native handle before retiring
   /// the prior handle's slot. Different handles never share an opaque.
-  func moveDirectPiPVideoCallbacks(to lifetime: NativePlayerHandleLifetime) {
+  @discardableResult
+  func moveDirectPiPVideoCallbacks(to lifetime: NativePlayerHandleLifetime) -> Bool {
     let previousSlot = directPiPVideoCallbackSlot
     if let previousSlot {
       precondition(previousSlot.lifetime === nativeHandleLifetime)
@@ -333,15 +350,30 @@ extension Player {
     guard let registration = directPiPVideoCallbackRegistration else {
       directPiPVideoCallbackSlot = nil
       previousSlot?.retire()
-      return
+      return true
     }
 
-    directPiPVideoCallbackGeneration &+= 1
-    let generation = directPiPVideoCallbackGeneration
+    let previousGeneration = directPiPVideoCallbackGeneration
+    let generation = previousGeneration &+ 1
     let successorSlot = registration.makeSlot(on: lifetime)
-    registration.bind(to: successorSlot, generation: generation)
+    guard registration.bind(to: successorSlot, generation: generation) else {
+      // Playback replacement can continue, but direct sample-buffer PiP may
+      // not. Retire both generations, revoke the registration, and let the
+      // controller report backendUnavailable instead of exposing a partially
+      // configured successor or silently continuing on the outgoing handle.
+      successorSlot.retire()
+      registration.unbind(generation: previousGeneration)
+      directPiPVideoCallbackGeneration = generation
+      directPiPVideoCallbackRegistration = nil
+      directPiPVideoCallbackSlot = nil
+      previousSlot?.retire()
+      return false
+    }
+
+    directPiPVideoCallbackGeneration = generation
     directPiPVideoCallbackSlot = successorSlot
     previousSlot?.retire()
+    return true
   }
 
   /// Relinquishes the display target only if the caller still owns the current

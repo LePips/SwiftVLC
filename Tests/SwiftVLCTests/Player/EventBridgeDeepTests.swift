@@ -155,6 +155,7 @@ extension Integration {
         PlayerEvent.mediaChanged,
         PlayerEvent.encounteredError,
         PlayerEvent.volumeChanged(0.8),
+        PlayerEvent.rateChanged(1.25),
         PlayerEvent.muted,
         PlayerEvent.unmuted,
         PlayerEvent.voutChanged(2),
@@ -170,7 +171,7 @@ extension Integration {
         PlayerEvent.programSelected(unselectedId: 1, selectedId: 2),
         PlayerEvent.programUpdated(10)
       ]
-      #expect(events.count == 24)
+      #expect(events.count == 25)
     }
 
     @Test(.tags(.logic))
@@ -192,6 +193,7 @@ extension Integration {
         (.mediaChanged, "mediaChanged"),
         (.encounteredError, "encounteredError"),
         (.volumeChanged(1.0), "volumeChanged"),
+        (.rateChanged(1.5), "rateChanged"),
         (.muted, "muted"),
         (.unmuted, "unmuted"),
         (.voutChanged(0), "voutChanged"),
@@ -322,6 +324,7 @@ extension Integration {
       case .mediaChanged: "mediaChanged"
       case .encounteredError: "encounteredError"
       case .volumeChanged: "volumeChanged"
+      case .rateChanged: "rateChanged"
       case .muted: "muted"
       case .unmuted: "unmuted"
       case .corked: "corked"

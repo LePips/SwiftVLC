@@ -932,7 +932,7 @@ extension Integration {
       backend.handlePictureInPictureReady(NSObject())
 
       // Start/stop/invalidate are safe whether or not a controller installed.
-      backend.start()
+      _ = backend.start()
       backend.stop()
       backend.invalidatePlaybackState()
 

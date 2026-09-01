@@ -31,8 +31,7 @@ extension PiPController {
     #if os(iOS)
     guard nativeBackend == nil else { return }
     #endif
-    guard renderer.setRenderSize(size) else { return }
-    renderer.flushDisplayLayer()
+    _ = renderer.setRenderSize(size)
   }
 }
 #endif

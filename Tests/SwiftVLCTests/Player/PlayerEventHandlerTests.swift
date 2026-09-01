@@ -246,6 +246,23 @@ extension Integration {
       #expect(fired.withLock { $0 })
     }
 
+    /// The payload is exposed on the event stream, while observation re-reads
+    /// the effective native rate so the two cannot silently diverge.
+    @Test
+    func `rateChanged invalidates the rate observer`() {
+      let player = Player(instance: TestInstance.shared)
+      let fired = Mutex(false)
+      withObservationTracking {
+        _ = player.rate
+      } onChange: {
+        fired.withLock { $0 = true }
+      }
+
+      player._handleEventForTesting(.rateChanged(1.5))
+
+      #expect(fired.withLock { $0 })
+    }
+
     @Test
     func `muted event invalidates the isMuted observer`() {
       let player = Player(instance: TestInstance.shared)

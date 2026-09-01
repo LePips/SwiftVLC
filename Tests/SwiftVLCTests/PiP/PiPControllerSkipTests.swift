@@ -269,10 +269,31 @@ extension Integration {
     func `An unrepresentable interval is classified without reaching the player`() async {
       let player = Player(instance: TestInstance.shared)
 
-      for interval in [CMTime.invalid, .indefinite, .positiveInfinity, .negativeInfinity] {
+      for interval in [
+        CMTime.invalid,
+        .indefinite,
+        .positiveInfinity,
+        .negativeInfinity,
+        CMTime(value: LibVLCTimeMilliseconds.minimum - 1, timescale: 1000),
+        CMTime(value: LibVLCTimeMilliseconds.maximum + 1, timescale: 1000)
+      ] {
         let request = PiPController.performSkip(on: player, by: interval)
         #expect(request.initialOutcome == .unrepresentableInterval)
         #expect(await request.outcome == .unrepresentableInterval)
+      }
+    }
+
+    @Test
+    func `Exact VLC tick boundary PiP intervals remain representable`() async {
+      let player = Player(instance: TestInstance.shared)
+
+      for interval in [
+        CMTime(value: LibVLCTimeMilliseconds.minimum, timescale: 1000),
+        CMTime(value: LibVLCTimeMilliseconds.maximum, timescale: 1000)
+      ] {
+        let request = PiPController.performSkip(on: player, by: interval)
+        #expect(request.initialOutcome == .rejected)
+        #expect(await request.outcome == .rejected)
       }
     }
 
