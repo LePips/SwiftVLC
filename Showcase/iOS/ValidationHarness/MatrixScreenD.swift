@@ -6,7 +6,9 @@ End-to-end recast on one `Player`: start local playback, optionally \
 start PiP, then hand the session to a discovered renderer with \
 `recast(to:)` and bring it back with `recast(to: nil)`. The log records \
 `currentTime` around every hop (sampled once per second in between), \
-each state transition, and any thrown error. This validates harness \
+each state transition, the exact `RecastOutcome`, and any thrown error. \
+Only `.settled` is labelled complete; a timeout, failure, cancellation, \
+or superseding operation remains visible instead of looking successful. This validates harness \
 item (d′); item (d) — starting a cast while the PiP window is up — is \
 observational on this same screen. On tvOS the bundled libVLC ships no \
 renderer output backends, so this screen is meaningful on iOS devices \
@@ -206,8 +208,15 @@ struct MatrixScreenD: View {
     append("recast(to: \(label)) at \(player.currentTime.formatted)")
     Task {
       do {
-        try await player.recast(to: renderer)
-        append("recast → \(label) done, currentTime = \(player.currentTime.formatted)")
+        let outcome = try await player.recast(to: renderer)
+        if outcome.isSettled {
+          append("recast → \(label) settled, currentTime = \(player.currentTime.formatted)")
+        } else {
+          append(
+            "recast → \(label) did not settle (\(outcome)), "
+              + "currentTime = \(player.currentTime.formatted)"
+          )
+        }
       } catch {
         append("recast → \(label) threw: \(error)")
       }

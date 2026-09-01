@@ -26,7 +26,7 @@ struct MacSnapshotCase: View {
           if let snapshot {
             Image(nsImage: snapshot)
               .resizable()
-              .aspectRatio(contentMode: .fit)
+              .scaledToFit()
               .frame(maxHeight: 260)
               .clipShape(.rect(cornerRadius: 8))
           }

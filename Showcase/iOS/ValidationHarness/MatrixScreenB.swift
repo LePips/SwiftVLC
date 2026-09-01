@@ -36,8 +36,7 @@ struct MatrixScreenB: View {
         PiPVideoView(
           player,
           controller: $pip,
-          startsAutomaticallyFromInline: autoStartsFromInline,
-          managesAudioSession: true
+          startsAutomaticallyFromInline: autoStartsFromInline
         )
         .id(autoStartsFromInline)
         .aspectRatio(16 / 9, contentMode: .fit)

@@ -53,9 +53,38 @@ final class PiPRenderPerformanceDeviceUITests: ShowcaseIOSTestCase {
     XCUIDevice.shared.press(.home)
     var region = try locateSystemPictureInPictureWindow()
     let springboard = XCUIApplication(bundleIdentifier: "com.apple.springboard")
-    let deadline = Date().addingTimeInterval(TimeInterval(duration))
+    let visualStartedAt = Date()
+    let deadline = visualStartedAt.addingTimeInterval(TimeInterval(duration))
     var resizeCount = 0
+    var nextVisualCheckpoint = 0
+    var visualObservations: [PerformanceVisualObservation] = []
     while Date() < deadline.addingTimeInterval(-8) {
+      let elapsed = Int(Date().timeIntervalSince(visualStartedAt))
+      if elapsed >= nextVisualCheckpoint {
+        region = try locateSystemPictureInPictureWindow(
+          samples: 5,
+          interval: 0.25,
+          retainDiagnostics: false
+        )
+        let visual = try captureSystemPictureInPictureVisualEvidence(
+          in: region,
+          samples: 3,
+          interval: 0.25
+        )
+        let capturedAt = Int(Date().timeIntervalSince(visualStartedAt))
+        _ = try XCTUnwrap(
+          visual.changedPixelScore >= 0.01
+            && Set(visual.frameHashes).count == visual.frameHashes.count
+            ? visual : nil,
+          "System PiP visual evidence froze at \(capturedAt)s"
+        )
+        visualObservations.append(
+          PerformanceVisualObservation(elapsedSeconds: capturedAt, visual: visual)
+        )
+        repeat {
+          nextVisualCheckpoint += 60
+        } while nextVisualCheckpoint <= capturedAt
+      }
       springboard.coordinate(
         withNormalizedOffset: region.normalizedPoint(x: 0.5, y: 0.5)
       ).doubleTap()
@@ -75,7 +104,13 @@ final class PiPRenderPerformanceDeviceUITests: ShowcaseIOSTestCase {
     XCTAssertFalse(error.exists, "Performance row failed: \(error.label)")
     assertRendersNonBlackFrame(video, timeout: 15)
 
-    let evidence = try decodeEvidence(result.label)
+    var evidence = try decodeEvidence(result.label)
+    evidence["visualObservations"] = [
+      "formatVersion": 1,
+      "method": VideoSurfaceMotionEvidence.method,
+      "records": visualObservations.map(\.rawRecord)
+    ]
+    evidence["systemPiPMotionSeries"] = visualObservations.map(\.derivedCheckpoint)
     let expectedScenario = profile == "4k60"
       ? "pip-render-performance-4k60"
       : "pip-render-performance-1080p60"
@@ -117,5 +152,27 @@ final class PiPRenderPerformanceDeviceUITests: ShowcaseIOSTestCase {
 
   private func element(_ identifier: String) -> XCUIElement {
     app.descendants(matching: .any)[identifier]
+  }
+}
+
+private struct PerformanceVisualObservation {
+  let elapsedSeconds: Int
+  let visual: VideoSurfaceMotionEvidence
+
+  var rawRecord: [String: Any] {
+    [
+      "elapsedSeconds": elapsedSeconds,
+      "frameHashes": visual.frameHashes,
+      "adjacentChangedPixelRatios": visual.adjacentChangedPixelRatios,
+      "changedPixelScore": visual.changedPixelScore
+    ]
+  }
+
+  var derivedCheckpoint: [String: Any] {
+    [
+      "elapsedSeconds": elapsedSeconds,
+      "motionScore": visual.changedPixelScore,
+      "distinctFrameHashes": Set(visual.frameHashes).count
+    ]
   }
 }

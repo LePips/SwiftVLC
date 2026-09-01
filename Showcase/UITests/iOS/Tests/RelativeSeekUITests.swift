@@ -31,6 +31,10 @@ final class RelativeSeekUITests: ShowcaseIOSTestCase {
     app.buttons[AccessibilityID.RelativeSeek.skipForward30]
   }
 
+  private var sameDirectionBurst: XCUIElement {
+    app.buttons[AccessibilityID.RelativeSeek.sameDirectionBurst]
+  }
+
   private var currentTimeLabel: XCUIElement {
     app.staticTexts[AccessibilityID.SeekBar.currentTime]
   }
@@ -164,6 +168,50 @@ final class RelativeSeekUITests: ShowcaseIOSTestCase {
   }
 
   // MARK: - Stress
+
+  /// One synchronous UI action submits three same-direction commands while the
+  /// first native seek still owns libVLC's watcher. The final clock proves the
+  /// scheduler preserved the whole +30-second intent instead of replacing the
+  /// queue with three identical +10-second snapshots.
+  func test_stress_sameDirectionBurstPreservesNetDisplacement() {
+    launch(route: .relativeSeek)
+
+    waitForLabel(playPauseButton, equals: "Pause", timeout: 10)
+    waitForLabel(durationLabel, notEqual: "0:00", timeout: 5)
+    playPauseButton.tap()
+    waitForLabel(playPauseButton, equals: "Play", timeout: 3)
+
+    guard let before = seconds(from: currentTimeLabel.label) else {
+      XCTFail("currentTime unparseable: '\(currentTimeLabel.label)'")
+      return
+    }
+    if !sameDirectionBurst.isHittable {
+      app.swipeUp()
+    }
+    XCTAssertTrue(sameDirectionBurst.waitForExistence(timeout: 2))
+    sameDirectionBurst.tap()
+
+    guard let after = waitForCurrentTime(near: before + 30, tolerance: 4) else {
+      XCTFail("currentTime unparseable after burst: '\(currentTimeLabel.label)'")
+      return
+    }
+    let displacement = after - before
+    XCTAssertGreaterThanOrEqual(
+      displacement,
+      26,
+      "Three +10s commands only advanced \(displacement)s"
+    )
+    XCTAssertLessThanOrEqual(
+      displacement,
+      34,
+      "Three +10s commands advanced an unexpected \(displacement)s"
+    )
+    if !videoView.isHittable {
+      app.swipeDown()
+    }
+    assertRendersNonBlackFrame(videoView, timeout: 10)
+    assertNoLibraryErrors()
+  }
 
   /// Hammer all four buttons in alternating directions. The decoder
   /// cascade and buffer manager must stay coherent across rapid

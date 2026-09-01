@@ -30,7 +30,9 @@ final class PiPVODControlsDeviceUITests: ShowcaseIOSTestCase {
           "pause": "pass",
           "scrub": "pass",
           "skipForward": "pass",
-          "skipBackward": "pass"
+          "skipBackward": "pass",
+          "skipPastZero": "pass",
+          "postBoundaryForward": "pass"
         ],
         "backendResults": [
           "native": native,
@@ -91,10 +93,62 @@ final class PiPVODControlsDeviceUITests: ShowcaseIOSTestCase {
     let evidence = try decodeEvidence(result.label)
     XCTAssertEqual(evidence["backend"] as? String, renderingPath)
     let controls = try XCTUnwrap(evidence["controls"] as? [String: Any])
-    for control in ["play", "pause", "scrub", "skipForward", "skipBackward"] {
+    for control in [
+      "play", "pause", "scrub", "skipForward", "skipBackward", "skipPastZero",
+      "postBoundaryForward"
+    ] {
       XCTAssertEqual(controls[control] as? String, "pass", "\(renderingPath) \(control)")
     }
+    let pausedBefore = try integer(controls, key: "pausedBeforeMilliseconds")
+    let pausedAfter = try integer(controls, key: "pausedAfterMilliseconds")
+    let pauseTolerance = try integer(
+      controls,
+      key: "maximumPausedClockDeltaMilliseconds"
+    )
+    XCTAssertEqual(
+      try integer(controls, key: "pauseObservationDurationMilliseconds"),
+      1000
+    )
+    XCTAssertLessThanOrEqual(abs(pausedAfter - pausedBefore), pauseTolerance)
+    let scrubTarget = try integer(controls, key: "scrubTargetMilliseconds")
+    let scrubLanded = try integer(controls, key: "scrubLandedTimeMilliseconds")
+    XCTAssertLessThanOrEqual(abs(scrubLanded - scrubTarget), 2000)
+    XCTAssertGreaterThan(
+      try integer(controls, key: "presentedAfterScrub"),
+      try integer(controls, key: "presentedBeforeScrub")
+    )
+    XCTAssertGreaterThan(
+      try integer(controls, key: "forwardAfterMilliseconds"),
+      try integer(controls, key: "forwardBeforeMilliseconds")
+    )
+    XCTAssertLessThan(
+      try integer(controls, key: "backwardAfterMilliseconds"),
+      try integer(controls, key: "backwardBeforeMilliseconds")
+    )
+    let zeroBefore = try integer(controls, key: "zeroBoundaryBeforeMilliseconds")
+    let zeroOffset = try integer(controls, key: "zeroBoundaryOffsetMilliseconds")
+    let zeroAfter = try integer(controls, key: "zeroBoundaryAfterMilliseconds")
+    let presentedBefore = try integer(controls, key: "presentedBeforeZeroBoundary")
+    let presentedAfter = try integer(controls, key: "presentedAfterZeroBoundary")
+    let postBoundaryBefore = try integer(
+      controls,
+      key: "postBoundaryForwardBeforeMilliseconds"
+    )
+    let postBoundaryAfter = try integer(
+      controls,
+      key: "postBoundaryForwardAfterMilliseconds"
+    )
+    XCTAssertGreaterThan(zeroBefore, 0)
+    XCTAssertLessThan(zeroOffset, -zeroBefore)
+    XCTAssertTrue((0...2000).contains(zeroAfter))
+    XCTAssertGreaterThan(presentedAfter, presentedBefore)
+    XCTAssertGreaterThan(postBoundaryAfter, postBoundaryBefore)
     return evidence
+  }
+
+  private func integer(_ object: [String: Any], key: String) throws -> Int64 {
+    let number = try XCTUnwrap(object[key] as? NSNumber, "Missing numeric field \(key)")
+    return number.int64Value
   }
 
   private func unexpectedStopCount(in evidence: [String: Any]) throws -> Int {

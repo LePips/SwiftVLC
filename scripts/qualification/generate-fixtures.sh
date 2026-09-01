@@ -38,6 +38,9 @@ mkdir -p \
   "$fixture_tmp/hls/soak/ts/high" \
   "$fixture_tmp/hls/soak/fmp4/low" \
   "$fixture_tmp/hls/soak/fmp4/high" \
+  "$fixture_tmp/oracles" \
+  "$fixture_tmp/local-playback/video" \
+  "$fixture_tmp/local-playback/audio" \
   "$fixture_tmp/performance" \
   "$fixture_tmp/cadence" \
   "$fixture_tmp/subtitles"
@@ -196,6 +199,73 @@ rm "$fixture_tmp/subtitles/bitmap-only.mkv" \
   -c:a aac -b:a 128k -movflags +faststart \
   "$fixture_tmp/vod.mp4"
 
+# Content-coded release oracles. The seek source has six unmistakable ten-
+# second color bands plus a white marker that advances across each band. Its
+# only keyframes are the band boundaries, so a precise seek several seconds
+# inside a band must decode forward to the requested presentation rather than
+# merely reporting the preceding keyframe timestamp. Rapid targets in different
+# bands also make stale predecessor presentation visible in an XCUI screenshot.
+"${ffmpeg_quiet[@]}" \
+  -f lavfi -i "color=c=0xC02020:s=640x360:r=30:d=10" \
+  -f lavfi -i "color=c=0x20A040:s=640x360:r=30:d=10" \
+  -f lavfi -i "color=c=0x2040C0:s=640x360:r=30:d=10" \
+  -f lavfi -i "color=c=0xC0A020:s=640x360:r=30:d=10" \
+  -f lavfi -i "color=c=0xA020A0:s=640x360:r=30:d=10" \
+  -f lavfi -i "color=c=0x20A0A0:s=640x360:r=30:d=10" \
+  -f lavfi -i "sine=frequency=880:sample_rate=48000:d=60" \
+  -filter_complex \
+    "[0:v][1:v][2:v][3:v][4:v][5:v]concat=n=6:v=1:a=0[base];\
+color=c=white:s=24x200:r=30:d=60[marker];\
+[base][marker]overlay=x='40+mod(t,10)*56':y=80:eval=frame:shortest=1[v]" \
+  -map '[v]' -map 6:a -t 60 \
+  -c:v libx264 -preset veryfast -crf 18 -pix_fmt yuv420p \
+  -g 300 -keyint_min 300 -sc_threshold 0 \
+  -c:a aac -b:a 96k -movflags +faststart \
+  "$fixture_tmp/oracles/seek-sparse-gop.mp4"
+
+# Every frame in this source is independently decodable and has a unique
+# full-frame RGB value derived from its zero-based index. At 10 fps, a valid
+# next-frame request must advance exactly 100 ms and visibly change the entire
+# video surface once. This is intentionally low-rate so device screenshots
+# cannot hide accidental multi-frame advancement inside capture latency.
+"${ffmpeg_quiet[@]}" \
+  -f lavfi -i "nullsrc=s=640x360:r=10:d=12" \
+  -f lavfi -i "sine=frequency=660:sample_rate=48000:d=12" \
+  -vf \
+    "format=gbrp,geq=r='32+mod(N,5)*48':g='32+mod(floor(N/5),5)*48':b='32+mod(floor(N/25),5)*48',format=yuv420p" \
+  -t 12 -c:v libx264 -preset veryfast -crf 12 \
+  -g 1 -keyint_min 1 -sc_threshold 0 \
+  -c:a aac -b:a 96k -movflags +faststart \
+  "$fixture_tmp/oracles/frame-all-intra.mp4"
+
+# A large, content-coded progressive MP4 for physical HTTP Range seeking.
+# It extends the independently decoded color/marker timeline inside one filter
+# graph, resetting each branch to timestamp zero before concatenation. A white
+# lower-right cycle block exists only in the second half, so 43.5 and 103.5
+# seconds cannot produce interchangeable pixel evidence. This avoids the
+# one-frame discontinuity that demuxer-level stream looping can introduce at the
+# join. It is re-encoded at a real constant 4 Mbps with HRD filler. Combined with the
+# progressive endpoint's deterministic 7,520-byte/20ms throttle, the complete
+# file takes well over two minutes to transfer and therefore cannot be hidden
+# in a pre-seek cache during the bounded device test. Ten-second GOPs retain
+# the same 43.5-second decoded landing oracle as the sparse-GOP fixture.
+"${ffmpeg_quiet[@]}" \
+  -i "$fixture_tmp/oracles/seek-sparse-gop.mp4" \
+  -filter_complex \
+    '[0:v]split=2[first][second];[first]setpts=PTS-STARTPTS[first0];[second]drawbox=x=480:y=300:w=120:h=40:color=white:t=fill,setpts=PTS-STARTPTS[second0];[first0][second0]concat=n=2:v=1:a=0[out]' \
+  -map '[out]' -frames:v 3600 \
+  -c:v libx264 -preset veryfast -pix_fmt yuv420p \
+  -b:v 4000k -minrate 4000k -maxrate 4000k -bufsize 4000k \
+  -x264-params "nal-hrd=cbr:filler=1" \
+  -g 300 -keyint_min 300 -sc_threshold 0 \
+  -an -movflags +faststart \
+  "$fixture_tmp/oracles/progressive-range.mp4"
+
+# Decode the encoded bytes and prove the semantic oracle. Metadata alone is
+# insufficient: a syntactically valid filter expression can still render no
+# marker at all, creating a self-consistent but meaningless release test.
+python3 "$SCRIPT_DIR/verify-fixtures.py" --media-only "$fixture_tmp" >/dev/null
+
 "${ffmpeg_quiet[@]}" \
   -stream_loop -1 -i "$fixture_tmp/vod.mp4" -t "$LIVE_DURATION_SECONDS" \
   -c copy -f mpegts "$fixture_tmp/live.ts"
@@ -258,15 +328,17 @@ for cadence_spec in "${cadence_specs[@]}"; do
   cadence_short="$fixture_tmp/cadence/$cadence_name-short.mp4"
   "${ffmpeg_quiet[@]}" \
     -f lavfi -i "testsrc2=size=640x360:rate=$cadence_rate" \
-    -f lavfi -i "sine=frequency=550:sample_rate=48000" \
-    -t 4 -shortest \
+    -t 4 -an \
     -c:v libx264 -preset ultrafast -crf 30 -pix_fmt yuv420p \
     -g 120 -keyint_min 1 -sc_threshold 0 \
-    -c:a aac -b:a 96k -movflags +faststart \
+    -movflags +faststart \
     "$cadence_short"
   "${ffmpeg_quiet[@]}" \
-    -stream_loop -1 -i "$cadence_short" -t "$LIVE_DURATION_SECONDS" \
-    -c copy -movflags +faststart "$fixture_tmp/cadence/$cadence_name.mp4"
+    -stream_loop -1 -i "$cadence_short" \
+    -f lavfi -i "sine=frequency=550:sample_rate=48000" \
+    -t "$LIVE_DURATION_SECONDS" -map 0:v:0 -map 1:a:0 \
+    -c:v copy -c:a aac -b:a 96k -movflags +faststart \
+    "$fixture_tmp/cadence/$cadence_name.mp4"
   rm "$cadence_short"
 done
 
@@ -276,15 +348,16 @@ done
 "${ffmpeg_quiet[@]}" \
   -f lavfi -t 2 -i "testsrc2=size=640x360:rate=24" \
   -f lavfi -t 2 -i "testsrc2=size=640x360:rate=60" \
-  -f lavfi -t 4 -i "sine=frequency=550:sample_rate=48000" \
   -filter_complex '[0:v][1:v]concat=n=2:v=1:a=0[v]' \
-  -map '[v]' -map 2:a -fps_mode vfr \
+  -map '[v]' -an -fps_mode vfr \
   -c:v libx264 -preset ultrafast -crf 30 -pix_fmt yuv420p \
-  -c:a aac -b:a 96k -shortest -movflags +faststart \
+  -movflags +faststart \
   "$fixture_tmp/cadence/vfr-short.mp4"
 "${ffmpeg_quiet[@]}" \
   -stream_loop -1 -i "$fixture_tmp/cadence/vfr-short.mp4" \
-  -t "$LIVE_DURATION_SECONDS" -c copy -movflags +faststart \
+  -f lavfi -i "sine=frequency=550:sample_rate=48000" \
+  -t "$LIVE_DURATION_SECONDS" -map 0:v:0 -map 1:a:0 \
+  -c:v copy -c:a aac -b:a 96k -movflags +faststart \
   "$fixture_tmp/cadence/vfr.mp4"
 rm "$fixture_tmp/cadence/vfr-short.mp4"
 ffprobe -v error -select_streams v:0 \
@@ -302,6 +375,56 @@ if len(deltas) < 2:
   -f lavfi -i "sine=frequency=440:sample_rate=48000" \
   -t "$DURATION_SECONDS" -c:a aac -b:a 128k \
   "$fixture_tmp/audio.m4a"
+
+# Candidate-bound local-file coverage. These are deliberately short enough to
+# run on every supported phone/tablet while spanning containers and decoder
+# families that exercise materially different demux/codec paths. The device
+# downloads each file from the loopback fixture server, hashes it, persists it
+# under the app container, and then proves playback came from a file:// URL.
+LOCAL_PLAYBACK_DURATION_SECONDS=12
+"${ffmpeg_quiet[@]}" \
+  -i "$fixture_tmp/vod.mp4" -t "$LOCAL_PLAYBACK_DURATION_SECONDS" -c copy \
+  "$fixture_tmp/local-playback/video/h264-aac.mp4"
+"${ffmpeg_quiet[@]}" \
+  -i "$fixture_tmp/local-playback/video/h264-aac.mp4" -c copy \
+  "$fixture_tmp/local-playback/video/h264-aac.mkv"
+"${ffmpeg_quiet[@]}" \
+  -i "$fixture_tmp/local-playback/video/h264-aac.mp4" -c copy \
+  -movflags +frag_keyframe+empty_moov+default_base_moof \
+  "$fixture_tmp/local-playback/video/h264-aac-fragmented.mp4"
+"${ffmpeg_quiet[@]}" \
+  -f lavfi -i "testsrc2=size=640x360:rate=30" \
+  -f lavfi -i "sine=frequency=610:sample_rate=48000" \
+  -t "$LOCAL_PLAYBACK_DURATION_SECONDS" -shortest \
+  -c:v libvpx-vp9 -deadline realtime -cpu-used 8 -crf 34 -b:v 0 \
+  -g 60 -c:a libopus -b:a 96k \
+  "$fixture_tmp/local-playback/video/vp9-opus.webm"
+"${ffmpeg_quiet[@]}" \
+  -f lavfi -i "testsrc2=size=640x360:rate=30" \
+  -f lavfi -i "sine=frequency=720:sample_rate=48000" \
+  -t "$LOCAL_PLAYBACK_DURATION_SECONDS" -shortest \
+  -c:v mpeg2video -q:v 5 -g 15 -c:a mp2 -b:a 128k -f mpegts \
+  "$fixture_tmp/local-playback/video/mpeg2-mp2.ts"
+
+"${ffmpeg_quiet[@]}" \
+  -f lavfi -i "sine=frequency=523.25:sample_rate=48000" \
+  -t "$LOCAL_PLAYBACK_DURATION_SECONDS" -c:a pcm_s16le \
+  "$fixture_tmp/local-playback/audio/pcm-s16le.wav"
+"${ffmpeg_quiet[@]}" \
+  -i "$fixture_tmp/local-playback/audio/pcm-s16le.wav" -c:a aac -b:a 128k \
+  "$fixture_tmp/local-playback/audio/aac.m4a"
+"${ffmpeg_quiet[@]}" \
+  -i "$fixture_tmp/local-playback/audio/pcm-s16le.wav" -c:a alac \
+  "$fixture_tmp/local-playback/audio/alac.m4a"
+"${ffmpeg_quiet[@]}" \
+  -i "$fixture_tmp/local-playback/audio/pcm-s16le.wav" -c:a libmp3lame -b:a 160k \
+  "$fixture_tmp/local-playback/audio/mp3.mp3"
+"${ffmpeg_quiet[@]}" \
+  -i "$fixture_tmp/local-playback/audio/pcm-s16le.wav" -c:a flac \
+  "$fixture_tmp/local-playback/audio/flac.flac"
+"${ffmpeg_quiet[@]}" \
+  -i "$fixture_tmp/local-playback/audio/pcm-s16le.wav" -c:a libopus -b:a 96k \
+  "$fixture_tmp/local-playback/audio/opus.ogg"
 
 # Short, highly compressible 60 fps sources are looped by libVLC during the
 # 15-minute physical rows. They exercise the real 1080p/4K decode and BGRA
@@ -335,6 +458,10 @@ mv "$fixture_tmp/live.ts" "$OUTPUT_DIR/live.ts"
 mv "$fixture_tmp/audio.m4a" "$OUTPUT_DIR/audio.m4a"
 rm -rf "$OUTPUT_DIR/performance"
 mv "$fixture_tmp/performance" "$OUTPUT_DIR/performance"
+rm -rf "$OUTPUT_DIR/oracles"
+mv "$fixture_tmp/oracles" "$OUTPUT_DIR/oracles"
+rm -rf "$OUTPUT_DIR/local-playback"
+mv "$fixture_tmp/local-playback" "$OUTPUT_DIR/local-playback"
 rm -rf "$OUTPUT_DIR/cadence"
 mv "$fixture_tmp/cadence" "$OUTPUT_DIR/cadence"
 rm -rf "$OUTPUT_DIR/subtitles"
@@ -388,6 +515,141 @@ manifest = {
     "performance": {
         "1080p60": {"width": 1920, "height": 1080, "framesPerSecond": 60},
         "4k60": {"width": 3840, "height": 2160, "framesPerSecond": 60},
+    },
+    "localPlayback": {
+        "durationSeconds": 12,
+        "video": [
+            {
+                "id": "h264-aac-mp4",
+                "path": "local-playback/video/h264-aac.mp4",
+                "container": "mp4",
+                "videoCodec": "h264",
+                "audioCodec": "aac",
+                "width": 640,
+                "height": 360,
+                "framesPerSecond": 30,
+                "sampleRate": 48000,
+                "channels": 1,
+            },
+            {
+                "id": "h264-aac-matroska",
+                "path": "local-playback/video/h264-aac.mkv",
+                "container": "matroska",
+                "videoCodec": "h264",
+                "audioCodec": "aac",
+                "width": 640,
+                "height": 360,
+                "framesPerSecond": 30,
+                "sampleRate": 48000,
+                "channels": 1,
+            },
+            {
+                "id": "h264-aac-fragmented-mp4",
+                "path": "local-playback/video/h264-aac-fragmented.mp4",
+                "container": "mp4",
+                "videoCodec": "h264",
+                "audioCodec": "aac",
+                "width": 640,
+                "height": 360,
+                "framesPerSecond": 30,
+                "sampleRate": 48000,
+                "channels": 1,
+            },
+            {
+                "id": "vp9-opus-webm",
+                "path": "local-playback/video/vp9-opus.webm",
+                "container": "webm",
+                "videoCodec": "vp9",
+                "audioCodec": "opus",
+                "width": 640,
+                "height": 360,
+                "framesPerSecond": 30,
+                "sampleRate": 48000,
+                "channels": 1,
+            },
+            {
+                "id": "mpeg2-mp2-ts",
+                "path": "local-playback/video/mpeg2-mp2.ts",
+                "container": "mpegts",
+                "videoCodec": "mpeg2video",
+                "audioCodec": "mp2",
+                "width": 640,
+                "height": 360,
+                "framesPerSecond": 30,
+                "sampleRate": 48000,
+                "channels": 1,
+            },
+        ],
+        "audio": [
+            {"id": "aac-m4a", "path": "local-playback/audio/aac.m4a", "container": "mp4", "audioCodec": "aac", "sampleRate": 48000, "channels": 1},
+            {"id": "alac-m4a", "path": "local-playback/audio/alac.m4a", "container": "mp4", "audioCodec": "alac", "sampleRate": 48000, "channels": 1},
+            {"id": "mp3", "path": "local-playback/audio/mp3.mp3", "container": "mp3", "audioCodec": "mp3", "sampleRate": 48000, "channels": 1},
+            {"id": "flac", "path": "local-playback/audio/flac.flac", "container": "flac", "audioCodec": "flac", "sampleRate": 48000, "channels": 1},
+            {"id": "opus-ogg", "path": "local-playback/audio/opus.ogg", "container": "ogg", "audioCodec": "opus", "sampleRate": 48000, "channels": 1},
+            {"id": "pcm-wav", "path": "local-playback/audio/pcm-s16le.wav", "container": "wav", "audioCodec": "pcm_s16le", "sampleRate": 48000, "channels": 1},
+        ],
+    },
+    "oracles": {
+        "seekSparseGOP": {
+            "path": "oracles/seek-sparse-gop.mp4",
+            "durationSeconds": 60,
+            "width": 640,
+            "height": 360,
+            "framesPerSecond": 30,
+            "keyframeTimesSeconds": [0, 10, 20, 30, 40, 50],
+            "bandDurationSeconds": 10,
+            "bandRGB": [
+                "C02020", "20A040", "2040C0",
+                "C0A020", "A020A0", "20A0A0",
+            ],
+            "marker": {
+                "color": "FFFFFF",
+                "xAtBandStart": 40,
+                "horizontalPixelsPerSecond": 56,
+                "width": 24,
+                "y": 80,
+                "height": 200,
+            },
+        },
+        "frameAllIntra": {
+            "path": "oracles/frame-all-intra.mp4",
+            "durationSeconds": 12,
+            "width": 640,
+            "height": 360,
+            "framesPerSecond": 10,
+            "frameCount": 120,
+            "allIntra": True,
+            "rgbFormula": {
+                "red": "32 + ((frameIndex mod 5) * 48)",
+                "green": "32 + (((frameIndex div 5) mod 5) * 48)",
+                "blue": "32 + (((frameIndex div 25) mod 5) * 48)",
+            },
+        },
+        "progressiveHTTPRange": {
+            "path": "oracles/progressive-range.mp4",
+            "durationSeconds": 120,
+            "minimumBytes": 50000000,
+            "width": 640,
+            "height": 360,
+            "framesPerSecond": 30,
+            "keyframeIntervalSeconds": 10,
+            "seekTargetMilliseconds": 43500,
+            "landingBoundaryMilliseconds": 40000,
+            "seekToleranceMilliseconds": 750,
+            "bandDurationSeconds": 10,
+            "targetBandIndex": 4,
+            "targetBandRGB": "A020A0",
+            "timelineCycleIndicator": {
+                "secondHalfStartSeconds": 60,
+                "rgb": "FFFFFF",
+                "x": 480,
+                "y": 300,
+                "width": 120,
+                "height": 40,
+            },
+            "serverChunkBytes": 7520,
+            "serverChunkDelayMilliseconds": 20,
+        },
     },
     "cadence": {
         "rates": [23.976, 24, 25, 29.97, 30, 50, 59.94, 60],

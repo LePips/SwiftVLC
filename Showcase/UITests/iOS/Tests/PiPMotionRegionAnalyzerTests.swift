@@ -5,6 +5,7 @@ final class PiPMotionRegionAnalyzerTests: XCTestCase {
   private let screenWidth = 160
   private let screenHeight = 240
   private let expectedPiP = PiPMotionRegion(x: 64, y: 156, width: 80, height: 45)
+  private let iOS27SizedPiP = PiPMotionRegion(x: 96, y: 24, width: 56, height: 32)
 
   func testNormalizedSystemPiPControlPointUsesDetectedBounds() {
     let region = SystemPictureInPictureWindowRegion(
@@ -39,6 +40,101 @@ final class PiPMotionRegionAnalyzerTests: XCTestCase {
     )
     XCTAssertGreaterThanOrEqual(analysis.sustainedMotionPairCount, analysis.requiredPairCount)
     XCTAssertGreaterThanOrEqual(analysis.nonBlackFrameCount, frames.count - 1)
+  }
+
+  func testSparseMotionInsideIOS27SizedPiPRegionPassesTemporalUnionFallback() throws {
+    let frames = sparsePiPFrames(regions: [iOS27SizedPiP])
+
+    let analysis = analyzer.analyze(frames)
+
+    XCTAssertTrue(analysis.passed, diagnostics(for: analysis))
+    XCTAssertEqual(analysis.candidateSource, .temporalUnion, diagnostics(for: analysis))
+    let detected = try XCTUnwrap(analysis.region)
+    XCTAssertGreaterThanOrEqual(
+      Double(detected.intersectionArea(with: iOS27SizedPiP)) / Double(iOS27SizedPiP.area),
+      0.75,
+      diagnostics(for: analysis)
+    )
+    XCTAssertGreaterThanOrEqual(analysis.sustainedMotionPairCount, analysis.requiredPairCount)
+    XCTAssertGreaterThanOrEqual(analysis.nonBlackFrameCount, frames.count - 1)
+  }
+
+  func testTwoSparseIOS27SizedMotionRegionsFailAsAmbiguous() {
+    let second = PiPMotionRegion(x: 4, y: 176, width: 56, height: 32)
+    let frames = sparsePiPFrames(regions: [iOS27SizedPiP, second])
+
+    let analysis = analyzer.analyze(frames)
+
+    XCTAssertFalse(analysis.passed, diagnostics(for: analysis))
+    XCTAssertEqual(analysis.failure, .ambiguousMotionRegions, diagnostics(for: analysis))
+  }
+
+  func testTemporalUnionRejectsSweepingBandsThatOnlyFormPiPGeometryOverTime() {
+    let frames = sweepingBandFrames(in: iOS27SizedPiP)
+
+    let analysis = analyzer.analyze(frames)
+
+    XCTAssertFalse(analysis.passed, diagnostics(for: analysis))
+    XCTAssertNil(analysis.candidateSource, diagnostics(for: analysis))
+    XCTAssertEqual(
+      analysis.failure,
+      .noStablePiPSizedComponent,
+      diagnostics(for: analysis)
+    )
+  }
+
+  func testTemporalUnionDoesNotBoxDisconnectedAnimationsIntoPiPGeometry() {
+    let frames = disconnectedCornerAnimationFrames(in: iOS27SizedPiP)
+
+    let analysis = analyzer.analyze(frames)
+
+    XCTAssertFalse(analysis.passed, diagnostics(for: analysis))
+    XCTAssertNil(analysis.candidateSource, diagnostics(for: analysis))
+    XCTAssertEqual(
+      analysis.failure,
+      .noStablePiPSizedComponent,
+      diagnostics(for: analysis)
+    )
+  }
+
+  func testTemporalUnionRejectsTransientBridgeBetweenAlternatingCornerAnimations() {
+    let frames = transientBridgeCornerAnimationFrames(in: iOS27SizedPiP)
+
+    let analysis = analyzer.analyze(frames)
+
+    XCTAssertFalse(analysis.passed, diagnostics(for: analysis))
+    XCTAssertNil(analysis.candidateSource, diagnostics(for: analysis))
+    XCTAssertEqual(
+      analysis.failure,
+      .noStablePiPSizedComponent,
+      diagnostics(for: analysis)
+    )
+  }
+
+  func testSystemSurfaceStabilityAllowsBoundedMovingPiP() throws {
+    let frames = sparsePiPFrames(regions: [iOS27SizedPiP], count: 2)
+    let detector = PiPSystemSurfaceStabilityDetector()
+
+    let changedRatio = try XCTUnwrap(
+      detector.changedPixelRatio(from: frames[0], to: frames[1])
+    )
+
+    XCTAssertGreaterThan(changedRatio, 0)
+    XCTAssertLessThanOrEqual(changedRatio, 0.12)
+    XCTAssertTrue(detector.isStableTransition(from: frames[0], to: frames[1]))
+  }
+
+  func testSystemSurfaceStabilityRejectsWholeScreenTransition() throws {
+    let before = syntheticFrames(count: 1) { _, _, _, _ in .background }[0]
+    let after = syntheticFrames(count: 1) { _, _, _, _ in
+      .pixel(PiPMotionPixel(red: 180, green: 180, blue: 180))
+    }[0]
+    let detector = PiPSystemSurfaceStabilityDetector()
+
+    let changedRatio = try XCTUnwrap(detector.changedPixelRatio(from: before, to: after))
+
+    XCTAssertGreaterThan(changedRatio, 0.90)
+    XCTAssertFalse(detector.isStableTransition(from: before, to: after))
   }
 
   func testWholeScreenAnimationFails() {
@@ -104,7 +200,12 @@ final class PiPMotionRegionAnalyzerTests: XCTestCase {
     let analysis = analyzer.analyze(frames)
 
     XCTAssertFalse(analysis.passed, diagnostics(for: analysis))
-    XCTAssertEqual(analysis.failure, .noStablePiPSizedComponent)
+    XCTAssertNil(analysis.candidateSource, diagnostics(for: analysis))
+    XCTAssertEqual(
+      analysis.failure,
+      .noStablePiPSizedComponent,
+      diagnostics(for: analysis)
+    )
   }
 
   func testStaticNonBlackPiPRegionFails() {
@@ -286,6 +387,146 @@ extension PiPMotionRegionAnalyzerTests {
     return PiPMotionFrame(width: screenWidth, height: screenHeight, pixels: pixels)
   }
 
+  private func sparsePiPFrames(
+    regions: [PiPMotionRegion],
+    count: Int = 6
+  ) -> [PiPMotionFrame] {
+    let staticBars = [
+      PiPMotionPixel(red: 220, green: 35, blue: 35),
+      PiPMotionPixel(red: 35, green: 220, blue: 45),
+      PiPMotionPixel(red: 235, green: 225, blue: 40),
+      PiPMotionPixel(red: 45, green: 65, blue: 225),
+      PiPMotionPixel(red: 220, green: 45, blue: 215),
+      PiPMotionPixel(red: 40, green: 215, blue: 220)
+    ]
+    return syntheticFrames(count: count) { x, y, _, frameIndex in
+      guard let region = regions.first(where: { $0.contains(x: x, y: y) }) else {
+        return .background
+      }
+      let localX = x - region.x
+      let localY = y - region.y
+      let diagonalY = (localX / 2 + frameIndex * 4) % region.height
+      let movingDiagonal = abs(localY - diagonalY) <= 1
+      let checker = localX >= region.width * 2 / 3
+        && localX < region.width - 3
+        && localY >= region.height / 2
+        && localY < region.height - 3
+        && (localX / 2 + localY / 2 + frameIndex).isMultiple(of: 2)
+      let markerX = (frameIndex * 7 + region.width / 4) % region.width
+      let movingMarker = abs(localX - markerX) <= 1
+        && abs(localY - region.height / 3) <= 1
+      if movingDiagonal || checker || movingMarker {
+        return .pixel(animatedPixel(x: x, y: y, frameIndex: frameIndex))
+      }
+      let bar = min(staticBars.count - 1, localX * staticBars.count / region.width)
+      return .pixel(staticBars[bar])
+    }
+  }
+
+  /// A static non-black landscape widget with one animated horizontal band at
+  /// a time. Its temporal union has PiP geometry and every pair has ample
+  /// motion, but no pair contains a window-shaped moving surface.
+  private func sweepingBandFrames(in region: PiPMotionRegion) -> [PiPMotionFrame] {
+    let background = PiPMotionPixel(red: 80, green: 115, blue: 155)
+    let bandColors = [
+      PiPMotionPixel(red: 230, green: 45, blue: 45),
+      PiPMotionPixel(red: 45, green: 225, blue: 70)
+    ]
+    return syntheticFrames { x, y, _, frameIndex in
+      guard region.contains(x: x, y: y) else { return .background }
+      let localY = y - region.y
+      let band = frameIndex % 5
+      let lowerBound = band * 6
+      if localY >= lowerBound, localY < min(region.height, lowerBound + 6) {
+        return .pixel(bandColors[frameIndex.isMultiple(of: 2) ? 0 : 1])
+      }
+      return .pixel(background)
+    }
+  }
+
+  /// Four disconnected corner animations collectively outline a landscape
+  /// box over time. No connected moving surface ever has PiP geometry, so a
+  /// temporal fallback must not combine those components into one candidate.
+  private func disconnectedCornerAnimationFrames(
+    in region: PiPMotionRegion
+  ) -> [PiPMotionFrame] {
+    let background = PiPMotionPixel(red: 80, green: 115, blue: 155)
+    let off = PiPMotionPixel(red: 210, green: 45, blue: 55)
+    let on = PiPMotionPixel(red: 45, green: 220, blue: 75)
+    let firstDiagonalStates = [false, true, false, false, false, false]
+    let secondDiagonalStates = [false, false, false, true, false, true]
+    let blockSize = 9
+    return syntheticFrames { x, y, _, frameIndex in
+      guard region.contains(x: x, y: y) else { return .background }
+      let localX = x - region.x
+      let localY = y - region.y
+      let left = localX < blockSize
+      let right = localX >= region.width - blockSize
+      let top = localY < blockSize
+      let bottom = localY >= region.height - blockSize
+      if (left && top) || (right && bottom) {
+        return .pixel(firstDiagonalStates[frameIndex] ? on : off)
+      }
+      if (right && top) || (left && bottom) {
+        return .pixel(secondDiagonalStates[frameIndex] ? on : off)
+      }
+      return .pixel(background)
+    }
+  }
+
+  /// A single X-shaped flash connects four corner animations in the temporal
+  /// union. Later pairs only alternate two disconnected opposite corners. A
+  /// raw union plus a combined bounding box mistakes this static widget for a
+  /// fixed moving PiP window; the persistent identity core must reject it.
+  private func transientBridgeCornerAnimationFrames(
+    in region: PiPMotionRegion
+  ) -> [PiPMotionFrame] {
+    let background = PiPMotionPixel(red: 80, green: 115, blue: 155)
+    let off = PiPMotionPixel(red: 45, green: 225, blue: 70)
+    let on = PiPMotionPixel(red: 230, green: 45, blue: 45)
+    let cornerStates = [
+      [false, false, false, false],
+      [true, false, false, true],
+      [true, true, true, true],
+      [false, true, true, false],
+      [false, false, false, false],
+      [true, false, false, true]
+    ]
+    let blockSize = 9
+    return syntheticFrames { x, y, _, frameIndex in
+      guard region.contains(x: x, y: y) else { return .background }
+      let localX = x - region.x
+      let localY = y - region.y
+      let left = localX < blockSize
+      let right = localX >= region.width - blockSize
+      let top = localY < blockSize
+      let bottom = localY >= region.height - blockSize
+      let corner: Int? = if left && top {
+        0
+      } else if right && top {
+        1
+      } else if left && bottom {
+        2
+      } else if right && bottom {
+        3
+      } else {
+        nil
+      }
+      if let corner {
+        return .pixel(cornerStates[frameIndex][corner] ? on : off)
+      }
+
+      let diagonalY = localX * (region.height - 1) / (region.width - 1)
+      let reverseDiagonalY = region.height - 1 - diagonalY
+      if
+        frameIndex == 1,
+        abs(localY - diagonalY) <= 1 || abs(localY - reverseDiagonalY) <= 1 {
+        return .pixel(on)
+      }
+      return .pixel(background)
+    }
+  }
+
   private func animatedPixel(x: Int, y: Int, frameIndex: Int) -> PiPMotionPixel {
     let palette = [
       PiPMotionPixel(red: 225, green: 65, blue: 55),
@@ -341,6 +582,7 @@ extension PiPMotionRegionAnalyzerTests {
   private func diagnostics(for analysis: PiPMotionRegionAnalysis) -> String {
     "failure=\(analysis.failure?.rawValue ?? "none"), "
       + "region=\(String(describing: analysis.region)), "
+      + "source=\(analysis.candidateSource?.rawValue ?? "none"), "
       + "pairMotion=\(analysis.pairMotionRatios), "
       + "nonBlack=\(analysis.frameNonBlackRatios), "
       + "matching=\(analysis.matchingPairCount)/\(analysis.requiredPairCount), "

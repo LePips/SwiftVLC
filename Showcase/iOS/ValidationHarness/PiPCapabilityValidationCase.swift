@@ -12,7 +12,6 @@ struct PiPCapabilityValidationCase: View {
   @State private var lifecycleEvents: [String] = []
   @State private var skipResult = "none"
   @State private var playbackError: String?
-  @State private var isSuppressionEnabled = false
 
   private let streams = HarnessStreams.load()?.streams
 
@@ -115,7 +114,6 @@ struct PiPCapabilityValidationCase: View {
     .navigationTitle("PiP capability convergence")
     .task {
       player.suppressRawCapabilityEventsForQualification(true)
-      isSuppressionEnabled = true
     }
     .task(id: controller.map(ObjectIdentifier.init)) {
       lifecycleEvents.removeAll()
@@ -126,7 +124,6 @@ struct PiPCapabilityValidationCase: View {
     }
     .onDisappear {
       player.suppressRawCapabilityEventsForQualification(false)
-      isSuppressionEnabled = false
       player.stop()
     }
   }
@@ -155,10 +152,18 @@ struct PiPCapabilityValidationCase: View {
   }
 
   private var suppressionSnapshot: String {
-    let snapshot = player.rawCapabilityEventSuppressionSnapshot
-    return "\(isSuppressionEnabled ? "enabled" : "disabled"):"
-      + "\(snapshot.suppressedLengthEventCount):"
-      + "\(snapshot.suppressedSeekableEventCount)"
+    let playerSnapshot = player.rawCapabilityEventSuppressionSnapshot
+    guard let controller else {
+      return "disabled:\(playerSnapshot.suppressedLengthEventCount):"
+        + "\(playerSnapshot.suppressedSeekableEventCount):0:0"
+    }
+    let controllerSnapshot = controller.rawCapabilityObserverEventSuppressionSnapshot
+    let enabled = playerSnapshot.isEnabled && controllerSnapshot.isEnabled
+    return "\(enabled ? "enabled" : "disabled"):"
+      + "\(playerSnapshot.suppressedLengthEventCount):"
+      + "\(playerSnapshot.suppressedSeekableEventCount):"
+      + "\(controllerSnapshot.suppressedLengthEventCount):"
+      + "\(controllerSnapshot.suppressedSeekableEventCount)"
   }
 
   private func load(_ url: URL?) {
@@ -211,7 +216,7 @@ struct PiPCapabilityValidationCase: View {
       Text(value)
         .foregroundStyle(.secondary)
     }
-    .qualificationAccessibilityValue(value, title: title, identifier: identifier)
+    .qualificationAccessibilityValue(label: title, value: value, identifier: identifier)
   }
 }
 

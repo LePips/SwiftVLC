@@ -391,8 +391,7 @@ struct PiPRenderPerformanceValidationCase: View {
   }
 
   private func valueRow(_ title: String, value: String, identifier: String) -> some View {
-    HStack { Text(title); Spacer(); Text(value).foregroundStyle(.secondary) }
-      .qualificationAccessibilityValue(value, title: title, identifier: identifier)
+    HStack { Text(title); Spacer(); Text(value).foregroundStyle(.secondary).accessibilityIdentifier(identifier) }
   }
 }
 

@@ -346,8 +346,7 @@ struct TimebaseSoakValidationCase: View {
   }
 
   private func valueRow(_ title: String, _ value: String, _ identifier: String) -> some View {
-    HStack { Text(title); Spacer(); Text(value).foregroundStyle(.secondary) }
-      .qualificationAccessibilityValue(value, title: title, identifier: identifier)
+    HStack { Text(title); Spacer(); Text(value).foregroundStyle(.secondary).accessibilityIdentifier(identifier) }
   }
 
   fileprivate static func rate(elapsed: Int, duration: Int) -> Float {

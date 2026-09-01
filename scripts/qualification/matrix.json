@@ -1,11 +1,275 @@
 {
+  "releasePolicyIdentity": "swiftvlc-1.1.0-physical-qualification-v1",
   "description": "Physical-device rows required before the v1.1.0 xcframework can be released. Simulator runs never satisfy a row.",
+  "runnerContracts": [
+    {
+      "id": "analyzer",
+      "selection": {
+        "kind": "candidatePrefixes",
+        "prefixes": [
+          "iOSUITests/DeferredPauseSettlementObservationTests/",
+          "iOSUITests/HLSSeekLandingFrameGateTests/",
+          "iOSUITests/NativeRendererRecoveryEvidenceTests/",
+          "iOSUITests/NativeRendererRecoveryVisualEvidenceTests/",
+          "iOSUITests/PiPMotionRegionAnalyzerTests/",
+          "iOSUITests/VideoSurfaceMotionEvidenceTests/",
+          "iOSUITests/VideoOracleAnalyzerTests/"
+        ]
+      },
+      "outputs": []
+    },
+    {
+      "id": "ui-suite",
+      "selection": {
+        "kind": "candidateExcludingPrefixes",
+        "prefixes": [
+          "iOSUITests/PiPLiveDeviceUITests/",
+          "iOSUITests/PiPContinuityDeviceUITests/",
+          "iOSUITests/PiPCapabilityDeviceUITests/",
+          "iOSUITests/PiPVODControlsDeviceUITests/",
+          "iOSUITests/PiPLongStallDeviceUITests/",
+          "iOSUITests/PiPDismissalDeviceUITests/",
+          "iOSUITests/PiPInterruptionDeviceUITests/",
+          "iOSUITests/MediaServicesResetDeviceUITests/",
+          "iOSUITests/AudioSessionOwnershipDeviceUITests/",
+          "iOSUITests/PiPNativeLifecycleDeviceUITests/",
+          "iOSUITests/NativeRendererRecoveryDeviceUITests/",
+          "iOSUITests/TerminalOutcomesDeviceUITests/",
+          "iOSUITests/AdaptiveHLSSoakDeviceUITests/",
+          "iOSUITests/PiPRenderPerformanceDeviceUITests/",
+          "iOSUITests/PiPCadenceDeviceUITests/",
+          "iOSUITests/NativeSubtitleMatrixDeviceUITests/",
+          "iOSUITests/TimebaseSoakDeviceUITests/",
+          "iOSUITests/PiPDeferredPauseDeviceUITests/",
+          "iOSUITests/PiPDelayedStartFailureDeviceUITests/",
+          "iOSUITests/PiPOverlayDeviceUITests/",
+          "iOSUITests/SeekFrameOracleDeviceUITests/",
+          "iOSUITests/ProgressiveHTTPRangeSeekDeviceUITests/",
+          "iOSUITests/LocalPlaybackMatrixDeviceUITests/",
+          "iOSUITests/AudioOnlyPlaybackDeviceUITests/",
+          "iOSUITests/DeferredPauseSettlementObservationTests/",
+          "iOSUITests/HLSSeekLandingFrameGateTests/",
+          "iOSUITests/NativeRendererRecoveryEvidenceTests/",
+          "iOSUITests/NativeRendererRecoveryVisualEvidenceTests/",
+          "iOSUITests/PiPMotionRegionAnalyzerTests/",
+          "iOSUITests/VideoSurfaceMotionEvidenceTests/",
+          "iOSUITests/VideoOracleAnalyzerTests/"
+        ]
+      },
+      "outputs": []
+    },
+    {
+      "id": "harness-regressions",
+      "selection": {"kind": "exact", "testIdentifiers": ["iOSUITests/MusicPlayerUITests/test_switchingTracksKeepsTransportStateAndDoesNotCrash", "iOSUITests/PiPUITests/test_deep_toggleButtonDisabledWhenNotPossible"]},
+      "outputs": []
+    },
+    {
+      "id": "native-live",
+      "selection": {"kind": "exact", "testIdentifiers": ["iOSUITests/PiPLiveDeviceUITests/test_nativeLiveMPEGTSRendersMovingFramesInSystemPiP"]},
+      "outputs": []
+    },
+    {
+      "id": "direct-live",
+      "selection": {"kind": "exact", "testIdentifiers": ["iOSUITests/PiPLiveDeviceUITests/test_directLiveMPEGTSRendersMovingFramesInSystemPiP"]},
+      "outputs": []
+    },
+    {
+      "id": "ui-failures",
+      "selection": {"kind": "candidatePrefixes", "prefixes": ["iOSUITests/RelativeSeekUITests/", "iOSUITests/ThumbnailScrubUITests/", "iOSUITests/VolumeUITests/"]},
+      "outputs": []
+    },
+    {
+      "id": "thumbnail-preview",
+      "selection": {"kind": "exact", "testIdentifiers": ["iOSUITests/ThumbnailScrubUITests/test_deep_scrubbingKeepsPreviewStableAcrossPositions", "iOSUITests/ThumbnailScrubUITests/test_deep_scrubbingShowsPreviewTileOnceLoaded", "iOSUITests/ThumbnailScrubUITests/test_perf_firstScrubPreviewAppearsWithinBudget"]},
+      "outputs": []
+    },
+    {
+      "id": "live-media",
+      "outputs": [
+        {"scenario": "live-media", "attachmentName": "qualification-live-media.json", "testIdentifiers": ["iOSUITests/PiPLiveDeviceUITests/test_liveMediaQualificationAcrossNativeAndDirectBackends"]}
+      ]
+    },
+    {
+      "id": "background-audio",
+      "outputs": [
+        {"scenario": "background-audio", "attachmentName": "qualification-background-audio.json", "testIdentifiers": ["iOSUITests/PiPLiveDeviceUITests/test_backgroundAudioQualificationWhileAppIsBackgrounded"]}
+      ]
+    },
+    {
+      "id": "continuity",
+      "outputs": [
+        {"scenario": "replacement", "attachmentName": "qualification-replacement.json", "testIdentifiers": ["iOSUITests/PiPContinuityDeviceUITests/test_nativePiPSurvivesSamePlayerReplacement"]},
+        {"scenario": "replacement-continuity", "attachmentName": "qualification-replacement-continuity.json", "testIdentifiers": ["iOSUITests/PiPContinuityDeviceUITests/test_nativePiPReplacementContinuityAcrossVODAndLive"]}
+      ]
+    },
+    {
+      "id": "capability-convergence",
+      "outputs": [
+        {"scenario": "capability-convergence", "attachmentName": "qualification-capability-convergence.json", "testIdentifiers": ["iOSUITests/PiPCapabilityDeviceUITests/test_capabilityConvergenceAcrossNativeAndDirectBackends"]}
+      ]
+    },
+    {
+      "id": "vod-controls",
+      "outputs": [
+        {"scenario": "vod-controls", "attachmentName": "qualification-vod-controls.json", "testIdentifiers": ["iOSUITests/PiPVODControlsDeviceUITests/test_vodControlsAcrossNativeAndDirectBackends"]}
+      ]
+    },
+    {
+      "id": "long-stall",
+      "outputs": [
+        {"scenario": "long-stall", "attachmentName": "qualification-long-stall.json", "testIdentifiers": ["iOSUITests/PiPLongStallDeviceUITests/test_longStallRecoversAcrossNativeAndDirectBackends"]}
+      ]
+    },
+    {
+      "id": "failed-start",
+      "attachmentEmission": "allOutputs",
+      "outputs": [
+        {"scenario": "failed-start", "attachmentName": "qualification-failed-start.json", "testIdentifiers": ["iOSUITests/PiPDelayedStartFailureDeviceUITests/test_acceptedStartRetainsAttributionThroughDelayedFailure"]},
+        {"scenario": "accepted-start-delayed-failure", "attachmentName": "qualification-accepted-start-delayed-failure.json", "testIdentifiers": ["iOSUITests/PiPDelayedStartFailureDeviceUITests/test_acceptedStartRetainsAttributionThroughDelayedFailure"]}
+      ]
+    },
+    {
+      "id": "dismissal",
+      "outputs": [
+        {"scenario": "restore", "attachmentName": "qualification-restore.json", "testIdentifiers": ["iOSUITests/PiPDismissalDeviceUITests/test_systemRestoreAndCloseAcrossNativeAndDirectBackends"]},
+        {"scenario": "close", "attachmentName": "qualification-close.json", "testIdentifiers": ["iOSUITests/PiPDismissalDeviceUITests/test_systemRestoreAndCloseAcrossNativeAndDirectBackends"]}
+      ]
+    },
+    {
+      "id": "interruptions",
+      "outputs": [
+        {"scenario": "interruptions", "attachmentName": "qualification-interruptions.json", "testIdentifiers": ["iOSUITests/PiPInterruptionDeviceUITests/test_audioInterruptionAndRouteLossAcrossNativeAndDirectBackends"]}
+      ]
+    },
+    {
+      "id": "audio-media-services-reset",
+      "outputs": [
+        {"scenario": "audio-media-services-reset", "attachmentName": "qualification-audio-media-services-reset.json", "testIdentifiers": ["iOSUITests/MediaServicesResetDeviceUITests/test_realMediaServicesResetQuarantinesAndRebuildsBothAppleOutputs"]}
+      ]
+    },
+    {
+      "id": "audio-session-ownership",
+      "outputs": [
+        {"scenario": "audio-session-ownership", "attachmentName": "qualification-audio-session-ownership.json", "testIdentifiers": ["iOSUITests/AudioSessionOwnershipDeviceUITests/test_libraryAndApplicationManagedOwnershipIsExact"]}
+      ]
+    },
+    {
+      "id": "native-lifecycle",
+      "outputs": [
+        {"scenario": "native-lifecycle", "attachmentName": "qualification-native-lifecycle.json", "testIdentifiers": ["iOSUITests/PiPNativeLifecycleDeviceUITests/test_nativeLifecyclePublishesAuthoritativeOrderedEvents"]}
+      ]
+    },
+    {
+      "id": "playback-foreground-displaylayer-recovery",
+      "outputs": [
+        {"scenario": "playback-foreground-displaylayer-recovery", "attachmentName": "qualification-playback-foreground-displaylayer-recovery.json", "testIdentifiers": ["iOSUITests/NativeRendererRecoveryDeviceUITests/test_pausedNativeRendererRecoversAfterRealOSRevocation"]}
+      ]
+    },
+    {
+      "id": "terminal-outcomes",
+      "outputs": [
+        {"scenario": "terminal-outcomes", "attachmentName": "qualification-terminal-outcomes.json", "testIdentifiers": ["iOSUITests/TerminalOutcomesDeviceUITests/test_terminalOutcomeMatrixIsGenerationScopedAndPreReset"]}
+      ]
+    },
+    {
+      "id": "adaptive-hls-soak",
+      "outputs": [
+        {"scenario": "adaptive-hls-soak", "attachmentName": "qualification-adaptive-hls-soak.json", "testIdentifiers": ["iOSUITests/AdaptiveHLSSoakDeviceUITests/test_adaptiveHLSMatrixSoakRemainsBounded"]}
+      ]
+    },
+    {
+      "id": "pip-render-performance-1080p60",
+      "outputs": [
+        {"scenario": "pip-render-performance-1080p60", "attachmentName": "qualification-pip-render-performance-1080p60.json", "testIdentifiers": ["iOSUITests/PiPRenderPerformanceDeviceUITests/test_directPiPPerformanceRow"]}
+      ]
+    },
+    {
+      "id": "pip-render-performance-4k60",
+      "outputs": [
+        {"scenario": "pip-render-performance-4k60", "attachmentName": "qualification-pip-render-performance-4k60.json", "testIdentifiers": ["iOSUITests/PiPRenderPerformanceDeviceUITests/test_directPiPPerformanceRow"]}
+      ]
+    },
+    {
+      "id": "cadence-matrix",
+      "outputs": [
+        {"scenario": "cadence-matrix", "attachmentName": "qualification-cadence-matrix.json", "testIdentifiers": ["iOSUITests/PiPCadenceDeviceUITests/test_directPiPCadenceMatrix"]}
+      ]
+    },
+    {
+      "id": "native-subtitle-matrix",
+      "outputs": [
+        {"scenario": "native-subtitle-matrix", "attachmentName": "qualification-native-subtitle-matrix.json", "testIdentifiers": ["iOSUITests/NativeSubtitleMatrixDeviceUITests/test_nativeSubtitleMatrixIsVisibleAndBounded"]}
+      ]
+    },
+    {
+      "id": "timebase-vod-soak",
+      "outputs": [
+        {"scenario": "timebase-vod-soak", "attachmentName": "qualification-timebase-vod-soak.json", "testIdentifiers": ["iOSUITests/TimebaseSoakDeviceUITests/test_directPiPTimebaseSoak"]}
+      ]
+    },
+    {
+      "id": "timebase-live-soak",
+      "outputs": [
+        {"scenario": "timebase-live-soak", "attachmentName": "qualification-timebase-live-soak.json", "testIdentifiers": ["iOSUITests/TimebaseSoakDeviceUITests/test_directPiPTimebaseSoak"]}
+      ]
+    },
+    {
+      "id": "deferred-pause-rejection",
+      "outputs": [
+        {"scenario": "deferred-pause-rejection", "attachmentName": "qualification-deferred-pause-rejection.json", "testIdentifiers": ["iOSUITests/PiPDeferredPauseDeviceUITests/test_deferredPauseRejectionAndCancellationStayTruthful"]}
+      ]
+    },
+    {
+      "id": "hls-seek",
+      "selection": {
+        "kind": "exact",
+        "testIdentifiers": [
+          "iOSUITests/PiPOverlayDeviceUITests/test_nativePiPHLSSeeksRemainActive",
+          "iOSUITests/PiPOverlayDeviceUITests/test_nativePiPOverlayTransitionsRemainOperational"
+        ]
+      },
+      "outputs": [
+        {"scenario": "native-hls-seek-continuity", "attachmentName": "qualification-native-hls-seek-continuity.json", "testIdentifiers": ["iOSUITests/PiPOverlayDeviceUITests/test_nativePiPHLSSeeksRemainActive"]}
+      ]
+    },
+    {
+      "id": "seek-frame-oracles",
+      "outputs": [
+        {"scenario": "seek-frame-oracles", "attachmentName": "qualification-seek-frame-oracles.json", "testIdentifiers": ["iOSUITests/SeekFrameOracleDeviceUITests/test_seekAndFrameRequestsMatchDecodedContent"]}
+      ]
+    },
+    {
+      "id": "progressive-http-range-seek",
+      "outputs": [
+        {"scenario": "progressive-http-range-seek", "attachmentName": "qualification-progressive-http-range-seek.json", "testIdentifiers": ["iOSUITests/ProgressiveHTTPRangeSeekDeviceUITests/test_progressiveRangeSeekUsesFresh206AndNoRangeRejectsStrictly"]}
+      ]
+    },
+    {
+      "id": "local-file-matrix",
+      "outputs": [
+        {"scenario": "local-file-matrix", "attachmentName": "qualification-local-file-matrix.json", "testIdentifiers": ["iOSUITests/LocalPlaybackMatrixDeviceUITests/test_localFileContainerCodecMatrixProducesMovingVideo"]}
+      ]
+    },
+    {
+      "id": "audio-only-playback",
+      "outputs": [
+        {"scenario": "audio-only-playback", "attachmentName": "qualification-audio-only-playback.json", "testIdentifiers": ["iOSUITests/AudioOnlyPlaybackDeviceUITests/test_audioOnlyCodecMatrixAdvancesNativeOutput"]}
+      ]
+    }
+  ],
   "scenarios": [
     {
       "id": "vod-controls",
       "issues": [88],
-      "summary": "Finite VOD: play, pause, scrub, skip forward and back from the PiP controls",
-      "requiredEvidenceFields": ["events", "controls"],
+      "summary": "Finite VOD: play, bounded pause, scrub, forward/backward and zero-clamped relative seeks from both real PiP backends",
+      "requiredEvidenceFields": [
+        "events",
+        "controls",
+        "backendResults.native.controls",
+        "backendResults.direct.controls",
+        "systemPiPMotion.native",
+        "systemPiPMotion.direct"
+      ],
       "expectedEvidenceValues": {
         "events.started": true,
         "events.unexpectedStopCount": 0,
@@ -14,7 +278,11 @@
         "controls.pause": "pass",
         "controls.scrub": "pass",
         "controls.skipForward": "pass",
-        "controls.skipBackward": "pass"
+        "controls.skipBackward": "pass",
+        "controls.skipPastZero": "pass",
+        "controls.postBoundaryForward": "pass",
+        "systemPiPMotion.native": "pass",
+        "systemPiPMotion.direct": "pass"
       }
     },
     {
@@ -102,6 +370,84 @@
       }
     },
     {
+      "id": "audio-media-services-reset",
+      "summary": "A real Settings > Developer media-services reset quarantines forced AudioUnit and AVSampleBuffer outputs plus native PiP until exact fresh intent rebuilds and acknowledges the reset epoch",
+      "requiredEvidenceFields": [
+        "formatVersion",
+        "trigger",
+        "syntheticNotificationsPosted",
+        "mediaServicesLostNotificationCount",
+        "mediaServicesResetNotificationCount",
+        "mediaServicesNotificationSequence",
+        "quarantineObservationMilliseconds",
+        "pictureInPictureActiveBeforeReset",
+        "pictureInPictureActiveAfterRecovery",
+        "players",
+        "resetEpochProof",
+        "preIntentQuarantine",
+        "explicitResumeRecovery",
+        "forcedOutputModules",
+        "systemPiPMotionBeforeReset",
+        "systemPiPMotionAfterRecovery",
+        "sourceRequestProof",
+        "libraryErrorCount"
+      ],
+      "expectedEvidenceValues": {
+        "formatVersion": 1,
+        "trigger": "settings-developer-media-services-reset-v1",
+        "syntheticNotificationsPosted": false,
+        "pictureInPictureActiveBeforeReset": true,
+        "pictureInPictureActiveAfterRecovery": true,
+        "resetEpochProof": "pass",
+        "preIntentQuarantine": "pass",
+        "explicitResumeRecovery": "pass",
+        "forcedOutputModules": ["audiounit_ios", "avsamplebuffer"],
+        "systemPiPMotionBeforeReset": "pass",
+        "systemPiPMotionAfterRecovery": "pass",
+        "sourceRequestProof.method": "host-fixture-server-token-metrics-v2",
+        "libraryErrorCount": 0
+      }
+    },
+    {
+      "id": "audio-session-ownership",
+      "summary": "Idle construction, both forced library-managed release orders with surviving-output progress, both application-managed outputs, and staged cross-process focus proofs are retained on physical hardware",
+      "requiredEvidenceFields": [
+        "formatVersion",
+        "libraryManagedForcedModules",
+        "applicationManagedForcedModules",
+        "idleSessionBeforePlayerConstruction",
+        "idleSessionAfterPlayerConstruction",
+        "idleBrokerBeforePlayerConstruction",
+        "idleBrokerAfterPlayerConstruction",
+        "libraryManagedCycles",
+        "applicationManagedCycles",
+        "interruptionNotificationSequence",
+        "idleConstruction",
+        "multiOwnerRelease",
+        "survivingOutputContinuity",
+        "finalDeactivation",
+        "applicationManagedNonMutation",
+        "idleConstructionFocusProbe",
+        "libraryReleaseFocusProbes",
+        "applicationManagedReleaseFocusProbes",
+        "hostReleaseFocusProbe",
+        "sourceRequestProof",
+        "libraryErrorCount"
+      ],
+      "expectedEvidenceValues": {
+        "formatVersion": 3,
+        "libraryManagedForcedModules": ["audiounit_ios", "avsamplebuffer"],
+        "applicationManagedForcedModules": ["audiounit_ios", "avsamplebuffer"],
+        "idleConstruction": "pass",
+        "multiOwnerRelease": "pass",
+        "survivingOutputContinuity": "pass",
+        "finalDeactivation": "pass",
+        "applicationManagedNonMutation": "pass",
+        "sourceRequestProof.method": "host-fixture-server-token-metrics-v2",
+        "libraryErrorCount": 0
+      }
+    },
+    {
       "id": "background-audio",
       "issues": [87, 88],
       "summary": "Audio continues with the app backgrounded",
@@ -148,13 +494,31 @@
         "backendResults.direct",
         "backendResults.native",
         "transitions",
-        "skipControls"
+        "skipControls",
+        "faultInjection.rawEventsSuppressed",
+        "faultInjection.nativePlayerObserverExercised",
+        "faultInjection.nativeControllerObserverExercised",
+        "faultInjection.directPlayerObserverExercised",
+        "faultInjection.directControllerObserverExercised",
+        "faultInjection.nativePlayerLengthEvents",
+        "faultInjection.nativePlayerSeekableEvents",
+        "faultInjection.nativeControllerLengthEvents",
+        "faultInjection.nativeControllerSeekableEvents",
+        "faultInjection.directPlayerLengthEvents",
+        "faultInjection.directPlayerSeekableEvents",
+        "faultInjection.directControllerLengthEvents",
+        "faultInjection.directControllerSeekableEvents"
       ],
       "expectedEvidenceValues": {
         "backendResults.direct": "pass",
         "backendResults.native": "pass",
         "transitions": "pass",
-        "skipControls": "pass"
+        "skipControls": "pass",
+        "faultInjection.rawEventsSuppressed": true,
+        "faultInjection.nativePlayerObserverExercised": true,
+        "faultInjection.nativeControllerObserverExercised": true,
+        "faultInjection.directPlayerObserverExercised": true,
+        "faultInjection.directControllerObserverExercised": true
       }
     },
     {
@@ -193,6 +557,37 @@
         "seekResults.forward",
         "seekResults.backward",
         "seekResults.absolute",
+        "commandEvidence.forward.command",
+        "commandEvidence.forward.outcome",
+        "commandEvidence.forward.accepted",
+        "commandEvidence.forward.baselineNativeTimeMilliseconds",
+        "commandEvidence.forward.expectedTimeMilliseconds",
+        "commandEvidence.forward.landingNativeTimeMilliseconds",
+        "commandEvidence.forward.postCommandDisplayedPictures",
+        "commandEvidence.forward.displayedPicturesAtLanding",
+        "commandEvidence.forward.finalDisplayedPictures",
+        "commandEvidence.forward.commandToRecoveryMilliseconds",
+        "commandEvidence.backward.command",
+        "commandEvidence.backward.outcome",
+        "commandEvidence.backward.accepted",
+        "commandEvidence.backward.baselineNativeTimeMilliseconds",
+        "commandEvidence.backward.expectedTimeMilliseconds",
+        "commandEvidence.backward.landingNativeTimeMilliseconds",
+        "commandEvidence.backward.postCommandDisplayedPictures",
+        "commandEvidence.backward.displayedPicturesAtLanding",
+        "commandEvidence.backward.finalDisplayedPictures",
+        "commandEvidence.backward.commandToRecoveryMilliseconds",
+        "commandEvidence.absolute.command",
+        "commandEvidence.absolute.outcome",
+        "commandEvidence.absolute.accepted",
+        "commandEvidence.absolute.durationMilliseconds",
+        "commandEvidence.absolute.baselineNativeTimeMilliseconds",
+        "commandEvidence.absolute.expectedTimeMilliseconds",
+        "commandEvidence.absolute.landingNativeTimeMilliseconds",
+        "commandEvidence.absolute.postCommandDisplayedPictures",
+        "commandEvidence.absolute.displayedPicturesAtLanding",
+        "commandEvidence.absolute.finalDisplayedPictures",
+        "commandEvidence.absolute.commandToRecoveryMilliseconds",
         "events.unexpectedStopCount",
         "pipMotion",
         "inlineRecovery",
@@ -205,11 +600,168 @@
         "seekResults.forward": "pass",
         "seekResults.backward": "pass",
         "seekResults.absolute": "pass",
+        "commandEvidence.forward.command": "forward",
+        "commandEvidence.forward.outcome": "pass",
+        "commandEvidence.forward.accepted": true,
+        "commandEvidence.backward.command": "backward",
+        "commandEvidence.backward.outcome": "pass",
+        "commandEvidence.backward.accepted": true,
+        "commandEvidence.absolute.command": "absolute",
+        "commandEvidence.absolute.outcome": "pass",
+        "commandEvidence.absolute.accepted": true,
         "events.unexpectedStopCount": 0,
         "pipMotion": "pass",
         "inlineRecovery": "pass",
         "videoContinuityWithinBudget": true,
         "controls": "pass",
+        "libraryErrorCount": 0
+      }
+    },
+    {
+      "id": "seek-frame-oracles",
+      "issues": [185],
+      "hardware": ["iphone-current"],
+      "summary": "Sparse-GOP seeks and strict frame requests match independently decoded, content-coded frames",
+      "oracleContract": {
+        "seekToleranceSeconds": 0.75,
+        "preciseTargetSeconds": 23.5,
+        "fastTargetSeconds": 40.0,
+        "overlapTargetSeconds": 52.5,
+        "frameCount": 120,
+        "baselineTargetIndex": 10,
+        "baselineToleranceFrames": 2,
+        "singleAdvanceFrames": 1,
+        "burstAdvanceFrames": 20,
+        "replacementRequestCount": 12
+      },
+      "requiredEvidenceFields": [
+        "seekResults.precise",
+        "seekResults.fastKeyframe",
+        "seekResults.overlap",
+        "seekOracle.preciseTimelineSeconds",
+        "seekOracle.fastTimelineSeconds",
+        "seekOracle.overlapTimelineSeconds",
+        "seekOracle.contentSource",
+        "seekClock.preciseMilliseconds",
+        "seekClock.fastMilliseconds",
+        "seekClock.overlapMilliseconds",
+        "seekOutcomes.precise",
+        "seekOutcomes.fast",
+        "seekOutcomes.overlap",
+        "frameResults.single",
+        "frameResults.burst",
+        "frameResults.resumeClock",
+        "frameResults.eof",
+        "frameResults.replacement",
+        "frameOracle.baselineIndex",
+        "frameOracle.singleIndex",
+        "frameOracle.burstBaselineIndex",
+        "frameOracle.burstFinalIndex",
+        "frameOracle.resumeBaselineIndex",
+        "frameOracle.resumeFinalIndex",
+        "frameOracle.eofIndex",
+        "frameOracle.baselineClockMilliseconds",
+        "frameOracle.resumeClockMilliseconds",
+        "frameOracle.singleSubmittedTimeMilliseconds",
+        "frameOracle.burstSubmittedTimesMilliseconds",
+        "frameOracle.eofSubmittedTimesMilliseconds",
+        "frameOracle.contentSource",
+        "frameTerminals.single",
+        "frameTerminals.burst",
+        "frameTerminals.eof",
+        "frameTerminals.replacement",
+        "libraryErrorCount"
+      ],
+      "expectedEvidenceValues": {
+        "seekResults.precise": "pass",
+        "seekResults.fastKeyframe": "pass",
+        "seekResults.overlap": "pass",
+        "seekOracle.contentSource": "xcui-video-surface-screenshot",
+        "seekOutcomes.precise": "settled",
+        "seekOutcomes.fast": "settled",
+        "frameResults.single": "pass",
+        "frameResults.burst": "pass",
+        "frameResults.resumeClock": "pass",
+        "frameResults.eof": "pass",
+        "frameResults.replacement": "pass",
+        "frameOracle.contentSource": "xcui-video-surface-screenshot",
+        "frameTerminals.single": "submitted",
+        "libraryErrorCount": 0
+      }
+    },
+    {
+      "id": "local-file-matrix",
+      "summary": "Candidate-bound local H.264 MP4/fMP4/Matroska, VP9 WebM, and MPEG-2 TS files advance native decode, display counters, media time, and independently replayed pixels",
+      "requiredEvidenceFields": [
+        "durationSeconds",
+        "matrixOutcome",
+        "fixtureResults",
+        "libraryErrorCount"
+      ],
+      "expectedEvidenceValues": {
+        "matrixOutcome": "pass",
+        "libraryErrorCount": 0
+      }
+    },
+    {
+      "id": "progressive-http-range-seek",
+      "summary": "A candidate-bound large progressive MP4 performs a typed Range seek only after a same-attempt command marker and fresh HTTP 206, while the no-Range endpoint rejects the strict seek and continues playback",
+      "oracleContract": {
+        "fixturePath": "oracles/progressive-range.mp4",
+        "minimumFixtureBytes": 50000000,
+        "targetMilliseconds": 43500,
+        "landingBoundaryMilliseconds": 40000,
+        "seekToleranceMilliseconds": 750,
+        "maximumPrecommandBytes": 5000000,
+        "minimumPostCommandRangeStart": 10000000,
+        "firstPostMarkerRangeMustQualify": true,
+        "commandMarkerOrigin": "candidate-app-before-strict-request-seek-v1",
+        "maximumScreenshotCaptureIntervalSeconds": 1,
+        "absolutePixelTimelineDurationMilliseconds": 120000,
+        "rangeInitialOutcome": "pending",
+        "rangeTerminalOutcome": "settled",
+        "noRangeErrorDomain": "SwiftVLC.VLCError",
+        "noRangeErrorCase": "invalidState",
+        "noRangeErrorMessage": "current media is not seekable"
+      },
+      "requiredEvidenceFields": [
+        "fixture",
+        "attemptToken",
+        "rangeCase.typedSeek",
+        "rangeCase.start",
+        "rangeCase.landing",
+        "rangeCase.end",
+        "rangeCase.visualCapture",
+        "noRangeCase.typedRejection",
+        "noRangeCase.start",
+        "noRangeCase.end",
+        "noRangeCase.visualCapture",
+        "progressiveServerTranscripts",
+        "libraryErrorCount"
+      ],
+      "expectedEvidenceValues": {
+        "rangeCase.mode": "range",
+        "rangeCase.typedSeek.initialOutcome": "pending",
+        "rangeCase.typedSeek.terminalOutcome": "settled",
+        "noRangeCase.mode": "no-range",
+        "noRangeCase.typedRejection.errorDomain": "SwiftVLC.VLCError",
+        "noRangeCase.typedRejection.errorCase": "invalidState",
+        "noRangeCase.typedRejection.message": "current media is not seekable",
+        "noRangeCase.typedRejection.commandDispatched": false,
+        "libraryErrorCount": 0
+      }
+    },
+    {
+      "id": "audio-only-playback",
+      "summary": "Candidate-bound local AAC, ALAC, MP3, FLAC, Opus, and PCM files advance native audio decode, media time, and real audio-output buffers",
+      "requiredEvidenceFields": [
+        "durationSeconds",
+        "matrixOutcome",
+        "fixtureResults",
+        "libraryErrorCount"
+      ],
+      "expectedEvidenceValues": {
+        "matrixOutcome": "pass",
         "libraryErrorCount": 0
       }
     },
@@ -224,6 +776,46 @@
         "authoritativeStopReasons": true,
         "restoreExactlyOnce": true,
         "unsupportedBridgeVisible": true
+      }
+    },
+    {
+      "id": "playback-foreground-displaylayer-recovery",
+      "hardware": ["iphone-current"],
+      "summary": "Paused native video recovers a real OS renderer-resource revocation on foreground and resumes moving system-PiP pixels",
+      "requiredEvidenceFields": [
+        "formatVersion",
+        "scenario",
+        "renderingPath",
+        "trigger",
+        "syntheticNotificationsPosted",
+        "playbackStateAtBaseline",
+        "playbackStateAtEvaluation",
+        "backgroundForegroundCycles",
+        "status",
+        "reason",
+        "mechanics.baseline",
+        "mechanics.postForeground",
+        "mechanics.deltas",
+        "mechanics.checks",
+        "postRecoveryVisualOracle.captureBinding",
+        "postRecoveryVisualOracle.frameHashes",
+        "postRecoveryVisualOracle.adjacentChangedPixelRatios",
+        "postRecoveryVisualOracle.changedPixelScore"
+      ],
+      "expectedEvidenceValues": {
+        "formatVersion": 1,
+        "scenario": "playback-foreground-displaylayer-recovery",
+        "renderingPath": "native",
+        "trigger": "real-os-home-background-foreground-v1",
+        "syntheticNotificationsPosted": false,
+        "playbackStateAtBaseline": "paused",
+        "playbackStateAtEvaluation": "paused",
+        "status": "pass",
+        "reason": "native-mechanics-and-system-pip-motion-proved",
+        "mechanics.outcome": "pass",
+        "mechanics.reason": "renderer-recovered-after-real-os-revocation",
+        "postRecoveryVisualOracle.status": "pass",
+        "postRecoveryVisualOracle.surface": "system-picture-in-picture"
       }
     },
     {
@@ -267,9 +859,15 @@
       "minimumDurationSeconds": 7200,
       "summary": "Multi-hour live/VOD/event HLS soak across TS/fMP4, ABR, discontinuities, expired windows, retries, and cancellation",
       "requiredEvidenceFields": [
+        "durationSeconds",
+        "deviceObservedDurationSeconds",
+        "hostAttemptDurationSeconds",
         "playlistCoverage",
         "allocationProvenance",
         "memorySeries",
+        "playbackProgress",
+        "visualObservations",
+        "visualOracle",
         "sanitizerFindings",
         "crashes",
         "unboundedRecoveries",
@@ -290,6 +888,12 @@
       "minimumDurationSeconds": 900,
       "summary": "1080p60 direct PiP resize and replacement performance",
       "requiredEvidenceFields": [
+        "durationSeconds",
+        "deviceObservedDurationSeconds",
+        "hostAttemptDurationSeconds",
+        "samples",
+        "visualObservations",
+        "systemPiPMotionSeries",
         "metrics.cpu",
         "metrics.gpu",
         "metrics.rss",
@@ -322,6 +926,12 @@
       "minimumDurationSeconds": 900,
       "summary": "4K60 direct PiP resize and replacement performance",
       "requiredEvidenceFields": [
+        "durationSeconds",
+        "deviceObservedDurationSeconds",
+        "hostAttemptDurationSeconds",
+        "samples",
+        "visualObservations",
+        "systemPiPMotionSeries",
         "metrics.cpu",
         "metrics.gpu",
         "metrics.rss",
@@ -351,13 +961,18 @@
       "id": "native-subtitle-matrix",
       "issues": [95],
       "hardware": ["iphone-current"],
+      "minimumDurationSeconds": 900,
       "summary": "Text, styled, bitmap, forced, and live subtitles plus OSD remain correct through PiP transitions",
       "requiredEvidenceFields": [
+        "durationSeconds",
+        "deviceObservedDurationSeconds",
+        "hostAttemptDurationSeconds",
         "supportMatrix",
         "timingTransitions",
         "metrics.cpu",
         "metrics.gpu",
-        "metrics.colorHDRImpact"
+        "metrics.colorHDRImpact",
+        "metrics.samples"
       ],
       "expectedEvidenceValues": {
         "supportMatrix.text": "supported",
@@ -375,6 +990,10 @@
       "minimumDurationSeconds": 7200,
       "summary": "Multi-hour VOD direct PiP timebase and A/V drift at 0.5x, 1x, and 2x",
       "requiredEvidenceFields": [
+        "durationSeconds",
+        "deviceObservedDurationSeconds",
+        "hostAttemptDurationSeconds",
+        "rawCapture",
         "rates",
         "clockSeries",
         "corrections",
@@ -402,6 +1021,10 @@
       "minimumDurationSeconds": 7200,
       "summary": "Multi-hour live direct PiP timebase and A/V drift at supported rates",
       "requiredEvidenceFields": [
+        "durationSeconds",
+        "deviceObservedDurationSeconds",
+        "hostAttemptDurationSeconds",
+        "rawCapture",
         "rates",
         "clockSeries",
         "corrections",
@@ -429,10 +1052,21 @@
       "minimumDurationSeconds": 600,
       "summary": "23.976/24/25/29.97/30/50/59.94/60 fps and VFR cadence through rate, pause, replacement, and resize transitions",
       "requiredEvidenceFields": [
+        "durationSeconds",
+        "deviceObservedDurationSeconds",
+        "hostAttemptDurationSeconds",
+        "startedSystemUptime",
+        "samples",
+        "sourceTimestampProvenance",
+        "vmemOutputTimestampProvenance",
+        "visualObservations",
+        "visualCaptureBindings",
         "rates",
         "vfr",
         "presentationMetrics",
+        "cadenceOracle",
         "transitionResults",
+        "springboardResizeGestures",
         "fabricatedDurationCount"
       ],
       "expectedEvidenceValues": {

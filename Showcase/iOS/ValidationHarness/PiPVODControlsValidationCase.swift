@@ -131,7 +131,8 @@ struct PiPVODControlsValidationCase: View {
       try await waitUntil("PiP pause did not settle") { !player.isActive }
       let pausedTime = player.currentTime.milliseconds
       try await Task.sleep(for: .seconds(1))
-      guard abs(player.currentTime.milliseconds - pausedTime) <= 250 else {
+      let pausedAfterObservation = player.currentTime.milliseconds
+      guard abs(pausedAfterObservation - pausedTime) <= 250 else {
         throw QualificationFailure("Playback clock advanced while paused")
       }
 
@@ -150,6 +151,7 @@ struct PiPVODControlsValidationCase: View {
         return player.playbackHealth.counters.presentedVideoFrames > presentedBeforeScrub
       }
       let scrubLandedTime = player.currentTime.milliseconds
+      let presentedAfterScrub = player.playbackHealth.counters.presentedVideoFrames
       guard abs(scrubLandedTime - 15000) <= 2000 else {
         throw QualificationFailure("Absolute scrub presentation landed outside tolerance")
       }
@@ -172,19 +174,65 @@ struct PiPVODControlsValidationCase: View {
         throw QualificationFailure("Backward PiP skip moved forward or nowhere")
       }
 
+      // Intentionally overshoot the beginning through the same backend path
+      // AVKit uses. This catches signed underflow, wraparound to the end, and
+      // optimistic publication of zero without a post-seek presentation.
+      let zeroBoundaryBefore = player.currentTime.milliseconds
+      let zeroBoundaryOffset = -(zeroBoundaryBefore + 10000)
+      let presentedBeforeZeroBoundary = player.playbackHealth.counters.presentedVideoFrames
+      guard
+        await controller.performQualificationSkip(
+          bySeconds: Double(zeroBoundaryOffset) / 1000
+        )
+      else {
+        throw QualificationFailure("Overshooting relative skip did not settle")
+      }
+      let zeroBoundaryAfter = player.currentTime.milliseconds
+      guard (0...2000).contains(zeroBoundaryAfter) else {
+        throw QualificationFailure("Overshooting relative skip did not clamp near zero")
+      }
+      try await waitUntil("Zero-boundary skip produced no post-seek presentation") {
+        player.playbackHealth.counters.presentedVideoFrames > presentedBeforeZeroBoundary
+      }
+      let presentedAfterZeroBoundary = player.playbackHealth.counters.presentedVideoFrames
+
+      // Prove the boundary did not poison the seek lane or transport state.
+      let postBoundaryForwardBefore = player.currentTime.milliseconds
+      guard await controller.performQualificationSkip(bySeconds: 3) else {
+        throw QualificationFailure("Control after zero-boundary skip did not settle")
+      }
+      let postBoundaryForwardAfter = player.currentTime.milliseconds
+      guard postBoundaryForwardAfter > postBoundaryForwardBefore else {
+        throw QualificationFailure("Control after zero-boundary skip did not move forward")
+      }
+
       completedControls = ControlEvidence(
         play: "pass",
         pause: "pass",
         scrub: "pass",
         skipForward: "pass",
         skipBackward: "pass",
-        pausedTimeMilliseconds: pausedTime,
+        skipPastZero: "pass",
+        postBoundaryForward: "pass",
+        pauseObservationDurationMilliseconds: 1000,
+        maximumPausedClockDeltaMilliseconds: 250,
+        pausedBeforeMilliseconds: pausedTime,
+        pausedAfterMilliseconds: pausedAfterObservation,
         scrubTargetMilliseconds: 15000,
         scrubLandedTimeMilliseconds: scrubLandedTime,
+        presentedBeforeScrub: presentedBeforeScrub,
+        presentedAfterScrub: presentedAfterScrub,
         forwardBeforeMilliseconds: forwardBefore,
         forwardAfterMilliseconds: forwardAfter,
         backwardBeforeMilliseconds: backwardBefore,
-        backwardAfterMilliseconds: backwardAfter
+        backwardAfterMilliseconds: backwardAfter,
+        zeroBoundaryBeforeMilliseconds: zeroBoundaryBefore,
+        zeroBoundaryOffsetMilliseconds: zeroBoundaryOffset,
+        zeroBoundaryAfterMilliseconds: zeroBoundaryAfter,
+        presentedBeforeZeroBoundary: presentedBeforeZeroBoundary,
+        presentedAfterZeroBoundary: presentedAfterZeroBoundary,
+        postBoundaryForwardBeforeMilliseconds: postBoundaryForwardBefore,
+        postBoundaryForwardAfterMilliseconds: postBoundaryForwardAfter
       )
       result = "ready-for-motion-check"
     } catch is CancellationError {
@@ -263,8 +311,8 @@ struct PiPVODControlsValidationCase: View {
       Spacer()
       Text(value)
         .foregroundStyle(.secondary)
+        .accessibilityIdentifier(identifier)
     }
-    .qualificationAccessibilityValue(value, title: title, identifier: identifier)
   }
 }
 
@@ -295,13 +343,27 @@ private struct ControlEvidence: Encodable {
   let scrub: String
   let skipForward: String
   let skipBackward: String
-  let pausedTimeMilliseconds: Int64
+  let skipPastZero: String
+  let postBoundaryForward: String
+  let pauseObservationDurationMilliseconds: Int64
+  let maximumPausedClockDeltaMilliseconds: Int64
+  let pausedBeforeMilliseconds: Int64
+  let pausedAfterMilliseconds: Int64
   let scrubTargetMilliseconds: Int64
   let scrubLandedTimeMilliseconds: Int64
+  let presentedBeforeScrub: UInt64
+  let presentedAfterScrub: UInt64
   let forwardBeforeMilliseconds: Int64
   let forwardAfterMilliseconds: Int64
   let backwardBeforeMilliseconds: Int64
   let backwardAfterMilliseconds: Int64
+  let zeroBoundaryBeforeMilliseconds: Int64
+  let zeroBoundaryOffsetMilliseconds: Int64
+  let zeroBoundaryAfterMilliseconds: Int64
+  let presentedBeforeZeroBoundary: UInt64
+  let presentedAfterZeroBoundary: UInt64
+  let postBoundaryForwardBeforeMilliseconds: Int64
+  let postBoundaryForwardAfterMilliseconds: Int64
 }
 
 private struct QualificationFailure: Error, CustomStringConvertible {

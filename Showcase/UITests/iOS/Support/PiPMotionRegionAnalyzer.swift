@@ -38,6 +38,43 @@ struct PiPMotionFrame: Equatable {
   }
 }
 
+/// Distinguishes a settled SpringBoard surface from the app-switcher/home
+/// transition that immediately follows `XCUIDevice.press(.home)`.
+///
+/// A real PiP window may change several percent of the screen on every frame,
+/// so stability is defined as a bounded whole-screen delta rather than pixel
+/// equality. The motion oracle still performs the stricter region, geometry,
+/// persistence, motion, and non-black checks after this gate.
+struct PiPSystemSurfaceStabilityDetector {
+  struct Configuration: Equatable {
+    var pixelDeltaThreshold = 28
+    var maximumChangedPixelRatio = 0.12
+
+    static let physicalPiP = Self()
+  }
+
+  var configuration: Configuration = .physicalPiP
+
+  func changedPixelRatio(
+    from first: PiPMotionFrame,
+    to second: PiPMotionFrame
+  ) -> Double? {
+    guard first.width == second.width, first.height == second.height else { return nil }
+    let changed = zip(first.pixels, second.pixels).count {
+      $0.differs(from: $1, threshold: configuration.pixelDeltaThreshold)
+    }
+    return Double(changed) / Double(max(1, first.pixels.count))
+  }
+
+  func isStableTransition(
+    from first: PiPMotionFrame,
+    to second: PiPMotionFrame
+  ) -> Bool {
+    changedPixelRatio(from: first, to: second)
+      .map { $0 <= configuration.maximumChangedPixelRatio } == true
+  }
+}
+
 /// Integer coordinates in the analyzer's downsampled frame.
 struct PiPMotionRegion: Equatable {
   let x: Int
@@ -73,6 +110,11 @@ struct PiPMotionRegion: Equatable {
 }
 
 struct PiPMotionRegionAnalysis: Equatable {
+  enum CandidateSource: String, Equatable {
+    case persistentIntersection = "persistent-intersection"
+    case temporalUnion = "temporal-union"
+  }
+
   enum Failure: String, Equatable {
     case insufficientFrames = "fewer than five frames"
     case mismatchedFrameDimensions = "frame dimensions changed"
@@ -86,6 +128,7 @@ struct PiPMotionRegionAnalysis: Equatable {
   let frameWidth: Int
   let frameHeight: Int
   let region: PiPMotionRegion?
+  let candidateSource: CandidateSource?
   let failure: Failure?
   let pairMotionRatios: [Double]
   let frameNonBlackRatios: [Double]
@@ -128,7 +171,15 @@ struct PiPMotionRegionAnalyzer {
     var maximumRegionAspectRatio = 2.05
     var minimumPersistentFillRatio = 0.30
     var minimumClusterPersistentFillRatio = 0.08
+    var minimumTemporalUnionFillRatio = 0.08
     var minimumPairComponentSupportRatio = 0.35
+    var minimumTemporalPairComponentSupportRatio = 0.06
+    /// Temporal union may recover fixed PiP geometry from sparse motion, but
+    /// each supporting pair must still cover a meaningful part of both axes.
+    /// Otherwise unrelated animations can manufacture a landscape bounding
+    /// box only after changes from several moments are combined.
+    var minimumTemporalPairHorizontalCoverageRatio = 0.50
+    var minimumTemporalPairVerticalCoverageRatio = 0.50
     var minimumPairRegionAreaScale = 0.25
     /// A pair can contain much more connected motion than the persistent
     /// component (for example, a fast scene cut inside the fixed PiP window).
@@ -174,6 +225,13 @@ struct PiPMotionRegionAnalyzer {
         tileRows: tileRows
       )
     }
+    let pairComponents = pairData.map {
+      connectedComponents(
+        in: $0.activeTiles,
+        columns: tileColumns,
+        rows: tileRows
+      )
+    }
 
     var persistentCounts = [Int](repeating: 0, count: tileColumns * tileRows)
     for data in pairData {
@@ -194,7 +252,7 @@ struct PiPMotionRegionAnalyzer {
         (component: combinedComponent(persistentComponents), isCluster: true)
       )
     }
-    let evaluatedComponents = componentsToEvaluate.map {
+    let evaluatedPersistentComponents = componentsToEvaluate.map {
       evaluate(
         component: $0.component,
         frameWidth: width,
@@ -205,8 +263,7 @@ struct PiPMotionRegionAnalyzer {
           : configuration.minimumPersistentFillRatio
       )
     }
-    let largestAreaRatio = evaluatedComponents.map(\.areaRatio).max() ?? 0
-    let candidates = evaluatedComponents
+    let persistentCandidates = evaluatedPersistentComponents
       .filter(\.isPiPSized)
       .sorted {
         if $0.component.indices.count == $1.component.indices.count {
@@ -215,11 +272,89 @@ struct PiPMotionRegionAnalyzer {
         return $0.component.indices.count > $1.component.indices.count
       }
 
+    // Some real PiP fixtures deliberately keep most pixels static and move a
+    // diagonal, timestamp, checker, and a few markers. Requiring the exact
+    // same tiles to change in four of five pairs reduces that truthful window
+    // to a small non-16:9 fragment. The temporal fallback may recover geometry
+    // around a connected component that persists for the required pair count.
+    //
+    // A raw union of every active tile is unsafe: one transient bridge can join
+    // unrelated animations, after which disconnected corner motion can box a
+    // convincing landscape region. Instead, each candidate carries a stable
+    // identity core. Only pair components connected to that same core may
+    // contribute geometry or satisfy the per-pair support gate below.
+    var evaluatedTemporalComponents: [EvaluatedComponent] = []
+    for identityCore in persistentComponents {
+      let identityIndices = Set(identityCore.indices)
+      let identityPairComponents = pairComponents.compactMap { components in
+        let matches = components.filter {
+          $0.indices.contains(where: identityIndices.contains)
+        }
+        return matches.isEmpty ? nil : combinedComponent(matches)
+      }
+      // A bridge visible in only one captured frame changes both on arrival
+      // and departure, so it can contaminate two adjacent frame-pairs. Bounds
+      // must therefore be independently reached by a core-connected component
+      // in at least three pairs. Pixels may still move within those supported
+      // bounds; demanding the exact same sparse pixels would defeat the
+      // temporal fallback.
+      if
+        let component = temporallyPersistentComponent(
+          identityPairComponents,
+          minimumBoundSupport: min(3, requiredPairCount),
+          tileColumns: tileColumns
+        ) {
+        let evaluated = evaluate(
+          component: component,
+          frameWidth: width,
+          frameHeight: height,
+          tileColumns: tileColumns,
+          minimumFillRatio: configuration.minimumTemporalUnionFillRatio,
+          identityCoreIndices: identityCore.indices
+        )
+        if
+          let duplicate = evaluatedTemporalComponents.firstIndex(where: {
+            Set($0.component.indices) == Set(evaluated.component.indices)
+          }) {
+          if
+            evaluated.identityCoreIndices.count
+            > evaluatedTemporalComponents[duplicate].identityCoreIndices.count {
+            evaluatedTemporalComponents[duplicate] = evaluated
+          }
+        } else {
+          evaluatedTemporalComponents.append(evaluated)
+        }
+      }
+    }
+    let temporalCandidates = evaluatedTemporalComponents
+      .filter(\.isPiPSized)
+      .sorted {
+        if $0.component.indices.count == $1.component.indices.count {
+          return $0.region.area > $1.region.area
+        }
+        return $0.component.indices.count > $1.component.indices.count
+      }
+    let largestAreaRatio = (
+      evaluatedPersistentComponents.map(\.areaRatio)
+        + evaluatedTemporalComponents.map(\.areaRatio)
+    ).max() ?? 0
+
+    let candidates: [EvaluatedComponent]
+    let candidateSource: PiPMotionRegionAnalysis.CandidateSource
+    if !persistentCandidates.isEmpty {
+      candidates = persistentCandidates
+      candidateSource = .persistentIntersection
+    } else {
+      candidates = temporalCandidates
+      candidateSource = .temporalUnion
+    }
+
     guard let candidate = candidates.first else {
       return analysis(
         width: width,
         height: height,
         region: nil,
+        candidateSource: nil,
         failure: .noStablePiPSizedComponent,
         requiredPairCount: requiredPairCount,
         persistentComponentCount: persistentComponents.count,
@@ -235,6 +370,7 @@ struct PiPMotionRegionAnalyzer {
         width: width,
         height: height,
         region: candidate.region,
+        candidateSource: candidateSource,
         failure: .ambiguousMotionRegions,
         requiredPairCount: requiredPairCount,
         persistentComponentCount: persistentComponents.count,
@@ -245,23 +381,24 @@ struct PiPMotionRegionAnalyzer {
       )
     }
 
-    let persistentIndices = Set(candidate.component.indices)
+    let candidateIndices = Set(candidate.component.indices)
+    let identityIndices = candidateSource == .temporalUnion
+      ? Set(candidate.identityCoreIndices)
+      : candidateIndices
+    let minimumPairComponentSupportRatio = candidateSource == .temporalUnion
+      ? configuration.minimumTemporalPairComponentSupportRatio
+      : configuration.minimumPairComponentSupportRatio
     var matchingRegions: [PiPMotionRegion] = []
     var matchingPairCount = 0
     var pairMotionRatios: [Double] = []
     var sustainedMotionPairCount = 0
 
-    for data in pairData {
-      let components = connectedComponents(
-        in: data.activeTiles,
-        columns: tileColumns,
-        rows: tileRows
-      )
+    for (data, components) in zip(pairData, pairComponents) {
       let matchingComponents = components.filter {
-        $0.indices.contains { persistentIndices.contains($0) }
+        $0.indices.contains { identityIndices.contains($0) }
       }
       let match = matchingComponents.isEmpty ? nil : combinedComponent(matchingComponents)
-      let overlap = match?.indices.count { persistentIndices.contains($0) } ?? 0
+      let overlap = match?.indices.count { candidateIndices.contains($0) } ?? 0
       let supportRatio = Double(overlap) / Double(max(1, candidate.component.indices.count))
       let motionRatio = changedRatio(
         in: candidate.region,
@@ -279,10 +416,30 @@ struct PiPMotionRegionAnalyzer {
         )
         let areaScale = Double(matchedRegion.area) / Double(candidate.region.area)
         let matchedAreaRatio = Double(matchedRegion.area) / Double(width * height)
+        let horizontalCoverage = axisCoverage(
+          minimum: matchedRegion.x,
+          maximum: matchedRegion.maxX,
+          candidateMinimum: candidate.region.x,
+          candidateMaximum: candidate.region.maxX
+        )
+        let verticalCoverage = axisCoverage(
+          minimum: matchedRegion.y,
+          maximum: matchedRegion.maxY,
+          candidateMinimum: candidate.region.y,
+          candidateMaximum: candidate.region.maxY
+        )
+        let temporalCoverageIsSufficient = candidateSource != .temporalUnion
+          || (
+            horizontalCoverage
+              >= configuration.minimumTemporalPairHorizontalCoverageRatio
+              && verticalCoverage
+              >= configuration.minimumTemporalPairVerticalCoverageRatio
+          )
         guard
-          supportRatio >= configuration.minimumPairComponentSupportRatio,
+          supportRatio >= minimumPairComponentSupportRatio,
           areaScale >= configuration.minimumPairRegionAreaScale,
-          matchedAreaRatio <= configuration.maximumPairRegionAreaRatio
+          matchedAreaRatio <= configuration.maximumPairRegionAreaRatio,
+          temporalCoverageIsSufficient
         else { continue }
 
         matchingPairCount += 1
@@ -323,6 +480,7 @@ struct PiPMotionRegionAnalyzer {
       frameWidth: width,
       frameHeight: height,
       region: candidate.region,
+      candidateSource: candidateSource,
       failure: failure,
       pairMotionRatios: pairMotionRatios,
       frameNonBlackRatios: nonBlackRatios,
@@ -363,6 +521,7 @@ extension PiPMotionRegionAnalyzer {
     let aspectRatio: Double
     let fillRatio: Double
     let isPiPSized: Bool
+    let identityCoreIndices: [Int]
   }
 
   private func makePairData(
@@ -470,7 +629,8 @@ extension PiPMotionRegionAnalyzer {
     frameWidth: Int,
     frameHeight: Int,
     tileColumns: Int,
-    minimumFillRatio: Double
+    minimumFillRatio: Double,
+    identityCoreIndices: [Int] = []
   ) -> EvaluatedComponent {
     let componentRegion = region(
       for: component,
@@ -495,7 +655,8 @@ extension PiPMotionRegionAnalyzer {
       areaRatio: areaRatio,
       aspectRatio: aspectRatio,
       fillRatio: fillRatio,
-      isPiPSized: isPiPSized
+      isPiPSized: isPiPSized,
+      identityCoreIndices: identityCoreIndices
     )
   }
 
@@ -507,6 +668,43 @@ extension PiPMotionRegionAnalyzer {
       maximumColumn: components.map(\.maximumColumn).max()!,
       minimumRow: components.map(\.minimumRow).min()!,
       maximumRow: components.map(\.maximumRow).max()!
+    )
+  }
+
+  private func temporallyPersistentComponent(
+    _ components: [TileComponent],
+    minimumBoundSupport: Int,
+    tileColumns: Int
+  ) -> TileComponent? {
+    guard
+      minimumBoundSupport > 0,
+      components.count >= minimumBoundSupport
+    else { return nil }
+
+    let supportIndex = minimumBoundSupport - 1
+    let minimumColumn = components.map(\.minimumColumn).sorted()[supportIndex]
+    let maximumColumn = components.map(\.maximumColumn).sorted(by: >)[supportIndex]
+    let minimumRow = components.map(\.minimumRow).sorted()[supportIndex]
+    let maximumRow = components.map(\.maximumRow).sorted(by: >)[supportIndex]
+    guard minimumColumn <= maximumColumn, minimumRow <= maximumRow else {
+      return nil
+    }
+
+    let indices = Array(Set(components.flatMap(\.indices))).filter { index in
+      let column = index % tileColumns
+      let row = index / tileColumns
+      return column >= minimumColumn
+        && column <= maximumColumn
+        && row >= minimumRow
+        && row <= maximumRow
+    }
+    guard !indices.isEmpty else { return nil }
+    return TileComponent(
+      indices: indices,
+      minimumColumn: minimumColumn,
+      maximumColumn: maximumColumn,
+      minimumRow: minimumRow,
+      maximumRow: maximumRow
     )
   }
 
@@ -570,6 +768,19 @@ extension PiPMotionRegionAnalyzer {
     return (maximum - minimum) / Double(max(1, extent))
   }
 
+  private func axisCoverage(
+    minimum: Int,
+    maximum: Int,
+    candidateMinimum: Int,
+    candidateMaximum: Int
+  ) -> Double {
+    let overlap = max(
+      0,
+      min(maximum, candidateMaximum) - max(minimum, candidateMinimum)
+    )
+    return Double(overlap) / Double(max(1, candidateMaximum - candidateMinimum))
+  }
+
   private func divideRoundingUp(_ value: Int, by divisor: Int) -> Int {
     (value + divisor - 1) / divisor
   }
@@ -593,6 +804,7 @@ extension PiPMotionRegionAnalyzer {
     width: Int,
     height: Int,
     region: PiPMotionRegion?,
+    candidateSource: PiPMotionRegionAnalysis.CandidateSource? = nil,
     failure: PiPMotionRegionAnalysis.Failure,
     requiredPairCount: Int,
     persistentComponentCount: Int,
@@ -605,6 +817,7 @@ extension PiPMotionRegionAnalyzer {
       frameWidth: width,
       frameHeight: height,
       region: region,
+      candidateSource: candidateSource,
       failure: failure,
       pairMotionRatios: [],
       frameNonBlackRatios: [],

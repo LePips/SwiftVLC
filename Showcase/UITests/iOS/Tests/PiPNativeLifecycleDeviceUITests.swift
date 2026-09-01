@@ -14,13 +14,6 @@ final class PiPNativeLifecycleDeviceUITests: ShowcaseIOSTestCase {
       case .close: "userClosed"
       }
     }
-
-    var relativePoint: (x: Double, y: Double) {
-      switch self {
-      case .restore: (0.88, 0.18)
-      case .close: (0.12, 0.18)
-      }
-    }
   }
 
   func test_nativeLifecyclePublishesAuthoritativeOrderedEvents() throws {
@@ -190,7 +183,16 @@ final class PiPNativeLifecycleDeviceUITests: ShowcaseIOSTestCase {
 
     XCUIDevice.shared.press(.home)
     let region = try locateSystemPictureInPictureWindow()
-    tap(affordance, in: region)
+    let systemAffordances = try locateSystemPictureInPictureAffordances(
+      in: region,
+      attachmentName: "native-lifecycle-\(affordance.rawValue)"
+    )
+    switch affordance {
+    case .restore:
+      systemAffordances.restore.tap()
+    case .close:
+      systemAffordances.close.tap()
+    }
     RunLoop.current.run(until: Date().addingTimeInterval(2))
     if app.state != .runningForeground {
       app.activate()
@@ -236,26 +238,6 @@ final class PiPNativeLifecycleDeviceUITests: ShowcaseIOSTestCase {
     return required.allSatisfy { selectors[$0] == true }
       && bridge["hasAVController"] as? Bool == true
       && bridge["hasLifecycleDelegateBridge"] as? Bool == true
-  }
-
-  private func tap(
-    _ affordance: Affordance,
-    in region: SystemPictureInPictureWindowRegion
-  ) {
-    let springboard = XCUIApplication(bundleIdentifier: "com.apple.springboard")
-    RunLoop.current.run(until: Date().addingTimeInterval(3))
-    springboard.coordinate(
-      withNormalizedOffset: region.normalizedPoint(x: 0.5, y: 0.5)
-    ).tap()
-    RunLoop.current.run(until: Date().addingTimeInterval(0.4))
-
-    let point = affordance.relativePoint
-    let screenPoint = region.normalizedPoint(x: point.x, y: point.y)
-    let screenshot = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
-    screenshot.name = "native-lifecycle-\(affordance.rawValue)-controls"
-    screenshot.lifetime = .keepAlways
-    add(screenshot)
-    springboard.coordinate(withNormalizedOffset: screenPoint).tap()
   }
 
   private func decodeEvidence(_ label: String) throws -> [String: Any] {

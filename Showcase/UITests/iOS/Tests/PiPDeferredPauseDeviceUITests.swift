@@ -44,24 +44,42 @@ final class PiPDeferredPauseDeviceUITests: ShowcaseIOSTestCase {
     reveal(run)
     XCTAssertTrue(run.isEnabled)
     run.tap()
-    waitForPrefix(result, prefix: "pass:", timeout: 40)
-    XCTAssertFalse(error.exists, "Validation surface reported: \(error.label)")
+    guard waitForCompletion(result, timeout: 40) else { return }
 
     let evidence = try decodeEvidence(result.label)
+    attachQualificationEvidence(evidence, scenario: "deferred-pause-rejection")
+    guard result.label.hasPrefix("pass:") else {
+      reveal(error)
+      XCTFail("Validation surface reported: \(error.label)")
+      return
+    }
     XCTAssertEqual(value(at: ["permanentCase", "outcome"], in: evidence) as? String, "rejected")
+    XCTAssertEqual(
+      value(at: ["permanentCase", "taskStayedSettled"], in: evidence) as? Bool,
+      true
+    )
     XCTAssertEqual(value(at: ["transientCase", "outcome"], in: evidence) as? String, "issued")
+    XCTAssertEqual(
+      value(at: ["transientCase", "taskStayedSettled"], in: evidence) as? Bool,
+      true
+    )
     XCTAssertEqual(evidence["cancellationCases"] as? String, "pass")
     XCTAssertEqual(evidence["endlessTaskCount"] as? Int, 0)
     XCTAssertEqual(evidence["duplicatePauseCount"] as? Int, 0)
     XCTAssertEqual(evidence["truthfulControls"] as? Bool, true)
-    attachQualificationEvidence(evidence, scenario: "deferred-pause-rejection")
     assertNoLibraryErrors()
     #endif
   }
 
   private func decodeEvidence(_ label: String) throws -> [String: Any] {
-    let prefix = "pass:"
-    XCTAssertTrue(label.hasPrefix(prefix))
+    let prefix = if label.hasPrefix("pass:") {
+      "pass:"
+    } else if label.hasPrefix("failed:") {
+      "failed:"
+    } else {
+      ""
+    }
+    XCTAssertFalse(prefix.isEmpty, "Missing encoded qualification evidence: \(label)")
     let encoded = String(label.dropFirst(prefix.count))
     let data = try XCTUnwrap(Data(base64Encoded: encoded))
     return try XCTUnwrap(
@@ -79,20 +97,22 @@ final class PiPDeferredPauseDeviceUITests: ShowcaseIOSTestCase {
     app.descendants(matching: .any)[identifier]
   }
 
-  private func waitForPrefix(
+  private func waitForCompletion(
     _ element: XCUIElement,
-    prefix: String,
     timeout: TimeInterval
-  ) {
+  ) -> Bool {
     let predicate = NSPredicate { _, _ in
-      element.exists && element.label.hasPrefix(prefix)
+      element.exists
+        && (element.label.hasPrefix("pass:") || element.label.hasPrefix("failed:"))
     }
     let expectation = expectation(for: predicate, evaluatedWith: NSObject())
+    let result = XCTWaiter.wait(for: [expectation], timeout: timeout)
     XCTAssertEqual(
-      XCTWaiter.wait(for: [expectation], timeout: timeout),
+      result,
       .completed,
-      "Expected prefix \(prefix), got: \(element.label)"
+      "Expected encoded qualification evidence, got: \(element.label)"
     )
+    return result == .completed
   }
 
   private func reveal(_ element: XCUIElement) {

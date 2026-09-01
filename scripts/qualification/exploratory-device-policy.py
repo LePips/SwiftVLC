@@ -2,8 +2,11 @@
 from __future__ import annotations
 
 import argparse
-import json
+import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import qualification_policy as policy
 
 EXPLORATORY_HARDWARE_ID = "exploratory-future-ios"
 
@@ -16,9 +19,7 @@ def evidence_hardware_id(device_info: dict, matrix: dict) -> str | None:
         return None
 
     current_rows = [
-        row
-        for row in matrix.get("hardware", [])
-        if row.get("id") == "iphone-current"
+        row for row in matrix.get("hardware", []) if row.get("id") == "iphone-current"
     ]
     if len(current_rows) != 1:
         return None
@@ -43,8 +44,12 @@ def main() -> int:
     parser.add_argument("--matrix", type=Path, required=True)
     arguments = parser.parse_args()
 
-    device_info = json.loads(arguments.device_info.read_text())
-    matrix = json.loads(arguments.matrix.read_text())
+    try:
+        device_info = policy.load_json(arguments.device_info, "device information")
+        matrix = policy.load_json(arguments.matrix, "qualification matrix")
+    except policy.QualificationPolicyError as error:
+        print(f"Error: {error}", file=sys.stderr)
+        return 2
     hardware_id = evidence_hardware_id(device_info, matrix)
     if hardware_id is None:
         return 1

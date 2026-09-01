@@ -11,6 +11,9 @@ import subprocess
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import qualification_policy as policy
+
 
 class PerformanceTraceError(ValueError):
     pass
@@ -28,20 +31,27 @@ def trace_record(
     trace: Path,
     toc: Path,
     digest_script: Path,
+    role: str,
     template: str,
+    producer_fields: dict,
+    scenario: str,
+    target_device_identifier: str,
     artifact_directory: Path,
     evidence_directory: Path,
 ) -> dict:
     if not trace.is_dir() or not any(trace.rglob("*")):
         raise PerformanceTraceError(f"{template} trace is missing or empty")
     try:
-        toc_text = toc.read_text(errors="replace")
-    except OSError as error:
-        raise PerformanceTraceError(f"cannot read {template} trace TOC: {error}") from error
+        toc_text = toc.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as error:
+        raise PerformanceTraceError(
+            f"cannot read {template} trace TOC: {error}"
+        ) from error
     if "schema" not in toc_text.lower() and "table" not in toc_text.lower():
         raise PerformanceTraceError(f"{template} trace TOC has no recorded tables")
     staged_trace = artifact_directory / trace.name
     staged_toc = artifact_directory / toc.name
+    staged_summary = artifact_directory / f"{trace.stem}-summary.json"
     try:
         shutil.copytree(trace, staged_trace)
         shutil.copy2(toc, staged_toc)
@@ -58,15 +68,44 @@ def trace_record(
     digest = result.stdout.strip()
     if result.returncode != 0 or not SHA256.fullmatch(digest):
         raise PerformanceTraceError(f"could not digest {template} trace")
+    try:
+        summary = policy.capture_xctrace_export_summary(
+            staged_trace,
+            staged_toc,
+            scenario_id=scenario,
+            role=role,
+            template=template,
+            target_device_identifier=target_device_identifier,
+            producer_fields=producer_fields,
+        )
+        staged_summary.write_text(
+            json.dumps(summary, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+    except (OSError, policy.QualificationPolicyError) as error:
+        raise PerformanceTraceError(
+            f"cannot retain {template} xctrace export summary: {error}"
+        ) from error
     return {
         "status": "captured",
+        "artifactRole": role,
         "template": template,
         "format": "com.apple.instruments.trace",
         "runArtifact": staged_trace.relative_to(evidence_directory).as_posix(),
         "tableOfContents": staged_toc.relative_to(evidence_directory).as_posix(),
         "treeDigestAlgorithm": "swiftvlc-tree-v1",
         "treeDigest": digest,
+        "treeSizeBytes": policy.tree_size_bytes(staged_trace),
+        "treeEntryCount": policy.tree_entry_count(staged_trace),
+        "tableOfContentsDigestAlgorithm": "sha256",
+        "tableOfContentsDigest": policy.sha256_file(staged_toc),
+        "tableOfContentsSizeBytes": staged_toc.stat().st_size,
         "targetProcess": "iOS",
+        "exportSummary": staged_summary.relative_to(evidence_directory).as_posix(),
+        "exportSummaryDigestAlgorithm": "sha256",
+        "exportSummaryDigest": policy.sha256_file(staged_summary),
+        "exportSummarySizeBytes": staged_summary.stat().st_size,
+        **producer_fields,
     }
 
 
@@ -76,18 +115,28 @@ def augment(
     digest_script: Path,
 ) -> dict:
     try:
-        payload = json.loads(evidence_path.read_text())
-    except (OSError, ValueError) as error:
-        raise PerformanceTraceError(f"cannot read PiP performance evidence: {error}") from error
+        payload = policy.load_json(evidence_path, "PiP performance evidence")
+    except (OSError, policy.QualificationPolicyError) as error:
+        raise PerformanceTraceError(
+            f"cannot read PiP performance evidence: {error}"
+        ) from error
     scenario = payload.get("scenario") if isinstance(payload, dict) else None
     if scenario not in {
         "pip-render-performance-1080p60",
         "pip-render-performance-4k60",
     }:
-        raise PerformanceTraceError("performance traces belong only to a PiP performance row")
+        raise PerformanceTraceError(
+            "performance traces belong only to a PiP performance row"
+        )
     metrics = payload.get("metrics")
     if not isinstance(metrics, dict):
         raise PerformanceTraceError("performance evidence has no metrics object")
+    try:
+        producer_fields = policy.host_artifact_producer_fields(
+            payload, evidence_path.stem
+        )
+    except policy.QualificationPolicyError as error:
+        raise PerformanceTraceError(str(error)) from error
 
     artifact_directory = evidence_path.parent / "artifacts" / evidence_path.stem
     try:
@@ -103,7 +152,11 @@ def augment(
                 trace,
                 toc,
                 digest_script,
+                field,
                 template,
+                producer_fields,
+                scenario,
+                payload["deviceIdentifier"],
                 artifact_directory,
                 evidence_path.parent,
             )
@@ -119,6 +172,15 @@ def augment(
         shutil.rmtree(artifact_directory, ignore_errors=True)
         raise
     payload.pop("hostTraceRequirements", None)
+    try:
+        policy.validate_host_augmented_artifacts(
+            payload, scenario, evidence_path.parent, evidence_path.stem
+        )
+    except policy.QualificationPolicyError as error:
+        shutil.rmtree(artifact_directory, ignore_errors=True)
+        raise PerformanceTraceError(
+            f"retained performance traces failed semantic validation: {error}"
+        ) from error
     evidence_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
     return payload
 

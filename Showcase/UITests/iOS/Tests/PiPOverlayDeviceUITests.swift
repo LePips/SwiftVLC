@@ -4,6 +4,43 @@ import XCTest
 /// Visual subtitle fidelity, HDR/color behavior, and energy impact still
 /// require the Matrix H operator record on the target hardware.
 final class PiPOverlayDeviceUITests: ShowcaseIOSTestCase {
+  private struct HLSSeekEvidence: Decodable {
+    let formatVersion: Int
+    let command: String
+    let outcome: String
+    let accepted: Bool
+    let mediaGeneration: UInt64?
+    let durationMilliseconds: Int64?
+    let baselineNativeTimeMilliseconds: Int64?
+    let expectedTimeMilliseconds: Int64?
+    let landingToleranceMilliseconds: Int64?
+    let landingNativeTimeMilliseconds: Int64?
+    let postCommandDisplayedPictures: UInt64
+    let displayedPicturesAtLanding: UInt64?
+    let finalDisplayedPictures: UInt64
+    let commandToRecoveryMilliseconds: Int?
+    let failure: String?
+
+    var qualificationObject: [String: Any] {
+      [
+        "formatVersion": formatVersion,
+        "command": command,
+        "outcome": outcome,
+        "accepted": accepted,
+        "mediaGeneration": mediaGeneration ?? 0,
+        "durationMilliseconds": durationMilliseconds ?? -1,
+        "baselineNativeTimeMilliseconds": baselineNativeTimeMilliseconds ?? -1,
+        "expectedTimeMilliseconds": expectedTimeMilliseconds ?? -1,
+        "landingToleranceMilliseconds": landingToleranceMilliseconds ?? -1,
+        "landingNativeTimeMilliseconds": landingNativeTimeMilliseconds ?? -1,
+        "postCommandDisplayedPictures": postCommandDisplayedPictures,
+        "displayedPicturesAtLanding": displayedPicturesAtLanding ?? 0,
+        "finalDisplayedPictures": finalDisplayedPictures,
+        "commandToRecoveryMilliseconds": commandToRecoveryMilliseconds ?? -1
+      ]
+    }
+  }
+
   func test_nativePiPOverlayTransitionsRemainOperational() throws {
     #if targetEnvironment(simulator)
     throw XCTSkip("System Picture in Picture requires a physical iOS device")
@@ -39,7 +76,7 @@ final class PiPOverlayDeviceUITests: ShowcaseIOSTestCase {
     #endif
   }
 
-  func test_nativePiPHLSSeekAndReloadRemainActive() throws {
+  func test_nativePiPHLSSeeksRemainActive() throws {
     #if targetEnvironment(simulator)
     throw XCTSkip("System Picture in Picture requires a physical iOS device")
     #else
@@ -47,7 +84,7 @@ final class PiPOverlayDeviceUITests: ShowcaseIOSTestCase {
       throw XCTSkip("Set SWIFTVLC_PIP_SEEK_DEVICE=YES with a seekable Matrix H HLS stream")
     }
 
-    openMatrixH()
+    openMatrixH(requiresOverlayComposition: false)
     _ = startPictureInPicture()
 
     let active = app.descendants(matching: .any)[AccessibilityID.MatrixHValidation.activeLabel]
@@ -58,10 +95,14 @@ final class PiPOverlayDeviceUITests: ShowcaseIOSTestCase {
     let unexpectedStops = app.descendants(matching: .any)[
       AccessibilityID.MatrixHValidation.unexpectedStopCountLabel
     ]
-    waitForLabel(active, equals: "yes", timeout: 10)
-    waitForLabel(state, equals: "playing", timeout: 20)
-    var displayed = waitForIntegerLabel(displayedPictures, greaterThan: 0, timeout: 10)
+    revealMeasurement(active, swiping: .down)
+    waitForAccessibilityValue(active, equals: "yes", timeout: 10)
+    revealMeasurement(state, swiping: .up)
+    waitForAccessibilityValue(state, equals: "playing", timeout: 20)
+    revealMeasurement(displayedPictures, swiping: .up)
+    _ = waitForIntegerAccessibilityValue(displayedPictures, greaterThan: 0, timeout: 10)
     var maximumVideoGapMilliseconds = 0
+    var commandEvidence: [String: Any] = [:]
 
     let transitions = [
       (
@@ -84,30 +125,81 @@ final class PiPOverlayDeviceUITests: ShowcaseIOSTestCase {
       let transition = app.buttons[identifier]
       reveal(transition, swiping: .up)
       XCTAssertTrue(transition.isHittable)
-      let started = ContinuousClock.now
       transition.tap()
       let seekResult = app.descendants(matching: .any)[resultIdentifier]
-      waitForLabel(seekResult, equals: "accepted", timeout: 3)
-      displayed = waitForIntegerLabel(
-        displayedPictures,
-        greaterThan: displayed,
-        timeout: 5
+      revealMeasurement(seekResult, swiping: .down)
+      let result = try waitForHLSSeekEvidence(seekResult, timeout: 10)
+      guard result.outcome == "pass" else {
+        XCTFail("\(name) HLS seek failed: \(result.failure ?? "unknown failure")")
+        return
+      }
+      XCTAssertEqual(result.formatVersion, 1)
+      XCTAssertEqual(result.command, name)
+      XCTAssertTrue(result.accepted)
+      let generation = try XCTUnwrap(result.mediaGeneration)
+      XCTAssertGreaterThan(generation, 0)
+      let duration = try XCTUnwrap(result.durationMilliseconds)
+      XCTAssertGreaterThan(duration, 0)
+      let baselineTime = try XCTUnwrap(result.baselineNativeTimeMilliseconds)
+      let expectedTime = try XCTUnwrap(result.expectedTimeMilliseconds)
+      let landingTime = try XCTUnwrap(result.landingNativeTimeMilliseconds)
+      let tolerance = try XCTUnwrap(result.landingToleranceMilliseconds)
+      switch name {
+      case "forward":
+        XCTAssertEqual(expectedTime, min(duration, baselineTime + 10000))
+        XCTAssertEqual(expectedTime - baselineTime, 10000)
+        XCTAssertGreaterThan(landingTime, baselineTime)
+      case "backward":
+        XCTAssertEqual(expectedTime, max(0, baselineTime - 10000))
+        XCTAssertEqual(baselineTime - expectedTime, 10000)
+        XCTAssertLessThan(landingTime, baselineTime)
+      case "absolute":
+        XCTAssertEqual(expectedTime, duration / 2)
+        XCTAssertGreaterThan(
+          abs(expectedTime - baselineTime),
+          tolerance + 5000,
+          "Absolute target was close enough for ordinary playback to fake a landing"
+        )
+      default:
+        XCTFail("Unexpected HLS seek command \(name)")
+      }
+      XCTAssertLessThanOrEqual(abs(landingTime - expectedTime), tolerance)
+      let displayedAtLanding = try XCTUnwrap(result.displayedPicturesAtLanding)
+      XCTAssertGreaterThanOrEqual(
+        displayedAtLanding,
+        result.postCommandDisplayedPictures,
+        "\(name) seek landing regressed the cumulative display counter"
       )
-      let elapsed = started.duration(to: .now)
-      let gapMilliseconds = Int(elapsed / .milliseconds(1))
+      XCTAssertGreaterThan(
+        result.finalDisplayedPictures,
+        displayedAtLanding,
+        "\(name) seek published no strictly post-landing displayed frame"
+      )
+      let gapMilliseconds = try XCTUnwrap(result.commandToRecoveryMilliseconds)
+      XCTAssertGreaterThanOrEqual(gapMilliseconds, 0)
+      XCTAssertNil(result.failure)
       maximumVideoGapMilliseconds = max(maximumVideoGapMilliseconds, gapMilliseconds)
-      waitForLabel(active, equals: "yes", timeout: 5)
+      commandEvidence[name] = result.qualificationObject
+      revealMeasurement(active, swiping: .down)
+      waitForAccessibilityValue(active, equals: "yes", timeout: 5)
 
       XCUIDevice.shared.press(.home)
       if let failure = captureSystemPictureInPictureMotion() {
         XCTFail("\(name) seek PiP motion failed: \(failure)")
       }
       app.activate()
-      waitForLabel(state, equals: "playing", timeout: 10)
-      waitForLabel(active, equals: "yes", timeout: 10)
+      revealMeasurement(state, swiping: .down)
+      waitForAccessibilityValue(state, equals: "playing", timeout: 10)
+      revealMeasurement(active, swiping: .up)
+      waitForAccessibilityValue(active, equals: "yes", timeout: 10)
     }
 
-    XCTAssertEqual(Int(unexpectedStops.label), 0, "Native PiP stopped during a seek")
+    revealMeasurement(unexpectedStops, swiping: .up)
+    XCTAssertEqual(
+      Int(accessibilityValue(of: unexpectedStops)),
+      0,
+      "Native PiP stopped during a seek"
+    )
     XCTAssertLessThanOrEqual(
       maximumVideoGapMilliseconds,
       5000,
@@ -123,6 +215,7 @@ final class PiPOverlayDeviceUITests: ShowcaseIOSTestCase {
           "backward": "pass",
           "absolute": "pass"
         ],
+        "commandEvidence": commandEvidence,
         "events": ["unexpectedStopCount": 0],
         "pipMotion": "pass",
         "inlineRecovery": "pass",
@@ -138,7 +231,7 @@ final class PiPOverlayDeviceUITests: ShowcaseIOSTestCase {
     #endif
   }
 
-  private func openMatrixH() {
+  private func openMatrixH(requiresOverlayComposition: Bool = true) {
     addUIInterruptionMonitor(withDescription: "Local network permission") { alert in
       let allow = alert.buttons["Allow"]
       guard allow.exists else { return false }
@@ -155,12 +248,43 @@ final class PiPOverlayDeviceUITests: ShowcaseIOSTestCase {
     matrix.tap()
 
     let overlaySupport = app.descendants(matching: .any)["validation.matrixH.overlaySupport"]
-    reveal(overlaySupport, swiping: .up)
-    XCTAssertTrue(overlaySupport.waitForExistence(timeout: 10))
-    XCTAssertTrue(
-      overlaySupport.label.contains("composited"),
-      "The linked engine does not advertise native PiP overlay composition"
+    revealMeasurement(overlaySupport, swiping: .up)
+    if requiresOverlayComposition {
+      XCTAssertTrue(
+        accessibilityValue(of: overlaySupport).contains("composited"),
+        "The linked engine does not advertise native PiP overlay composition"
+      )
+    }
+  }
+
+  private func waitForHLSSeekEvidence(
+    _ element: XCUIElement,
+    timeout: TimeInterval
+  )
+    throws -> HLSSeekEvidence {
+    let predicate = NSPredicate { _, _ in
+      let value = self.accessibilityValue(of: element)
+      return element.exists && (value.hasPrefix("pass:") || value.hasPrefix("failed:"))
+    }
+    let expectation = expectation(for: predicate, evaluatedWith: NSObject())
+    XCTAssertEqual(
+      XCTWaiter.wait(for: [expectation], timeout: timeout),
+      .completed,
+      "Expected typed HLS seek evidence, got: \(accessibilityValue(of: element))"
     )
+    let value = accessibilityValue(of: element)
+    let prefix = try XCTUnwrap(
+      ["pass:", "failed:"].first(where: { value.hasPrefix($0) }),
+      "HLS seek row did not publish a recognized typed-evidence prefix: \(value)"
+    )
+    let data = try XCTUnwrap(Data(base64Encoded: String(value.dropFirst(prefix.count))))
+    let evidence = try JSONDecoder().decode(HLSSeekEvidence.self, from: data)
+    XCTAssertEqual(
+      value.hasPrefix("\(evidence.outcome):"),
+      true,
+      "Typed HLS outcome did not match its accessibility prefix"
+    )
+    return evidence
   }
 
   private func startPictureInPicture() -> XCUIElement {

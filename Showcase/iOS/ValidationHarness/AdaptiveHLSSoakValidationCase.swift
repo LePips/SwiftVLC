@@ -104,7 +104,6 @@ struct AdaptiveHLSSoakValidationCase: View {
       ]
       let perPhase = max(4, min(45, durationSeconds / modes.count))
       var phaseIndex = 0
-      var nextMemorySample = 0
 
       while Int(ProcessInfo.processInfo.systemUptime - started) < durationSeconds {
         let mode = modes[phaseIndex % modes.count]
@@ -124,18 +123,32 @@ struct AdaptiveHLSSoakValidationCase: View {
           throw error
         }
 
+        let phaseBaselineElapsed = Int(ProcessInfo.processInfo.systemUptime - started)
+        Self.appendProgressingMemorySample(
+          elapsedSeconds: phaseBaselineElapsed,
+          mode: mode,
+          player: player,
+          to: &memorySeries
+        )
+
         let phaseDeadline = min(
           started + Double(durationSeconds),
           ProcessInfo.processInfo.systemUptime + Double(perPhase)
         )
         var inactiveSince: TimeInterval?
+        var nextMemorySample = phaseBaselineElapsed + 15
         while ProcessInfo.processInfo.systemUptime < phaseDeadline {
           try Task.checkCancellation()
           let elapsed = Int(ProcessInfo.processInfo.systemUptime - started)
           progress = "\(elapsed)s / \(durationSeconds)s"
           if elapsed >= nextMemorySample {
-            memorySeries.append(Self.memorySample(elapsedSeconds: elapsed, player: player))
-            nextMemorySample = elapsed + 30
+            Self.appendProgressingMemorySample(
+              elapsedSeconds: elapsed,
+              mode: mode,
+              player: player,
+              to: &memorySeries
+            )
+            nextMemorySample = elapsed + 15
           }
 
           if player.state == .playing {
@@ -148,14 +161,21 @@ struct AdaptiveHLSSoakValidationCase: View {
           }
           try await Task.sleep(for: .seconds(2))
         }
+        Self.appendProgressingMemorySample(
+          elapsedSeconds: min(
+            durationSeconds,
+            Int(ProcessInfo.processInfo.systemUptime - started)
+          ),
+          mode: mode,
+          player: player,
+          to: &memorySeries
+        )
       }
 
-      memorySeries.append(
-        Self.memorySample(elapsedSeconds: durationSeconds, player: player)
-      )
       let metrics = try await serverMetrics()
       let coverage = try AdaptivePlaylistCoverage(metrics: metrics, cancellations: cancellationCount)
       let analysis = try Self.analyze(memorySeries)
+      let playbackProgress = try AdaptivePlaybackProgress(samples: memorySeries)
       let logs = await errorRecorder.snapshot
       let sanitizerFindings = logs.sanitizerFindings
       guard sanitizerFindings == 0 else {
@@ -180,6 +200,7 @@ struct AdaptiveHLSSoakValidationCase: View {
           sampleCount: memorySeries.count
         ),
         memorySeries: memorySeries,
+        playbackProgress: playbackProgress,
         memoryAnalysis: analysis,
         sanitizerFindings: sanitizerFindings,
         sanitizerInstrumentationActive: Self.addressSanitizerIsActive,
@@ -260,11 +281,15 @@ struct AdaptiveHLSSoakValidationCase: View {
       Spacer()
       Text(value)
         .foregroundStyle(.secondary)
+        .accessibilityIdentifier(identifier)
     }
-    .qualificationAccessibilityValue(value, title: title, identifier: identifier)
   }
 
-  private static func memorySample(elapsedSeconds: Int, player: Player) -> AdaptiveMemorySample {
+  private static func memorySample(
+    elapsedSeconds: Int,
+    mode: String,
+    player: Player
+  ) -> AdaptiveMemorySample {
     var info = mach_task_basic_info()
     var count = mach_msg_type_number_t(
       MemoryLayout<mach_task_basic_info>.size / MemoryLayout<natural_t>.size
@@ -281,6 +306,7 @@ struct AdaptiveHLSSoakValidationCase: View {
     let statistics = player.statistics
     return AdaptiveMemorySample(
       elapsedSeconds: elapsedSeconds,
+      mode: mode,
       residentBytes: status == KERN_SUCCESS ? info.resident_size : 0,
       mallocBytesInUse: UInt64(mallocStats.size_in_use),
       mallocBytesAllocated: UInt64(mallocStats.size_allocated),
@@ -290,6 +316,31 @@ struct AdaptiveHLSSoakValidationCase: View {
       displayedPictures: statistics?.displayedPictures ?? 0,
       demuxDiscontinuities: statistics?.demuxDiscontinuity ?? 0
     )
+  }
+
+  /// Retains only strictly chronological same-mode counter windows whose
+  /// network, decode, and display seams all advanced. A stalled poll remains
+  /// absent rather than being converted into a false progress window; if a
+  /// mode never produces a real advancing pair, `AdaptivePlaybackProgress`
+  /// fails the whole scenario.
+  private static func appendProgressingMemorySample(
+    elapsedSeconds: Int,
+    mode: String,
+    player: Player,
+    to samples: inout [AdaptiveMemorySample]
+  ) {
+    let sample = memorySample(elapsedSeconds: elapsedSeconds, mode: mode, player: player)
+    guard samples.last.map({ sample.elapsedSeconds > $0.elapsedSeconds }) ?? true else {
+      return
+    }
+    if let previous = samples.last, previous.mode == mode {
+      guard
+        sample.readBytes > previous.readBytes,
+        sample.decodedVideoFrames > previous.decodedVideoFrames,
+        sample.displayedPictures > previous.displayedPictures
+      else { return }
+    }
+    samples.append(sample)
   }
 
   private static func analyze(_ samples: [AdaptiveMemorySample]) throws -> AdaptiveMemoryAnalysis {
@@ -481,6 +532,7 @@ private struct AdaptiveAllocationProvenance: Encodable {
 
 private struct AdaptiveMemorySample: Encodable {
   let elapsedSeconds: Int
+  let mode: String
   let residentBytes: UInt64
   let mallocBytesInUse: UInt64
   let mallocBytesAllocated: UInt64
@@ -489,6 +541,60 @@ private struct AdaptiveMemorySample: Encodable {
   let decodedVideoFrames: UInt64
   let displayedPictures: UInt64
   let demuxDiscontinuities: UInt64
+}
+
+private struct AdaptivePlaybackProgress: Encodable {
+  let formatVersion = 1
+  let windowSeconds = 60
+  let modes: [String]
+  let windows: [AdaptivePlaybackProgressWindow]
+
+  init(samples: [AdaptiveMemorySample]) throws {
+    modes = [
+      "abr-high-fmp4",
+      "abr-low-ts",
+      "abr-ts",
+      "event-fmp4",
+      "live-fmp4",
+      "live-ts",
+      "retry-ts",
+      "vod-ts"
+    ]
+    windows = zip(samples, samples.dropFirst()).compactMap { previous, current in
+      guard previous.mode == current.mode else { return nil }
+      return AdaptivePlaybackProgressWindow(previous: previous, current: current)
+    }
+    guard
+      Set(windows.map(\.mode)) == Set(modes),
+      windows.allSatisfy({
+        $0.endElapsedSeconds > $0.startElapsedSeconds
+          && $0.endElapsedSeconds - $0.startElapsedSeconds <= windowSeconds
+          && $0.readBytesDelta > 0
+          && $0.decodedVideoFramesDelta > 0
+          && $0.displayedPicturesDelta > 0
+      })
+    else {
+      throw AdaptiveSoakFailure("Every adaptive mode did not produce retained playback progress")
+    }
+  }
+}
+
+private struct AdaptivePlaybackProgressWindow: Encodable {
+  let mode: String
+  let startElapsedSeconds: Int
+  let endElapsedSeconds: Int
+  let readBytesDelta: UInt64
+  let decodedVideoFramesDelta: UInt64
+  let displayedPicturesDelta: UInt64
+
+  init(previous: AdaptiveMemorySample, current: AdaptiveMemorySample) {
+    mode = current.mode
+    startElapsedSeconds = previous.elapsedSeconds
+    endElapsedSeconds = current.elapsedSeconds
+    readBytesDelta = current.readBytes - previous.readBytes
+    decodedVideoFramesDelta = current.decodedVideoFrames - previous.decodedVideoFrames
+    displayedPicturesDelta = current.displayedPictures - previous.displayedPictures
+  }
 }
 
 private struct AdaptiveMemoryAnalysis: Encodable {
@@ -525,6 +631,7 @@ private struct AdaptiveSoakEvidence: Encodable {
   let playlistCoverage: AdaptivePlaylistCoverage
   let allocationProvenance: AdaptiveAllocationProvenance
   let memorySeries: [AdaptiveMemorySample]
+  let playbackProgress: AdaptivePlaybackProgress
   let memoryAnalysis: AdaptiveMemoryAnalysis
   let sanitizerFindings: Int
   let sanitizerInstrumentationActive: Bool
