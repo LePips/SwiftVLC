@@ -259,6 +259,25 @@ class FeatureChecklistTests(unittest.TestCase):
             },
         )
         self.assertEqual(
+            controls["aom-nasm3-detection-contract"],
+            {
+                "id": "aom-nasm3-detection-contract",
+                "title": "libaom and NASM 3 consumer compatibility contract",
+                "description": (
+                    "Patch 0039 mirrors VLC's ABI-compatible libaom 3.13.2 "
+                    "update and exact archive checksum. Its executable CMake "
+                    "contract proves separate NASM 3 optimization and "
+                    "object-format probes, rejects missing capabilities, and "
+                    "reproduces libaom 3.13.1's false rejection so this failure "
+                    "is caught before native compilation."
+                ),
+                "command": (
+                    "./scripts/validate-aom-nasm3-detection.sh "
+                    "/path/to/patched-vlc-source /external/work-root"
+                ),
+            },
+        )
+        self.assertEqual(
             controls["libvlc-macho-metadata-contract"],
             {
                 "id": "libvlc-macho-metadata-contract",

@@ -24,6 +24,8 @@ MANIFEST_LINE = re.compile(r"([0-9a-f]{64})  ([!-~]+)")
 # this exact inventory and order, so deleting a line cannot silently remove a
 # validator from artifact provenance.
 ASSET_PATHS = (
+    "scripts/patches/validation/aom-nasm3-detection-probe.cmake",
+    "scripts/patches/validation/aom-nasm3-detection-source-check.py",
     "scripts/patches/validation/audio-media-services-reset-source-check.py",
     "scripts/patches/validation/effective-playback-rate-event-abi.c",
     "scripts/patches/validation/effective-playback-rate-event-abi.cpp",
@@ -39,6 +41,7 @@ ASSET_PATHS = (
     "scripts/patches/validation/vmem-picture-pts-probe.c",
     "scripts/patches/validation/vmem-picture-pts-source-check.py",
     "scripts/tests/test_pip_extension_version.py",
+    "scripts/validate-aom-nasm3-detection.sh",
     "scripts/validate-audio-media-services-reset.sh",
     "scripts/validate-effective-playback-rate-event.sh",
     "scripts/validate-native-extension-contract.sh",
@@ -54,6 +57,7 @@ ASSET_PATHS = (
 EXECUTABLE_ASSET_PATHS = (
     "scripts/patches/validation/effective-playback-rate-event-source-check.py",
     "scripts/patches/validation/vmem-picture-pts-source-check.py",
+    "scripts/validate-aom-nasm3-detection.sh",
     "scripts/validate-audio-media-services-reset.sh",
     "scripts/validate-effective-playback-rate-event.sh",
     "scripts/validate-native-extension-contract.sh",

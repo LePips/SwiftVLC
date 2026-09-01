@@ -758,6 +758,12 @@ oracle. Caches cover the libvlc xcframework, compiled build products, and SPM
 dependency checkouts. Real-output playback, system PiP,
 and long-duration acceptance remain candidate-bound physical-device gates; CI
 tests their fail-closed policy and parsers, not a simulated substitute.
+Native patch changes also run a source-only replay lane. It applies the exact
+hash-locked VLC patch sequence and executes mutation-sensitive consumer
+contracts without compiling libVLC. In particular, the libaom 3.13.2 contract
+models NASM 3's separate optimization and format help topics and proves the
+obsolete libaom 3.13.1 query still reproduces the discovered macOS x86_64
+configure failure.
 
 **Physical release qualification.** CI cannot exercise real system PiP,
 SpringBoard controls, device audio interruptions, native video output, or the
@@ -781,6 +787,7 @@ blocked until `check-qualification.sh` accepts that record.
 |---|---|
 | `scripts/setup-dev.sh` | First step for local repo work. Downloads the last-released xcframework into `Vendor/`, flips `Package.swift` to the local-path form, and points the Showcase app at the repo-local Swift package. Flags: `--force` (re-download), `--skip-download` (only flip local references). |
 | `scripts/build-libvlc.sh` | Compiles libVLC from VideoLAN source (pinned via `VLC_HASH`) into `Vendor/libvlc.xcframework`. Applies the local VLC source patches described in README. |
+| `scripts/validate-native-patch-series-source.sh` | Replays the complete hash-locked VLC patch stack in a disposable external work root and runs its fast source/mutation contracts, including libaom/NASM consumer compatibility. |
 | `scripts/fix-duplicate-symbols.sh` | Localizes `_json_parse_error` and `_json_read` in the chromecast plugin, which two VLC plugins each emit. Called automatically by `build-libvlc.sh` and `setup-dev.sh`. |
 | `scripts/release.sh` | Cuts a versioned release, uploads the xcframework asset, pins the Showcase app to that exact Swift package version, and advances `main`. |
 | `Validate SwiftVLC.command` | One-command physical-device validator for maintainers and community testers. Preflights signing and hardware, runs the complete applicable matrix unattended, and creates a privacy-scrubbed shareable report ZIP. |
@@ -863,6 +870,7 @@ resolves to the new release rather than the preceding tag.
 | `sanitize.yml` | Relevant push to `main` / manual / weekly schedule | Runs race, stress, memory, and lifecycle tests under Thread Sanitizer and Address Sanitizer outside the pull-request critical path. |
 | `fixtures.yml` | Packaging PR or push / manual | Builds the layered dynamic-host fixtures and verifies that applications load exactly one copy of libVLC when packaging topology can change. |
 | `vendor-manifest.yml` | Binary/manifest path change / manual | Verifies every xcframework slice against its checked-in archive-member manifest. |
+| `native-source-contracts.yml` | Native patch/configuration PR or push / manual | Replays every VLC patch and runs fast mutation/behavior contracts without paying for a hosted native build. |
 | `claude.yml` | Issue comment / PR mention | Claude Code bot integration. |
 
 ---

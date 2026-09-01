@@ -764,6 +764,7 @@ chromecast_metadata_warning_patch_listed=no
 chromecast_metadata_schema_patch_listed=no
 chromecast_load_transition_patch_listed=no
 apple_assembly_metadata_patch_listed=no
+aom_nasm3_detection_patch_listed=no
 swiftvlc_manifest_extension_version=""
 swiftvlc_apple_audio_session_leases_listed=no
 
@@ -823,6 +824,9 @@ if [ -n "${PATCHES_DIR}" ] && [ -d "${PATCHES_DIR}" ]; then
         if [ "$manifest_entry" = "0038-apple-assembly-metadata.patch" ]; then
             apple_assembly_metadata_patch_listed=yes
         fi
+        if [ "$manifest_entry" = "0039-aom-3.13.2-nasm-detection.patch" ]; then
+            aom_nasm3_detection_patch_listed=yes
+        fi
     done <<< "$manifest_listing"
     info "Patch manifest verified: ${#manifest_order[@]} patches"
 
@@ -834,6 +838,10 @@ if [ -n "${PATCHES_DIR}" ] && [ -d "${PATCHES_DIR}" ]; then
     if [ "$apple_assembly_metadata_patch_listed" = yes ] &&
        [ "$CLEAN_BUILD" != yes ]; then
         error "Patch 0038 requires --clean-build; cached tools, contrib configuration, or assembly objects cannot be reused."
+    fi
+    if [ "$aom_nasm3_detection_patch_listed" = yes ] &&
+       [ "$CLEAN_BUILD" != yes ]; then
+        error "Patch 0039 requires --clean-build; cached libaom configuration or objects cannot be reused."
     fi
     cd "${VLC_SRC}"
 
@@ -957,6 +965,12 @@ if [ -n "${PATCHES_DIR}" ] && [ -d "${PATCHES_DIR}" ]; then
         info "Validating Apple assembly tool and Mach-O metadata source contract..."
         "${SCRIPT_DIR}/validate-apple-assembly-metadata-patch.sh" \
             "${VLC_SRC}" "${BUILD_DIR}/validation/0038-apple-assembly-metadata"
+    fi
+
+    if [ "$aom_nasm3_detection_patch_listed" = yes ]; then
+        info "Validating libaom 3.13.2 and NASM 3 detection source contract..."
+        "${SCRIPT_DIR}/validate-aom-nasm3-detection.sh" \
+            "${VLC_SRC}" "${BUILD_DIR}/validation/0039-aom-nasm3-detection"
     fi
 
     # Patches 0035–0037 deliberately change no public API, so they have no
@@ -1976,6 +1990,7 @@ provenance_args=(
     --build-configuration-file "fix-duplicate-symbols.sh=${SCRIPT_DIR}/fix-duplicate-symbols.sh"
     --build-configuration-file "validate-libvlc-macho-metadata.py=${SCRIPT_DIR}/validate-libvlc-macho-metadata.py"
     --build-configuration-file "validate-apple-assembly-metadata-patch.sh=${SCRIPT_DIR}/validate-apple-assembly-metadata-patch.sh"
+    --build-configuration-file "validate-aom-nasm3-detection.sh=${SCRIPT_DIR}/validate-aom-nasm3-detection.sh"
     --build-configuration-file "validate-chromecast-load-transition.sh=${SCRIPT_DIR}/validate-chromecast-load-transition.sh"
     --build-configuration-file "validate-native-extension-contract.sh=${SCRIPT_DIR}/validate-native-extension-contract.sh"
     --build-configuration-file "native-extension-version-probe.c=${SCRIPT_DIR}/patches/validation/native-extension-version-probe.c"

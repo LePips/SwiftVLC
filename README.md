@@ -241,16 +241,29 @@ Needed only when bumping `VLC_HASH`, modifying build patches, or preparing a rel
 
 ```bash
 brew install autoconf automake libtool cmake pkg-config gettext
-./scripts/build-libvlc.sh --all
+./scripts/build-libvlc.sh --clean-build --all
 ```
 
-Expect a full `--all` build to take tens of minutes on Apple Silicon. The script clones VLC at a pinned commit into `scripts/.build-libvlc/`, applies the source patches below, builds every contrib (FFmpeg, dav1d, x264, libass, …) per slice, and assembles the result into `Vendor/libvlc.xcframework`.
+Expect a full `--all` build to take tens of minutes on Apple Silicon. The script clones VLC at a pinned commit into `scripts/.build-libvlc/`, applies the hash-locked patch manifest, builds every contrib (FFmpeg, dav1d, x264, libass, …) per slice, and assembles the result into `Vendor/libvlc.xcframework`.
 
 A clean all-platform build needs roughly 100 GiB of working space. The script
 checks the volume that contains the repository before compiling and fails early
 when it is too small. Keep the checkout on an external SSD when internal disk
 space is constrained: the VLC source, contrib trees, architecture builds, and
 assembled libraries all remain under `scripts/.build-libvlc/` on that volume.
+
+The inexpensive source-contract lane replays the complete ordered patch stack
+and exercises its mutation/behavior proofs without compiling VLC:
+
+```bash
+./scripts/validate-native-patch-series-source.sh \
+  --work-root /absolute/path/on/external-ssd/native-source-validation
+```
+
+That lane includes the libaom 3.13.2/NASM 3 consumer contract added after a
+real macOS x86_64 rebuild exposed libaom 3.13.1's obsolete one-topic help
+probe. It runs the fixed CMake logic against realistic split NASM 3 help and
+also proves that the old probe reproduces the failure.
 
 ### Platform selection
 

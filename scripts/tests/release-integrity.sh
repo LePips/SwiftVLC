@@ -1055,14 +1055,17 @@ manifest_lines = [
 expected_manifest_tail = [
     "dd3c672da9b7a6fcd82e6eadd298d1c5f86ce75e55d86800de8fd83683461105  0037-chromecast-load-transition-correctness.patch",
     "5f1a58d162c798b2d6f5c2a2fdac9f728279f195ef192405b80272bc2f164c59  0038-apple-assembly-metadata.patch",
+    "f78050944caf0c291cac76e28cc4238b3e407d104446e2876c6e0213923d3581  0039-aom-3.13.2-nasm-detection.patch",
 ]
-if manifest_lines[-2:] != expected_manifest_tail:
+if manifest_lines[-3:] != expected_manifest_tail:
     sys.exit(
-        "patch manifest must end with frozen 0037 followed by exact-NASM 0038: "
-        f"got {manifest_lines[-2:]}"
+        "patch manifest must end with frozen 0037/0038 followed by AOM 0039: "
+        f"got {manifest_lines[-3:]}"
     )
 
 required_validator_assets = (
+    "scripts/patches/validation/aom-nasm3-detection-probe.cmake",
+    "scripts/patches/validation/aom-nasm3-detection-source-check.py",
     "scripts/patches/validation/audio-media-services-reset-source-check.py",
     "scripts/patches/validation/effective-playback-rate-event-abi.c",
     "scripts/patches/validation/effective-playback-rate-event-abi.cpp",
@@ -1078,6 +1081,7 @@ required_validator_assets = (
     "scripts/patches/validation/vmem-picture-pts-probe.c",
     "scripts/patches/validation/vmem-picture-pts-source-check.py",
     "scripts/tests/test_pip_extension_version.py",
+    "scripts/validate-aom-nasm3-detection.sh",
     "scripts/validate-audio-media-services-reset.sh",
     "scripts/validate-effective-playback-rate-event.sh",
     "scripts/validate-native-extension-contract.sh",
@@ -1088,6 +1092,7 @@ required_validator_assets = (
 required_executable_validator_assets = (
     "scripts/patches/validation/effective-playback-rate-event-source-check.py",
     "scripts/patches/validation/vmem-picture-pts-source-check.py",
+    "scripts/validate-aom-nasm3-detection.sh",
     "scripts/validate-audio-media-services-reset.sh",
     "scripts/validate-effective-playback-rate-event.sh",
     "scripts/validate-native-extension-contract.sh",
@@ -1132,6 +1137,9 @@ if verifier_executable_asset_paths != required_executable_validator_assets:
 assembly_manifest_detection = build.index(
     'if [ "$manifest_entry" = "0038-apple-assembly-metadata.patch" ]; then'
 )
+aom_manifest_detection = build.index(
+    'if [ "$manifest_entry" = "0039-aom-3.13.2-nasm-detection.patch" ]; then'
+)
 warning_manifest_detection = build.index(
     'if [ "$manifest_entry" = "0035-chromecast-metadata-warning.patch" ]; then'
 )
@@ -1142,9 +1150,13 @@ load_transition_manifest_detection = build.index(
     'if [ "$manifest_entry" = "0037-chromecast-load-transition-correctness.patch" ]; then'
 )
 clean_build_gate = build.index('error "Patch 0038 requires --clean-build;')
+aom_clean_build_gate = build.index('error "Patch 0039 requires --clean-build;')
 patch_replay = build.index('if [ "$patch_series_matches" = yes ]; then')
 assembly_source_gate = build.index(
     'info "Validating Apple assembly tool and Mach-O metadata source contract..."'
+)
+aom_source_gate = build.index(
+    'info "Validating libaom 3.13.2 and NASM 3 detection source contract..."'
 )
 first_other_post_replay_gate = build.index(
     '# Patches 0035–0037 deliberately change no public API'
@@ -1155,9 +1167,12 @@ if not (
     < schema_manifest_detection
     < load_transition_manifest_detection
     < assembly_manifest_detection
+    < aom_manifest_detection
     < clean_build_gate
+    < aom_clean_build_gate
     < patch_replay
     < assembly_source_gate
+    < aom_source_gate
     < first_other_post_replay_gate
     < dynamic_source_edit
 ):
@@ -1176,17 +1191,33 @@ if (
     not in build
 ):
     sys.exit("build does not invoke the standalone 0038 validator exactly")
+if (
+    'if [ "$aom_nasm3_detection_patch_listed" = yes ] &&\n'
+    '       [ "$CLEAN_BUILD" != yes ]; then'
+    not in build
+):
+    sys.exit("0039 is not guarded by an exact clean-build requirement")
+if (
+    '"${SCRIPT_DIR}/validate-aom-nasm3-detection.sh" \\\n'
+    '            "${VLC_SRC}" "${BUILD_DIR}/validation/0039-aom-nasm3-detection"'
+    not in build
+):
+    sys.exit("build does not invoke the standalone 0039 validator exactly")
 
 for assignment in (
     "chromecast_metadata_warning_patch_listed=no",
     "chromecast_metadata_schema_patch_listed=no",
     "chromecast_load_transition_patch_listed=no",
+    "apple_assembly_metadata_patch_listed=no",
+    "aom_nasm3_detection_patch_listed=no",
     "chromecast_metadata_warning_patch_listed=yes",
     "chromecast_metadata_schema_patch_listed=yes",
     "chromecast_load_transition_patch_listed=yes",
+    "apple_assembly_metadata_patch_listed=yes",
+    "aom_nasm3_detection_patch_listed=yes",
 ):
     if build.count(assignment) != 1:
-        sys.exit(f"Chromecast validator selector is not initialized exactly once: {assignment}")
+        sys.exit(f"native patch selector is not initialized exactly once: {assignment}")
 load_transition_selection = build.index(
     'if [ "$chromecast_load_transition_patch_listed" = yes ]; then',
     assembly_source_gate,
@@ -1507,6 +1538,7 @@ expected_configurations = {
     "pip_extension_version.py",
     "validate-libvlc-macho-metadata.py",
     "validate-apple-assembly-metadata-patch.sh",
+    "validate-aom-nasm3-detection.sh",
     "validate-chromecast-load-transition.sh",
     "validate-native-extension-contract.sh",
     "validate-post-pin-stability.sh",
@@ -2728,6 +2760,7 @@ for release_flow_stub in \
   fix-duplicate-symbols.sh \
   validate-native-extension-contract.sh \
   validate-apple-assembly-metadata-patch.sh \
+  validate-aom-nasm3-detection.sh \
   validate-chromecast-load-transition.sh \
   validate-post-pin-stability.sh \
   verify-patch-manifest.sh; do

@@ -195,6 +195,10 @@ done
 section "Checking final patch whitespace"
 git -C "$VLC_SOURCE_ROOT" diff --check
 
+section "Validating libaom 3.13.2 and NASM 3 detection"
+"$SCRIPT_DIR/validate-aom-nasm3-detection.sh" \
+    "$VLC_SOURCE_ROOT" "$REPLAY_DIR/aom-nasm3-validation"
+
 section "Validating exact integrated extension version 8"
 "$SCRIPT_DIR/validate-native-extension-contract.sh" \
     --source-root "$VLC_SOURCE_ROOT" \
