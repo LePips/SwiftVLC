@@ -1,0 +1,61 @@
+name: Native source contracts
+
+# Replays the native VLC patch series and exercises source/mutation contracts
+# without configuring or compiling VLC. Keep this path-filtered: the expensive
+# clean Apple builds and physical-device matrix remain release evidence.
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - Sources/CLibVLC/**
+      - scripts/build-libvlc.sh
+      - scripts/native-validator-assets.sha256
+      - scripts/patches/**
+      - scripts/tests/test_pip_extension_version.py
+      - scripts/validate-*.sh
+      - scripts/verify-native-validator-assets.py
+      - scripts/verify-patch-manifest.sh
+      - .github/workflows/native-source-contracts.yml
+  push:
+    branches: [main]
+    paths:
+      - Sources/CLibVLC/**
+      - scripts/build-libvlc.sh
+      - scripts/native-validator-assets.sha256
+      - scripts/patches/**
+      - scripts/tests/test_pip_extension_version.py
+      - scripts/validate-*.sh
+      - scripts/verify-native-validator-assets.py
+      - scripts/verify-patch-manifest.sh
+      - .github/workflows/native-source-contracts.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-source-contracts-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  replay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    env:
+      GIT_TERMINAL_PROMPT: "0"
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - uses: actions/checkout@v6
+        timeout-minutes: 2
+
+      - name: Print source-contract toolchain
+        timeout-minutes: 1
+        run: |
+          git --version
+          python3 --version
+
+      - name: Replay patches and run source contracts
+        timeout-minutes: 9
+        run: >-
+          ./scripts/validate-native-patch-series-source.sh
+          --work-root "${{ runner.temp }}/swiftvlc-native-source"

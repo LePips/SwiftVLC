@@ -8,14 +8,22 @@ name: Fixtures
 # consumers double-link libvlc — that the test suite and the Showcase
 # build can't see.
 on:
+  workflow_dispatch:
   pull_request:
+    branches: [main]
     paths:
       - Package.swift
       - Fixtures/**
       - .github/workflows/fixtures.yml
-      - Sources/**
   push:
     branches: [main]
+    paths:
+      - Package.swift
+      - Fixtures/**
+      - .github/workflows/fixtures.yml
+
+permissions:
+  contents: read
 
 concurrency:
   group: fixtures-${{ github.ref }}

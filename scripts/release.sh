@@ -9,6 +9,7 @@
 #
 # Usage:
 #   ./scripts/release.sh 0.1.0
+#   ./scripts/release.sh 1.1.0-beta.1             # always a GitHub pre-release
 #   ./scripts/release.sh 0.1.0 --prepare /path/to/candidate
 #   ./scripts/release.sh 0.1.0 --candidate /path/to/candidate
 #   ./scripts/release.sh 0.1.0 --dry-run            # strip/zip/checksum only, no push
@@ -20,6 +21,15 @@ XCFW_PATH="Vendor/libvlc.xcframework"
 SHOWCASE_PROJECT="Showcase/SwiftVLCShowcase.xcodeproj/project.pbxproj"
 ZIP_NAME="libvlc.xcframework.zip"
 MAX_SIZE=$((2 * 1024 * 1024 * 1024))  # 2 GB (GitHub release asset limit)
+
+# Release re-runs the direct per-object metadata gate with the same five
+# deployment policies as build-libvlc.sh. Keep these values in sync with
+# Package.swift and the corresponding SWIFTVLC_MIN_* build constants.
+SWIFTVLC_MIN_IOS="18.0"
+SWIFTVLC_MIN_TVOS="18.0"
+SWIFTVLC_MIN_VISIONOS="2.0"
+SWIFTVLC_MIN_MACOS="15.0"
+SWIFTVLC_MIN_CATALYST="18.0"
 
 # All 8 slices the xcframework must contain. If a slice is missing, the release
 # would ship a partial artifact that fails on one of SwiftVLC's Apple platforms.
@@ -44,6 +54,7 @@ CANDIDATE_DIR=""
 CANDIDATE_SOURCE_COMMIT=""
 CANDIDATE_SOURCE_DIGEST=""
 CANDIDATE_MATRIX_CHECKSUM=""
+CANDIDATE_FEATURE_MANIFEST_CHECKSUM=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -88,9 +99,28 @@ if [[ -z "$VERSION" ]]; then
   exit 1
 fi
 
-TAG="v${VERSION}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+FEATURE_MANIFEST="$SCRIPT_DIR/qualification/feature-manifest-v1.json"
+
+# SwiftPM classifies versions from git tags, not GitHub's pre-release flag.
+# Parse the version before touching an artifact so a caller cannot use
+# `--unqualified` to publish a stable-looking tag without device qualification.
+if ! RELEASE_KIND=$(python3 "$SCRIPT_DIR/release-version-policy.py" \
+  "$VERSION" --field kind); then
+  exit 2
+fi
+if [[ "$RELEASE_KIND" == "prerelease" ]]; then
+  # Pre-release routing is version-derived. The flag remains accepted for
+  # backwards compatibility, but beta/alpha/RC versions do not require it.
+  UNQUALIFIED=true
+elif [[ "$UNQUALIFIED" == true ]]; then
+  echo "Error: --unqualified is only valid for a SemVer pre-release." >&2
+  echo "  Use a version such as 1.1.0-beta.1; stable tags require qualification." >&2
+  exit 2
+fi
+
+TAG="v${VERSION}"
 RELEASE_URL="https://github.com/$REPO/releases/download/$TAG/$ZIP_NAME"
 cd "$ROOT_DIR"
 
@@ -110,6 +140,13 @@ if [[ -n "$CANDIDATE_DIR" ]]; then
     exit 1
   }
   XCFW_PATH="$CANDIDATE_DIR/libvlc.xcframework"
+fi
+
+echo "Verifying native validator asset manifest..."
+if ! python3 "$SCRIPT_DIR/verify-native-validator-assets.py"; then
+  echo "Error: native validator asset manifest verification failed." >&2
+  echo "  Rebuild after restoring or intentionally rebinding the audited validator assets." >&2
+  exit 1
 fi
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -341,6 +378,49 @@ if [[ ${#missing_slices[@]} -gt 0 ]]; then
   exit 1
 fi
 
+# A byte-for-byte member manifest catches unreviewed plugin drift, while the
+# semantic contract prevents an intentionally regenerated manifest from
+# blessing missing renderer/Chromecast objects or Chromecast on tvOS. Run this
+# for betas, prepared candidates, and stable releases alike.
+if ! "$SCRIPT_DIR/check-libvlc-manifest.sh" --xcframework "$XCFW_PATH"; then
+  echo "Error: libVLC archive members do not satisfy the release contract." >&2
+  exit 1
+fi
+
+# Release 1.1.0's frozen patch manifest owns extension version 8 plus the 0033
+# Apple audio-session lease refinement. Probe the actual linked macOS archive
+# in this checkout before accepting its recorded provenance; current headers or
+# provenance metadata alone cannot establish the binary's runtime identity.
+echo "Verifying exact linked native extension contract..."
+if ! "$SCRIPT_DIR/validate-native-extension-contract.sh" \
+  --xcframework "$XCFW_PATH" \
+  --expected-version 8 \
+  --require-apple-audio-session-leases; then
+  echo "Error: release artifact does not implement native extension version 8 with Apple audio-session leases." >&2
+  echo "  Rebuild it from the current patch manifest before preparing a release." >&2
+  exit 1
+fi
+
+# Provenance proves which gate implementation was used by the build, but it is
+# not a substitute for evaluating the artifact in this release checkout.
+# Parse every archive member again and require exact platform/minimum metadata,
+# CPU attribution, and bounded section alignment before packaging any bytes.
+# Delete the build-time report first so a failed release audit cannot leave an
+# older PASS beside the rejected artifact. The parser then records this exact
+# release-checkout evaluation, including a structured FAIL report on violations.
+MACHO_METADATA_REPORT="$(dirname "$XCFW_PATH")/libvlc-macho-metadata.json"
+rm -f "$MACHO_METADATA_REPORT"
+echo "Verifying release artifact Mach-O platform metadata and section alignment..."
+PYTHONDONTWRITEBYTECODE=1 python3 \
+  "$SCRIPT_DIR/validate-libvlc-macho-metadata.py" \
+  --xcframework "$XCFW_PATH" \
+  --deployment-target "ios=${SWIFTVLC_MIN_IOS}" \
+  --deployment-target "tvos=${SWIFTVLC_MIN_TVOS}" \
+  --deployment-target "xros=${SWIFTVLC_MIN_VISIONOS}" \
+  --deployment-target "macos=${SWIFTVLC_MIN_MACOS}" \
+  --deployment-target "catalyst=${SWIFTVLC_MIN_CATALYST}" \
+  --json-output "$MACHO_METADATA_REPORT"
+
 # Refuse to publish a debug-configured libVLC. Run-time assertions turn
 # malformed-media edge cases into process-killing abort()s (issue #30);
 # build-libvlc.sh disables them by default. assert() embeds its stringified
@@ -448,6 +528,11 @@ SOURCE_COMMIT=$(git rev-parse HEAD)
 RELEASE_SOURCE_DIGEST=$("$SCRIPT_DIR/release-source-digest.py" "$VERSION")
 QUALIFICATION_MATRIX_CHECKSUM=$(shasum -a 256 \
   "$SCRIPT_DIR/qualification/matrix.json" | cut -d' ' -f1)
+if [[ ! -f "$FEATURE_MANIFEST" ]]; then
+  echo "Error: release feature policy is missing: $FEATURE_MANIFEST" >&2
+  exit 1
+fi
+FEATURE_MANIFEST_CHECKSUM=$(shasum -a 256 "$FEATURE_MANIFEST" | cut -d' ' -f1)
 
 # ── Artifact freshness ────────────────────────────────────────────────────────
 #
@@ -485,7 +570,16 @@ verify_artifact_provenance() {
     --pinned-revision "$current_pin" \
     --patch-manifest "$SCRIPT_DIR/patches/manifest.sha256" \
     --build-configuration-file "build-libvlc.sh=$SCRIPT_DIR/build-libvlc.sh" \
-    --build-configuration-file "fix-duplicate-symbols.sh=$SCRIPT_DIR/fix-duplicate-symbols.sh"; then
+    --build-configuration-file "fix-duplicate-symbols.sh=$SCRIPT_DIR/fix-duplicate-symbols.sh" \
+    --build-configuration-file "validate-libvlc-macho-metadata.py=$SCRIPT_DIR/validate-libvlc-macho-metadata.py" \
+    --build-configuration-file "validate-apple-assembly-metadata-patch.sh=$SCRIPT_DIR/validate-apple-assembly-metadata-patch.sh" \
+    --build-configuration-file "validate-chromecast-load-transition.sh=$SCRIPT_DIR/validate-chromecast-load-transition.sh" \
+    --build-configuration-file "validate-native-extension-contract.sh=$SCRIPT_DIR/validate-native-extension-contract.sh" \
+    --build-configuration-file "native-extension-version-probe.c=$SCRIPT_DIR/patches/validation/native-extension-version-probe.c" \
+    --build-configuration-file "pip_extension_version.py=$SCRIPT_DIR/patches/validation/pip_extension_version.py" \
+    --build-configuration-file "validate-post-pin-stability.sh=$SCRIPT_DIR/validate-post-pin-stability.sh" \
+    --build-configuration-file "native-validator-assets.sha256=$SCRIPT_DIR/native-validator-assets.sha256" \
+    --build-configuration-file "verify-native-validator-assets.py=$SCRIPT_DIR/verify-native-validator-assets.py"; then
     echo "  Rebuild so every shipped slice and input has current provenance:" >&2
     echo "    ./scripts/build-libvlc.sh --clean-build --all" >&2
     return 1
@@ -544,6 +638,7 @@ required = {
     "releaseSourceDigestAlgorithm",
     "releaseSourceDigest",
     "qualificationMatrixChecksum",
+    "featureManifestChecksum",
 }
 missing = sorted(required - candidate.keys())
 if missing:
@@ -564,6 +659,7 @@ for field, length in (
     ("reproducibilityChecksum", 64),
     ("releaseSourceDigest", 64),
     ("qualificationMatrixChecksum", 64),
+    ("featureManifestChecksum", 64),
 ):
     value = candidate[field]
     if not isinstance(value, str) or not re.fullmatch(
@@ -578,6 +674,7 @@ print(candidate["sourceCommit"])
 print(candidate["releaseSourceDigestAlgorithm"])
 print(candidate["releaseSourceDigest"])
 print(candidate["qualificationMatrixChecksum"])
+print(candidate["featureManifestChecksum"])
 PY
 )
   CANDIDATE_TREE_DIGEST=$(printf '%s\n' "$CANDIDATE_VALUES" | sed -n '1p')
@@ -588,6 +685,8 @@ PY
   CANDIDATE_SOURCE_DIGEST_ALGORITHM=$(printf '%s\n' "$CANDIDATE_VALUES" | sed -n '6p')
   CANDIDATE_SOURCE_DIGEST=$(printf '%s\n' "$CANDIDATE_VALUES" | sed -n '7p')
   CANDIDATE_MATRIX_CHECKSUM=$(printf '%s\n' "$CANDIDATE_VALUES" | sed -n '8p')
+  CANDIDATE_FEATURE_MANIFEST_CHECKSUM=$(printf '%s\n' \
+    "$CANDIDATE_VALUES" | sed -n '9p')
 
   ACTUAL_TREE_DIGEST=$("$SCRIPT_DIR/artifact-tree-digest.py" "$WORK_XCFW")
   CHECKSUM=$(swift package compute-checksum "$ZIP_PATH")
@@ -621,6 +720,10 @@ PY
     echo "Error: the qualification matrix changed after candidate creation." >&2
     exit 1
   fi
+  if [[ "$FEATURE_MANIFEST_CHECKSUM" != "$CANDIDATE_FEATURE_MANIFEST_CHECKSUM" ]]; then
+    echo "Error: the release feature policy changed after candidate creation." >&2
+    exit 1
+  fi
   if ! git cat-file -e "${CANDIDATE_SOURCE_COMMIT}^{commit}" 2>/dev/null || \
       ! git merge-base --is-ancestor "$CANDIDATE_SOURCE_COMMIT" HEAD; then
     echo "Error: candidate source commit is not an ancestor of the release checkout." >&2
@@ -640,22 +743,24 @@ PY
 else
   WORK_DIR=$(make_temp_dir)
   WORK_XCFW="$WORK_DIR/libvlc.xcframework"
+  RELEASE_PROVENANCE="$(dirname "$XCFW_PATH")/libvlc-provenance.json"
+  RELEASE_REPRODUCIBILITY="$(dirname "$XCFW_PATH")/libvlc-reproducibility.json"
 
   echo "Copying xcframework to temp dir..."
-  cp -R "$XCFW_PATH" "$WORK_XCFW"
+  "$SCRIPT_DIR/canonical-libvlc-artifact.sh" stage \
+    "$XCFW_PATH" "$WORK_XCFW" "$RELEASE_PROVENANCE"
 
   echo "Verifying duplicate symbols in release-ready libraries..."
   "$SCRIPT_DIR/fix-duplicate-symbols.sh" --verify "$WORK_XCFW"
 
-  RELEASE_PROVENANCE="$(dirname "$XCFW_PATH")/libvlc-provenance.json"
-  RELEASE_REPRODUCIBILITY="$(dirname "$XCFW_PATH")/libvlc-reproducibility.json"
   python3 "$SCRIPT_DIR/libvlc-provenance.py" verify-proof \
     --proof "$RELEASE_REPRODUCIBILITY" \
     --provenance "$RELEASE_PROVENANCE"
 
   echo "Creating zip..."
   ZIP_PATH="$WORK_DIR/$ZIP_NAME"
-  (cd "$WORK_DIR" && ditto -c -k --keepParent libvlc.xcframework "$ZIP_NAME")
+  "$SCRIPT_DIR/canonical-libvlc-artifact.sh" archive \
+    "$WORK_XCFW" "$ZIP_PATH" "$RELEASE_PROVENANCE"
 
   echo "Computing checksum..."
   CHECKSUM=$(swift package compute-checksum "$ZIP_PATH")
@@ -679,7 +784,8 @@ if [[ -n "$PREPARE_DIR" ]]; then
   fi
   mkdir -p "$(dirname "$PREPARE_DIR")"
   mkdir "$PREPARE_DIR"
-  cp -R "$WORK_XCFW" "$PREPARE_DIR/libvlc.xcframework"
+  "$SCRIPT_DIR/canonical-libvlc-artifact.sh" stage \
+    "$WORK_XCFW" "$PREPARE_DIR/libvlc.xcframework" "$RELEASE_PROVENANCE"
   cp "$ZIP_PATH" "$PREPARE_DIR/$ZIP_NAME"
   cp "$RELEASE_PROVENANCE" "$PREPARE_DIR/libvlc-provenance.json"
   cp "$RELEASE_REPRODUCIBILITY" "$PREPARE_DIR/libvlc-reproducibility.json"
@@ -697,6 +803,7 @@ if [[ -n "$PREPARE_DIR" ]]; then
     SOURCE_COMMIT="$SOURCE_COMMIT" \
     RELEASE_SOURCE_DIGEST="$RELEASE_SOURCE_DIGEST" \
     QUALIFICATION_MATRIX_CHECKSUM="$QUALIFICATION_MATRIX_CHECKSUM" \
+    FEATURE_MANIFEST_CHECKSUM="$FEATURE_MANIFEST_CHECKSUM" \
     python3 - "$PREPARE_DIR/release-candidate.json" <<'PY'
 import json
 import os
@@ -713,6 +820,7 @@ candidate = {
     "releaseSourceDigestAlgorithm": "swiftvlc-git-tree-v1",
     "releaseSourceDigest": os.environ["RELEASE_SOURCE_DIGEST"],
     "qualificationMatrixChecksum": os.environ["QUALIFICATION_MATRIX_CHECKSUM"],
+    "featureManifestChecksum": os.environ["FEATURE_MANIFEST_CHECKSUM"],
 }
 with open(sys.argv[1], "w") as output:
     json.dump(candidate, output, indent=2, sort_keys=True)
@@ -729,13 +837,15 @@ if [[ -n "$PREPARE_DIR" ]]; then
 elif [[ "$UNQUALIFIED" == true ]]; then
   echo "WARNING: releasing WITHOUT device qualification."
   echo "  Publishing as a pre-release. It must not be described as qualified,"
-  echo "  and the device matrix in scripts/qualification still owes a run."
+  echo "  and the device/feature gates in scripts/qualification remain owed."
 elif [[ "$DRY_RUN" == true ]]; then
   echo "Dry run only; no device qualification is claimed."
 else
   if ! SWIFTVLC_CANDIDATE_SOURCE_COMMIT="$CANDIDATE_SOURCE_COMMIT" \
     SWIFTVLC_CANDIDATE_SOURCE_DIGEST="$CANDIDATE_SOURCE_DIGEST" \
     SWIFTVLC_CANDIDATE_MATRIX_CHECKSUM="$CANDIDATE_MATRIX_CHECKSUM" \
+    SWIFTVLC_CANDIDATE_FEATURE_MANIFEST_CHECKSUM="$CANDIDATE_FEATURE_MANIFEST_CHECKSUM" \
+    SWIFTVLC_FEATURE_MANIFEST="$FEATURE_MANIFEST" \
     "$SCRIPT_DIR/check-qualification.sh" "$VERSION" "$WORK_XCFW"; then
     echo "" >&2
     echo "  Qualify the prepared candidate before publishing stable." >&2
@@ -830,7 +940,7 @@ fi
 QUALIFICATION_NOTE=""
 if [[ "$UNQUALIFIED" == true ]]; then
   RELEASE_FLAGS+=(--prerelease)
-  QUALIFICATION_NOTE=$'\n> **Not device-qualified.** The physical-device matrix in `scripts/qualification` has not been executed against this artifact. Published as a pre-release for that reason.\n'
+  QUALIFICATION_NOTE=$'\n> **Not release-qualified.** The physical-device matrix and required feature policy in `scripts/qualification` have not both been satisfied for this artifact. Published as a pre-release for that reason.\n'
 fi
 
 gh release create "$TAG" "${RELEASE_ASSETS[@]}" \

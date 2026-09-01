@@ -6,9 +6,16 @@ name: Tests
 # `push` to `main` means branch pushes only run under the PR; `main` still
 # gets CI on direct pushes / merges.
 on:
+  workflow_dispatch:
   pull_request:
+    branches: [main]
   push:
     branches: [main]
+
+# CI consumes source and immutable release artifacts only. Keep the workflow
+# token unable to tag, push, publish a release, or mutate repository state.
+permissions:
+  contents: read
 
 # Cancel superseded runs on the same branch so stale pushes don't burn billing.
 concurrency:
@@ -30,8 +37,12 @@ jobs:
 
       - name: Install swiftlint and swiftformat
         timeout-minutes: 3
+        env:
+          # GitHub's macOS images are refreshed regularly. Updating every
+          # Homebrew formula before installing two tools adds paid minutes and
+          # makes the lint gate depend on unrelated formula changes.
+          HOMEBREW_NO_AUTO_UPDATE: "1"
         run: |
-          brew update >/dev/null
           brew install swiftlint swiftformat
           swiftlint --version
           swiftformat --version
@@ -72,6 +83,20 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: ./scripts/check-engine-coverage.sh
 
+      # The accounting parser is part of the PR gate, so test it independently
+      # of the Swift build. A parser regression must not turn a broad but skipped
+      # run into a false green result.
+      - name: Test CI behavior-accounting gate
+        timeout-minutes: 1
+        run: python3 -B -m unittest discover -s scripts/ci/tests -p 'test_*.py'
+
+      # The real-device lane is intentionally local, but its fail-closed policy,
+      # report assembly, feature/risk mapping, and device parsing are pure
+      # Python and cheap enough to verify on every pull request.
+      - name: Test physical-qualification policy
+        timeout-minutes: 2
+        run: python3 -B -m unittest discover -s scripts/qualification/tests -p 'test_*.py'
+
   # Showcase apps build gate. Catches API breakage that the SwiftVLC
   # test suite wouldn't notice — e.g. renaming a public symbol used
   # only by the Showcase, or breaking the Showcase's Mac/iOS/tvOS/visionOS
@@ -82,6 +107,10 @@ jobs:
   # checkout so the Showcase compiles against the in-PR code rather
   # than the last release.
   showcase:
+    # Pull requests compile the iOS Showcase in `ios-build` below. The full
+    # four-platform matrix remains post-merge/manual evidence without charging
+    # for it both immediately before and immediately after every merge.
+    if: github.event_name != 'pull_request'
     # Xcode's package graph resolver checks Package.swift's tools-version
     # with Xcode's built-in SwiftPM, not the open-source toolchain passed
     # through `-toolchain`. SwiftVLC's manifest requires Swift 6.3, so the
@@ -200,12 +229,34 @@ jobs:
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGNING_ALLOWED=NO
 
+      # Reuse this already-provisioned Xcode/Vendor job for the one Showcase
+      # build required on a pull request. The other Apple platforms run in the
+      # post-merge/manual matrix above.
+      - name: Build iOS Showcase against pull-request sources
+        if: github.event_name == 'pull_request'
+        timeout-minutes: 15
+        run: |
+          xcodebuild build \
+            -project Showcase/SwiftVLCShowcase.xcodeproj \
+            -scheme iOS \
+            -destination "generic/platform=iOS" \
+            -configuration Debug \
+            -skipPackagePluginValidation \
+            -skipMacroValidation \
+            ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO
+
   # tvOS test-run gate. The `test` job below runs `swift test` on the macOS
   # host, which only type-checks the macOS slice of the test target — the
   # tvOS slices of Sources and Tests are never *executed* anywhere else.
   # This job runs the SwiftVLCTests suite on a tvOS simulator against real
   # libVLC, so tvOS-only runtime breakage can't reach `main` unseen.
   tvos-test:
+    # The iOS compile gate catches pull-request source/test breakage. Keep the
+    # slower tvOS simulator execution as post-merge/manual platform evidence.
+    if: github.event_name != 'pull_request'
     # Same rationale as ios-build: xcodebuild resolves the package with
     # Xcode's built-in SwiftPM, which must understand the manifest's Swift
     # 6.3 tools-version — needs Xcode 26.4+, hence macos-26.
@@ -392,8 +443,38 @@ jobs:
         # Swift 6.3.1 toolchain installed above, while still using the
         # Xcode-provided SDKs/simulators.
         run: |
+          mkdir -p .build/ci-results
           ./scripts/ci-run-with-timeouts.py 600 180 \
-            xcrun --toolchain "$TOOLCHAINS" swift test --no-parallel --enable-code-coverage
+            xcrun --toolchain "$TOOLCHAINS" swift test \
+              --no-parallel \
+              --enable-code-coverage \
+              --xunit-output .build/ci-results/swiftpm.xml
+
+      # Test count alone is not evidence: many real-output tests intentionally
+      # skip under CI=true. Require the headless contracts that cross meaningful
+      # native boundaries to have actually passed, publish every reported skip,
+      # and reject growth in the source-level canPlayMedia skip debt. This runs
+      # even after a failing test step so the job summary still explains what ran.
+      - name: Audit executed and skipped behavior contracts
+        if: ${{ always() }}
+        timeout-minutes: 1
+        run: |
+          # SwiftPM appends the runner kind to the requested xUnit basename.
+          python3 -B scripts/ci/audit-test-results.py \
+            --xunit .build/ci-results/swiftpm-swift-testing.xml \
+            --contract scripts/ci/headless-test-contracts.json \
+            --test-source-root Tests/SwiftVLCTests \
+            --json-output .build/ci-results/test-accounting.json \
+            --github-summary "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload test execution accounting
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: swiftpm-test-accounting
+          path: .build/ci-results
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Export coverage report
         timeout-minutes: 1

@@ -1,17 +1,17 @@
 name: Sanitizers
 
 # Sanitizer runs are slower than the regular test job (TSan instruments
-# every memory access, ~3-5x slowdown; ASan ~2x slowdown), so they run
-# only on PRs that touch concurrency-sensitive code, on push to main,
-# or weekly to catch regressions in dependencies.
+# every memory access, ~3-5x slowdown; ASan ~2x slowdown). Pull requests run
+# the deterministic race/lifecycle suites without instrumentation; the two
+# expensive sanitizer variants run after merge, manually, and weekly.
 #
 # Scoped to the race/lifecycle/memory test suites — these are the suites
 # that exist *because* of races. Running the full test suite under
 # sanitizers would inflate CI minutes without proportional benefit.
 on:
+  workflow_dispatch:
   push:
     branches: [main]
-  pull_request:
     paths:
       - 'Sources/SwiftVLC/Player/**'
       - 'Sources/SwiftVLC/PiP/**'
@@ -32,6 +32,9 @@ on:
     # Weekly run on Monday 03:00 UTC catches sanitizer regressions in
     # libVLC, Swift toolchain, or transitive deps even when no PR opens.
     - cron: '0 3 * * 1'
+
+permissions:
+  contents: read
 
 concurrency:
   group: sanitize-${{ github.ref }}

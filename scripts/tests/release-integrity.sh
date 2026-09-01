@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Keep Python imports from dirtying the release source tree with bytecode caches.
+export PYTHONDONTWRITEBYTECODE=1
+
 SCRIPT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 temp_dir=$(mktemp -d "${TMPDIR:-/tmp}/swiftvlc-release-tests.XXXXXX")
@@ -10,6 +13,100 @@ fail() {
   echo "FAIL: $1" >&2
   exit 1
 }
+
+python3 "$SCRIPT_DIR/verify-native-validator-assets.py" >/dev/null || \
+  fail "repository native validator asset manifest is not current"
+
+# Native validation is executable release evidence, not an untracked build
+# convenience. Exercise the standalone asset-manifest verifier in an isolated
+# repository-shaped fixture so drift, omission, and duplicate entries all fail
+# before an expensive libVLC build begins.
+validator_asset_fixture="$temp_dir/validator-assets"
+mkdir -p "$validator_asset_fixture"
+validator_asset_listing=$(
+  python3 "$SCRIPT_DIR/verify-native-validator-assets.py" --list
+)
+while IFS= read -r relative; do
+  [[ -n "$relative" ]] || continue
+  mkdir -p "$validator_asset_fixture/$(dirname "$relative")"
+  printf 'fixture for %s\n' "$relative" > "$validator_asset_fixture/$relative"
+  chmod 0644 "$validator_asset_fixture/$relative"
+  case "$relative" in
+    scripts/patches/validation/effective-playback-rate-event-source-check.py|\
+    scripts/patches/validation/vmem-picture-pts-source-check.py|\
+    scripts/validate-*.sh)
+      chmod 0755 "$validator_asset_fixture/$relative"
+      ;;
+  esac
+done <<< "$validator_asset_listing"
+
+python3 "$SCRIPT_DIR/verify-native-validator-assets.py" \
+  --root "$validator_asset_fixture" --update >/dev/null
+python3 "$SCRIPT_DIR/verify-native-validator-assets.py" \
+  --root "$validator_asset_fixture" >/dev/null
+validator_manifest_before=$(shasum -a 256 \
+  "$validator_asset_fixture/scripts/native-validator-assets.sha256" | cut -d' ' -f1)
+python3 "$SCRIPT_DIR/verify-native-validator-assets.py" \
+  --root "$validator_asset_fixture" --update >/dev/null
+validator_manifest_after=$(shasum -a 256 \
+  "$validator_asset_fixture/scripts/native-validator-assets.sha256" | cut -d' ' -f1)
+[[ "$validator_manifest_before" == "$validator_manifest_after" ]] || \
+  fail "native validator asset manifest update is nondeterministic"
+
+cp -R "$validator_asset_fixture" "$temp_dir/validator-assets-drift"
+printf 'drift\n' >> \
+  "$temp_dir/validator-assets-drift/scripts/validate-strict-frame-step.sh"
+if python3 "$SCRIPT_DIR/verify-native-validator-assets.py" \
+  --root "$temp_dir/validator-assets-drift" \
+  >"$temp_dir/validator-assets-drift.log" 2>&1; then
+  fail "native validator asset drift was accepted"
+fi
+grep -q 'native validator asset hash mismatch' \
+  "$temp_dir/validator-assets-drift.log" || \
+  fail "native validator drift did not produce a fail-closed diagnostic"
+
+cp -R "$validator_asset_fixture" "$temp_dir/validator-assets-mode-drift"
+chmod 0755 \
+  "$temp_dir/validator-assets-mode-drift/scripts/tests/test_pip_extension_version.py"
+if python3 "$SCRIPT_DIR/verify-native-validator-assets.py" \
+  --root "$temp_dir/validator-assets-mode-drift" \
+  >"$temp_dir/validator-assets-mode-drift.log" 2>&1; then
+  fail "native validator asset mode drift was accepted"
+fi
+grep -q 'native validator asset mode mismatch' \
+  "$temp_dir/validator-assets-mode-drift.log" || \
+  fail "native validator mode drift did not produce a fail-closed diagnostic"
+
+cp -R "$validator_asset_fixture" "$temp_dir/validator-assets-omission"
+sed '1d' \
+  "$temp_dir/validator-assets-omission/scripts/native-validator-assets.sha256" \
+  > "$temp_dir/validator-assets-omission/scripts/native-validator-assets.sha256.tmp"
+mv "$temp_dir/validator-assets-omission/scripts/native-validator-assets.sha256.tmp" \
+  "$temp_dir/validator-assets-omission/scripts/native-validator-assets.sha256"
+if python3 "$SCRIPT_DIR/verify-native-validator-assets.py" \
+  --root "$temp_dir/validator-assets-omission" \
+  >"$temp_dir/validator-assets-omission.log" 2>&1; then
+  fail "an omitted native validator asset was accepted"
+fi
+grep -q 'native validator asset inventory mismatch' \
+  "$temp_dir/validator-assets-omission.log" || \
+  fail "native validator omission did not produce a fail-closed diagnostic"
+
+cp -R "$validator_asset_fixture" "$temp_dir/validator-assets-duplicate"
+head -n 1 \
+  "$temp_dir/validator-assets-duplicate/scripts/native-validator-assets.sha256" \
+  >> "$temp_dir/validator-assets-duplicate/scripts/native-validator-assets.sha256"
+if python3 "$SCRIPT_DIR/verify-native-validator-assets.py" \
+  --root "$temp_dir/validator-assets-duplicate" \
+  >"$temp_dir/validator-assets-duplicate.log" 2>&1; then
+  fail "a duplicate native validator asset was accepted"
+fi
+grep -q 'duplicate native validator asset' \
+  "$temp_dir/validator-assets-duplicate.log" || \
+  fail "duplicate native validator asset did not produce a fail-closed diagnostic"
+
+python3 -B -m unittest discover \
+  -s "$SCRIPT_DIR/tests" -p 'test_release_version_policy.py'
 
 checksum="03a57454a6159c455406889c7867e0b284db028d2734a10bdf85a6a7285c862f"
 cat > "$temp_dir/Package.swift" <<EOF
@@ -65,8 +162,11 @@ mkdir -p "$temp_dir/fake-vlc/contrib/src/example"
 printf 'example contrib checksum\n' > "$temp_dir/fake-vlc/contrib/src/example/SHA512SUMS"
 printf '%064d  0001-example.patch\n' 0 > "$temp_dir/patch-manifest.sha256"
 printf '#!/bin/sh\necho fixture\n' > "$temp_dir/build-config.sh"
+printf '#!/bin/sh\necho validator fixture\n' > "$temp_dir/validator-config.sh"
+fixture_source_date_epoch=1700000000
 mkdir -p "$temp_dir/build-a/macos-arm64/Headers"
 printf 'header\n' > "$temp_dir/build-a/macos-arm64/Headers/libvlc.h"
+ln -s libvlc.h "$temp_dir/build-a/macos-arm64/Headers/current.h"
 printf 'int swiftvlc_provenance_fixture(void) { return 1; }\n' > "$temp_dir/member.c"
 xcrun clang -c "$temp_dir/member.c" -o "$temp_dir/member.o"
 ar rcs "$temp_dir/build-a/macos-arm64/libvlc.a" "$temp_dir/member.o"
@@ -90,7 +190,25 @@ value = {
 with open(sys.argv[1], "wb") as output:
     plistlib.dump(value, output, sort_keys=True)
 PY
-cp -R "$temp_dir/build-a" "$temp_dir/build-b"
+mkdir -p "$temp_dir/build-b/macos-arm64/Headers"
+# Create the second logical tree in a different directory-entry order too.
+cp "$temp_dir/build-a/Info.plist" "$temp_dir/build-b/Info.plist"
+cp "$temp_dir/build-a/macos-arm64/libvlc.a" \
+  "$temp_dir/build-b/macos-arm64/libvlc.a"
+ln -s libvlc.h "$temp_dir/build-b/macos-arm64/Headers/current.h"
+cp "$temp_dir/build-a/macos-arm64/Headers/libvlc.h" \
+  "$temp_dir/build-b/macos-arm64/Headers/libvlc.h"
+
+# Provenance deliberately ignores host filesystem metadata, while release ZIP
+# bytes must not. Make the two logical trees differ in every excluded metadata
+# class and prove canonical staging/archive removes that host dependence.
+touch -t 203801190314 "$temp_dir/build-b/Info.plist"
+xattr -w com.swiftvlc.release-integrity different \
+  "$temp_dir/build-b/macos-arm64/Headers/libvlc.h"
+xattr -w com.apple.ResourceFork resource-fork \
+  "$temp_dir/build-b/macos-arm64/libvlc.a"
+chmod +a "user:$(id -un) allow read" \
+  "$temp_dir/build-b/macos-arm64/Headers/libvlc.h"
 
 build_index=0
 for build_name in a b; do
@@ -101,9 +219,10 @@ for build_name in a b; do
     --vlc-source "$temp_dir/fake-vlc" \
     --source-revision 1111111111111111111111111111111111111111 \
     --pinned-revision 111111111 \
-    --source-date-epoch 0 \
+    --source-date-epoch "$fixture_source_date_epoch" \
     --patch-manifest "$temp_dir/patch-manifest.sha256" \
     --build-configuration-file "build-script=$temp_dir/build-config.sh" \
+    --build-configuration-file "0037-validator=$temp_dir/validator-config.sh" \
     --build-invocation-id "00000000-0000-0000-0000-00000000000${build_index}" \
     --clean-build \
     --make-flags=-j1 \
@@ -118,10 +237,247 @@ done
   --xcframework "$temp_dir/build-b" \
   --pinned-revision 111111111 \
   --patch-manifest "$temp_dir/patch-manifest.sha256" \
-  --build-configuration-file "build-script=$temp_dir/build-config.sh" >/dev/null
+  --build-configuration-file "build-script=$temp_dir/build-config.sh" \
+  --build-configuration-file "0037-validator=$temp_dir/validator-config.sh" >/dev/null
+
+# Every named validator is part of the exact build-configuration inventory.
+if "$SCRIPT_DIR/libvlc-provenance.py" verify \
+  --provenance "$temp_dir/provenance-b.json" \
+  --xcframework "$temp_dir/build-b" \
+  --pinned-revision 111111111 \
+  --patch-manifest "$temp_dir/patch-manifest.sha256" \
+  --build-configuration-file "build-script=$temp_dir/build-config.sh" >/dev/null 2>&1; then
+  fail "provenance accepted an omitted 0037 validator configuration"
+fi
 "$SCRIPT_DIR/libvlc-provenance.py" verify-proof \
   --proof "$temp_dir/reproducibility.json" \
   --provenance "$temp_dir/provenance-b.json" >/dev/null
+
+# Every field in the proof's per-slice output block is authoritative. Reject
+# value, shape, and type mutations cleanly instead of treating it as display
+# data or leaking a Python traceback for malformed schema input.
+python3 - "$temp_dir/reproducibility.json" "$temp_dir" <<'PY'
+import copy
+import json
+import sys
+from pathlib import Path
+
+source_path = Path(sys.argv[1])
+output_root = Path(sys.argv[2])
+source = json.loads(source_path.read_text())
+slice_identifier = next(iter(source["slices"]))
+slice_record = source["slices"][slice_identifier]
+
+
+def write(name, value):
+    (output_root / f"proof-{name}.json").write_text(
+        json.dumps(value, indent=2, sort_keys=True) + "\n"
+    )
+
+
+changed = copy.deepcopy(source)
+changed["slices"][slice_identifier]["librarySha256"] = "0" * 64
+write("changed-slice-value", changed)
+
+missing_slice = copy.deepcopy(source)
+del missing_slice["slices"][slice_identifier]
+write("missing-slice", missing_slice)
+
+extra_slice = copy.deepcopy(source)
+extra_slice["slices"]["unexpected-slice"] = copy.deepcopy(slice_record)
+write("extra-slice", extra_slice)
+
+missing_key = copy.deepcopy(source)
+del missing_key["slices"][slice_identifier]["memberCount"]
+write("missing-slice-key", missing_key)
+
+extra_key = copy.deepcopy(source)
+extra_key["slices"][slice_identifier]["uncheckedDisplayField"] = "not-bound"
+write("extra-slice-key", extra_key)
+
+wrong_type = copy.deepcopy(source)
+wrong_type["slices"][slice_identifier]["memberCount"] = True
+write("wrong-slice-value-type", wrong_type)
+
+non_object_slices = copy.deepcopy(source)
+non_object_slices["slices"] = []
+write("non-object-slices", non_object_slices)
+
+write("non-object-proof", [])
+
+unsupported_schema = copy.deepcopy(source)
+unsupported_schema["schemaVersion"] = 3
+write("unsupported-schema", unsupported_schema)
+PY
+proof_mutations=(
+  changed-slice-value
+  missing-slice
+  extra-slice
+  missing-slice-key
+  extra-slice-key
+  wrong-slice-value-type
+  non-object-slices
+  non-object-proof
+  unsupported-schema
+)
+for mutation in "${proof_mutations[@]}"; do
+  error_log="$temp_dir/proof-$mutation.stderr"
+  if "$SCRIPT_DIR/libvlc-provenance.py" verify-proof \
+    --proof "$temp_dir/proof-$mutation.json" \
+    --provenance "$temp_dir/provenance-b.json" \
+    >/dev/null 2>"$error_log"; then
+    fail "reproducibility proof accepted mutation: $mutation"
+  fi
+  if grep -q 'Traceback' "$error_log"; then
+    fail "reproducibility proof leaked a traceback for mutation: $mutation"
+  fi
+  grep -q '^Error:' "$error_log" \
+    || fail "reproducibility proof did not report a schema error: $mutation"
+done
+
+mkdir -p "$temp_dir/canonical-a" "$temp_dir/canonical-b"
+for build_name in a b; do
+  "$SCRIPT_DIR/canonical-libvlc-artifact.sh" stage \
+    "$temp_dir/build-$build_name" \
+    "$temp_dir/canonical-$build_name/libvlc.xcframework" \
+    "$temp_dir/provenance-$build_name.json"
+  # Host reads and copies can leave arbitrary atimes after staging. Archive
+  # normalization must occur after its final provenance read.
+  touch -a -t 203801190314 \
+    "$temp_dir/canonical-$build_name/libvlc.xcframework/Info.plist"
+  "$SCRIPT_DIR/canonical-libvlc-artifact.sh" archive \
+    "$temp_dir/canonical-$build_name/libvlc.xcframework" \
+    "$temp_dir/canonical-$build_name.zip" \
+    "$temp_dir/provenance-$build_name.json"
+done
+archive_timezones=(Pacific/Honolulu Europe/Amsterdam Asia/Tokyo UTC)
+for archive_iteration in 1 2 3 4; do
+  archive_timezone=${archive_timezones[$((archive_iteration - 1))]}
+  for build_name in a b; do
+    repeated_zip="$temp_dir/canonical-$build_name-repeat-$archive_iteration.zip"
+    touch -a -t 203801190314 \
+      "$temp_dir/canonical-$build_name/libvlc.xcframework/Info.plist"
+    TZ="$archive_timezone" "$SCRIPT_DIR/canonical-libvlc-artifact.sh" archive \
+      "$temp_dir/canonical-$build_name/libvlc.xcframework" \
+      "$repeated_zip" \
+      "$temp_dir/provenance-$build_name.json"
+    cmp -s "$temp_dir/canonical-a.zip" "$repeated_zip" \
+      || fail "canonical libVLC ZIP changed across repeated archives"
+  done
+done
+if xattr -p com.swiftvlc.release-integrity \
+  "$temp_dir/canonical-b/libvlc.xcframework/macos-arm64/Headers/libvlc.h" \
+  >/dev/null 2>&1; then
+  fail "canonical libVLC staging preserved a custom extended attribute"
+fi
+if xattr -p com.apple.ResourceFork \
+  "$temp_dir/canonical-b/libvlc.xcframework/macos-arm64/libvlc.a" \
+  >/dev/null 2>&1; then
+  fail "canonical libVLC staging preserved a resource fork"
+fi
+staged_acl_lines=$(ls -lde \
+  "$temp_dir/canonical-b/libvlc.xcframework/macos-arm64/Headers/libvlc.h" \
+  | wc -l | tr -d ' ')
+[[ "$staged_acl_lines" == 1 ]] \
+  || fail "canonical libVLC staging preserved an ACL"
+[[ $(stat -f%m "$temp_dir/canonical-b/libvlc.xcframework") \
+  == "$fixture_source_date_epoch" ]] \
+  || fail "canonical libVLC staging did not apply sourceDateEpoch"
+cmp -s "$temp_dir/canonical-a.zip" "$temp_dir/canonical-b.zip" \
+  || fail "canonical libVLC ZIP depends on excluded filesystem metadata"
+python3 - "$temp_dir/canonical-a.zip" "$fixture_source_date_epoch" <<'PY'
+from datetime import datetime, timezone
+from pathlib import Path
+import struct
+import sys
+import zipfile
+
+archive_path = Path(sys.argv[1])
+epoch = int(sys.argv[2])
+timestamp = datetime.fromtimestamp(epoch, timezone.utc)
+expected_timestamp = (
+    timestamp.year,
+    timestamp.month,
+    timestamp.day,
+    timestamp.hour,
+    timestamp.minute,
+    timestamp.second // 2 * 2,
+)
+with zipfile.ZipFile(archive_path) as archive:
+    entries = archive.infolist()
+names = [entry.filename for entry in entries]
+if any(
+    "/__MACOSX/" in f"/{name}"
+    or name.rsplit("/", 1)[-1].startswith("._")
+    for name in names
+):
+    raise SystemExit("canonical libVLC ZIP contains AppleDouble metadata")
+with archive_path.open("rb") as raw_archive:
+    for entry in entries:
+        if entry.extra:
+            raise SystemExit(
+                f"canonical libVLC ZIP has a central extra field: {entry.filename}"
+            )
+        if entry.date_time != expected_timestamp:
+            raise SystemExit(
+                f"canonical libVLC ZIP has a noncanonical timestamp: {entry.filename}"
+            )
+        raw_archive.seek(entry.header_offset)
+        header = raw_archive.read(30)
+        if len(header) != 30:
+            raise SystemExit("canonical libVLC ZIP has a truncated local header")
+        values = struct.unpack("<IHHHHHIIIHH", header)
+        if values[0] != 0x04034B50:
+            raise SystemExit("canonical libVLC ZIP has an invalid local header")
+        filename_size, extra_size = values[-2:]
+        raw_archive.seek(filename_size, 1)
+        local_extra = raw_archive.read(extra_size)
+        if local_extra:
+            raise SystemExit(
+                f"canonical libVLC ZIP has a local extra field: {entry.filename}"
+            )
+        if len(local_extra) != extra_size:
+            raise SystemExit(
+                f"canonical libVLC ZIP has a truncated local extra field: "
+                f"{entry.filename}"
+            )
+        if entry.create_system != 3:
+            raise SystemExit(
+                f"canonical libVLC ZIP lost Unix modes: {entry.filename}"
+            )
+        if entry.external_attr >> 16 == 0:
+            raise SystemExit(
+                f"canonical libVLC ZIP has an empty Unix mode: {entry.filename}"
+            )
+PY
+mkdir -p "$temp_dir/canonical-unpacked"
+ditto -x -k "$temp_dir/canonical-a.zip" "$temp_dir/canonical-unpacked"
+canonical_digest=$("$SCRIPT_DIR/artifact-tree-digest.py" \
+  "$temp_dir/canonical-unpacked/libvlc.xcframework")
+recorded_digest=$(python3 - "$temp_dir/provenance-a.json" <<'PY'
+import json
+import sys
+
+print(json.load(open(sys.argv[1]))["xcframeworkTreeDigest"])
+PY
+)
+[[ "$canonical_digest" == "$recorded_digest" ]] \
+  || fail "canonical ZIP does not expand to the proven logical tree"
+canonical_link="$temp_dir/canonical-unpacked/libvlc.xcframework/macos-arm64/Headers/current.h"
+[[ -L "$canonical_link" && $(readlink "$canonical_link") == libvlc.h ]] \
+  || fail "canonical ZIP did not preserve the provenance-covered symlink"
+
+mode_before=$("$SCRIPT_DIR/artifact-tree-digest.py" "$temp_dir/build-a")
+chmod +x "$temp_dir/build-a/macos-arm64/Headers/libvlc.h"
+mode_after=$("$SCRIPT_DIR/artifact-tree-digest.py" "$temp_dir/build-a")
+[[ "$mode_before" != "$mode_after" ]] \
+  || fail "logical tree digest ignored a changed POSIX mode"
+if "$SCRIPT_DIR/canonical-libvlc-artifact.sh" stage \
+  "$temp_dir/build-a" "$temp_dir/mode-mutated/libvlc.xcframework" \
+  "$temp_dir/provenance-a.json" >/dev/null 2>&1; then
+  fail "canonical staging accepted a mode-mutated logical tree"
+fi
+chmod -x "$temp_dir/build-a/macos-arm64/Headers/libvlc.h"
 
 # A changed effective build script invalidates otherwise matching provenance.
 printf '#!/bin/sh\necho changed\n' > "$temp_dir/build-config.sh"
@@ -130,10 +486,23 @@ if "$SCRIPT_DIR/libvlc-provenance.py" verify \
   --xcframework "$temp_dir/build-b" \
   --pinned-revision 111111111 \
   --patch-manifest "$temp_dir/patch-manifest.sha256" \
-  --build-configuration-file "build-script=$temp_dir/build-config.sh" >/dev/null 2>&1; then
+  --build-configuration-file "build-script=$temp_dir/build-config.sh" \
+  --build-configuration-file "0037-validator=$temp_dir/validator-config.sh" >/dev/null 2>&1; then
   fail "provenance accepted a changed build configuration"
 fi
 printf '#!/bin/sh\necho fixture\n' > "$temp_dir/build-config.sh"
+
+printf '#!/bin/sh\necho changed validator\n' > "$temp_dir/validator-config.sh"
+if "$SCRIPT_DIR/libvlc-provenance.py" verify \
+  --provenance "$temp_dir/provenance-b.json" \
+  --xcframework "$temp_dir/build-b" \
+  --pinned-revision 111111111 \
+  --patch-manifest "$temp_dir/patch-manifest.sha256" \
+  --build-configuration-file "build-script=$temp_dir/build-config.sh" \
+  --build-configuration-file "0037-validator=$temp_dir/validator-config.sh" >/dev/null 2>&1; then
+  fail "provenance accepted 0037 validator hash drift"
+fi
+printf '#!/bin/sh\necho validator fixture\n' > "$temp_dir/validator-config.sh"
 
 # A clean-build marker without an independent invocation is not a second build.
 cp "$temp_dir/provenance-b.json" "$temp_dir/provenance-same-invocation.json"
@@ -184,9 +553,10 @@ ar rcs "$temp_dir/mutated-build/macos-arm64/libvlc.a" "$temp_dir/member.o"
   --vlc-source "$temp_dir/fake-vlc" \
   --source-revision 1111111111111111111111111111111111111111 \
   --pinned-revision 111111111 \
-  --source-date-epoch 0 \
+  --source-date-epoch "$fixture_source_date_epoch" \
   --patch-manifest "$temp_dir/patch-manifest.sha256" \
   --build-configuration-file "build-script=$temp_dir/build-config.sh" \
+  --build-configuration-file "0037-validator=$temp_dir/validator-config.sh" \
   --build-invocation-id 00000000-0000-0000-0000-000000000004 \
   --clean-build \
   --make-flags=-j1 \
@@ -197,24 +567,608 @@ if "$SCRIPT_DIR/libvlc-provenance.py" verify-proof \
   fail "reproducibility proof accepted a mutated post-build tree"
 fi
 
-python3 - "$SCRIPT_DIR/build-libvlc.sh" "$SCRIPT_DIR/release.sh" <<'PY'
+# The artifact binds the post-pin wrapper; the wrapper must in turn reject a
+# drifted nested probe before any compiler/tool lookup can make the result
+# environment-dependent.
+post_pin_fixture="$temp_dir/post-pin-hash-fixture"
+mkdir -p \
+  "$post_pin_fixture/scripts/patches" \
+  "$post_pin_fixture/vlc/modules/demux/json" \
+  "$post_pin_fixture/vlc/modules/stream_out/chromecast" \
+  "$post_pin_fixture/vlc/modules/services_discovery" \
+  "$post_pin_fixture/vlc/src/text" \
+  "$post_pin_fixture/vlc/compat" \
+  "$post_pin_fixture/work"
+cp "$SCRIPT_DIR/validate-post-pin-stability.sh" "$post_pin_fixture/scripts/"
+cp -R "$SCRIPT_DIR/patches/validation" "$post_pin_fixture/scripts/patches/"
+for fixture_input in \
+  modules/demux/json/json.c \
+  modules/demux/json/json.h \
+  modules/demux/json/grammar.y \
+  modules/demux/json/lexicon.l \
+  modules/stream_out/chromecast/chromecast_protocol.hpp \
+  modules/stream_out/chromecast/chromecast_demux_duration.hpp \
+  modules/services_discovery/upnp-wrapper.cpp \
+  modules/services_discovery/upnp-wrapper.hpp \
+  src/text/url.c \
+  src/text/memstream.c \
+  compat/memrchr.c; do
+  : > "$post_pin_fixture/vlc/$fixture_input"
+done
+printf '\n// release-integrity nested hash drift\n' >> \
+  "$post_pin_fixture/scripts/patches/validation/post-pin-stability-probe.cpp"
+if "$post_pin_fixture/scripts/validate-post-pin-stability.sh" \
+  "$post_pin_fixture/vlc" "$post_pin_fixture/work" \
+  >"$post_pin_fixture/hash-drift.log" 2>&1; then
+  fail "post-pin wrapper accepted a drifted nested native probe"
+fi
+grep -Fq "linked JSON/Cast probe hash changed" \
+  "$post_pin_fixture/hash-drift.log" || \
+  fail "post-pin wrapper did not diagnose nested native-probe hash drift"
+
+python3 - \
+  "$SCRIPT_DIR/build-libvlc.sh" \
+  "$SCRIPT_DIR/release.sh" \
+  "$SCRIPT_DIR/patches/manifest.sha256" \
+  "$SCRIPT_DIR/validate-chromecast-load-transition.sh" \
+  "$SCRIPT_DIR/patches/validation/chromecast-load-transition-source-check.py" \
+  "$SCRIPT_DIR/validate-post-pin-stability.sh" \
+  "$SCRIPT_DIR/native-validator-assets.sha256" \
+  "$SCRIPT_DIR/verify-native-validator-assets.py" <<'PY'
+import ast
+import re
 import sys
 
 build = open(sys.argv[1]).read()
 release = open(sys.argv[2]).read()
-verification = build.rindex("verify_deployment_targets\n")
+load_transition_validator = open(sys.argv[4]).read()
+load_transition_checker = open(sys.argv[5]).read()
+post_pin_validator = open(sys.argv[6]).read()
+validator_asset_manifest = [
+    line.rstrip("\n").split("  ", 1)
+    for line in open(sys.argv[7])
+]
+validator_asset_verifier = open(sys.argv[8]).read()
+manifest_lines = [
+    line.strip() for line in open(sys.argv[3]) if line.strip() and not line.lstrip().startswith("#")
+]
+expected_manifest_tail = [
+    "dd3c672da9b7a6fcd82e6eadd298d1c5f86ce75e55d86800de8fd83683461105  0037-chromecast-load-transition-correctness.patch",
+    "402b7ca09aab50fe89391ea22b8b96113b899bce3028406a3293d574eb706beb  0038-apple-assembly-metadata.patch",
+]
+if manifest_lines[-2:] != expected_manifest_tail:
+    sys.exit(
+        "patch manifest must end with frozen 0037 followed by exact-NASM 0038: "
+        f"got {manifest_lines[-2:]}"
+    )
+
+required_validator_assets = (
+    "scripts/patches/validation/audio-media-services-reset-source-check.py",
+    "scripts/patches/validation/effective-playback-rate-event-abi.c",
+    "scripts/patches/validation/effective-playback-rate-event-abi.cpp",
+    "scripts/patches/validation/effective-playback-rate-event-probe.c",
+    "scripts/patches/validation/effective-playback-rate-event-source-check.py",
+    "scripts/patches/validation/native-extension-version-probe.c",
+    "scripts/patches/validation/pip_extension_version.py",
+    "scripts/patches/validation/strict-frame-step-probe.c",
+    "scripts/patches/validation/strict-frame-step-source-check.py",
+    "scripts/patches/validation/test_pip_extension_version.py",
+    "scripts/patches/validation/vmem-configuration-race.c",
+    "scripts/patches/validation/vmem-picture-pts-abi.cpp",
+    "scripts/patches/validation/vmem-picture-pts-probe.c",
+    "scripts/patches/validation/vmem-picture-pts-source-check.py",
+    "scripts/tests/test_pip_extension_version.py",
+    "scripts/validate-audio-media-services-reset.sh",
+    "scripts/validate-effective-playback-rate-event.sh",
+    "scripts/validate-native-extension-contract.sh",
+    "scripts/validate-native-patch-series-source.sh",
+    "scripts/validate-strict-frame-step.sh",
+    "scripts/validate-vmem-picture-pts.sh",
+)
+required_executable_validator_assets = (
+    "scripts/patches/validation/effective-playback-rate-event-source-check.py",
+    "scripts/patches/validation/vmem-picture-pts-source-check.py",
+    "scripts/validate-audio-media-services-reset.sh",
+    "scripts/validate-effective-playback-rate-event.sh",
+    "scripts/validate-native-extension-contract.sh",
+    "scripts/validate-native-patch-series-source.sh",
+    "scripts/validate-strict-frame-step.sh",
+    "scripts/validate-vmem-picture-pts.sh",
+)
+manifest_asset_paths = tuple(path for _, path in validator_asset_manifest)
+if manifest_asset_paths != required_validator_assets:
+    sys.exit(
+        "native validator asset manifest inventory drifted: "
+        f"{manifest_asset_paths}"
+    )
+if len(set(manifest_asset_paths)) != len(manifest_asset_paths):
+    sys.exit("native validator asset manifest contains a duplicate path")
+
+verifier_tree = ast.parse(validator_asset_verifier)
+verifier_asset_paths = None
+verifier_executable_asset_paths = None
+for statement in verifier_tree.body:
+    if isinstance(statement, ast.Assign) and any(
+        isinstance(target, ast.Name) and target.id == "ASSET_PATHS"
+        for target in statement.targets
+    ):
+        verifier_asset_paths = ast.literal_eval(statement.value)
+    if isinstance(statement, ast.Assign) and any(
+        isinstance(target, ast.Name) and target.id == "EXECUTABLE_ASSET_PATHS"
+        for target in statement.targets
+    ):
+        verifier_executable_asset_paths = ast.literal_eval(statement.value)
+if verifier_asset_paths != required_validator_assets:
+    sys.exit(
+        "native validator verifier inventory drifted: "
+        f"{verifier_asset_paths}"
+    )
+if verifier_executable_asset_paths != required_executable_validator_assets:
+    sys.exit(
+        "native validator executable-mode inventory drifted: "
+        f"{verifier_executable_asset_paths}"
+    )
+
+assembly_manifest_detection = build.index(
+    'if [ "$manifest_entry" = "0038-apple-assembly-metadata.patch" ]; then'
+)
+warning_manifest_detection = build.index(
+    'if [ "$manifest_entry" = "0035-chromecast-metadata-warning.patch" ]; then'
+)
+schema_manifest_detection = build.index(
+    'if [ "$manifest_entry" = "0036-chromecast-metadata-schema-correctness.patch" ]; then'
+)
+load_transition_manifest_detection = build.index(
+    'if [ "$manifest_entry" = "0037-chromecast-load-transition-correctness.patch" ]; then'
+)
+clean_build_gate = build.index('error "Patch 0038 requires --clean-build;')
+patch_replay = build.index('if [ "$patch_series_matches" = yes ]; then')
+assembly_source_gate = build.index(
+    'info "Validating Apple assembly tool and Mach-O metadata source contract..."'
+)
+first_other_post_replay_gate = build.index(
+    '# Patches 0035–0037 deliberately change no public API'
+)
+dynamic_source_edit = build.index('\npatch_vlc_snapshot_filter_owner\n')
+if not (
+    warning_manifest_detection
+    < schema_manifest_detection
+    < load_transition_manifest_detection
+    < assembly_manifest_detection
+    < clean_build_gate
+    < patch_replay
+    < assembly_source_gate
+    < first_other_post_replay_gate
+    < dynamic_source_edit
+):
+    sys.exit(
+        "0038 clean-build/source validation is not ordered before dynamic source edits"
+    )
+if (
+    'if [ "$apple_assembly_metadata_patch_listed" = yes ] &&\n'
+    '       [ "$CLEAN_BUILD" != yes ]; then'
+    not in build
+):
+    sys.exit("0038 is not guarded by an exact clean-build requirement")
+if (
+    '"${SCRIPT_DIR}/validate-apple-assembly-metadata-patch.sh" \\\n'
+    '            "${VLC_SRC}" "${BUILD_DIR}/validation/0038-apple-assembly-metadata"'
+    not in build
+):
+    sys.exit("build does not invoke the standalone 0038 validator exactly")
+
+for assignment in (
+    "chromecast_metadata_warning_patch_listed=no",
+    "chromecast_metadata_schema_patch_listed=no",
+    "chromecast_load_transition_patch_listed=no",
+    "chromecast_metadata_warning_patch_listed=yes",
+    "chromecast_metadata_schema_patch_listed=yes",
+    "chromecast_load_transition_patch_listed=yes",
+):
+    if build.count(assignment) != 1:
+        sys.exit(f"Chromecast validator selector is not initialized exactly once: {assignment}")
+load_transition_selection = build.index(
+    'if [ "$chromecast_load_transition_patch_listed" = yes ]; then',
+    assembly_source_gate,
+)
+schema_fallback = build.index(
+    'elif [ "$chromecast_metadata_schema_patch_listed" = yes ]; then',
+    load_transition_selection,
+)
+warning_fallback = build.index(
+    'elif [ "$chromecast_metadata_warning_patch_listed" = yes ]; then',
+    schema_fallback,
+)
+if not (
+    assembly_source_gate
+    < load_transition_selection
+    < schema_fallback
+    < warning_fallback
+    < dynamic_source_edit
+):
+    sys.exit("Chromecast validators are not selected newest-first before source edits")
+if build.count('"${SCRIPT_DIR}/validate-chromecast-load-transition.sh"') != 1:
+    sys.exit("build must invoke the 0037 final-source validator exactly once")
+if build.count('"${SCRIPT_DIR}/validate-chromecast-metadata-schema.sh"') != 1:
+    sys.exit("build must retain exactly one 0036-only fallback validator")
+if (
+    '"${SCRIPT_DIR}/validate-chromecast-metadata-schema.sh" \\\n'
+    '            "${VLC_SRC}" "${BUILD_DIR}/validation/0036-chromecast-metadata-schema"'
+    not in build
+):
+    sys.exit("0036 fallback does not keep generated validation work external")
+if (
+    '"${SCRIPT_DIR}/validate-chromecast-load-transition.sh" \\\n'
+    '            "${VLC_SRC}" "${BUILD_DIR}/validation/0037-chromecast-load-transition"'
+    not in build
+):
+    sys.exit("build does not invoke the 0037 validator with an external build work root")
+if (
+    'if [ "$chromecast_load_transition_patch_listed" != yes ] &&\n'
+    '       [ -f "${VLC_SRC}/modules/stream_out/chromecast/chromecast_demux_eof.hpp" ]; then'
+    not in build
+):
+    sys.exit("build does not suppress the redundant frozen 0034 gate under 0037")
+if build.count('"${SCRIPT_DIR}/validate-chromecast-state.sh"') != 1:
+    sys.exit("build must retain exactly one direct 0034 fallback gate")
+if build.count('"${SCRIPT_DIR}/validate-post-pin-stability.sh"') != 1:
+    sys.exit("build must retain the complete post-pin linked/native gate exactly once")
+tools_build = build.index('info "Building VLC build tools..."')
+post_pin_call = build.index(
+    '"${SCRIPT_DIR}/validate-post-pin-stability.sh" \\\n'
+    '        "${VLC_SRC}" "${BUILD_DIR}/validation"'
+)
+if post_pin_call < tools_build:
+    sys.exit("post-pin linked/native validation runs before its generated tools exist")
+
+checker_call = load_transition_validator.index(
+    'PYTHONDONTWRITEBYTECODE=1 python3 "$CHECKER" "$VLC_SOURCE_ROOT" "$PATCH"'
+)
+base_probe_call = load_transition_validator.index(
+    'compile_and_run "$BASE_PROBE"'
+)
+schema_probe_call = load_transition_validator.index(
+    'compile_and_run "$SCHEMA_PROBE"'
+)
+load_transition_probe_call = load_transition_validator.index(
+    'compile_and_run "$PROBE"'
+)
+if not checker_call < base_probe_call < schema_probe_call < load_transition_probe_call:
+    sys.exit("0037 standalone validation does not run its checker and inherited probes in order")
+for marker in (
+    'check_hash "$SCHEMA_CHECKER" "$EXPECTED_SCHEMA_CHECKER_SHA"',
+    'check_hash "$SCHEMA_PROBE" "$EXPECTED_SCHEMA_PROBE_SHA"',
+    'check_hash "$SCHEMA_PATCH" "$EXPECTED_SCHEMA_PATCH_SHA"',
+    'check_hash "$WARNING_CHECKER" "$EXPECTED_WARNING_CHECKER_SHA"',
+    'check_hash "$WARNING_PATCH" "$EXPECTED_WARNING_PATCH_SHA"',
+    'check_hash "$BASE_CHECKER" "$EXPECTED_BASE_CHECKER_SHA"',
+    'check_hash "$BASE_PROBE" "$EXPECTED_BASE_PROBE_SHA"',
+    'check_hash "$COMPAT" "$EXPECTED_COMPAT_SHA"',
+):
+    if load_transition_validator.count(marker) != 1:
+        sys.exit(f"0037 standalone validator does not hash-bind {marker}")
+
+final_schema_contract = load_transition_checker.index(
+    "schema_checker.validate_sources(final_schema_sources)"
+)
+reverse_to_predecessor = load_transition_checker.index(
+    "reconstructed = dict(sources)", final_schema_contract
+)
+predecessor_schema_contract = load_transition_checker.index(
+    "schema_checker.validate_sources(predecessor_schema_sources)",
+    reverse_to_predecessor,
+)
+predecessor_schema_mutations = load_transition_checker.index(
+    "schema_checker.run_source_mutations(\n        predecessor_schema_sources",
+    predecessor_schema_contract,
+)
+new_source_mutations = load_transition_checker.index(
+    "source_mutations = run_source_mutations(sources)",
+    predecessor_schema_mutations,
+)
+if not (
+    final_schema_contract
+    < reverse_to_predecessor
+    < predecessor_schema_contract
+    < predecessor_schema_mutations
+    < new_source_mutations
+):
+    sys.exit("0037 does not separate final 0036 semantics from predecessor mutations")
+if load_transition_checker.count("schema_checker.run_source_mutations(") != 1:
+    sys.exit("frozen 0036 mutation suite must run exactly once")
+if "schema_checker.run_source_mutations(final_schema_sources)" in load_transition_checker:
+    sys.exit("frozen 0036 mutations are incorrectly running on 0037 final source")
+if "source.count(old) != 1" not in load_transition_checker:
+    sys.exit("0037 mutation fixtures are not fail-closed on exact uniqueness")
+
+post_pin_hash_inputs = (
+    '"$SOURCE_CHECK"',
+    '"$PROBE"',
+    '"$ICONV_SUPPORT"',
+    '"$COMPAT"',
+    '"$UPNP_PROBE"',
+    '"$UPNP_FAKES/vlc_common.h"',
+    '"$UPNP_FAKES/vlc_threads.h"',
+    '"$UPNP_FAKES/vlc_cxx_helpers.hpp"',
+    '"$UPNP_FAKES/vlc_charset.h"',
+    '"$UPNP_FAKES/upnp.h"',
+    '"$UPNP_FAKES/upnptools.h"',
+    '"$UPNP_FAKES/TargetConditionals.h"',
+)
+for bound_input in post_pin_hash_inputs:
+    marker = f"verify_sha256 {bound_input}"
+    if post_pin_validator.count(marker) != 1:
+        sys.exit(f"post-pin wrapper does not hash-bind exactly once: {bound_input}")
+for retained_evidence in (
+    'python3 "$SOURCE_CHECK" --self-test',
+    'python3 "$SOURCE_CHECK" "$VLC_SOURCE_ROOT"',
+    '\n"$VALIDATION_DIR/post-pin-stability-probe"\n',
+    '\n"$VALIDATION_DIR/upnp-lifecycle-probe"\n',
+):
+    if post_pin_validator.count(retained_evidence) != 1:
+        sys.exit(f"post-pin linked/native evidence was dropped: {retained_evidence}")
+
+artifact_replacement = build.index('rm -rf "${OUTPUT_DIR}/libvlc.xcframework"')
+metadata_report_removal = build.index('    "${MACHO_METADATA_REPORT}"')
+artifact_creation = build.index('\nxcodebuild -create-xcframework \\\n')
+if not metadata_report_removal < artifact_replacement < artifact_creation:
+    sys.exit("artifact replacement can retain a stale Mach-O metadata report")
+
+build_metadata_verification = build.index(
+    'info "Verifying per-object Mach-O platform metadata and section alignment..."'
+)
 provenance = build.index('python3 "${SCRIPT_DIR}/libvlc-provenance.py" create')
-if provenance < verification:
-    sys.exit("provenance is written before deployment-target verification")
+if provenance < build_metadata_verification:
+    sys.exit("provenance is written before per-object Mach-O verification")
 if 'rm -f "${OUTPUT_DIR}/libvlc-provenance.json"' not in build:
     sys.exit("a failed rebuild can leave stale provenance beside its artifact")
+
+build_validator_asset_verification = build.index(
+    'if ! python3 "${SCRIPT_DIR}/verify-native-validator-assets.py"; then'
+)
+build_source_setup = build.index('info "Setting up VLC source..."')
+if build_validator_asset_verification > build_source_setup:
+    sys.exit("native validator assets are verified after VLC source setup")
+
+expected_extension_patch_versions = {
+    "0004-samplebuffer-pip-safety-geometry.patch": 1,
+    "0022-atomic-pip-playback-snapshot.patch": 2,
+    "0024-native-pip-overlays.patch": 3,
+    "0027-strict-frame-step-contract.patch": 4,
+    "0029-sample-buffer-renderer-recovery.patch": 5,
+    "0030-vmem-picture-pts.patch": 6,
+    "0031-effective-playback-rate-event.patch": 7,
+    "0032-audio-media-services-reset.patch": 8,
+}
+for patch_name, version in expected_extension_patch_versions.items():
+    marker = (
+        f"{patch_name})\n"
+        f"                manifest_extension_candidate={version} ;;"
+    )
+    if build.count(marker) != 1:
+        sys.exit(
+            "build does not map the patch manifest to one exact native "
+            f"extension version: {patch_name} -> {version}"
+        )
+lease_marker = (
+    "0033-apple-audio-session-policy-leases.patch)\n"
+    "                swiftvlc_apple_audio_session_leases_listed=yes ;;"
+)
+if build.count(lease_marker) != 1:
+    sys.exit("build does not track the 0033 same-version lease refinement")
+for export_marker in (
+    'export SWIFTVLC_EXPECTED_EXTENSION_VERSION="$swiftvlc_manifest_extension_version"',
+    'export SWIFTVLC_REQUIRE_APPLE_AUDIO_SESSION_LEASES="$swiftvlc_apple_audio_session_leases_listed"',
+):
+    if build.count(export_marker) != 1:
+        sys.exit(f"build does not export manifest-owned validator intent: {export_marker}")
+
+native_source_contract_setup = build.index(
+    'native_source_contract_args=('
+)
+native_source_contract = build.index(
+    'info "Validating the manifest-owned native extension source and vendored-header contract..."'
+)
+first_legacy_native_source_gate = build.index(
+    '# Exercise the exact production helper whenever this patch is in the engine'
+)
+if not (
+    patch_replay
+    < native_source_contract_setup
+    < native_source_contract
+    < first_legacy_native_source_gate
+):
+    sys.exit(
+        "manifest-owned native extension source validation is not between "
+        "exact patch replay and legacy source gates"
+    )
+native_source_command = build[
+    native_source_contract_setup:first_legacy_native_source_gate
+]
+for marker in (
+    '--source-root "$VLC_SRC"',
+    '--expected-version "$SWIFTVLC_EXPECTED_EXTENSION_VERSION"',
+    '--run-mutations',
+    'native_source_contract_args+=(--require-apple-audio-session-leases)',
+):
+    if native_source_command.count(marker) != 1:
+        sys.exit(f"native extension source contract is incomplete: {marker}")
+
+archive_repair = build.index(
+    '"${SCRIPT_DIR}/fix-duplicate-symbols.sh" "${OUTPUT_DIR}/libvlc.xcframework"'
+)
+final_archive_mutation = build.index(
+    'find "${OUTPUT_DIR}/libvlc.xcframework" -name \'*.a\' -exec xcrun ranlib -D {} \\;'
+)
+native_archive_contract_setup = build.index(
+    'native_archive_contract_args=('
+)
+native_archive_contract = build.index(
+    'info "Validating the exact linked native extension archive contract across every produced slice..."'
+)
+archive_metadata_gate = build.index(
+    'info "Verifying per-object Mach-O platform metadata and section alignment..."'
+)
+if not (
+    archive_repair
+    < final_archive_mutation
+    < native_archive_contract_setup
+    < native_archive_contract
+    < archive_metadata_gate
+):
+    sys.exit(
+        "exact linked native extension validation is not after the final "
+        "archive mutation and before artifact metadata/provenance gates"
+    )
+native_archive_command = build[
+    native_archive_contract_setup:archive_metadata_gate
+]
+if 'if [ "$BUILD_MACOS" = yes ]; then' in native_archive_command:
+    sys.exit("device-only builds bypass the all-slice native extension contract")
+if "Exact linked native extension validation skipped" in native_archive_command:
+    sys.exit("build retains a device-only native extension validation skip")
+for marker in (
+    '--xcframework "${OUTPUT_DIR}/libvlc.xcframework"',
+    '--expected-version "$SWIFTVLC_EXPECTED_EXTENSION_VERSION"',
+    'native_archive_contract_args+=(--require-apple-audio-session-leases)',
+):
+    if native_archive_command.count(marker) != 1:
+        sys.exit(f"native extension archive contract is incomplete: {marker}")
+
+release_validator_asset_verification = release.index(
+    'if ! python3 "$SCRIPT_DIR/verify-native-validator-assets.py"; then'
+)
+release_provenance_verification = release.index(
+    'if ! verify_artifact_provenance; then'
+)
+if release_validator_asset_verification > release_provenance_verification:
+    sys.exit("release verifies native validator assets after artifact provenance")
+
+expected_configurations = {
+    "build-libvlc.sh",
+    "fix-duplicate-symbols.sh",
+    "native-validator-assets.sha256",
+    "native-extension-version-probe.c",
+    "pip_extension_version.py",
+    "validate-libvlc-macho-metadata.py",
+    "validate-apple-assembly-metadata-patch.sh",
+    "validate-chromecast-load-transition.sh",
+    "validate-native-extension-contract.sh",
+    "validate-post-pin-stability.sh",
+    "verify-native-validator-assets.py",
+}
+configuration_pattern = re.compile(
+    r'--build-configuration-file "([^"=]+)=[^"\n]+"'
+)
+build_configurations = set(configuration_pattern.findall(build))
+release_configurations = set(configuration_pattern.findall(release))
+if build_configurations != expected_configurations:
+    sys.exit(
+        f"build provenance configuration is incomplete: {sorted(build_configurations)}"
+    )
+if release_configurations != build_configurations:
+    sys.exit(
+        "build/release provenance configuration sets differ: "
+        f"build={sorted(build_configurations)}, release={sorted(release_configurations)}"
+    )
+
+deployment_constants = {
+    "SWIFTVLC_MIN_IOS": "18.0",
+    "SWIFTVLC_MIN_TVOS": "18.0",
+    "SWIFTVLC_MIN_VISIONOS": "2.0",
+    "SWIFTVLC_MIN_MACOS": "15.0",
+    "SWIFTVLC_MIN_CATALYST": "18.0",
+}
+deployment_policies = {
+    "ios": "SWIFTVLC_MIN_IOS",
+    "tvos": "SWIFTVLC_MIN_TVOS",
+    "xros": "SWIFTVLC_MIN_VISIONOS",
+    "macos": "SWIFTVLC_MIN_MACOS",
+    "catalyst": "SWIFTVLC_MIN_CATALYST",
+}
+for variable, expected_value in deployment_constants.items():
+    assignment = f'{variable}="{expected_value}"'
+    if assignment not in build or assignment not in release:
+        sys.exit(f"build/release deployment constant drifted: {assignment}")
+
+release_member_manifest = release.index(
+    'check-libvlc-manifest.sh" --xcframework "$XCFW_PATH"'
+)
+release_native_extension_contract = release.index(
+    'echo "Verifying exact linked native extension contract..."'
+)
+release_metadata_report = release.index(
+    'MACHO_METADATA_REPORT="$(dirname "$XCFW_PATH")/libvlc-macho-metadata.json"'
+)
+release_metadata_report_removal = release.index(
+    'rm -f "$MACHO_METADATA_REPORT"', release_metadata_report
+)
+release_metadata_verification = release.index(
+    'echo "Verifying release artifact Mach-O platform metadata and section alignment..."'
+)
+release_provenance = release.index('if ! verify_artifact_provenance; then')
+if not (
+    release_member_manifest
+    < release_native_extension_contract
+    < release_metadata_report
+    < release_metadata_report_removal
+    < release_metadata_verification
+    < release_provenance
+):
+    sys.exit("release Mach-O validation is not ordered before provenance/package work")
+release_native_extension_command = release[
+    release_native_extension_contract:release_metadata_report
+]
+for marker in (
+    '"$SCRIPT_DIR/validate-native-extension-contract.sh"',
+    '--xcframework "$XCFW_PATH"',
+    '--expected-version 8',
+    '--require-apple-audio-session-leases',
+):
+    if release_native_extension_command.count(marker) != 1:
+        sys.exit(f"release native extension contract is incomplete: {marker}")
+if release.count('"$SCRIPT_DIR/validate-libvlc-macho-metadata.py"') != 1:
+    sys.exit("release must directly invoke the Mach-O parser exactly once")
+build_metadata_command = build[
+    build_metadata_verification : build.index(
+        'info "Verified every Mach-O object;', build_metadata_verification
+    )
+]
+release_metadata_command = release[
+    release_metadata_verification : release.index(
+        '# Refuse to publish a debug-configured libVLC',
+        release_metadata_verification,
+    )
+]
+if build_metadata_command.count("--deployment-target ") != 5:
+    sys.exit("build Mach-O parser invocation does not have exactly five policies")
+if release_metadata_command.count("--deployment-target ") != 5:
+    sys.exit("release Mach-O parser invocation does not have exactly five policies")
+if release_metadata_command.count('--json-output "$MACHO_METADATA_REPORT"') != 1:
+    sys.exit("release Mach-O parser does not refresh the invalidated metadata report")
+for platform_name, variable in deployment_policies.items():
+    marker = f'--deployment-target "{platform_name}=${{{variable}}}"'
+    if marker not in build_metadata_command or marker not in release_metadata_command:
+        sys.exit(f"build/release Mach-O policy is missing: {marker}")
+
 if "libvlc-provenance.py\" rebind" in release or "find \"$WORK_XCFW\" -name '*.a'" in release:
     sys.exit("release packaging still mutates or rebinds the proven artifact")
+if (
+    'cp -R "$XCFW_PATH" "$WORK_XCFW"' in release
+    or "ditto -c -k --keepParent libvlc.xcframework" in release
+):
+    sys.exit("release packaging bypasses canonical libVLC staging/archive")
 for marker in (
     '"releaseSourceDigestAlgorithm": "swiftvlc-git-tree-v1"',
     '"releaseSourceDigest": os.environ["RELEASE_SOURCE_DIGEST"]',
     '"qualificationMatrixChecksum": os.environ["QUALIFICATION_MATRIX_CHECKSUM"]',
+    '"featureManifestChecksum": os.environ["FEATURE_MANIFEST_CHECKSUM"]',
     'SWIFTVLC_CANDIDATE_SOURCE_DIGEST="$CANDIDATE_SOURCE_DIGEST"',
+    'SWIFTVLC_CANDIDATE_FEATURE_MANIFEST_CHECKSUM="$CANDIDATE_FEATURE_MANIFEST_CHECKSUM"',
+    'SWIFTVLC_FEATURE_MANIFEST="$FEATURE_MANIFEST"',
+    'check-libvlc-manifest.sh" --xcframework "$XCFW_PATH"',
+    'canonical-libvlc-artifact.sh" stage',
+    'canonical-libvlc-artifact.sh" archive',
     'elif [[ "$DRY_RUN" == true ]]; then',
 ):
     if marker not in release:
@@ -311,15 +1265,27 @@ if [[ "$source_digest_c" == "$source_digest_d" ]]; then
   fail "a qualification matrix change did not change the release-source digest"
 fi
 
-python3 - "$temp_dir/matrix.json" "$temp_dir/record.json" "$digest_a" <<'PY'
+python3 - "$temp_dir/matrix.json" "$temp_dir/record.json" \
+  "$temp_dir/feature-manifest.json" "$digest_a" \
+  "$SCRIPT_DIR/qualification" <<'PY'
 import json
 import sys
 
-matrix_path, record_path, digest = sys.argv[1:4]
+(
+    matrix_path,
+    record_path,
+    feature_manifest_path,
+    digest,
+    qualification_directory,
+) = sys.argv[1:6]
+sys.path.insert(0, qualification_directory)
+import qualification_policy as policy
+
 matrix = {
     "scenarios": [
         {
             "id": "vod",
+            "summary": "Fixture VOD playback",
             "hardware": ["iphone-current"],
             "minimumDurationSeconds": 60,
             "requiredEvidenceFields": ["metrics.cpu", "outcome", "retryCount"],
@@ -334,85 +1300,480 @@ matrix = {
         }
     ],
     "hardware": [
-        {"id": "iphone-current", "deviceFamily": "iPhone", "osMajor": 26},
-        {"id": "ipad-current", "deviceFamily": "iPad", "osMajor": 26},
-    ],
-}
-evidence = {
-    "artifactDigest": digest,
-    "scenario": "vod",
-    "hardware": "iphone-current",
-    "metrics": {"cpu": 0, "errors": 0},
-    "rates": [1.0, 2],
-    "outcome": "stable",
-    "retryCount": 0,
-}
-json.dump(
-    evidence,
-    open(str(record_path).rsplit("/", 1)[0] + "/evidence.json", "w"),
-)
-record = {
-    "version": "1.1.0",
-    "artifactDigestAlgorithm": "swiftvlc-tree-v1",
-    "artifactDigest": digest,
-    "rows": [
         {
-            "scenario": "vod",
-            "hardware": "iphone-current",
-            "device": "Test phone",
+            "id": "iphone-current",
             "deviceFamily": "iPhone",
-            "productType": "iPhone16,1",
-            "osVersion": "26.6",
-            "osBuild": "23G80",
-            "osReleaseType": "stable",
-            "fixture": "fixture.mp4",
-            "duration": "2m",
-            "durationSeconds": 120,
-            "evidence": "evidence.json",
-            "result": "pass",
+            "osMajor": 26,
+            "summary": "Fixture iPhone",
+        },
+        {
+            "id": "ipad-current",
+            "deviceFamily": "iPad",
+            "osMajor": 26,
+            "summary": "Fixture iPad",
+        },
+    ],
+    "runnerContracts": [
+        {
+            "id": runner,
+            "selection": {
+                "kind": "exact",
+                "testIdentifiers": [
+                    "iOSUITests/FixtureTests/test_releaseIntegrity"
+                ],
+            },
+            "outputs": [],
+        }
+        for runner in sorted(policy.REQUIRED_RELEASE_RUNNER_SCENARIOS)
+    ]
+    + [
+        {
+            "id": "vod",
+            "selection": {
+                "kind": "exact",
+                "testIdentifiers": [
+                    "iOSUITests/FixtureTests/test_releaseIntegrity"
+                ],
+            },
+            "outputs": [
+                {
+                    "scenario": "vod",
+                    "attachmentName": "qualification-vod.json",
+                    "testIdentifiers": [
+                        "iOSUITests/FixtureTests/test_releaseIntegrity"
+                    ],
+                }
+            ],
         }
     ],
 }
+feature_manifest = {
+    "formatVersion": 1,
+    "id": "release-integrity-features",
+    "manifestVersion": "1.0.0",
+    "releaseVersionPrefix": "1.1.0",
+    "title": "Release integrity feature policy",
+    "categories": [{"id": "playback", "title": "Playback"}],
+    "features": [
+        {
+            "id": feature_id,
+            "category": "playback",
+            "title": feature_id.replace("-", " ").title(),
+            "description": "The release-integrity fixture maps this canonical obligation to its VOD proof.",
+            "releaseRequirement": "required",
+            "execution": "automated",
+            "evidenceLevel": "engine-output",
+            "scenarioIds": ["vod"],
+            "runnerScenarioIds": ["vod"],
+        }
+        for feature_id in sorted(policy.REQUIRED_FEATURE_IDS)
+    ],
+}
 json.dump(matrix, open(matrix_path, "w"))
-json.dump(record, open(record_path, "w"))
+json.dump(feature_manifest, open(feature_manifest_path, "w"))
 PY
+
+export SWIFTVLC_FEATURE_MANIFEST="$temp_dir/feature-manifest.json"
 
 qualification_source_digest=$("$SCRIPT_DIR/release-source-digest.py" 1.1.0)
 qualification_source_commit=$(git rev-parse HEAD)
 qualification_matrix_checksum=$(shasum -a 256 \
   "$temp_dir/matrix.json" | cut -d' ' -f1)
+fixture_feature_checksum=$(shasum -a 256 \
+  "$temp_dir/feature-manifest.json" | cut -d' ' -f1)
+qualification_profiles_checksum=$(shasum -a 256 \
+  "$SCRIPT_DIR/qualification/profiles-v1.json" | cut -d' ' -f1)
 python3 - "$temp_dir/record.json" "$temp_dir/evidence.json" \
   "$qualification_source_commit" "$qualification_source_digest" \
-  "$qualification_matrix_checksum" <<'PY'
+  "$qualification_matrix_checksum" "$digest_a" "$fixture_feature_checksum" \
+  "$qualification_profiles_checksum" "$SCRIPT_DIR/qualification" "$temp_dir" <<'PY'
 import json
 import sys
+from pathlib import Path
 
-record_path, evidence_path, commit, source_digest, matrix_checksum = sys.argv[1:]
-record = json.load(open(record_path))
-record.update(
-    {
-        "sourceCommit": commit,
-        "releaseSourceDigestAlgorithm": "swiftvlc-git-tree-v1",
-        "releaseSourceDigest": source_digest,
-        "qualificationMatrixChecksum": matrix_checksum,
-    }
+(
+    record_path_value,
+    evidence_path_value,
+    commit,
+    source_digest,
+    matrix_checksum,
+    artifact_digest,
+    feature_checksum,
+    profiles_checksum,
+    qualification_directory,
+    temporary_directory,
+) = sys.argv[1:]
+sys.path.insert(0, qualification_directory)
+import qualification_policy as policy
+
+record_path = Path(record_path_value)
+evidence_path = Path(evidence_path_value)
+root = Path(temporary_directory)
+retained_root = root / "retained-report"
+retained_root.mkdir()
+
+catalog = ["iOSUITests/FixtureTests/test_releaseIntegrity"]
+catalog_record = policy.catalog_record(catalog)
+identity = {
+    "formatVersion": 2,
+    "version": "1.1.0",
+    "sourceCommit": commit,
+    "releaseSourceDigestAlgorithm": "swiftvlc-git-tree-v1",
+    "releaseSourceDigest": source_digest,
+    "artifactDigestAlgorithm": "swiftvlc-tree-v1",
+    "artifactDigest": artifact_digest,
+    "candidateAppDigestAlgorithm": "swiftvlc-tree-v1",
+    "candidateAppDigest": "a" * 64,
+    "testRunnerDigestAlgorithm": "swiftvlc-tree-v1",
+    "testRunnerDigest": "b" * 64,
+    "testBundleRelativePath": "PlugIns/iOSUITests.xctest",
+    "testBundleDigestAlgorithm": "swiftvlc-tree-v1",
+    "testBundleDigest": "c" * 64,
+    "baseXCTestRunDigestAlgorithm": "sha256",
+    "baseXCTestRunDigest": "d" * 64,
+    "baseXCTestRunName": "fixture.xctestrun",
+    "testCatalogDigestAlgorithm": "swiftvlc-test-catalog-v1",
+    "testCatalogDigest": catalog_record["digest"],
+    "testCatalogCount": catalog_record["testCount"],
+    "testCatalog": catalog_record["testIdentifiers"],
+    "qualificationMatrixChecksum": matrix_checksum,
+    "featureManifestChecksum": feature_checksum,
+    "qualificationProfilesChecksum": profiles_checksum,
+    "fixtureManifestChecksum": "f" * 64,
+    "qualificationPolicyDigestAlgorithm": "swiftvlc-qualification-policy-v1",
+    "qualificationPolicyDigest": policy.policy_digest(),
+}
+execution = {
+    "expected": catalog_record,
+    "executed": catalog_record,
+    "identityAndCountMatch": True,
+    "allPassed": True,
+}
+
+runner_rows = []
+runner_data = {}
+for runner in sorted(policy.REQUIRED_RELEASE_RUNNER_SCENARIOS | {"vod"}):
+    attempt_root = retained_root / f"{runner}-attempt-artifacts"
+    attempt_root.mkdir()
+    attempt_log = attempt_root / "attempt-1.log"
+    attempt_log.write_text("** TEST EXECUTE SUCCEEDED **\n")
+    attempt_bundle = attempt_root / "attempt-1.xcresult"
+    attempt_bundle.mkdir()
+    (attempt_bundle / "Info.plist").write_text("fixture xcresult")
+    attempts = policy.bind_attempt_artifacts(
+        [
+            {
+                "attempt": 1,
+                "classification": "passed",
+                "retryable": False,
+                "intendedTestBegan": True,
+                "xcodebuildExitCode": 0,
+                "logArtifact": attempt_log.relative_to(retained_root).as_posix(),
+                "xcresultArtifact": attempt_bundle.relative_to(
+                    retained_root
+                ).as_posix(),
+                "testExecution": execution,
+            }
+        ],
+        retained_root,
+    )
+    inventory = None
+    app_log = "none"
+    if runner != "analyzer":
+        raw_root = retained_root / f"{runner}-raw-jsonl"
+        raw_root.mkdir()
+        raw_record = (
+            json.dumps(
+                {
+                    "ts": "2026-08-31T12:00:00Z",
+                    "level": "debug",
+                    "module": policy.LOG_MIRROR_HEALTH_MODULE,
+                    "message": policy.LOG_MIRROR_HEALTH_MESSAGE,
+                }
+            )
+            + "\n"
+        )
+        raw_name = policy.test_log_filename(
+            "run",
+            catalog_record["testIdentifiers"][0],
+            "00000000-0000-4000-8000-000000000001",
+        )
+        (raw_root / raw_name).write_text(raw_record)
+        declared_children = policy.DECLARED_TEST_CHILD_LOGS.get(runner)
+        if declared_children is not None:
+            for child in sorted(declared_children):
+                raw_name = policy.test_log_filename(
+                    "run",
+                    catalog_record["testIdentifiers"][0],
+                    "00000000-0000-4000-8000-000000000001",
+                    child=child,
+                )
+                (raw_root / raw_name).write_text(raw_record)
+        inventory = policy.build_error_inventory(
+            raw_root,
+            "run",
+            runner,
+            retained_root=raw_root.name,
+            expected_test_catalog=catalog_record,
+        )
+        app_log = "captured"
+    runner_rows.append(
+        {
+            "scenario": runner,
+            "result": "pass",
+            "xcodebuildExitCode": 0,
+            "libraryErrorCount": 0,
+            "appLog": app_log,
+            "qualificationEvidence": (
+                "captured" if runner == "vod" else "not-applicable"
+            ),
+            "durationSeconds": 120,
+            "expectedTestCatalog": catalog_record,
+            "testExecution": execution,
+            "attempts": attempts,
+            "attemptArtifactRoot": attempt_root.name,
+            "hostErrorInventory": inventory,
+        }
+    )
+    runner_data[runner] = {"attempts": attempts, "inventory": inventory}
+
+attachment_root = retained_root / "vod-attachments"
+attachment_root.mkdir()
+attachment_payload = attachment_root / "vod.json"
+raw_evidence = {
+    "scenario": "vod",
+    "durationSeconds": 120,
+    "metrics": {"cpu": 0, "errors": 0},
+    "rates": [1.0, 2],
+    "outcome": "stable",
+    "retryCount": 0,
+}
+attachment_payload.write_text(json.dumps(raw_evidence, sort_keys=True))
+attachment_manifest = attachment_root / "manifest.json"
+attachment_manifest.write_text(
+    json.dumps(
+        [
+            {
+                "testIdentifier": "iOSUITests/FixtureTests/test_releaseIntegrity",
+                "attachments": [
+                    {
+                        "suggestedHumanReadableName": "qualification-vod.json",
+                        "exportedFileName": attachment_payload.name,
+                    }
+                ]
+            }
+        ],
+        sort_keys=True,
+    )
 )
-json.dump(record, open(record_path, "w"))
-evidence = json.load(open(evidence_path))
-evidence["releaseSourceDigest"] = source_digest
-json.dump(evidence, open(evidence_path, "w"))
+vod_attempts = runner_data["vod"]["attempts"]
+evidence = {
+    **raw_evidence,
+    **{field: identity[field] for field in policy.CORE_IDENTITY_FIELDS},
+    "hardware": "iphone-current",
+    "deviceIdentifier": "fixture-device",
+    "testExecution": execution,
+    "hostErrorInventory": runner_data["vod"]["inventory"],
+    "qualificationProducer": {
+        "runnerScenario": "vod",
+        "sourceAttempt": 1,
+        "sourceXcresultArtifact": vod_attempts[-1]["xcresultArtifact"],
+        "sourceXcresultDigestAlgorithm": vod_attempts[-1][
+            "xcresultDigestAlgorithm"
+        ],
+        "sourceXcresultDigest": vod_attempts[-1]["xcresultDigest"],
+        "sourceXcresultSizeBytes": vod_attempts[-1]["xcresultSizeBytes"],
+        "attachmentName": "qualification-vod.json",
+        "attachmentTestIdentifier": "iOSUITests/FixtureTests/test_releaseIntegrity",
+        "retainedAttachmentRoot": attachment_root.name,
+        "manifestRelativePath": attachment_manifest.relative_to(
+            retained_root
+        ).as_posix(),
+        "manifestDigestAlgorithm": "sha256",
+        "manifestDigest": policy.sha256_file(attachment_manifest),
+        "manifestSizeBytes": attachment_manifest.stat().st_size,
+        "attachmentRelativePath": attachment_payload.relative_to(
+            retained_root
+        ).as_posix(),
+        "attachmentDigestAlgorithm": "sha256",
+        "attachmentDigest": policy.sha256_file(attachment_payload),
+        "attachmentSizeBytes": attachment_payload.stat().st_size,
+    },
+}
+row = {
+    "scenario": "vod",
+    "runnerScenario": "vod",
+    "hardware": "iphone-current",
+    "device": "Test phone",
+    "deviceFamily": "iPhone",
+    "productType": "iPhone16,1",
+    "osVersion": "26.6",
+    "osBuild": "23G80",
+    "osReleaseType": "stable",
+    "fixture": f"qualification-fixtures:{identity['fixtureManifestChecksum']}",
+    "duration": "120s",
+    "durationSeconds": 120,
+    "evidence": "evidence.json",
+    "result": "pass",
+}
+(retained_root / "evidence.json").write_text(json.dumps(evidence, sort_keys=True))
+report_path = retained_root / "report.json"
+report_path.write_text(
+    json.dumps(
+        {
+            **identity,
+            "mode": "qualification",
+            "qualificationEligibleEnvironment": True,
+            "device": {"udid": "fixture-device"},
+            "result": "pass",
+            "scenarios": runner_rows,
+            "qualificationRows": [row],
+        },
+        sort_keys=True,
+    )
+)
+source_binding = {
+    "path": retained_root.relative_to(root).as_posix(),
+    "reportRelativePath": report_path.name,
+    "reportDigestAlgorithm": "sha256",
+    "reportDigest": policy.sha256_file(report_path),
+    "reportSizeBytes": report_path.stat().st_size,
+    "treeDigestAlgorithm": "swiftvlc-tree-v1",
+    "treeDigest": policy.tree_digest(retained_root),
+    "treeSizeBytes": policy.tree_size_bytes(retained_root),
+}
+evidence_path.write_text(json.dumps(evidence, sort_keys=True))
+source_report_relative = (
+    Path(source_binding["path"]) / source_binding["reportRelativePath"]
+).as_posix()
+record_path.write_text(
+    json.dumps(
+        {
+            **identity,
+            "sourceReports": [source_binding],
+            "runnerScenarios": [
+                policy.runner_record_summary(
+                    runner_row, "iphone-current", source_report_relative
+                )
+                for runner_row in runner_rows
+            ],
+            "rows": [row],
+        },
+        sort_keys=True,
+    )
+)
 PY
+
+mkdir -p "$temp_dir/fake-bin"
+cat > "$temp_dir/fake-bin/xcrun" <<'EOF'
+#!/bin/sh
+if [ "${1:-}" = "xcresulttool" ]; then
+  if [ "${2:-}" = "export" ] && [ "${3:-}" = "attachments" ]; then
+    output=""
+    while [ "$#" -gt 0 ]; do
+      if [ "$1" = "--output-path" ]; then
+        shift
+        output="${1:-}"
+        break
+      fi
+      shift
+    done
+    [ -n "$output" ] || exit 2
+    mkdir -p "$output"
+    cp -R "$SWIFTVLC_RELEASE_TEST_ATTACHMENT_EXPORT/." "$output/"
+    exit 0
+  fi
+  printf '%s\n' '{"testNodes":[{"nodeType":"Test Case","nodeIdentifier":"iOSUITests/FixtureTests/test_releaseIntegrity","result":"Passed"}]}'
+  exit 0
+fi
+exec /usr/bin/xcrun "$@"
+EOF
+chmod +x "$temp_dir/fake-bin/xcrun"
+export SWIFTVLC_RELEASE_TEST_ATTACHMENT_EXPORT="$temp_dir/retained-report/vod-attachments"
+export PATH="$temp_dir/fake-bin:$PATH"
 
 SWIFTVLC_QUALIFICATION_MATRIX="$temp_dir/matrix.json" \
   SWIFTVLC_QUALIFICATION_RECORD="$temp_dir/record.json" \
   "$SCRIPT_DIR/check-qualification.sh" 1.1.0 "$temp_dir/tree-a" >/dev/null
 
+if SWIFTVLC_CANDIDATE_FEATURE_MANIFEST_CHECKSUM=$(printf '%064d' 0) \
+  SWIFTVLC_QUALIFICATION_MATRIX="$temp_dir/matrix.json" \
+  SWIFTVLC_QUALIFICATION_RECORD="$temp_dir/record.json" \
+  "$SCRIPT_DIR/check-qualification.sh" 1.1.0 "$temp_dir/tree-a" >/dev/null 2>&1; then
+  fail "qualification accepted a feature policy from another prepared candidate"
+fi
+
 SWIFTVLC_CANDIDATE_SOURCE_COMMIT="$qualification_source_commit" \
   SWIFTVLC_CANDIDATE_SOURCE_DIGEST="$qualification_source_digest" \
   SWIFTVLC_CANDIDATE_MATRIX_CHECKSUM="$qualification_matrix_checksum" \
+  SWIFTVLC_CANDIDATE_FEATURE_MANIFEST_CHECKSUM="$fixture_feature_checksum" \
   SWIFTVLC_QUALIFICATION_MATRIX="$temp_dir/matrix.json" \
   SWIFTVLC_QUALIFICATION_RECORD="$temp_dir/record.json" \
   "$SCRIPT_DIR/check-qualification.sh" 1.1.0 "$temp_dir/tree-a" >/dev/null
+
+if SWIFTVLC_FEATURE_MANIFEST="$temp_dir/missing-feature-manifest.json" \
+  SWIFTVLC_QUALIFICATION_MATRIX="$temp_dir/matrix.json" \
+  SWIFTVLC_QUALIFICATION_RECORD="$temp_dir/record.json" \
+  "$SCRIPT_DIR/check-qualification.sh" 1.1.0 "$temp_dir/tree-a" >/dev/null 2>&1; then
+  fail "qualification accepted a missing feature policy"
+fi
+
+python3 - "$temp_dir/feature-manifest.json" \
+  "$temp_dir/blocked-feature-manifest.json" \
+  "$temp_dir/advisory-feature-manifest.json" <<'PY'
+import json
+import sys
+
+source, blocked_output, advisory_output = sys.argv[1:]
+manifest = json.load(open(source))
+receiver = {
+    "id": "receiver-output",
+    "category": "playback",
+    "title": "Receiver output",
+    "description": "Fixture receiver output must be proven.",
+    "releaseRequirement": "required",
+    "execution": "external-lab",
+    "evidenceLevel": "receiver-output",
+    "blocker": "No fixture receiver evidence exists.",
+}
+manifest["features"].append(receiver)
+json.dump(manifest, open(blocked_output, "w"))
+receiver["releaseRequirement"] = "advisory"
+json.dump(manifest, open(advisory_output, "w"))
+PY
+if SWIFTVLC_FEATURE_MANIFEST="$temp_dir/blocked-feature-manifest.json" \
+  SWIFTVLC_QUALIFICATION_MATRIX="$temp_dir/matrix.json" \
+  SWIFTVLC_QUALIFICATION_RECORD="$temp_dir/record.json" \
+  "$SCRIPT_DIR/check-qualification.sh" 1.1.0 "$temp_dir/tree-a" >/dev/null 2>&1; then
+  fail "qualification accepted an incomplete required feature policy"
+fi
+
+if SWIFTVLC_FEATURE_MANIFEST="$temp_dir/advisory-feature-manifest.json" \
+  SWIFTVLC_QUALIFICATION_MATRIX="$temp_dir/matrix.json" \
+  SWIFTVLC_QUALIFICATION_RECORD="$temp_dir/record.json" \
+  "$SCRIPT_DIR/check-qualification.sh" 1.1.0 "$temp_dir/tree-a" >/dev/null 2>&1; then
+  fail "qualification accepted advisory feature policy drift"
+fi
+
+python3 - "$temp_dir/feature-manifest.json" \
+  "$temp_dir/unclassified-feature-manifest.json" <<'PY'
+import json
+import sys
+
+source, output = sys.argv[1:]
+manifest = json.load(open(source))
+manifest["features"][0]["scenarioIds"] = []
+manifest["features"][0]["execution"] = "planned"
+manifest["features"][0]["blocker"] = "Fixture scenario was removed from policy."
+manifest["features"][0]["runnerScenarioIds"] = []
+json.dump(manifest, open(output, "w"))
+PY
+if SWIFTVLC_FEATURE_MANIFEST="$temp_dir/unclassified-feature-manifest.json" \
+  SWIFTVLC_QUALIFICATION_MATRIX="$temp_dir/matrix.json" \
+  SWIFTVLC_QUALIFICATION_RECORD="$temp_dir/record.json" \
+  "$SCRIPT_DIR/check-qualification.sh" 1.1.0 "$temp_dir/tree-a" >/dev/null 2>&1; then
+  fail "qualification accepted a feature policy that omitted a matrix scenario"
+fi
 
 # The scenario is scoped to iPhone, so the unrecorded iPad row must not be
 # invented by the checker. The successful call above is the regression test.
@@ -639,7 +2000,7 @@ import sys
 
 path = sys.argv[1]
 evidence = json.load(open(path))
-evidence["outcome"] = "recovered"
+evidence["outcome"] = "stable"
 json.dump(evidence, open(path, "w"))
 PY
 
@@ -694,6 +2055,7 @@ PY
 
 cd "$ROOT_DIR"
 bash -n \
+  scripts/canonical-libvlc-artifact.sh \
   scripts/check-engine-coverage.sh \
   scripts/check-qualification.sh \
   scripts/ci-use-released-xcframework.sh \
@@ -725,6 +2087,9 @@ stable_tag=$(printf '%s' "$stable_info" \
 
 if ./scripts/release.sh 1.1.0 >/dev/null 2>&1; then
   fail "stable release was accepted without a prepared candidate"
+fi
+if ./scripts/release.sh 1.1.0 --unqualified >/dev/null 2>&1; then
+  fail "stable release bypassed qualification through --unqualified"
 fi
 
 echo "Release-integrity tests passed."

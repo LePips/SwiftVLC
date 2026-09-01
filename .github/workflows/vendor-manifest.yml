@@ -11,14 +11,28 @@
 name: Vendor manifest
 
 on:
+  workflow_dispatch:
   pull_request:
+    branches: [main]
     paths:
       - Package.swift
       - scripts/libvlc-manifests/**
       - scripts/check-libvlc-manifest.sh
+      - scripts/validate_libvlc_feature_contract.py
+      - scripts/tests/test_libvlc_feature_contract.py
       - .github/workflows/vendor-manifest.yml
   push:
     branches: [main]
+    paths:
+      - Package.swift
+      - scripts/libvlc-manifests/**
+      - scripts/check-libvlc-manifest.sh
+      - scripts/validate_libvlc_feature_contract.py
+      - scripts/tests/test_libvlc_feature_contract.py
+      - .github/workflows/vendor-manifest.yml
+
+permissions:
+  contents: read
 
 concurrency:
   group: vendor-manifest-${{ github.ref }}
@@ -59,4 +73,6 @@ jobs:
 
       - name: Check libvlc archive-member manifests
         timeout-minutes: 5
-        run: ./scripts/check-libvlc-manifest.sh
+        run: |
+          python3 -m unittest scripts/tests/test_libvlc_feature_contract.py
+          ./scripts/check-libvlc-manifest.sh
