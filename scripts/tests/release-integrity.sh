@@ -2726,7 +2726,7 @@ adaptive_source_gate = native_patch_series_validator.index(
     'section "Validating adaptive ES codec-configuration recycling"'
 )
 v9_source_gate = native_patch_series_validator.index(
-    'section "Validating exact integrated extension version 9"'
+    'section "Validating exact integrated extension version 10"'
 )
 pip_identity_gate = native_patch_series_validator.index(
     'section "Validating native PiP output identity and race semantics"'
@@ -3118,7 +3118,7 @@ release_native_extension_command = release[
 for marker in (
     '"$SCRIPT_DIR/validate-native-extension-contract.sh"',
     '--xcframework "$XCFW_PATH"',
-    '--expected-version 9',
+    '--expected-version 10',
     '--require-apple-audio-session-leases',
 ):
     if release_native_extension_command.count(marker) != 1:

@@ -21,8 +21,8 @@ SPEC.loader.exec_module(VERSION)
 
 
 def make_sources(version: int, leases: bool = False) -> Dict[str, str]:
-    """Build one minimal but realistic contiguous v4-v9 source surface."""
-    if version not in range(4, 10):
+    """Build one minimal but realistic contiguous v4-v10 source surface."""
+    if version not in range(4, 11):
         raise ValueError(f"unsupported fixture version: {version}")
     if leases and version < 8:
         raise ValueError("the lease refinement requires version 8 or newer")
@@ -227,6 +227,23 @@ def make_sources(version: int, leases: bool = False) -> Dict[str, str]:
         ])
         exports.append(
             "swiftvlc_libvlc_media_player_set_pip_playback_identity"
+        )
+
+    if version >= 10:
+        public_header.append(
+            "bool swiftvlc_libvlc_media_player_"
+            "set_subtitle_text_snapshot_callback(void);"
+        )
+        media_player.extend([
+            "bool swiftvlc_libvlc_media_player_"
+            "set_subtitle_text_snapshot_callback(void)",
+            "{",
+            "    return true;",
+            "}",
+        ])
+        exports.append(
+            "swiftvlc_libvlc_media_player_"
+            "set_subtitle_text_snapshot_callback"
         )
 
     drawable_header = ""
@@ -602,7 +619,7 @@ class PiPExtensionVersionTests(unittest.TestCase):
             VERSION.resolve_extension_version(sources, **kwargs)
 
     def test_every_historical_version_boundary_resolves_exactly(self) -> None:
-        for expected in range(4, 10):
+        for expected in range(4, 11):
             with self.subTest(version=expected):
                 resolution = VERSION.resolve_extension_version(
                     make_sources(expected, leases=expected >= 9),
@@ -695,7 +712,7 @@ class PiPExtensionVersionTests(unittest.TestCase):
 
     def test_comment_and_string_markers_do_not_advance_version(self) -> None:
         baseline = make_sources(4)
-        complete = make_sources(9, leases=True)
+        complete = make_sources(10, leases=True)
         marker_index = 0
         for group in VERSION.VERSION_GROUPS[1:] + VERSION.SAME_VERSION_GROUPS:
             for current in group.markers:

@@ -2,7 +2,7 @@
 """Fail-closed resolver for SwiftVLC's additive libVLC extension ABI.
 
 The extension function is shared by several otherwise independent patches.
-This module is the single composition proof for versions 4 through 9: every
+This module is the single composition proof for versions 4 through 10: every
 stage must be complete, unique, and contiguous, and the implementation must be
 exactly one literal return of the resolved version.  Release callers should
 also provide ``expected_version`` from the ordered patch manifest so removing
@@ -321,6 +321,26 @@ VERSION_GROUPS = (
             ),
         ),
     ),
+    MarkerGroup(
+        "subtitle-text-snapshot",
+        10,
+        (
+            marker(
+                "public_header",
+                "subtitle text snapshot declaration",
+                "swiftvlc_libvlc_media_player_set_subtitle_text_snapshot_callback",
+            ),
+            implementation_marker(
+                "subtitle text snapshot implementation",
+                "swiftvlc_libvlc_media_player_set_subtitle_text_snapshot_callback",
+            ),
+            Marker(
+                "exports",
+                "subtitle text snapshot export",
+                r"(?m)^swiftvlc_libvlc_media_player_set_subtitle_text_snapshot_callback$",
+            ),
+        ),
+    ),
 )
 
 
@@ -534,8 +554,9 @@ def classify_group(group: MarkerGroup,
 def validate_v9_native_pip_claim_semantics(sources: Mapping[str, str]) -> None:
     """Require exact preserved/fresh claims before native controller exposure."""
     source = sources["pip_controller"]
+    v9_group = next(group for group in VERSION_GROUPS if group.version == 9)
     lifecycle_marker = next(
-        current for current in VERSION_GROUPS[-1].markers
+        current for current in v9_group.markers
         if current.label == V9_LIFECYCLE_MARKER_LABEL
     )
     lifecycle_markers = marker_matches(source, lifecycle_marker)
@@ -1528,9 +1549,9 @@ def resolve_extension_version(
         required_same_version_groups: Sequence[str] = ()) -> Resolution:
     if (expected_version is not None
             and (isinstance(expected_version, bool)
-                 or expected_version not in range(4, 10))):
+                 or expected_version not in range(4, 11))):
         raise ExtensionVersionError(
-            f"expected version must be an integer from 4 through 9: "
+            f"expected version must be an integer from 4 through 10: "
             f"{expected_version!r}")
     if isinstance(required_same_version_groups, (str, bytes)):
         raise ExtensionVersionError(

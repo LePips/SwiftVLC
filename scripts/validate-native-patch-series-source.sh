@@ -210,10 +210,10 @@ python3 -B \
     "$VLC_SOURCE_ROOT" \
     "$SCRIPT_DIR/patches/0042-adaptive-es-recycling-extradata-identity.patch"
 
-section "Validating exact integrated extension version 9"
+section "Validating exact integrated extension version 10"
 "$SCRIPT_DIR/validate-native-extension-contract.sh" \
     --source-root "$VLC_SOURCE_ROOT" \
-    --expected-version 9 \
+    --expected-version 10 \
     --require-apple-audio-session-leases \
     --run-mutations
 
@@ -253,4 +253,4 @@ python3 -B \
 section "Native patch-series source contracts passed"
 echo "Pinned VLC commit: $actual_commit"
 echo "Applied patches:   ${#patch_names[@]}"
-echo "Extension version: 9 (apple-audio-session-leases required)"
+echo "Extension version: 10 (apple-audio-session-leases required)"
