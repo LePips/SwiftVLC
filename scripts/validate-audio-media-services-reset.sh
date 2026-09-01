@@ -23,7 +23,7 @@ fi
 VLC_SOURCE_ROOT="$(cd "$VLC_SOURCE_ROOT" && pwd)"
 
 SOURCE_CHECKER="$SCRIPT_DIR/patches/validation/audio-media-services-reset-source-check.py"
-EXPECTED_SOURCE_CHECKER_SHA="dbcf8978fdf2edc8c8a717e96335fec2cbce0221bb16fe2bab1a469c63be55d9"
+EXPECTED_SOURCE_CHECKER_SHA="790cdcda875ea0d63afe4feabb7842059c4a83302123556b50ace549e9c74365"
 ACTUAL_SOURCE_CHECKER_SHA="$(shasum -a 256 "$SOURCE_CHECKER" | awk '{print $1}')"
 if [[ "$ACTUAL_SOURCE_CHECKER_SHA" != "$EXPECTED_SOURCE_CHECKER_SHA" ]]; then
     echo "Audio media-services reset validator hash mismatch:" >&2
@@ -171,7 +171,7 @@ MODULE_COMMON=(
 )
 
 echo "[1/10] Process Apple audio-session broker ($TARGET)"
-"$CLANG" "${COMMON[@]}" \
+"$CLANG" "${COMMON[@]}" -fobjc-arc \
     "$VLC_SOURCE_ROOT/src/darwin/apple_audio_session.m"
 
 echo "[2/10] AVAudioSession common policy/ownership ($TARGET)"

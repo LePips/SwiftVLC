@@ -197,6 +197,28 @@ def build_gates() -> list[Gate]:
     # Process broker: epochs, coherent counters, ownership, leases,
     # reentrancy, callback drains, and Lost-safe orphaning.
     add(source_gate(
+        "broker.automake_target_uses_arc", "src_makefile",
+        "libvlccore_objc_la_OBJCFLAGS = $(AM_OBJCFLAGS) -fobjc-arc",
+        must=("libvlccore_objc_la_SOURCES =",
+              "darwin/apple_audio_session.m")))
+    add(source_gate(
+        "broker.meson_target_uses_arc", "src_meson",
+        "vlccore_objcargs += '-fobjc-arc'",
+        must=("'darwin/apple_audio_session.m'",)))
+
+    def broker_uses_arc_ownership(sources: Mapping[str, str]) -> None:
+        forbid(sources["broker"], " release]", " retain]", " autorelease]",
+               "[super dealloc]")
+
+    copied_audio_units = (
+        "NSArray<NSValue *> *audioUnits = [_orphanedAudioUnits copy];"
+    )
+    add(custom_gate(
+        "broker.arc_forbids_manual_object_ownership",
+        broker_uses_arc_ownership, "broker", "drainOrphansOnEventQueue",
+        copied_audio_units, copied_audio_units + "\n    [audioUnits release];"))
+
+    add(source_gate(
         "broker.initial_epoch_nonzero", "broker",
         "UINT64_C(1) << MEDIA_SERVICES_STATE_EPOCH_SHIFT",
         must=("Epoch zero is reserved",), replacement="UINT64_C(0)"))
@@ -1276,6 +1298,8 @@ def validate_abi_model() -> None:
 SOURCE_PATHS = {
     "broker": "src/darwin/apple_audio_session.m",
     "broker_header": "include/vlc_apple_audio_session.h",
+    "src_makefile": "src/Makefile.am",
+    "src_meson": "src/meson.build",
     "common": "modules/audio_output/apple/avaudiosession_common.m",
     "audiounit": "modules/audio_output/apple/audiounit_ios.m",
     "avsample": "modules/audio_output/apple/avsamplebuffer.m",

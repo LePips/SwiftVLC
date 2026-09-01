@@ -6,13 +6,14 @@
 - Patch 0032 is generated after SwiftVLC patches 0001–0031 and owns the
   media-services Lost/Reset graph rebuild, causal playback gate, resource-wide
   command broker, read-only recovery evidence, broker-serialized Apple graph
-  destruction, and safe retirement of stale reset-epoch lease records.
+  destruction, ARC-correct orphan snapshot ownership, and safe retirement of
+  stale reset-epoch lease records.
 - Patch 0033 owns the process-wide AVAudioSession management policy and the
   exact-token application/PiP ownership lease. It does not weaken patch 0032's
   user-action gate under application-managed policy.
 - Frozen patch SHA-256 values after a clean pinned-series replay are:
   - `0032-audio-media-services-reset.patch`:
-    `3b402d434287d2e64b0169f9a7917b6d4648151374eff85b2ee149c6a964841b`
+    `299dcf69856805872e803c44e84826d95c39e4eea5876bf1cc0d01de3f99b8c4`
   - `0033-apple-audio-session-policy-leases.patch`:
     `2b8f68dd496463bc69d915b05feb6f484ddeb674af991405faa5205c2204db74`
 
@@ -107,6 +108,10 @@
 
 Validation asset pins for the composed version/archive proof are:
 
+- `audio-media-services-reset-source-check.py`:
+  `790cdcda875ea0d63afe4feabb7842059c4a83302123556b50ace549e9c74365`
+- `validate-audio-media-services-reset.sh`:
+  `410817cf391d1f0ce726b02eb29a2e5cdf78996521e1b4c3955f138f02df1622`
 - `pip_extension_version.py`:
   `98adb898d64ed8c8a57bbc883bf10dd96eeb399a2f7671c1d2fceb262fad63b5`
 - `native-extension-version-probe.c`:
@@ -117,9 +122,10 @@ Validation asset pins for the composed version/archive proof are:
 The source validator performs structural checks, one deliberate negative
 mutation per gate, ABI parity checks, bounded-exhaustive two-owner/two-output
 state exploration, and long deterministic retry/reset sequences. The shell
-wrapper adds exact Apple Objective-C/C syntax against a configured slice.
-`build-libvlc.sh` runs that wrapper as a postflight; it does not replace the
-physical oracle.
+wrapper adds exact ARC-enabled Apple Objective-C/C syntax against a configured
+slice. `build-libvlc.sh` runs the portable proof before architecture
+compilation and repeats it with configured Apple syntax as a postflight; it
+does not replace the physical oracle.
 
 The ordered patch manifest owns extension version 8 and separately requires
 the patch 0033 audio-session lease refinement. A shared source-composition

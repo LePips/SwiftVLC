@@ -5898,10 +5898,10 @@ index 35e375bd5ca56655aab5820cf289fe6da1dccc10..ee77f646990bfced19dd94e3098b4c1c
  
 diff --git a/src/darwin/apple_audio_session.m b/src/darwin/apple_audio_session.m
 new file mode 100644
-index 0000000000000000000000000000000000000000..9abc7164c3757d46a5b0d31d4cc9cf519f2daa9e
+index 0000000000000000000000000000000000000000..d6c1ad1129b2c7badfc0868f06d8d70bcf3a01cf
 --- /dev/null
 +++ b/src/darwin/apple_audio_session.m
-@@ -0,0 +1,882 @@
+@@ -0,0 +1,878 @@
 +/*****************************************************************************
 + * apple_audio_session.m: process-wide Apple audio-session recovery broker
 + *****************************************************************************
@@ -6218,9 +6218,6 @@ index 0000000000000000000000000000000000000000..9abc7164c3757d46a5b0d31d4cc9cf51
 +            [_orphanedAudioUnitContexts addObject:contexts[i]];
 +        }
 +    }
-+    [audioUnits release];
-+    [contexts release];
-+
 +    NSArray<NSValue *> *cfObjects = [_orphanedCFObjects copy];
 +    [_orphanedCFObjects removeAllObjects];
 +    for (NSValue *value in cfObjects)
@@ -6230,7 +6227,6 @@ index 0000000000000000000000000000000000000000..9abc7164c3757d46a5b0d31d4cc9cf51
 +        else
 +            CFRelease((CFTypeRef)value.pointerValue);
 +    }
-+    [cfObjects release];
 +}
 +
 +- (uint64_t)recordNotificationOnEventQueue:(NSNotification *)notification

@@ -963,6 +963,19 @@ else
     info "Selected patch manifest has no SwiftVLC native extension contract."
 fi
 
+# The libvlccore Darwin Objective-C target is compiled under ARC. Run the
+# 0032/0033 structural/mutation/model proof before any architecture build so
+# manual ownership or build-system drift fails in seconds instead of after the
+# expensive contrib compilation. The configured-slice postflight below still
+# owns the exact Apple SDK syntax proof.
+if grep -q 'audioSessionMediaServicesWereReset:' \
+       "${VLC_SRC}/modules/audio_output/apple/audiounit_ios.m" 2>/dev/null ||
+   grep -q 'audioSessionMediaServicesWereReset:' \
+       "${VLC_SRC}/modules/audio_output/apple/avsamplebuffer.m" 2>/dev/null; then
+    info "Validating Apple audio reset/ownership ARC source contract before native compilation..."
+    "${SCRIPT_DIR}/validate-audio-media-services-reset.sh" "${VLC_SRC}"
+fi
+
 # Exercise the exact production helper whenever this patch is in the engine
 # source. CI links a released xcframework and cannot cover a newly added native
 # patch until its beta exists, so engine builds themselves own this regression.
@@ -1783,9 +1796,10 @@ fi
 
 # Patches 0032/0033 harden both Apple audio-output implementations and route
 # reset recovery plus optional application ownership through one process
-# broker. Run their fail-closed source/mutation/state/ABI proof after all
-# selected slices finish, then type-check against one exact configured Apple
-# device build when the build includes a platform that uses AVAudioSession.
+# broker. The source proof already ran before native compilation; repeat it
+# after all selected slices finish and type-check against one exact configured
+# Apple device build when the build includes a platform that uses
+# AVAudioSession.
 if grep -q 'audioSessionMediaServicesWereReset:' \
        "${VLC_SRC}/modules/audio_output/apple/audiounit_ios.m" 2>/dev/null ||
    grep -q 'audioSessionMediaServicesWereReset:' \

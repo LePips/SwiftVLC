@@ -614,7 +614,8 @@ python3 - \
   "$SCRIPT_DIR/patches/validation/chromecast-load-transition-source-check.py" \
   "$SCRIPT_DIR/validate-post-pin-stability.sh" \
   "$SCRIPT_DIR/native-validator-assets.sha256" \
-  "$SCRIPT_DIR/verify-native-validator-assets.py" <<'PY'
+  "$SCRIPT_DIR/verify-native-validator-assets.py" \
+  "$SCRIPT_DIR/validate-audio-media-services-reset.sh" <<'PY'
 import ast
 import re
 import sys
@@ -629,6 +630,7 @@ validator_asset_manifest = [
     for line in open(sys.argv[7])
 ]
 validator_asset_verifier = open(sys.argv[8]).read()
+audio_reset_validator = open(sys.argv[9]).read()
 manifest_lines = [
     line.strip() for line in open(sys.argv[3]) if line.strip() and not line.lstrip().startswith("#")
 ]
@@ -993,6 +995,28 @@ for marker in (
 ):
     if native_source_command.count(marker) != 1:
         sys.exit(f"native extension source contract is incomplete: {marker}")
+
+audio_source_contract = build.index(
+    'info "Validating Apple audio reset/ownership ARC source contract before native compilation..."'
+)
+dynamic_source_edit = build.index('\npatch_vlc_snapshot_filter_owner\n')
+if not native_source_contract < audio_source_contract < dynamic_source_edit:
+    sys.exit(
+        "Apple audio ARC source validation is not between exact patch replay "
+        "and native compilation setup"
+    )
+audio_source_region = build[audio_source_contract:dynamic_source_edit]
+if audio_source_region.count(
+    '"${SCRIPT_DIR}/validate-audio-media-services-reset.sh" "${VLC_SRC}"'
+) != 1:
+    sys.exit("pre-build Apple audio ARC source validation is missing or duplicated")
+
+arc_broker_syntax = (
+    '"$CLANG" "${COMMON[@]}" -fobjc-arc \\\n'
+    '    "$VLC_SOURCE_ROOT/src/darwin/apple_audio_session.m"'
+)
+if audio_reset_validator.count(arc_broker_syntax) != 1:
+    sys.exit("Apple audio broker syntax proof does not mirror its ARC build mode")
 
 archive_repair = build.index(
     '"${SCRIPT_DIR}/fix-duplicate-symbols.sh" "${OUTPUT_DIR}/libvlc.xcframework"'
