@@ -278,6 +278,30 @@ class FeatureChecklistTests(unittest.TestCase):
             },
         )
         self.assertEqual(
+            controls["headless-vout-teardown-contract"],
+            {
+                "id": "headless-vout-teardown-contract",
+                "title": (
+                    "Stopped video-output teardown and natural-EOF contract"
+                ),
+                "description": (
+                    "Patch 0040 applies VLC's established started-vout "
+                    "admission rule to SwiftVLC's Hold-backed emptiness query. "
+                    "Mutation-sensitive source and state proofs preserve strict "
+                    "work only for a running output, while two watchdog-bounded "
+                    "macOS processes prove that the real H.264 archive survives "
+                    "renderer-start failure through both early stop/release and "
+                    "natural EOF/release."
+                ),
+                "command": (
+                    "./scripts/validate-headless-vout-teardown.sh "
+                    "--source-root /path/to/patched-vlc-source "
+                    "--xcframework /path/to/libvlc.xcframework "
+                    "--work-root /external/work-root"
+                ),
+            },
+        )
+        self.assertEqual(
             controls["libvlc-macho-metadata-contract"],
             {
                 "id": "libvlc-macho-metadata-contract",

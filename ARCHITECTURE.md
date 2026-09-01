@@ -763,7 +763,11 @@ hash-locked VLC patch sequence and executes mutation-sensitive consumer
 contracts without compiling libVLC. In particular, the libaom 3.13.2 contract
 models NASM 3's separate optimization and format help topics and proves the
 obsolete libaom 3.13.1 query still reproduces the discovered macOS x86_64
-configure failure.
+configure failure. The same lane proves that stopped video outputs never enter
+Hold-backed render-thread control, while the native macOS build executes
+watchdog-bounded early-stop and natural-EOF processes against the assembled
+archive. This preserves the failure-path behavior that exposed patch 0027's
+teardown deadlock without moving the hour-scale native build into hosted CI.
 
 **Physical release qualification.** CI cannot exercise real system PiP,
 SpringBoard controls, device audio interruptions, native video output, or the
@@ -788,6 +792,7 @@ blocked until `check-qualification.sh` accepts that record.
 | `scripts/setup-dev.sh` | First step for local repo work. Downloads the last-released xcframework into `Vendor/`, flips `Package.swift` to the local-path form, and points the Showcase app at the repo-local Swift package. Flags: `--force` (re-download), `--skip-download` (only flip local references). |
 | `scripts/build-libvlc.sh` | Compiles libVLC from VideoLAN source (pinned via `VLC_HASH`) into `Vendor/libvlc.xcframework`. Applies the local VLC source patches described in README. |
 | `scripts/validate-native-patch-series-source.sh` | Replays the complete hash-locked VLC patch stack in a disposable external work root and runs its fast source/mutation contracts, including libaom/NASM consumer compatibility. |
+| `scripts/validate-headless-vout-teardown.sh` | Verifies patch 0040's started-vout lifecycle ordering and, when given an XCFramework, runs bounded headless H.264 stop/release and natural-EOF/release regressions against its macOS archive. |
 | `scripts/fix-duplicate-symbols.sh` | Localizes `_json_parse_error` and `_json_read` in the chromecast plugin, which two VLC plugins each emit. Called automatically by `build-libvlc.sh` and `setup-dev.sh`. |
 | `scripts/release.sh` | Cuts a versioned release, uploads the xcframework asset, pins the Showcase app to that exact Swift package version, and advances `main`. |
 | `Validate SwiftVLC.command` | One-command physical-device validator for maintainers and community testers. Preflights signing and hardware, runs the complete applicable matrix unattended, and creates a privacy-scrubbed shareable report ZIP. |

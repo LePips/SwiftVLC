@@ -685,6 +685,7 @@ verify_artifact_provenance() {
     --build-configuration-file "validate-libvlc-macho-metadata.py=$SCRIPT_DIR/validate-libvlc-macho-metadata.py" \
     --build-configuration-file "validate-apple-assembly-metadata-patch.sh=$SCRIPT_DIR/validate-apple-assembly-metadata-patch.sh" \
     --build-configuration-file "validate-aom-nasm3-detection.sh=$SCRIPT_DIR/validate-aom-nasm3-detection.sh" \
+    --build-configuration-file "validate-headless-vout-teardown.sh=$SCRIPT_DIR/validate-headless-vout-teardown.sh" \
     --build-configuration-file "validate-chromecast-load-transition.sh=$SCRIPT_DIR/validate-chromecast-load-transition.sh" \
     --build-configuration-file "validate-native-extension-contract.sh=$SCRIPT_DIR/validate-native-extension-contract.sh" \
     --build-configuration-file "native-extension-version-probe.c=$SCRIPT_DIR/patches/validation/native-extension-version-probe.c" \

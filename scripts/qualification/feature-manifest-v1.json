@@ -832,6 +832,12 @@
       "command": "./scripts/validate-aom-nasm3-detection.sh /path/to/patched-vlc-source /external/work-root"
     },
     {
+      "id": "headless-vout-teardown-contract",
+      "title": "Stopped video-output teardown and natural-EOF contract",
+      "description": "Patch 0040 applies VLC's established started-vout admission rule to SwiftVLC's Hold-backed emptiness query. Mutation-sensitive source and state proofs preserve strict work only for a running output, while two watchdog-bounded macOS processes prove that the real H.264 archive survives renderer-start failure through both early stop/release and natural EOF/release.",
+      "command": "./scripts/validate-headless-vout-teardown.sh --source-root /path/to/patched-vlc-source --xcframework /path/to/libvlc.xcframework --work-root /external/work-root"
+    },
+    {
       "id": "libvlc-macho-metadata-contract",
       "title": "Final libVLC Mach-O object contract",
       "description": "The candidate XCFramework is parsed archive member by archive member; every Mach-O object must identify the exact Apple platform and deployment target, match its containing CPU slice, use exactly one modern build-version command, avoid legacy platform commands, and stay within architecture-specific section-alignment caps.",

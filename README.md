@@ -265,6 +265,12 @@ real macOS x86_64 rebuild exposed libaom 3.13.1's obsolete one-topic help
 probe. It runs the fixed CMake logic against realistic split NASM 3 help and
 also proves that the old probe reproduces the failure.
 
+It also enforces patch 0040's stopped-video-output lifecycle rule. A native
+macOS build runs the same contract against the assembled archive in two
+watchdog-bounded headless processes: early stop/release and natural
+EOF/release after renderer creation fails. This turns a teardown deadlock into
+a bounded build failure instead of letting a release build hang indefinitely.
+
 ### Platform selection
 
 | Flag | Platforms |

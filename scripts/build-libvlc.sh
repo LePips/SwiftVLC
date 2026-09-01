@@ -765,6 +765,7 @@ chromecast_metadata_schema_patch_listed=no
 chromecast_load_transition_patch_listed=no
 apple_assembly_metadata_patch_listed=no
 aom_nasm3_detection_patch_listed=no
+headless_vout_teardown_patch_listed=no
 swiftvlc_manifest_extension_version=""
 swiftvlc_apple_audio_session_leases_listed=no
 
@@ -826,6 +827,9 @@ if [ -n "${PATCHES_DIR}" ] && [ -d "${PATCHES_DIR}" ]; then
         fi
         if [ "$manifest_entry" = "0039-aom-3.13.2-nasm-detection.patch" ]; then
             aom_nasm3_detection_patch_listed=yes
+        fi
+        if [ "$manifest_entry" = "0040-headless-vout-teardown-deadlock.patch" ]; then
+            headless_vout_teardown_patch_listed=yes
         fi
     done <<< "$manifest_listing"
     info "Patch manifest verified: ${#manifest_order[@]} patches"
@@ -971,6 +975,13 @@ if [ -n "${PATCHES_DIR}" ] && [ -d "${PATCHES_DIR}" ]; then
         info "Validating libaom 3.13.2 and NASM 3 detection source contract..."
         "${SCRIPT_DIR}/validate-aom-nasm3-detection.sh" \
             "${VLC_SRC}" "${BUILD_DIR}/validation/0039-aom-nasm3-detection"
+    fi
+
+    if [ "$headless_vout_teardown_patch_listed" = yes ]; then
+        info "Validating headless video-output teardown source contract..."
+        "${SCRIPT_DIR}/validate-headless-vout-teardown.sh" \
+            --source-root "${VLC_SRC}" \
+            --work-root "${BUILD_DIR}/validation/0040-headless-vout-teardown"
     fi
 
     # Patches 0035–0037 deliberately change no public API, so they have no
@@ -1809,6 +1820,14 @@ if grep -q 'bool seekable;' \
         "${OUTPUT_DIR}/libvlc.xcframework"
 fi
 
+if [ "$headless_vout_teardown_patch_listed" = yes ] && [ "$BUILD_MACOS" = "yes" ]; then
+    info "Validating bounded headless video-output stop and natural-EOF teardown..."
+    "${SCRIPT_DIR}/validate-headless-vout-teardown.sh" \
+        --source-root "${VLC_SRC}" \
+        --xcframework "${OUTPUT_DIR}/libvlc.xcframework" \
+        --work-root "${BUILD_DIR}/validation/0040-headless-vout-teardown-runtime"
+fi
+
 if grep -q 'swiftvlc_next_frame_request_result_t' \
     "${REPO_ROOT}/Sources/CLibVLC/include/vlc/libvlc_media_player.h"; then
     if [ "$BUILD_MACOS" = "yes" ]; then
@@ -1991,6 +2010,7 @@ provenance_args=(
     --build-configuration-file "validate-libvlc-macho-metadata.py=${SCRIPT_DIR}/validate-libvlc-macho-metadata.py"
     --build-configuration-file "validate-apple-assembly-metadata-patch.sh=${SCRIPT_DIR}/validate-apple-assembly-metadata-patch.sh"
     --build-configuration-file "validate-aom-nasm3-detection.sh=${SCRIPT_DIR}/validate-aom-nasm3-detection.sh"
+    --build-configuration-file "validate-headless-vout-teardown.sh=${SCRIPT_DIR}/validate-headless-vout-teardown.sh"
     --build-configuration-file "validate-chromecast-load-transition.sh=${SCRIPT_DIR}/validate-chromecast-load-transition.sh"
     --build-configuration-file "validate-native-extension-contract.sh=${SCRIPT_DIR}/validate-native-extension-contract.sh"
     --build-configuration-file "native-extension-version-probe.c=${SCRIPT_DIR}/patches/validation/native-extension-version-probe.c"

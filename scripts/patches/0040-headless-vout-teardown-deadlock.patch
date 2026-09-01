@@ -1,0 +1,28 @@
+diff --git a/src/input/decoder.c b/src/input/decoder.c
+index 1a437a266a..2e3f6cab6a 100644
+--- a/src/input/decoder.c
++++ b/src/input/decoder.c
+@@ -3237,10 +3237,23 @@ static bool vlc_input_decoder_IsDrainedLocked(vlc_input_decoder_t *owner)
+          * aggregate (including static-filter pending output). A committed
+          * result with no tail may drain while its deferred terminal is held;
+          * input-side commit arbitration preserves that winner across END_S. */
++        /* vout_IsEmpty() serializes against the render thread. A failed
++         * window/display request leaves the decoder's vout non-NULL but keeps
++         * video.started false because no render thread was cloned. Transitions
++         * cancel strict and installed-observer work before closing this gate;
++         * a legacy/internal countdown cannot produce final output while it is
++         * closed and must not keep natural EOF alive forever. */
++        if (!Decoder_HasStartedVoutLocked(owner))
++        {
++            assert(owner->strict_frame_request_id == 0);
++            assert(!Decoder_HasFrameNextObserverLocked(owner));
++            return true;
++        }
++
+         if (!Decoder_HasFrameNextObserverLocked(owner)
+          && (owner->frames_countdown > 0
+           || owner->strict_frame_request_id != 0))
+             return false;
+         return vout_IsEmpty(owner->video.vout);
+     }
+     else if(owner->cat == AUDIO_ES && owner->audio.stream != NULL)

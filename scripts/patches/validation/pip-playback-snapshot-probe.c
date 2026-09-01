@@ -1,8 +1,35 @@
-/* Runtime proof for patch 0022 (identity-coherent native PiP playback state). */
+/* Runtime proof for patch 0022's identity-coherent PiP playback state.
+ * A hard watchdog also makes stopped-vout teardown regressions fail boundedly
+ * instead of wedging the enclosing native build. */
+#include <signal.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <time.h>
+#include <unistd.h>
 #include <vlc/vlc.h>
+
+static void watchdog_expired(int signal_number)
+{
+    (void) signal_number;
+    static const char message[] =
+        "TIMEOUT PiP playback snapshot teardown did not terminate\n";
+    (void) write(STDERR_FILENO, message, sizeof(message) - 1);
+    _exit(124);
+}
+
+static int install_watchdog(void)
+{
+    struct sigaction action = {0};
+    action.sa_handler = watchdog_expired;
+    sigemptyset(&action.sa_mask);
+    if (sigaction(SIGALRM, &action, NULL) != 0)
+    {
+        perror("sigaction");
+        return -1;
+    }
+    alarm(20);
+    return 0;
+}
 
 static void sleep_milliseconds(long milliseconds)
 {
@@ -20,6 +47,9 @@ int main(int argc, char **argv)
         fprintf(stderr, "usage: %s <seekable-vod>\n", argv[0]);
         return 2;
     }
+
+    if (install_watchdog() != 0)
+        return 2;
 
     const char *arguments[] = { "--no-audio", "--vout=dummy", "--aout=dummy" };
     libvlc_instance_t *vlc = libvlc_new(3, arguments);
@@ -101,6 +131,7 @@ int main(int argc, char **argv)
     libvlc_media_player_release(player);
     libvlc_media_release(media);
     libvlc_release(vlc);
+    alarm(0);
 
     if (!ready)
     {

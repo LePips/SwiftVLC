@@ -1056,11 +1056,13 @@ expected_manifest_tail = [
     "dd3c672da9b7a6fcd82e6eadd298d1c5f86ce75e55d86800de8fd83683461105  0037-chromecast-load-transition-correctness.patch",
     "5f1a58d162c798b2d6f5c2a2fdac9f728279f195ef192405b80272bc2f164c59  0038-apple-assembly-metadata.patch",
     "f78050944caf0c291cac76e28cc4238b3e407d104446e2876c6e0213923d3581  0039-aom-3.13.2-nasm-detection.patch",
+    "a4945772122ce3d02f9a5c0c7136fa5dae940f251081238260b760b86c834681  0040-headless-vout-teardown-deadlock.patch",
 ]
-if manifest_lines[-3:] != expected_manifest_tail:
+if manifest_lines[-4:] != expected_manifest_tail:
     sys.exit(
-        "patch manifest must end with frozen 0037/0038 followed by AOM 0039: "
-        f"got {manifest_lines[-3:]}"
+        "patch manifest must end with frozen 0037/0038/0039 followed by "
+        "headless teardown 0040: "
+        f"got {manifest_lines[-4:]}"
     )
 
 required_validator_assets = (
@@ -1071,7 +1073,10 @@ required_validator_assets = (
     "scripts/patches/validation/effective-playback-rate-event-abi.cpp",
     "scripts/patches/validation/effective-playback-rate-event-probe.c",
     "scripts/patches/validation/effective-playback-rate-event-source-check.py",
+    "scripts/patches/validation/headless-vout-teardown-probe.c",
+    "scripts/patches/validation/headless-vout-teardown-source-check.py",
     "scripts/patches/validation/native-extension-version-probe.c",
+    "scripts/patches/validation/pip-playback-snapshot-probe.c",
     "scripts/patches/validation/pip_extension_version.py",
     "scripts/patches/validation/strict-frame-step-probe.c",
     "scripts/patches/validation/strict-frame-step-source-check.py",
@@ -1084,8 +1089,10 @@ required_validator_assets = (
     "scripts/validate-aom-nasm3-detection.sh",
     "scripts/validate-audio-media-services-reset.sh",
     "scripts/validate-effective-playback-rate-event.sh",
+    "scripts/validate-headless-vout-teardown.sh",
     "scripts/validate-native-extension-contract.sh",
     "scripts/validate-native-patch-series-source.sh",
+    "scripts/validate-pip-playback-snapshot.sh",
     "scripts/validate-strict-frame-step.sh",
     "scripts/validate-vmem-picture-pts.sh",
 )
@@ -1095,8 +1102,10 @@ required_executable_validator_assets = (
     "scripts/validate-aom-nasm3-detection.sh",
     "scripts/validate-audio-media-services-reset.sh",
     "scripts/validate-effective-playback-rate-event.sh",
+    "scripts/validate-headless-vout-teardown.sh",
     "scripts/validate-native-extension-contract.sh",
     "scripts/validate-native-patch-series-source.sh",
+    "scripts/validate-pip-playback-snapshot.sh",
     "scripts/validate-strict-frame-step.sh",
     "scripts/validate-vmem-picture-pts.sh",
 )
@@ -1140,6 +1149,9 @@ assembly_manifest_detection = build.index(
 aom_manifest_detection = build.index(
     'if [ "$manifest_entry" = "0039-aom-3.13.2-nasm-detection.patch" ]; then'
 )
+headless_manifest_detection = build.index(
+    'if [ "$manifest_entry" = "0040-headless-vout-teardown-deadlock.patch" ]; then'
+)
 warning_manifest_detection = build.index(
     'if [ "$manifest_entry" = "0035-chromecast-metadata-warning.patch" ]; then'
 )
@@ -1158,6 +1170,9 @@ assembly_source_gate = build.index(
 aom_source_gate = build.index(
     'info "Validating libaom 3.13.2 and NASM 3 detection source contract..."'
 )
+headless_source_gate = build.index(
+    'info "Validating headless video-output teardown source contract..."'
+)
 first_other_post_replay_gate = build.index(
     '# Patches 0035–0037 deliberately change no public API'
 )
@@ -1168,11 +1183,13 @@ if not (
     < load_transition_manifest_detection
     < assembly_manifest_detection
     < aom_manifest_detection
+    < headless_manifest_detection
     < clean_build_gate
     < aom_clean_build_gate
     < patch_replay
     < assembly_source_gate
     < aom_source_gate
+    < headless_source_gate
     < first_other_post_replay_gate
     < dynamic_source_edit
 ):
@@ -1203,6 +1220,13 @@ if (
     not in build
 ):
     sys.exit("build does not invoke the standalone 0039 validator exactly")
+if (
+    '"${SCRIPT_DIR}/validate-headless-vout-teardown.sh" \\\n'
+    '            --source-root "${VLC_SRC}" \\\n'
+    '            --work-root "${BUILD_DIR}/validation/0040-headless-vout-teardown"'
+    not in build
+):
+    sys.exit("build does not invoke the standalone 0040 source validator exactly")
 
 for assignment in (
     "chromecast_metadata_warning_patch_listed=no",
@@ -1210,11 +1234,13 @@ for assignment in (
     "chromecast_load_transition_patch_listed=no",
     "apple_assembly_metadata_patch_listed=no",
     "aom_nasm3_detection_patch_listed=no",
+    "headless_vout_teardown_patch_listed=no",
     "chromecast_metadata_warning_patch_listed=yes",
     "chromecast_metadata_schema_patch_listed=yes",
     "chromecast_load_transition_patch_listed=yes",
     "apple_assembly_metadata_patch_listed=yes",
     "aom_nasm3_detection_patch_listed=yes",
+    "headless_vout_teardown_patch_listed=yes",
 ):
     if build.count(assignment) != 1:
         sys.exit(f"native patch selector is not initialized exactly once: {assignment}")
@@ -1483,6 +1509,12 @@ if audio_reset_validator.count(arc_broker_syntax) != 1:
 archive_repair = build.index(
     '"${SCRIPT_DIR}/fix-duplicate-symbols.sh" "${OUTPUT_DIR}/libvlc.xcframework"'
 )
+headless_runtime_selection = build.index(
+    'if [ "$headless_vout_teardown_patch_listed" = yes ] && [ "$BUILD_MACOS" = "yes" ]; then'
+)
+headless_runtime_gate = build.index(
+    'info "Validating bounded headless video-output stop and natural-EOF teardown..."'
+)
 final_archive_mutation = build.index(
     'find "${OUTPUT_DIR}/libvlc.xcframework" -name \'*.a\' -exec xcrun ranlib -D {} \\;'
 )
@@ -1497,6 +1529,8 @@ archive_metadata_gate = build.index(
 )
 if not (
     archive_repair
+    < headless_runtime_selection
+    < headless_runtime_gate
     < final_archive_mutation
     < native_archive_contract_setup
     < native_archive_contract
@@ -1506,6 +1540,16 @@ if not (
         "exact linked native extension validation is not after the final "
         "archive mutation and before artifact metadata/provenance gates"
     )
+headless_runtime_region = build[headless_runtime_selection:final_archive_mutation]
+for marker in (
+    'if [ "$headless_vout_teardown_patch_listed" = yes ] && [ "$BUILD_MACOS" = "yes" ]; then',
+    '"${SCRIPT_DIR}/validate-headless-vout-teardown.sh" \\\n',
+    '        --source-root "${VLC_SRC}" \\\n',
+    '        --xcframework "${OUTPUT_DIR}/libvlc.xcframework" \\\n',
+    '        --work-root "${BUILD_DIR}/validation/0040-headless-vout-teardown-runtime"',
+):
+    if headless_runtime_region.count(marker) != 1:
+        sys.exit(f"0040 bounded runtime gate is incomplete: {marker}")
 native_archive_command = build[
     native_archive_contract_setup:archive_metadata_gate
 ]
@@ -1539,6 +1583,7 @@ expected_configurations = {
     "validate-libvlc-macho-metadata.py",
     "validate-apple-assembly-metadata-patch.sh",
     "validate-aom-nasm3-detection.sh",
+    "validate-headless-vout-teardown.sh",
     "validate-chromecast-load-transition.sh",
     "validate-native-extension-contract.sh",
     "validate-post-pin-stability.sh",
@@ -2761,6 +2806,7 @@ for release_flow_stub in \
   validate-native-extension-contract.sh \
   validate-apple-assembly-metadata-patch.sh \
   validate-aom-nasm3-detection.sh \
+  validate-headless-vout-teardown.sh \
   validate-chromecast-load-transition.sh \
   validate-post-pin-stability.sh \
   verify-patch-manifest.sh; do
