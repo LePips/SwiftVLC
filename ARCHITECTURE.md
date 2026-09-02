@@ -796,6 +796,7 @@ blocked until `check-qualification.sh` accepts that record.
 |---|---|
 | `scripts/setup-dev.sh` | First step for local repo work. Downloads the last-released xcframework into `Vendor/`, flips `Package.swift` to the local-path form, and points the Showcase app at the repo-local Swift package. Flags: `--force` (re-download), `--skip-download` (only flip local references). |
 | `scripts/build-libvlc.sh` | Compiles libVLC from VideoLAN source (pinned via `VLC_HASH`) into `Vendor/libvlc.xcframework`. Applies the local VLC source patches described in README. |
+| `scripts/detach-managed-build-directory.py` | Implements no-follow, descriptor-relative initialization, handoff, quarantine cleanup, and publication primitives for native build/output directories. It rejects identity changes and device/filesystem crossings instead of falling back to pathname-recursive deletion. |
 | `scripts/validate-native-patch-series-source.sh` | Replays the complete hash-locked VLC patch stack in a disposable external work root and runs its fast source/mutation contracts, including libaom/NASM consumer compatibility. |
 | `scripts/validate-headless-vout-teardown.sh` | Verifies patch 0040's started-vout lifecycle ordering and, when given an XCFramework, runs bounded headless H.264 stop/release and natural-EOF/release regressions against its macOS archive. |
 | `scripts/validate-native-extension-contract.sh` | Binds the ordered native patch intent to exact extension v9 source/header semantics, the inherited v8 audio-session lease refinement, a fail-closed weak compatibility path, and one strong required symbol in every XCFramework architecture. |
@@ -941,6 +942,7 @@ SwiftVLC/
 │
 ├── scripts/
 │   ├── build-libvlc.sh                   # Compile libvlc from source
+│   ├── detach-managed-build-directory.py # Descriptor-safe native filesystem operations
 │   ├── setup-dev.sh                      # Download xcframework for local dev
 │   ├── release.sh                        # Cut a versioned release and advance main
 │   ├── fix-duplicate-symbols.sh          # Localize duplicate json symbols

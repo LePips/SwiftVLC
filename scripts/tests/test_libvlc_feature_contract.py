@@ -93,7 +93,7 @@ class LibVLCFeatureContractTests(unittest.TestCase):
             failures.extend(VALIDATOR.validate_contract(manifest.stem, manifest))
         self.assertEqual(failures, [])
 
-    def test_clean_retries_when_metadata_repopulates_the_build_directory(self) -> None:
+    def test_checkout_local_clean_uses_descriptor_safe_helper(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             scripts = root / "scripts"
@@ -101,6 +101,12 @@ class LibVLCFeatureContractTests(unittest.TestCase):
             build_script = scripts / "build-libvlc.sh"
             build_script.write_bytes(
                 (REPO_ROOT / "scripts" / "build-libvlc.sh").read_bytes()
+            )
+            helper = scripts / "detach-managed-build-directory.py"
+            helper.write_bytes(
+                (
+                    REPO_ROOT / "scripts" / "detach-managed-build-directory.py"
+                ).read_bytes()
             )
             subprocess.run(
                 ["git", "init", "-q"],
@@ -112,22 +118,18 @@ class LibVLCFeatureContractTests(unittest.TestCase):
             build_directory = scripts / ".build-libvlc"
             (build_directory / "vlc").mkdir(parents=True)
             (build_directory / "vlc" / "stale").write_text("stale")
+            (build_directory / ".swiftvlc-managed-libvlc-build-v1").write_text(
+                "SwiftVLC managed libVLC build directory v1\n"
+            )
 
             fake_bin = root / "bin"
             fake_bin.mkdir()
-            state = root / "rm-was-raced"
+            state = root / "unsafe-rm-was-called"
             (fake_bin / "rm").write_text("""#!/bin/bash
 set -eu
-target="${@: -1}"
-if [ ! -e "$SWIFTVLC_RM_TEST_STATE" ]; then
-  : > "$SWIFTVLC_RM_TEST_STATE"
-  /bin/rm "$@"
-  mkdir -p "$target"
-  : > "$target/.DS_Store"
-  echo "rm: $target: Directory not empty" >&2
-  exit 1
-fi
-exec /bin/rm "$@"
+: > "$SWIFTVLC_RM_TEST_STATE"
+echo "unsafe pathname rm was called" >&2
+exit 99
 """)
             (fake_bin / "rm").chmod(0o755)
             environment = dict(
@@ -146,9 +148,8 @@ exec /bin/rm "$@"
             )
 
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertTrue(state.is_file())
+            self.assertFalse(state.exists())
             self.assertFalse(build_directory.exists())
-            self.assertIn("cleanup did not settle", result.stderr)
 
 
 if __name__ == "__main__":

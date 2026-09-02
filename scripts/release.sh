@@ -900,6 +900,7 @@ verify_artifact_provenance() {
     --pinned-revision "$current_pin" \
     --patch-manifest "$SCRIPT_DIR/patches/manifest.sha256" \
     --build-configuration-file "build-libvlc.sh=$SCRIPT_DIR/build-libvlc.sh" \
+    --build-configuration-file "detach-managed-build-directory.py=$SCRIPT_DIR/detach-managed-build-directory.py" \
     --build-configuration-file "fix-duplicate-symbols.sh=$SCRIPT_DIR/fix-duplicate-symbols.sh" \
     --build-configuration-file "validate-libvlc-macho-metadata.py=$SCRIPT_DIR/validate-libvlc-macho-metadata.py" \
     --build-configuration-file "verify-libvlc-build-paths.py=$SCRIPT_DIR/verify-libvlc-build-paths.py" \

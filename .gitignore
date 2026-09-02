@@ -11,6 +11,8 @@ Package.resolved
 
 # libVLC build artifacts (21GB+ — rebuild with ./scripts/build-libvlc.sh)
 .build-libvlc/
+/scripts/.build-libvlc.removing-*/
+/scripts/.swiftvlc-managed-build.initializing-*/
 
 # Pre-built xcframework (1.2GB — rebuild with ./scripts/build-libvlc.sh)
 Vendor/

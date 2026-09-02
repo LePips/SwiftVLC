@@ -266,10 +266,25 @@ mkdir -p /Volumes/ExternalSSD/SwiftVLC-Native
   --clean-build --all
 ```
 
-The managed child carries an ownership marker, and an atomic lock prevents two
-builds from using the root concurrently. The script refuses to remove an
-unmarked directory and never automatically clears a stale lock; verify its
-recorded owner first.
+The managed child carries an ownership marker, and an atomic generation-bound
+lock prevents two builds from using the root concurrently. The script refuses
+to remove an unmarked directory and never automatically clears a stale lock;
+verify that no build is active before inspecting or removing that exact lock
+directory and its `.swiftvlc-lock-generation-v1` token.
+Cleanup detaches the marked child atomically and walks it through no-follow
+directory descriptors, refusing filesystem boundaries or replacement races.
+Any interrupted quarantine or publication staging is preserved and reported
+for inspection instead of being silently reused or recursively deleted.
+
+Source mutation, output assembly, and final `Vendor/` publication each use a
+one-use directory binding before entering an anchored working directory. The
+XCFramework is built and fully validated in the stable external path, copied
+to a private Vendor staging directory, and checked against its recorded tree
+identity before it replaces the previous artifact. Publication uses atomic
+no-replace moves and writes provenance last as the completion marker, so a
+partial handoff cannot masquerade as a releasable native artifact. These
+constraints are part of the release reproducibility and data-safety contract,
+not coverage-only tests.
 
 The inexpensive source-contract lane replays the complete ordered patch stack
 and exercises its mutation/behavior proofs without compiling VLC:

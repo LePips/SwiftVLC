@@ -77,9 +77,12 @@ jobs:
           SWIFTVLC_ALLOW_DRAFT_RELEASE: ${{ ((github.event_name == 'push' && startsWith(github.ref, 'refs/heads/release-candidates/')) || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && startsWith(github.head_ref, 'release-candidates/'))) && '1' || '' }}
         run: ./scripts/tests/release-integrity.sh
 
-      - name: Test native artifact path gate
+      - name: Test native filesystem safety helpers
         timeout-minutes: 1
-        run: python3 -B -m unittest scripts/tests/test_verify_libvlc_build_paths.py
+        run: |
+          python3 -B -m unittest \
+            scripts/tests/test_verify_libvlc_build_paths.py \
+            scripts/tests/test_detach_managed_build_directory.py
 
       - name: Test native build-root safety
         timeout-minutes: 1
