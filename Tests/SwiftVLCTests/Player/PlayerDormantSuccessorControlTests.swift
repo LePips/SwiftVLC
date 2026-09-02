@@ -386,7 +386,7 @@ extension Integration {
     @Test
     func `Fresh-handle play publication yields to nested load and play`() throws {
       let player = try makeActiveDrawablePlayer(nativeState: .paused)
-      let retiringPointer = player.pointer
+      let retiringNativeHandleGeneration = player.eventBridge.currentNativeHandleGeneration
       let generationBeforePlays = player.sessionGeneration
       var nestedMRL: String?
       var nestedLoadRan = false
@@ -417,7 +417,13 @@ extension Integration {
       #expect(player.sessionGenerationMedia == player.currentMedia?.pointer)
       #expect(player.mediaPublicationGeneration == nil)
       #expect(player.nativeHandleRepresentsCurrentMedia)
-      #expect(player.pointer != retiringPointer)
+      // A can finish releasing before C is allocated, so C may reuse A's
+      // address. The monotonic attachment generation is the non-aliasing
+      // identity for the two committed A -> B -> C replacements.
+      #expect(
+        player.eventBridge.currentNativeHandleGeneration
+          == retiringNativeHandleGeneration &+ 2
+      )
       #expect(playDispatchCount == 1)
     }
 
