@@ -18,6 +18,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from report_validation import atomic_write_json  # noqa: E402
+
 
 class RangeNotSatisfiable(ValueError):
     pass
@@ -515,6 +518,8 @@ class FixtureHTTPServer(ThreadingHTTPServer):
         self.request_log = request_log
         self._request_log_lock = threading.Lock()
         self._accepts_request_log_writes = True
+        if ":" in address[0]:
+            self.address_family = socket.AF_INET6
         super().__init__(address, FixtureHandler)
         self.root = root.resolve()
         self.chunk_size = chunk_size
@@ -963,6 +968,11 @@ def lan_address() -> str:
         return connection.getsockname()[0]
 
 
+def advertised_url(host: str, port: int) -> str:
+    url_host = f"[{host}]" if ":" in host else host
+    return f"http://{url_host}:{port}"
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", type=Path, required=True)
@@ -990,10 +1000,10 @@ def main() -> None:
     ready = {
         "host": advertised,
         "port": server.server_port,
-        "baseURL": f"http://{advertised}:{server.server_port}",
+        "baseURL": advertised_url(advertised, server.server_port),
     }
     if args.ready_file:
-        args.ready_file.write_text(json.dumps(ready, indent=2, sort_keys=True) + "\n")
+        atomic_write_json(args.ready_file, ready)
     print(json.dumps(ready, sort_keys=True), flush=True)
     server.serve_forever()
 

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 import hashlib
 import importlib.util
 import json
@@ -134,6 +134,16 @@ class FeatureChecklistTests(unittest.TestCase):
             "durationSeconds": 12,
         }
 
+    @staticmethod
+    def fresh_timing() -> dict:
+        completed = datetime.now(timezone.utc).replace(microsecond=0)
+        started = completed - timedelta(seconds=12)
+        return {
+            "startedAtUTC": started.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "completedAtUTC": completed.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "wallDurationSeconds": 12,
+        }
+
     def build(self, source: dict) -> dict:
         return feature_checklist.build_checklist(
             source,
@@ -232,6 +242,7 @@ class FeatureChecklistTests(unittest.TestCase):
             "./scripts/validate-chromecast-load-transition.sh "
             "/path/to/patched-vlc-source /external/work-root",
         )
+
         self.assertEqual(
             controls["chromecast-metadata-schema-contract"]["command"],
             "./scripts/validate-chromecast-load-transition.sh "
@@ -324,6 +335,44 @@ class FeatureChecklistTests(unittest.TestCase):
                 ),
             },
         )
+
+    def test_recast_session_isolation_is_an_explicit_receiver_blocker(self):
+        manifest = feature_checklist.load_json(
+            QUALIFICATION / "feature-manifest-v1.json", "feature manifest"
+        )
+        feature = next(
+            row
+            for row in manifest["features"]
+            if row["id"] == "cast-recast-session-isolation"
+        )
+
+        self.assertEqual(feature["releaseRequirement"], "required")
+        self.assertEqual(feature["execution"], "external-lab")
+        self.assertEqual(feature["evidenceLevel"], "receiver-output")
+        self.assertIn("rapidly recasts media B", feature["description"])
+        self.assertIn("30–60 seconds", feature["description"])
+        self.assertIn("no late STOP or CLOSE", feature["description"])
+        self.assertIn("local player events", feature["blocker"])
+        self.assertNotIn("scenarioIds", feature)
+        self.assertNotIn("runnerScenarioIds", feature)
+
+    def test_real_system_pip_controls_remain_an_explicit_operator_blocker(self):
+        manifest = feature_checklist.load_json(
+            QUALIFICATION / "feature-manifest-v1.json", "feature manifest"
+        )
+        feature = next(
+            row
+            for row in manifest["features"]
+            if row["id"] == "pip-system-overlay-controls"
+        )
+
+        self.assertEqual(feature["releaseRequirement"], "required")
+        self.assertEqual(feature["execution"], "operator-assisted")
+        self.assertEqual(feature["evidenceLevel"], "system-output")
+        self.assertIn("visible SpringBoard", feature["description"])
+        self.assertIn("does not press the real SpringBoard", feature["blocker"])
+        self.assertNotIn("scenarioIds", feature)
+        self.assertNotIn("runnerScenarioIds", feature)
 
     def test_manifest_rejects_unknown_and_unclassified_scenarios(self):
         unknown = json.loads(json.dumps(self.manifest))
@@ -460,6 +509,9 @@ class FeatureChecklistTests(unittest.TestCase):
     def test_device_report_distinguishes_pass_runner_failure_and_blocked(self):
         source = {
             **self.identity(),
+            **self.fresh_timing(),
+            "mode": "qualification",
+            "qualificationEligibleEnvironment": True,
             "device": {
                 "name": "Fixture Phone",
                 "productType": "iPhone99,1",
@@ -493,6 +545,40 @@ class FeatureChecklistTests(unittest.TestCase):
         self.assertFalse(checklist["summary"]["requiredFeaturesSatisfied"])
         self.assertFalse(checklist["summary"]["releaseReady"])
         self.assertEqual(checklist["runnerFailures"][0]["scenario"], "vod")
+
+    def test_stale_qualifying_device_report_cannot_render_a_green_checklist(self):
+        completed = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(
+            seconds=feature_checklist.policy.MAXIMUM_STABLE_REPORT_AGE_SECONDS + 1
+        )
+        started = completed - timedelta(seconds=12)
+        source = {
+            **self.identity(),
+            "mode": "qualification",
+            "qualificationEligibleEnvironment": True,
+            "startedAtUTC": started.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "completedAtUTC": completed.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "wallDurationSeconds": 12,
+            "device": {
+                "name": "Stale Fixture Phone",
+                "productType": "iPhone99,1",
+                "osVersion": "26.0",
+                "osBuild": "23A1",
+                "osReleaseType": "stable",
+                "matchingHardwareRows": ["iphone"],
+            },
+            "qualificationRows": [self.row("seek", "iphone")],
+            "scenarios": [
+                {
+                    "scenario": "seek-runner",
+                    "result": "pass",
+                    "xcodebuildExitCode": 0,
+                    "libraryErrorCount": 0,
+                }
+            ],
+        }
+
+        with self.assertRaisesRegex(feature_checklist.ChecklistError, "is stale"):
+            self.build(source)
 
     def exploratory_future_device_report(self) -> dict:
         return {
@@ -575,6 +661,62 @@ class FeatureChecklistTests(unittest.TestCase):
                 mutate(source)
                 with self.assertRaises(feature_checklist.ChecklistError):
                     self.build(source)
+
+    def test_current_major_beta_report_never_presents_automated_passes(self):
+        source = {
+            **self.identity(),
+            "mode": "exploratory",
+            "qualificationEligibleEnvironment": False,
+            "device": {
+                "name": "Current Matrix Beta Phone",
+                "deviceFamily": "iPhone",
+                "productType": "iPhone99,1",
+                "osVersion": "26.1",
+                "osMajor": 26,
+                "osBuild": "23B1a",
+                "osReleaseType": "beta",
+                "matchingHardwareRows": ["iphone"],
+            },
+            "qualificationRows": [],
+            "scenarios": [
+                {
+                    "scenario": "seek-runner",
+                    "result": "pass",
+                    "xcodebuildExitCode": 0,
+                    "libraryErrorCount": 0,
+                },
+                {
+                    "scenario": "vod",
+                    "result": "pass",
+                    "xcodebuildExitCode": 0,
+                    "libraryErrorCount": 0,
+                },
+            ],
+        }
+
+        checklist = self.build(source)
+
+        automated = [
+            feature
+            for feature in checklist["features"]
+            if feature["execution"] == "automated"
+        ]
+        self.assertTrue(automated)
+        self.assertTrue(all(feature["status"] == "notRun" for feature in automated))
+        self.assertEqual(checklist["summary"]["counts"]["pass"], 0)
+        self.assertFalse(checklist["summary"]["requiredFeaturesSatisfied"])
+        self.assertFalse(checklist["scope"]["releaseCreditEligible"])
+        self.assertIn(
+            "EXPLORATORY — NOT RELEASE-QUALIFYING",
+            feature_checklist.render_markdown(checklist, self.manifest),
+        )
+
+        source["qualificationRows"].append(self.row("seek", "iphone"))
+        with self.assertRaisesRegex(
+            feature_checklist.ChecklistError,
+            "cannot contain qualification rows",
+        ):
+            self.build(source)
 
     def test_release_record_is_ready_only_when_every_required_row_passes(self):
         self.manifest["features"] = self.manifest["features"][:2]
@@ -680,6 +822,8 @@ class FeatureChecklistTests(unittest.TestCase):
             }
 
             def write_strict_record() -> None:
+                completed_at = datetime.now(timezone.utc).replace(microsecond=0)
+                started_at = completed_at - timedelta(seconds=12)
                 identity = {
                     **self.identity(),
                     "formatVersion": 2,
@@ -933,6 +1077,13 @@ class FeatureChecklistTests(unittest.TestCase):
                             "device": {"udid": "fixture-device"},
                             "qualificationEligibleEnvironment": True,
                             "mode": "qualification",
+                            "startedAtUTC": started_at.strftime(
+                                "%Y-%m-%dT%H:%M:%SZ"
+                            ),
+                            "completedAtUTC": completed_at.strftime(
+                                "%Y-%m-%dT%H:%M:%SZ"
+                            ),
+                            "wallDurationSeconds": 12,
                             "result": "pass",
                             "scenarios": runner_rows,
                             "qualificationRows": rows,
@@ -1048,6 +1199,9 @@ class FeatureChecklistTests(unittest.TestCase):
     def test_outputs_are_deterministic_and_html_escaped(self):
         source = {
             **self.identity(),
+            **self.fresh_timing(),
+            "mode": "qualification",
+            "qualificationEligibleEnvironment": True,
             "device": {
                 "name": "Fixture & Phone",
                 "productType": "iPhone99,1",

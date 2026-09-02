@@ -97,6 +97,33 @@ extension Integration {
       #expect(first?.generation != second?.generation)
     }
 
+    /// Loading is a synchronous session boundary but not a playback command.
+    /// The outgoing `.playing` mirror must never be relabeled as readiness for
+    /// the newly loaded media.
+    @Test
+    func `Loading from playback publishes idle for the incoming generation`() async throws {
+      let player = Player(instance: TestInstance.makeAudioOnly())
+      try player.load(Media(url: TestMedia.silenceURL))
+      player._setStateForTesting(
+        state: .playing,
+        isPlaybackRequestedActive: true
+      )
+      let stream = player.playbackStatus
+
+      try player.load(Media(url: TestMedia.twosecURL))
+      let incomingGeneration = player.generation
+      player.playbackStatusBridge.terminate()
+
+      var incoming: [PlaybackStatus] = []
+      for await status in stream where status.generation == incomingGeneration {
+        incoming.append(status)
+      }
+
+      #expect(!incoming.isEmpty)
+      #expect(incoming.allSatisfy { $0.state == .idle })
+      #expect(player.state == .idle)
+    }
+
     /// `stateTransitions` must keep its no-replay behaviour. `recast(to:)`
     /// captures it before calling `play()` and awaits the *next* `.playing`; a
     /// replayed one from the outgoing session would let it report success

@@ -5,6 +5,7 @@ from pathlib import Path
 import sys
 
 from pip_extension_version import (
+    read_source_root,
     resolve_extension_version,
     run_negative_mutations as run_extension_version_mutations,
     validate_vendored_headers,
@@ -1428,17 +1429,12 @@ def main() -> int:
     # Patch 0027's setters remain additive ABI v4. Later patches own their own
     # semantics, while this composition gate binds the exact shared extension
     # version selected by their complete, monotonically nested public markers.
-    extension_sources = {
-        "media_player": media_player,
-        "public_header": media_player_header,
-        "events_header": events_header,
-        "exports": libvlc_symbols,
-    }
+    extension_sources = read_source_root(root)
     extension_resolution = resolve_extension_version(extension_sources)
     extension_mutations = run_extension_version_mutations(
         extension_sources, extension_resolution.version,
         extension_resolution.same_version_groups)
-    if (extension_resolution.version == 8
+    if (extension_resolution.version >= 8
             and "apple-audio-session-leases"
             in extension_resolution.same_version_groups):
         vendored_include = (

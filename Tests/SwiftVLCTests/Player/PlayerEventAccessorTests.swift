@@ -13,7 +13,6 @@ extension Logic {
       expectNoDifference(PlayerEvent.seekableChanged(true).seekableChanged, true)
       expectNoDifference(PlayerEvent.pausableChanged(false).pausableChanged, false)
       expectNoDifference(PlayerEvent.volumeChanged(0.75).volumeChanged, 0.75)
-      expectNoDifference(PlayerEvent.rateChanged(1.5).rateChanged, 1.5)
       expectNoDifference(PlayerEvent.voutChanged(2).voutChanged, 2)
       expectNoDifference(PlayerEvent.bufferingProgress(0.5).bufferingProgress, 0.5)
       expectNoDifference(PlayerEvent.chapterChanged(4).chapterChanged, 4)
@@ -77,7 +76,6 @@ extension Logic {
         PlayerEvent.muted.mediaChanged == nil,
         PlayerEvent.muted.encounteredError == nil,
         PlayerEvent.muted.volumeChanged == nil,
-        PlayerEvent.muted.rateChanged == nil,
         PlayerEvent.unmuted.muted == nil,
         PlayerEvent.muted.unmuted == nil,
         PlayerEvent.muted.corked == nil,

@@ -33,6 +33,30 @@ extension Integration {
     }
 
     @Test
+    func `Legacy and policy-aware VLCInstance initializer references stay callable`() throws {
+      let legacyInitializer:
+        ([String], String?, String?) throws(VLCError) -> VLCInstance =
+        VLCInstance.init(arguments:applicationName:httpUserAgent:)
+      let policyInitializer:
+        ([String], String?, String?, AppleAudioSessionPolicy) throws(VLCError) -> VLCInstance =
+        VLCInstance.init(
+          arguments:applicationName:httpUserAgent:appleAudioSessionPolicy:
+        )
+
+      let legacyInstance = try legacyInitializer(lifecycleArguments, nil, nil)
+      let explicitInstance = try policyInitializer(
+        lifecycleArguments,
+        nil,
+        nil,
+        .libraryManaged
+      )
+
+      expectNoDifference(legacyInstance.appleAudioSessionPolicy, .libraryManaged)
+      expectNoDifference(explicitInstance.appleAudioSessionPolicy, .libraryManaged)
+      expectNoDifference(legacyInstance.arguments, explicitInstance.arguments)
+    }
+
+    @Test
     func `Version 8 propagates the default policy as one canonical argument`() throws {
       let resolved = try VLCInstance.arguments(
         VLCInstance.defaultArguments,
@@ -207,12 +231,30 @@ extension Integration {
     }
 
     @Test
-    func `Legacy PiP conflicts resolve to the immutable instance owner`() {
+    func `No legacy PiP override inherits the immutable instance owner`() {
+      expectNoDifference(
+        AppleAudioSessionPolicy.libraryManaged.resolvingLegacyPiPOverride(nil),
+        AppleAudioSessionPolicyResolution(
+          managesAudioSession: true,
+          diagnostic: nil
+        )
+      )
+      expectNoDifference(
+        AppleAudioSessionPolicy.applicationManaged.resolvingLegacyPiPOverride(nil),
+        AppleAudioSessionPolicyResolution(
+          managesAudioSession: false,
+          diagnostic: nil
+        )
+      )
+    }
+
+    @Test
+    func `Legacy PiP override remains controller-local in both conflict directions`() {
       expectNoDifference(
         AppleAudioSessionPolicy.libraryManaged.resolvingLegacyPiPOverride(false),
         AppleAudioSessionPolicyResolution(
-          managesAudioSession: true,
-          diagnostic: .ignoredLegacyPiPOverride(
+          managesAudioSession: false,
+          diagnostic: .appliedLegacyPiPControllerOverride(
             requestedManagement: false,
             inheritedPolicy: .libraryManaged
           )
@@ -221,8 +263,8 @@ extension Integration {
       expectNoDifference(
         AppleAudioSessionPolicy.applicationManaged.resolvingLegacyPiPOverride(true),
         AppleAudioSessionPolicyResolution(
-          managesAudioSession: false,
-          diagnostic: .ignoredLegacyPiPOverride(
+          managesAudioSession: true,
+          diagnostic: .appliedLegacyPiPControllerOverride(
             requestedManagement: true,
             inheritedPolicy: .applicationManaged
           )
@@ -295,7 +337,7 @@ extension Integration {
     #if canImport(AppKit)
     @Test
     @available(*, deprecated, message: "Exercises the pre-1.1 compatibility initializer")
-    func `PiPVideoView legacy conflict is nonfatal and instance policy wins`() async throws {
+    func `PiPVideoView legacy false preserves its controller-local opt-out`() async throws {
       let instance = try VLCInstance(arguments: lifecycleArguments)
       let player = Player(instance: instance)
       let result = try await legacyHost(
@@ -303,10 +345,10 @@ extension Integration {
         managesAudioSession: false
       )
 
-      expectNoDifference(result.controller.managesAudioSession, true)
+      expectNoDifference(result.controller.managesAudioSession, false)
       expectNoDifference(
         result.controller.audioSessionPolicyDiagnostic,
-        .ignoredLegacyPiPOverride(
+        .appliedLegacyPiPControllerOverride(
           requestedManagement: false,
           inheritedPolicy: .libraryManaged
         )

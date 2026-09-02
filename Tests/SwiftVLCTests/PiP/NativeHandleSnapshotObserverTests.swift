@@ -257,6 +257,30 @@ extension Integration {
       await player.shutdown()
     }
     #endif
+
+    #if os(macOS)
+    @Test
+    func `A handle replacement moves the macOS media controller snapshot`() async throws {
+      let player = Player(instance: TestInstance.shared)
+      let mediaController = MacNativePiPMediaController()
+      mediaController.player = player
+
+      let outgoing = player.pointer
+      #expect(mediaController.callbackSnapshot.withLock { $0.playerPointer } == outgoing)
+      #expect(player.nativeHandleSnapshotObservers.count == 1)
+
+      try player.replaceNativePlayerForDrawablePlayback(target: nil)
+      let incoming = player.pointer
+
+      #expect(incoming != outgoing)
+      #expect(mediaController.callbackSnapshot.withLock { $0.playerPointer } == incoming)
+
+      mediaController.player = nil
+      #expect(player.nativeHandleSnapshotObservers.isEmpty)
+      #expect(mediaController.callbackSnapshot.withLock { $0.playerPointer } == nil)
+      await player.shutdown()
+    }
+    #endif
   }
 }
 #endif

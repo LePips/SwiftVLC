@@ -107,7 +107,9 @@ struct TimebaseSoakValidationCase: View {
         }
       }
       await Task.yield()
-      guard controller.start() == .accepted else { throw TimebaseSoakFailure("PiP start was not accepted") }
+      guard controller.requestStart() == .accepted else {
+        throw TimebaseSoakFailure("PiP start was not accepted")
+      }
       try await waitUntil("Direct PiP did not become active", timeout: .seconds(30)) { controller.isActive }
       try await signalReady(baseURL: baseURL)
       let soakStarted = ProcessInfo.processInfo.systemUptime

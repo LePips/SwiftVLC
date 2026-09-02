@@ -392,11 +392,11 @@ flowchart TB
     end
 
     subgraph L2["AsyncStream Broadcasting — any thread"]
-        Store["EventBridge · Broadcaster<PlayerEvent><br/>Each makeStream() creates an independent consumer"]
+        Store["EventBridge broadcasters<br/>Public events + private ordered sourced signals"]
     end
 
     subgraph L3["Observable Properties — @MainActor"]
-        Update["Player event consumer Task<br/>for await event → update @Observable props"]
+        Update["Player signal consumer Task<br/>for await signal → update @Observable props"]
     end
 
     CB -->|"yield to all continuations"| Store
@@ -411,7 +411,6 @@ libVLC's player event types are attached to the event manager and mapped to type
 |---|---|
 | **State** | `stateChanged(PlayerState)`, `mediaStopping`, `encounteredError` |
 | **Time** | `timeChanged(Duration)`, `positionChanged(Double)`, `lengthChanged(Duration)` |
-| **Playback control** | `rateChanged(Float)` (effective-state resolution; not request-correlated or measured throughput) |
 | **Capability** | `seekableChanged(Bool)`, `pausableChanged(Bool)` |
 | **Tracks** | `tracksChanged`, `mediaChanged` |
 | **Buffering** | `bufferingProgress(Float)` |
@@ -420,6 +419,12 @@ libVLC's player event types are attached to the event manager and mapped to type
 | **Chapters** | `chapterChanged(Int)`, `titleListChanged`, `titleSelectionChanged(Int)` |
 | **Recording** | `recordingChanged(isRecording:filePath:)` |
 | **Programs** | `programAdded(Int)`, `programDeleted(Int)`, `programSelected(unselectedId:selectedId:)`, `programUpdated(Int)` |
+
+Effective playback-rate resolutions deliberately stay outside this
+source-exhaustive enum. `Player.effectivePlaybackRateResolutions` publishes
+`EffectivePlaybackRateResolution` values on a lossless stream with exact native
+handle and playback-generation provenance, while the private ordered signal
+lane invalidates `Player.rate` after any preceding media change is adopted.
 
 ### Multi-Consumer Broadcasting
 
@@ -623,7 +628,7 @@ invalidate as a payload-free fallback. Seekability payloads also synchronize
 3. **Range policy.** Reports no-content, live/indefinite, and finite media distinctly, and invalidates from event payloads rather than stale observable mirrors.
 4. **State observation.** Distinguishes VLC-initiated state changes from pending PiP-initiated play/pause intent and keeps AVKit's linear-playback policy aligned with seekability.
 5. **Deferred pause.** Debounces transient AVKit pause signals so skips and PiP transitions do not issue an unsafe short-lived native pause.
-6. **Audio policy.** `VLCInstance.appleAudioSessionPolicy` is the immutable owner shared by Swift and native output. Library-managed PiP performs no construction-time audio mutation: each Player lazily acquires one opaque, exact-owner lease from the same process-wide native broker used by AudioUnit and AVSampleBufferAudioRenderer. The broker serializes category/mode configuration, activation, owner counting, reset epochs, and true-final-owner deactivation; native-handle replacement acquires the successor before releasing the predecessor. Native adoption of an already-active Player acquires before publishing backend ownership so automatic PiP cannot outrun session setup, while failed acquisition remains retryable at observed native did-start. One player-owned notification router delivers disruptions to at most one live PiP controller and supplies the route-loss/reset transport fallback when no controller exists. Application-managed instances receive a native no-op result and suppress every audio-session mutation while retaining the user-action boundary required after media-services reset.
+6. **Audio policy.** `VLCInstance.appleAudioSessionPolicy` is the immutable owner shared by Swift and native output. Library-managed PiP performs no construction-time audio mutation: each Player lazily acquires one opaque, exact-owner lease from the same process-wide native broker used by AudioUnit and AVSampleBufferAudioRenderer. The broker serializes category/mode configuration, activation, owner counting, reset epochs, and true-final-owner deactivation; native-handle replacement acquires the successor before releasing the predecessor. Native adoption of an already-active Player acquires before publishing backend ownership so automatic PiP cannot outrun session setup, while failed acquisition remains retryable at observed native did-start. One player-owned notification router delivers disruptions to at most one live PiP controller and supplies the route-loss/reset transport fallback when no controller exists. Application-managed instances receive a native no-op result and suppress every audio-session mutation while retaining the user-action boundary required after media-services reset. The deprecated `PiPVideoView(..., managesAudioSession:)` overload is a documented transition exception: it preserves SwiftVLC 1.0's controller-local Boolean but never changes the immutable policy inherited by native output; applications needing a complete opt-out must use an application-managed instance.
 
 On macOS, the SPI native backend intentionally bypasses SwiftVLC's vmem
 renderer. It gives libVLC a normal `NSView` drawable and deliberately does
@@ -688,7 +693,7 @@ failure and propagate an error thrown by the caller's closure unchanged.
 | `parseFailed` | Media parsing reports failure status |
 | `parseTimeout` | Parsing exceeds specified timeout |
 | `trackNotFound` | Track selection fails (invalid track ID) |
-| `rendererFailed` | libVLC synchronously rejects applying a renderer |
+| `operationFailed("Set renderer")` | libVLC synchronously rejects applying a renderer |
 | `invalidState` | Operation attempted in wrong state |
 | `invalidInput` | Public API argument is outside its documented range |
 | `operationFailed` | Generic libVLC operation failure |
@@ -793,8 +798,9 @@ blocked until `check-qualification.sh` accepts that record.
 | `scripts/build-libvlc.sh` | Compiles libVLC from VideoLAN source (pinned via `VLC_HASH`) into `Vendor/libvlc.xcframework`. Applies the local VLC source patches described in README. |
 | `scripts/validate-native-patch-series-source.sh` | Replays the complete hash-locked VLC patch stack in a disposable external work root and runs its fast source/mutation contracts, including libaom/NASM consumer compatibility. |
 | `scripts/validate-headless-vout-teardown.sh` | Verifies patch 0040's started-vout lifecycle ordering and, when given an XCFramework, runs bounded headless H.264 stop/release and natural-EOF/release regressions against its macOS archive. |
+| `scripts/validate-native-extension-contract.sh` | Binds the ordered native patch intent to exact extension v9 source/header semantics, the inherited v8 audio-session lease refinement, a fail-closed weak compatibility path, and one strong required symbol in every XCFramework architecture. |
 | `scripts/fix-duplicate-symbols.sh` | Localizes `_json_parse_error` and `_json_read` in the chromecast plugin, which two VLC plugins each emit. Called automatically by `build-libvlc.sh` and `setup-dev.sh`. |
-| `scripts/release.sh` | Cuts a versioned release, uploads the xcframework asset, pins the Showcase app to that exact Swift package version, and advances `main`. |
+| `scripts/release.sh` | Stages a non-SemVer draft candidate on an exact release commit, requires that commit's GitHub gates, atomically assigns/publishes the final SemVer tag, proves immutability and public consumption, then advances `main`. |
 | `Validate SwiftVLC.command` | One-command physical-device validator for maintainers and community testers. Preflights signing and hardware, runs the complete applicable matrix unattended, and creates a privacy-scrubbed shareable report ZIP. |
 | `scripts/qualification/run-device-tests.sh` | Lower-level candidate-bound device runner used by the launcher. Supports exact prebuilt products and focused diagnostic lanes. |
 | `scripts/qualification/assemble-record.py` | Combines eligible reports from separate devices into the versioned qualification record while rejecting stale, duplicate, exploratory, or identity-mismatched evidence. |
@@ -826,13 +832,15 @@ The Showcase apps follow the same split: published states pin `SwiftVLC` by exac
 |---|---|---|
 | Published `main` | `url: + checksum:` of the latest release | GitHub Release asset |
 | Local dev after `setup-dev.sh` | `path: "Vendor/libvlc.xcframework"` | `setup-dev.sh` (download) or `build-libvlc.sh` (build) |
-| CI | rewritten in-memory to `url: + checksum:` of the latest release | SPM resolves + caches (keyed on checksum) |
+| Ordinary CI | rewritten in-memory to `url: + checksum:` of the latest public release | SPM resolves + caches (keyed on checksum) |
+| Exact release-candidate CI | `path: "Vendor/libvlc.xcframework"` after authenticated draft verification | `gh` downloads the deterministic non-SemVer candidate-tag asset; intended final manifest, checksum, candidate tag/branch/release target, and HEAD identity are rechecked |
 | Release tag `vX.Y.Z` | `url: + checksum:` | `release.sh` uploads the zip as a release asset at that URL |
 | SPM consumer pinning `X.Y.Z` | Reads the tag's `Package.swift` | SPM resolves + verifies checksum + caches |
 
 ### Release flow
 
-`release.sh` creates a real release commit that stays on `main`.
+`release.sh` creates the exact release commit off the last public `main`; that
+commit becomes the single fast-forward of `main` only after publication proof.
 
 ```mermaid
 flowchart LR
@@ -845,23 +853,38 @@ flowchart LR
     ASSEMBLE --> GATE["check-qualification.sh"]
     GATE -->|all rows pass| RELEASE["release.sh X.Y.Z --candidate"]
     GATE -->|missing, stale, or failed| BLOCK["Block stable publication"]
-    RELEASE --> COMMIT["Commit on main:<br/>Package.swift → url+checksum<br/>Showcase → exactVersion X.Y.Z"]
-    COMMIT --> TAG["git tag vX.Y.Z"]
-    TAG --> DRAFT["Upload immutable assets<br/>to draft GitHub release"]
-    DRAFT --> PUSH_MAIN["Advance origin/main"]
-    PUSH_MAIN --> PUBLISH["Publish GitHub release"]
-    PUBLISH --> SPM["main and consumers resolve the same release"]
+    RELEASE --> COMMIT["Canonical release commit:<br/>Package.swift → intended final URL+checksum<br/>Showcase → exactVersion X.Y.Z"]
+    COMMIT --> CANDIDATE_TAG["Push non-SemVer tag:<br/>swiftvlc-candidate-vX.Y.Z-&lt;full SHA&gt;"]
+    CANDIDATE_TAG --> DRAFT["Create empty draft; retain exact uploads,<br/>repair starter uploads, upload only missing"]
+    DRAFT --> CANDIDATE_BRANCH["After all assets: push<br/>release-candidates/vX.Y.Z"]
+    CANDIDATE_BRANCH --> CI["Exact-commit Tests, Fixtures,<br/>Vendor, native, sanitizer gates"]
+    CI -->|all succeed| FINALIZE["release.sh --candidate ... --finalize"]
+    CI -->|missing, pending, failed| DRAFT
+    FINALIZE --> PUBLISH["One release update:<br/>tag=vX.Y.Z + target=SHA + draft=false"]
+    PUBLISH --> PUBLIC["Verify immutable release/attestation,<br/>anonymous asset + external SwiftPM"]
+    PUBLIC --> PUSH_MAIN["Recheck identities + fast-forward origin/main"]
+    PUSH_MAIN --> CLEANUP["Verify final state; remove candidate refs"]
+    CLEANUP --> SPM["main and consumers resolve the same public release"]
 ```
 
 Preflight refuses releases from non-`main` branches, uncommitted changes in
-`Package.swift` or the Showcase project, pre-existing local or remote tags, and
-unauthenticated `gh`. Stable publication additionally rejects an absent,
+`Package.swift` or the Showcase project, pre-existing final release identities,
+disabled repository release immutability, and unauthenticated or under-scoped
+`gh`. Stable publication additionally rejects an absent,
 partial, exploratory, failed, or candidate-mismatched physical-device record.
 If a pre-commit rewrite or post-write sanity check fails, the script restores
-`Package.swift` and the Showcase project before exiting. Assets remain in a
-non-public draft until `origin/main` advances successfully. A post-write regex
-guard verifies that the rewritten `Package.swift` still contains the `CLibVLC`
-target, catching a malformed replacement before the tag is cut.
+`Package.swift` and the Showcase project before exiting. Staging leaves
+`origin/main` unchanged while exact-commit CI consumes the draft through a
+narrow authenticated candidate-branch path; pull requests and ordinary clients
+still reject drafts. No final SemVer tag exists during this phase, because
+SwiftPM discovers eligible versions from Git tags rather than GitHub release
+visibility. Finalization changes the release tag/target and publishes in one
+update, then verifies the immutable release attestation, every asset, anonymous
+download, and an external SwiftPM build before advancing `main`. An uncertain
+update response is classified from remote state rather than blindly repeated.
+A failed main push leaves a usable immutable release plus exact candidate
+anchors for a safe rerun. Canonical byte-for-byte reconstruction rejects staged
+Package/Showcase edits beyond the two generated release rewrites.
 
 After publishing a tag, verify that Swift Package Index has completed its
 asynchronous documentation build and that the unversioned documentation URL

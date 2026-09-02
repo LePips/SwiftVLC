@@ -31,9 +31,12 @@ extension Player {
   /// its native handle (stopping drawable-hosted playback does this
   /// lazily, and ``recast(to:)``-style renderer changes do it
   /// mid-session), the bridge reattaches to the replacement handle before
-  /// the old one finishes stopping on a background queue. Terminal events
-  /// of the *swapped-out* handle are never delivered to any stream; state
-  /// derived from them is reset by the swap itself.
+  /// the old one finishes stopping on a background queue. The swapped-out
+  /// handle's `Stopped` and later native terminal callbacks are never
+  /// delivered to any stream. If its authoritative EOS entered before
+  /// detachment, SwiftVLC retains that exact provenance and publishes one raw
+  /// ``PlayerEvent/endReached-enum.case`` after the replacement transaction
+  /// commits; it does not fabricate the missing `Stopped` transition.
   public nonisolated func events(
     policy: EventBufferingPolicy = .newest(64),
     filter: (@Sendable (PlayerEvent) -> Bool)? = nil

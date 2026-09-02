@@ -210,7 +210,7 @@ struct MediaServicesResetValidationCase: View {
 
   private func startPictureInPicture() async {
     do {
-      guard let controller, controller.start() == .accepted else {
+      guard let controller, controller.requestStart() == .accepted else {
         throw AppleAudioQualificationFailure("Native PiP start was not accepted")
       }
       try await AppleAudioQualificationSupport.waitUntil(timeout: .seconds(15)) {

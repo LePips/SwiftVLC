@@ -559,6 +559,19 @@ def _scope_hardware(
     device = source.get("device")
     if not isinstance(device, dict):
         raise ChecklistError("device report has no device object")
+    release_credit_eligible = (
+        source.get("mode") == "qualification"
+        and source.get("qualificationEligibleEnvironment") is True
+    )
+    if release_credit_eligible:
+        try:
+            policy.validate_report_timing(source, stable=True)
+        except policy.QualificationPolicyError as error:
+            raise ChecklistError(str(error)) from error
+    if not release_credit_eligible and indexed_rows:
+        raise ChecklistError(
+            "an exploratory or ineligible device report cannot contain qualification rows"
+        )
     matching = device.get("matchingHardwareRows")
     if not isinstance(matching, list):
         raise ChecklistError("device report has no matchingHardwareRows array")
@@ -798,8 +811,16 @@ def build_checklist(
             (runner, scope_hardware[0] if len(scope_hardware) == 1 else "device")
             for runner in sorted(required_runner_ids - set(runner_results))
         ]
+    release_credit_eligible = (
+        source_kind == "releaseRecord"
+        or (
+            source.get("mode") == "qualification"
+            and source.get("qualificationEligibleEnvironment") is True
+        )
+    )
     required_satisfied = (
         bool(required)
+        and release_credit_eligible
         and not missing_required_runner_runs
         and all(row.get("result") == "pass" for row in runner_results.values())
         and all(feature["status"] == "pass" for feature in required)
@@ -834,6 +855,15 @@ def build_checklist(
         scope["qualificationEligibleEnvironment"] = source.get(
             "qualificationEligibleEnvironment"
         )
+        scope["releaseCreditEligible"] = release_credit_eligible
+        scope["runTiming"] = {
+            key: source.get(key)
+            for key in (
+                "startedAtUTC",
+                "completedAtUTC",
+                "wallDurationSeconds",
+            )
+        }
         scope["device"] = {
             key: device.get(key)
             for key in (
@@ -979,6 +1009,7 @@ def render_markdown(checklist: dict, manifest: dict) -> str:
             [
                 f"| Device | {_markdown_escape(device.get('name') or device.get('marketingName'))} ({_markdown_escape(device.get('productType'))}) |",
                 f"| OS | {_markdown_escape(device.get('osVersion'))} ({_markdown_escape(device.get('osBuild'))}, {_markdown_escape(device.get('osReleaseType'))}) |",
+                f"| Evidence class | {'RELEASE-QUALIFYING' if scope.get('releaseCreditEligible') else 'EXPLORATORY — NOT RELEASE-QUALIFYING'} |",
             ]
         )
     projection = scope.get("exploratoryProjection")
@@ -1158,6 +1189,14 @@ def render_html(checklist: dict, manifest: dict) -> str:
         body.append(
             f"<tr><th>OS</th><td>{escaped(device.get('osVersion'))} "
             f"({escaped(device.get('osBuild'))}, {escaped(device.get('osReleaseType'))})</td></tr>"
+        )
+        evidence_class = (
+            "RELEASE-QUALIFYING"
+            if checklist["scope"].get("releaseCreditEligible")
+            else "EXPLORATORY — NOT RELEASE-QUALIFYING"
+        )
+        body.append(
+            f"<tr><th>Evidence class</th><td>{escaped(evidence_class)}</td></tr>"
         )
     projection = checklist["scope"].get("exploratoryProjection")
     if isinstance(projection, dict):

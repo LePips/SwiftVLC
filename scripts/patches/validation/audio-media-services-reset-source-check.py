@@ -898,17 +898,29 @@ def build_gates() -> list[Gate]:
             end = source.find(end_marker, start)
             if start < 0 or end < 0:
                 raise ProofFailure(f"missing Apple audio API region in {key}")
-            regions.append(compact(source[start : end + len(end_marker)]))
+            region = source[start : end + len(end_marker)]
+            regions.append(tuple(
+                token for token, _ in objective_c_tokens(region)
+            ))
         if regions[0] != regions[1]:
             raise ProofFailure("native/vendored Apple audio public API drift")
     add(custom_gate(
         "snapshot.native_vendored_full_audio_api_parity",
         public_audio_api_parity, "vendored_header", None,
         "swiftvlc_libvlc_media_player_release_apple_audio_session_lease"))
-    add(body_gate(
-        "snapshot.extension_version_v8", "media_player",
-        "swiftvlc_libvlc_pip_extensions_version(", "return 8;",
-        replacement="return 7;"))
+    def inherited_extension_version(sources: Mapping[str, str]) -> None:
+        version_body = compact(body(
+            sources["media_player"],
+            "swiftvlc_libvlc_pip_extensions_version(",
+        ))
+        if version_body not in ("{ return 8; }", "{ return 9; }"):
+            raise ProofFailure(
+                "Apple audio recovery requires exact extension version 8 or 9"
+            )
+    add(custom_gate(
+        "snapshot.extension_version_v8_or_v9", inherited_extension_version,
+        "media_player", "swiftvlc_libvlc_pip_extensions_version(",
+        "return "))
     add(source_gate(
         "snapshot.native_size_alignment_asserts", "media_player",
         "sizeof(swiftvlc_apple_audio_recovery_snapshot_t) == 120",

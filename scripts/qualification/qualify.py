@@ -314,6 +314,8 @@ def build_runner_command(
             command.extend([option, str(value)])
     if require_stable:
         command.append("--require-stable")
+    if profile.name == "release":
+        command.append("--full-suite-selection")
     if args.exploratory_current_only:
         command.append("--exploratory-current-only")
     if args.skip_build:

@@ -32,9 +32,12 @@ a release qualification:
 | `full` | ~60 minutes | Broad functional release rehearsal on one device. Endurance, receiver, and other unexecuted features remain visibly `NOT RUN` or `BLOCKED`. |
 | `release` | ~8.5 hours | Every automated matrix lane applicable to that stable device, including the unshortened performance and two-hour soak requirements. |
 
-Times are planning estimates, not timeouts. The release profile automatically
-omits `iphone-current`-only lanes on other matrix devices; it does not weaken or
-shorten them. Its validator derives every automated runner lane from the
+Times are planning estimates. Every Xcode build, test enumeration, and device
+test is also wrapped by independent wall-clock and output-idle watchdogs that
+terminate the complete subprocess group and retain the timeout reason in its
+log; long endurance and operator-assisted lanes receive explicit larger
+budgets. The release profile automatically omits `iphone-current`-only lanes on
+other matrix devices; it does not weaken or shorten them. Its validator derives every automated runner lane from the
 feature manifest and adds the mandatory analyzer, UI/support, performance, and
 endurance lanes, so editing the profile cannot silently omit one. Run it for
 every required hardware/OS row and assemble the
@@ -50,7 +53,9 @@ exists; completing only the currently automated rows is not enough.
 profile always requires a stable OS that matches `matrix.json`; it rejects an
 exploratory device before building. A future iPhone OS can exercise current-only
 lanes with `--exploratory-current-only`, but the resulting report remains
-ineligible for release.
+ineligible for release. The same is true for a beta build of the current matrix
+OS major: runner diagnostics are retained, but no qualification rows are
+materialized and the checklist cannot display an automated feature as passed.
 
 ### Ninety-second cadence semantics probe
 
@@ -89,6 +94,16 @@ profile did not execute it; and `BLOCKED` means trustworthy automation or an
 external prerequisite such as a real receiver is not yet available. These
 states are intentionally distinct so a skipped or unimplemented feature can
 never become a false pass.
+
+Two high-value physical observations remain explicit required blockers instead
+of being inferred from sender state. The system-PiP row requires an operator to
+press the visible SpringBoard play, pause, forward, and backward controls; the
+current VOD automation uses app-exposed qualification actions and cannot satisfy
+that row. The rapid-recast row requires local media A → physical receiver A,
+then an immediate same-receiver A → B recast, followed by 30–60 seconds of
+receiver telemetry plus visible or audible output proving B stays playing and
+no late STOP/CLOSE from the old session interrupts it. Until candidate-bound
+operator/receiver evidence exists, both rows stay `BLOCKED`.
 
 An existing per-device report or assembled release record can be rendered
 again without rerunning hardware:
@@ -212,6 +227,40 @@ DerivedData, generated fixtures, evidence, and disposable source snapshots
 default to ignored directories beside the repository. A checkout on an
 external SSD therefore keeps the complete qualification workload on that SSD;
 the paths remain individually overrideable for other machines.
+
+### Validation plans, receipts, and shareable checklists
+
+The device runner writes `validation-plan.json` and empty retained progress
+ledgers before fixture generation, build, install, or runner priming. The plan
+records the exact requested, selected, and hardware-skipped scenario drivers.
+An ordinary invocation is `FULL APPLICABLE DEVICE SUITE`; any explicit
+`--only` selection is `PARTIAL / TARGETED` even if every selected test passes.
+Here, full means the complete suite applicable to this one device—not a
+complete multi-device release record.
+
+After execution, `report_validation.py` validates an immutable snapshot with
+the applicable qualification or report-only policy. The plan and report bind a
+canonical UTC start, the report adds canonical completion and exact wall-clock
+duration, and stable evidence expires after 30 days. Only then does validation
+write a deterministic manifest of every retained directory and file (path,
+mode, size, and SHA-256), plus a receipt binding that manifest and the exact
+`report.json` and selected plan bytes. Generated checklist files and the
+privacy-only host summary are the only named post-validation exclusions; they
+cannot satisfy evidence rows. A changed, deleted, or added evidence artifact,
+changed report or plan, mismatched scenario list, missing receipt, stale stable
+run, or interruption therefore cannot be packaged or rendered as a qualifying
+`COMPLETE`/`PASS`.
+
+`volunteer-validation.sh` always attempts to produce a privacy-scrubbed ZIP,
+including after a failed or interrupted run. Its summary prominently labels
+full versus partial scope. Beta/future-OS evidence is `EXPLORATORY — NOT
+RELEASE-QUALIFYING`, and the cadence probe is `REPORT-ONLY — NOT
+RELEASE-QUALIFYING`. Malformed ancillary JSON is omitted and makes the ZIP
+`INCOMPLETE`; malformed device identity metadata also causes raw diagnostics
+to be omitted instead of risking disclosure. A changed candidate, device, or
+fixture sidecar also makes the share report incomplete. The adjacent `raw`
+directory is the authoritative local evidence and should be kept until release
+review.
 
 That default path builds the app and runner from a clean checkout, embeds the
 source commit and release-source digest in the signed app, and creates its
@@ -906,6 +955,9 @@ expected-value, allowed-value, duration, provenance, and exact-XCTest checks as
 the final release gate. It copies accepted attachments under
 `evidence/<version>/`, retains each complete source report tree under
 `reports/<version>/` with a tree digest, and writes the record atomically. The
+generated `reports/` tree is ignored by Git and explicitly excluded from the
+release-source digest; retained device evidence cannot make its own candidate
+source identity drift. The
 record validator reopens those reports, all attempt artifacts, and retained
 raw JSONL before reconciling their rows and evidence with the copied record. It
 also aggregates the exact executed runner inventory and requires every release
@@ -922,6 +974,17 @@ rejects it if any required product feature is failed, not run, or blocked.
 ```bash
 ./scripts/check-qualification.sh 1.1.0
 ```
+
+A passing record authorizes the immutable candidate; it does not publish it.
+Run `release.sh 1.1.0 --candidate <directory>` to create a draft under the
+non-SemVer tag `swiftvlc-candidate-v1.1.0-<full-release-SHA>` and then push the
+exact `release-candidates/v1.1.0` CI ref while leaving both `main` and the final
+SemVer tag untouched. After all exact-commit GitHub gates succeed, rerun with
+`--finalize`. Finalize revalidates the same qualification record and candidate,
+atomically assigns `v1.1.0` while publishing, verifies the immutable signed
+release and public SwiftPM consumption, and only then fast-forwards `main`.
+Missing, pending, or failed CI remains a non-public, non-SemVer candidate and
+cannot be overridden by qualification evidence.
 
 It fails when the record is absent, describes a different app/runner/bundle/
 xctestrun/catalog or engine artifact, is for another version, omits a required

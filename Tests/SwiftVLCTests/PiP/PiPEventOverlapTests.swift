@@ -177,16 +177,22 @@ extension Integration {
       #expect(envelopes[4].mediaGeneration == retryMediaGeneration)
       #expect(envelopes[5].mediaGeneration == failedMediaGeneration)
       #expect(envelopes[6].mediaGeneration == retryMediaGeneration)
-      guard case .willStop(reason: .programmatic) = envelopes[4].event else {
-        Issue.record("Expected the active retry's programmatic willStop")
+      guard
+        case .willStop(reason: .unknown) = envelopes[4].event,
+        envelopes[4].stopCause == .programmatic
+      else {
+        Issue.record("Expected the active retry's detailed programmatic willStop")
         return
       }
       guard case .didStop(reason: .failure) = envelopes[5].event else {
         Issue.record("Expected the delayed failed stop first")
         return
       }
-      guard case .didStop(reason: .programmatic) = envelopes[6].event else {
-        Issue.record("Expected the active retry's stop second")
+      guard
+        case .didStop(reason: .unknown) = envelopes[6].event,
+        envelopes[6].stopCause == .programmatic
+      else {
+        Issue.record("Expected the active retry's detailed stop second")
         return
       }
     }

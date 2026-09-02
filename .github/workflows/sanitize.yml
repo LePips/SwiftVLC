@@ -10,6 +10,11 @@ name: Sanitizers
 # sanitizers would inflate CI minutes without proportional benefit.
 on:
   workflow_dispatch:
+  # Release candidates run once through their protected PR. Other pull
+  # requests create only a skipped workflow row and consume no macOS runner;
+  # their deterministic race suites remain in Tests as described above.
+  pull_request:
+    branches: [main]
   push:
     branches: [main]
     paths:
@@ -42,23 +47,24 @@ concurrency:
 
 jobs:
   sanitize:
+    if: ${{ github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && startsWith(github.head_ref, 'release-candidates/')) }}
     strategy:
       fail-fast: false
       matrix:
         sanitizer: [thread, address]
     runs-on: macos-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         timeout-minutes: 2
 
-      - uses: maxim-lobanov/setup-xcode@v1
+      - uses: maxim-lobanov/setup-xcode@ed7a3b1fda3918c0306d1b724322adc0b8cc0a90 # v1
         timeout-minutes: 5
         with:
           xcode-version: latest-stable
 
-      - uses: SwiftyLab/setup-swift@v1.14.0
+      - uses: SwiftyLab/setup-swift@38f54a76b70d989321de9dc7c840618c08cf56e9 # v1.14.0
         timeout-minutes: 8
         with:
           swift-version: "6.3.1"
@@ -67,46 +73,54 @@ jobs:
         timeout-minutes: 1
         run: xcrun --toolchain "$TOOLCHAINS" swift --version
 
-      - name: Select declared libvlc release
-        id: xcf
-        timeout-minutes: 1
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: ./scripts/ci-use-released-xcframework.sh
-
+      # Restore before candidate verification so setup-dev validates/replaces
+      # cached Vendor bytes instead of a cache overwriting verified bytes.
       - name: Cache libvlc xcframework
-        uses: actions/cache@v5
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
         timeout-minutes: 5
         with:
-          path: .build/artifacts
-          key: libvlc-xcf-${{ steps.xcf.outputs.sha }}
+          path: |
+            .build/artifacts
+            Vendor
+          key: libvlc-xcf-${{ hashFiles('Package.swift') }}
           enableCrossOsArchive: false
+
+      - name: Select declared libvlc release
+        id: xcf
+        timeout-minutes: 12
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SWIFTVLC_ALLOW_DRAFT_RELEASE: ${{ ((github.event_name == 'push' && startsWith(github.ref, 'refs/heads/release-candidates/')) || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && startsWith(github.head_ref, 'release-candidates/'))) && '1' || '' }}
+        run: ./scripts/ci-use-released-xcframework.sh
 
       # Sanitizer-instrumented build products differ from the standard
       # debug build, so cache them separately. Cache key includes the
       # sanitizer name to avoid TSan and ASan stomping each other.
       - name: Cache build products (sanitizer-${{ matrix.sanitizer }})
-        uses: actions/cache@v5
+        if: ${{ !((github.event_name == 'push' && startsWith(github.ref, 'refs/heads/release-candidates/')) || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && startsWith(github.head_ref, 'release-candidates/'))) }}
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
         timeout-minutes: 3
         with:
           path: |
             .build/debug
             .build/arm64-apple-macosx
-          key: spm-build-sanitizer-${{ matrix.sanitizer }}-${{ hashFiles('Package.swift', 'Sources/**/*.swift', 'Sources/**/*.c', 'Sources/**/*.h', 'Tests/**/*.swift') }}
-          restore-keys: |
-            spm-build-sanitizer-${{ matrix.sanitizer }}-
+          key: spm-build-sanitizer-${{ matrix.sanitizer }}-${{ steps.xcf.outputs.sha }}-${{ hashFiles('Package.swift', 'Sources/**/*.swift', 'Sources/**/*.c', 'Sources/**/*.h', 'Tests/**/*.swift') }}
 
       - name: Cache SPM dependencies
-        uses: actions/cache@v5
+        if: ${{ !((github.event_name == 'push' && startsWith(github.ref, 'refs/heads/release-candidates/')) || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && startsWith(github.head_ref, 'release-candidates/'))) }}
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
         timeout-minutes: 2
         with:
           path: |
             .build/checkouts
             .build/repositories
             .build/workspace-state.json
-          key: spm-deps-${{ runner.os }}-${{ hashFiles('Package.swift', 'Package.resolved') }}
-          restore-keys: |
-            spm-deps-${{ runner.os }}-
+          key: spm-deps-${{ runner.os }}-${{ steps.xcf.outputs.sha }}-${{ hashFiles('Package.swift', 'Package.resolved') }}
+
+      - name: Clean candidate build links
+        if: ${{ (github.event_name == 'push' && startsWith(github.ref, 'refs/heads/release-candidates/')) || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && startsWith(github.head_ref, 'release-candidates/')) }}
+        timeout-minutes: 2
+        run: xcrun --toolchain "$TOOLCHAINS" swift package clean
 
       # Run only the suites that exist *because* of races/lifecycle/memory
       # concerns. The general test suite runs unsanitized in `test.yml`.

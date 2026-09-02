@@ -1,8 +1,8 @@
-/// The result of ``Player/stopAndWait()``, describing whether the native
-/// audio and video outputs are known to have been released.
+/// The result of ``Player/stopAndWaitForOutcome()``, describing whether the
+/// native audio and video outputs are known to have been released.
 ///
-/// ``Player/stopAndWait()`` exists so callers have a point in time after
-/// which nothing is still draining — most commonly before
+/// ``Player/stopAndWaitForOutcome()`` exists so callers have a point in time
+/// after which nothing is still draining — most commonly before
 /// `AVAudioSession.setActive(false, options: .notifyOthersOnDeactivation)`,
 /// which fails session-busy while an audio output is alive, or before
 /// detaching a drawable. Only ``stopped`` establishes that. The remaining

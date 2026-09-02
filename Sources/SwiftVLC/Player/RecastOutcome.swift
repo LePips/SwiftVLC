@@ -1,9 +1,10 @@
-/// The result of ``Player/recast(to:)``, describing whether the replacement
-/// session actually settled.
+/// The result of ``Player/recastAndWaitForOutcome(to:)``, describing whether
+/// the replacement session actually settled.
 ///
-/// Recasting tears down the current session and starts a new one on a
-/// different renderer, then restores the previous position, track selection
-/// and paused state. Every one of those steps can fail to complete: the new
+/// Recasting an active session tears it down and starts a replacement on a
+/// different renderer, then restores the previous position, track selection,
+/// and paused state. An unused or dormant handle only stages configuration and
+/// does not autoplay. Every active-session step can fail to complete: the new
 /// session may never reach playback, it may fail asynchronously, the caller's
 /// task may be cancelled mid-restore, or another recast or media load may take
 /// over. Returning `Void` made all of those indistinguishable from a clean
@@ -12,20 +13,30 @@
 /// Only ``settled`` means the recast ran to completion. It does not promise
 /// that every piece of carried-over state was reapplied — restoration is
 /// best-effort by design, and the cases where it is skipped are documented on
-/// ``settled`` and on ``Player/recast(to:)``.
+/// ``settled`` and on ``Player/recastAndWaitForOutcome(to:)``.
 public enum RecastOutcome: Sendable, Equatable {
-  /// The recast completed: the renderer change is in effect, and where a
-  /// session existed it reached playback and its paused state was honoured.
+  /// The requested recast work completed. For an active session, the renderer
+  /// change is in effect, replacement playback was reached, and its paused
+  /// state was honoured. For an inactive used handle or media awaiting a fresh
+  /// handle, the configuration is durably staged for the next explicit
+  /// `play()`; no transport is started and remote output is not yet claimed.
   ///
   /// Position and track restoration are **best-effort**, so this is also
   /// returned when they could not be applied:
   ///
   /// - A player that had never started playback is a plain renderer change
   ///   with no session to rebuild, so nothing needs restoring.
+  /// - Media already committed for a deferred fresh handle only updates the
+  ///   renderer configuration for that successor. A previously used idle,
+  ///   stopped, or failed handle stages the renderer and waits for the next
+  ///   explicit `play()` to create its fresh handle; neither path autoplays.
   /// - A session that never reports seekability — live streams never do —
   ///   keeps its restart position instead of resuming the prior one.
   /// - Tracks that never appear stay at the new session's defaults; ids are
-  ///   session-scoped and the match is by language then name.
+  ///   session-scoped, and metadata fallback is applied only when it identifies
+  ///   one unique language/name candidate. Ambiguous matches are not guessed.
+  /// - A newer same-session seek, track selection, or pause/resume command
+  ///   wins over captured state and that stale field is not restored.
   ///
   /// What ``settled`` does rule out is the session having failed, never
   /// arrived, been abandoned, or been taken over.
@@ -40,13 +51,18 @@ public enum RecastOutcome: Sendable, Equatable {
   case timedOut
 
   /// The awaiting task was cancelled. No further media, seek, track,
-  /// renderer or transport mutation was performed after that point, so the
-  /// session is left wherever cancellation found it.
+  /// renderer or transport request is started by recast after that point.
+  /// A native seek already accepted before cancellation is not cancelled or
+  /// reclassified; it keeps draining to its ordinary terminal outcome.
   case cancelled
 
-  /// Another ``Player/recast(to:)`` or a media load took over before this one
-  /// finished restoring. The newer operation owns the session; this one
-  /// stopped touching it.
+  /// Another recast, media generation, native callback-lane generation, or
+  /// terminal boundary took ownership, so this recast stopped touching the
+  /// session. Native failure is reported as ``failed`` and cancellation as
+  /// ``cancelled``; natural end, requested stop, replacement, and an otherwise
+  /// unattributed native stop are superseding boundaries. This is also returned
+  /// without starting replacement whenever a ``MediaListPlayer`` owns the
+  /// shared native handle; libVLC cannot atomically replace one exact list item.
   case superseded
 
   /// Whether the recast ran to completion.

@@ -12,7 +12,6 @@ extension Logic {
         (.parseFailed(reason: "timeout"), "Media parsing failed: timeout"),
         (.parseTimeout, "Media parsing timed out"),
         (.trackNotFound(id: "audio-0"), "Track not found: audio-0"),
-        (.rendererFailed, "Failed to apply renderer"),
         (.invalidState("not playing"), "Invalid state: not playing"),
         (.invalidInput("width must be non-negative"), "Invalid input: width must be non-negative"),
         (.operationFailed("Snapshot"), "Snapshot failed")
@@ -30,7 +29,6 @@ extension Logic {
         .parseFailed(reason: "z"),
         .parseTimeout,
         .trackNotFound(id: "t"),
-        .rendererFailed,
         .invalidState("s"),
         .invalidInput("i"),
         .operationFailed("o"),

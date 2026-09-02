@@ -13,6 +13,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import qualification_policy as policy
+from report_validation import atomic_write_json
 
 NON_STABLE_RELEASE_TYPES = ("beta", "seed", "internal", "development", "preview")
 
@@ -188,6 +189,7 @@ def normalize(device: dict, hardware_rows: list[dict]) -> dict:
         "osBuild": properties.get("osBuildUpdate"),
         "osReleaseType": os_release_type,
         "transport": connection.get("transportType"),
+        "tunnelIPAddress": connection.get("tunnelIPAddress"),
         "connected": connected,
         "matchingHardwareRows": matching_rows,
         "qualificationEligible": connected
@@ -204,6 +206,9 @@ def main() -> int:
     )
     parser.add_argument("--device", help="Select by CoreDevice id, UDID, name, or ECID")
     parser.add_argument("--require-stable", action="store_true")
+    parser.add_argument(
+        "--output", type=Path, help="Atomically write the normalized JSON here"
+    )
     args = parser.parse_args()
 
     try:
@@ -248,8 +253,11 @@ def main() -> int:
             else "exploratory" if selected else "unavailable"
         ),
     }
-    json.dump(result, sys.stdout, indent=2, sort_keys=True)
-    sys.stdout.write("\n")
+    if args.output is not None:
+        atomic_write_json(args.output, result)
+    else:
+        json.dump(result, sys.stdout, indent=2, sort_keys=True)
+        sys.stdout.write("\n")
 
     if selected is None:
         return 2

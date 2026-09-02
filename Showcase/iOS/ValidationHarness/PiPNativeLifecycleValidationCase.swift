@@ -81,7 +81,7 @@ struct PiPNativeLifecycleValidationCase: View {
       for await envelope in controller.pipEventEnvelopes {
         lifecycle.append(
           LifecycleEvent(
-            name: envelope.event.nativeLifecycleQualificationName,
+            name: envelope.nativeLifecycleQualificationName,
             controllerGeneration: envelope.controllerGeneration,
             mediaGeneration: envelope.mediaGeneration.qualificationValue
           )
@@ -199,7 +199,7 @@ struct PiPNativeLifecycleValidationCase: View {
 
     case .recast:
       try await startAndWait(controller)
-      let outcome = try await player.recast(to: nil)
+      let outcome = try await player.recastAndWaitForOutcome(to: nil)
       guard outcome == .settled else {
         throw NativeLifecycleFailure("Recast did not settle: \(String(describing: outcome))")
       }
@@ -223,7 +223,7 @@ struct PiPNativeLifecycleValidationCase: View {
   }
 
   private func startAndWait(_ controller: PiPController) async throws {
-    guard controller.start() == .accepted else {
+    guard controller.requestStart() == .accepted else {
       throw NativeLifecycleFailure("Native PiP start was not accepted")
     }
     try await waitUntil("Native PiP did not become active") { controller.isActive }
@@ -350,13 +350,15 @@ private struct NativeLifecycleFailure: Error, CustomStringConvertible {
   }
 }
 
-extension PiPEvent {
+extension PiPEventEnvelope {
   fileprivate var nativeLifecycleQualificationName: String {
-    switch self {
+    switch event {
     case .willStart: "willStart"
     case .didStart: "didStart"
-    case .willStop(let reason): "willStop:\(String(describing: reason))"
-    case .didStop(let reason): "didStop:\(String(describing: reason))"
+    case .willStop(let reason):
+      "willStop:\(stopCause?.rawValue ?? String(describing: reason))"
+    case .didStop(let reason):
+      "didStop:\(stopCause?.rawValue ?? String(describing: reason))"
     case .failedToStart: "failedToStart"
     }
   }

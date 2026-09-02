@@ -37,9 +37,9 @@ verify_source() {
 }
 
 verify_source "$SOURCE_CHECKER" \
-    a9db561a11a24234d7a7984149b1a4ddf0eaaddb1d8ca8e53a02868a610a5e8d
+    c3d38d12de458739e95bdacdedfcd5c233b9e41ce4bab922b5142c7cc9a3e8ad
 verify_source "$VERSION_RESOLVER" \
-    98adb898d64ed8c8a57bbc883bf10dd96eeb399a2f7671c1d2fceb262fad63b5
+    71ec748da3b77066514ad6134e980903b925c680b2788a16aef60e5d3fecedd6
 verify_source "$PROBE" \
     65347de5f707e49e0d2208e4c8310f84026a518ff87730c0d17eabe5757d3bb7
 verify_source "$ABI_CXX" \

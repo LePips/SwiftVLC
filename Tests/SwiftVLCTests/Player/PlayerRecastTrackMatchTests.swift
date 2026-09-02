@@ -2,8 +2,9 @@
 import Testing
 
 /// `recast` carries the audio/subtitle selection into the new session.
-/// Track ids are session-scoped, so the carry-over matches by id, then
-/// language, then name — `Player.matchingTrack(for:in:)` is that fallback.
+/// Track ids are session-scoped, so carry-over prefers exact id and then only
+/// unique language/name metadata — `Player.matchingTrack(for:in:)` owns that
+/// ambiguity-safe policy.
 extension Integration {
   @Suite(.tags(.mainActor))
   @MainActor struct PlayerRecastTrackMatchTests {
@@ -80,6 +81,28 @@ extension Integration {
         Player.matchingTrack(for: prior, in: candidates) == nil,
         "empty language must not be treated as a match key"
       )
+    }
+
+    @Test
+    func `duplicate exact language and name metadata is ambiguous`() {
+      let prior = track(id: "spu/old", name: "English", language: "en")
+      let candidates = [
+        track(id: "spu/new-1", name: "English", language: "EN"),
+        track(id: "spu/new-2", name: "English", language: "en")
+      ]
+
+      #expect(Player.matchingTrack(for: prior, in: candidates) == nil)
+    }
+
+    @Test
+    func `ambiguous language does not hide one unique exact metadata match`() {
+      let prior = track(id: "spu/old", name: "Commentary", language: "en")
+      let candidates = [
+        track(id: "spu/new-1", name: "Main", language: "en"),
+        track(id: "spu/new-2", name: "Commentary", language: "EN")
+      ]
+
+      #expect(Player.matchingTrack(for: prior, in: candidates)?.id == "spu/new-2")
     }
   }
 }

@@ -9,6 +9,9 @@ extension Player {
   /// Advances on every media change, including ones SwiftVLC did not initiate.
   /// Capture it before work that spans a suspension point and compare it after
   /// to find out whether the session you started on is still the current one.
+  /// To observe generation changes, consume ``playbackStatus``; the internal
+  /// identity write is deliberately excluded from Observation so native-handle
+  /// replacement can publish its pointer, lifetime, and generation atomically.
   public var generation: PlaybackGeneration {
     PlaybackGeneration(sessionGeneration)
   }

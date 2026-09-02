@@ -177,7 +177,7 @@ extension Integration {
 
     @Test
     func `AppKit surface pins and reshapes VLC subviews to local bounds`() {
-      #if canImport(AppKit)
+      #if os(macOS)
       let surface = VideoSurface(frame: NSRect(x: 120, y: 80, width: 320, height: 180))
       surface.wantsLayer = true
       surface.layer?.masksToBounds = true
@@ -204,7 +204,7 @@ extension Integration {
 
     @Test
     func `AppKit surface republishes drawable when moved into a window`() {
-      #if canImport(AppKit)
+      #if os(macOS)
       let player = Player(instance: TestInstance.shared)
       let surface = VideoSurface(frame: NSRect(x: 0, y: 0, width: 320, height: 180))
       let window = NSWindow(
@@ -260,7 +260,7 @@ extension Integration {
   }
 }
 
-#if canImport(AppKit)
+#if os(macOS)
 @MainActor
 private final class AppKitReshapeProbeView: NSView {
   var reshapeCount = 0

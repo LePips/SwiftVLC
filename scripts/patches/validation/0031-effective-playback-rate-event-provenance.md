@@ -61,18 +61,21 @@ core actually reports; callers cannot infer one completion per request.
 
 SwiftVLC preserves the synchronous, throwing `setPlaybackRate(_:)` signature.
 A successful return continues to mean only that the immediate native call did
-not report an error. `PlayerEvent.rateChanged(Float)` exposes effective
-transitions, and the internal lossless event consumer invalidates the live
-`Player.rate` observable. `Player.supportsEffectivePlaybackRateEvents` is
-gated by extension version 7; an older archive stays linkable through the
-existing weak version shim and reports the event unavailable.
+not report an error. `Player.effectivePlaybackRateResolutions` exposes
+`EffectivePlaybackRateResolution` values without expanding the
+source-exhaustive `PlayerEvent` enum, and the internal lossless signal consumer
+invalidates the live `Player.rate` observable. The native callback and its
+preceding media change are serialized by the same VLC player lock before they
+enter that ordered signal lane. `Player.supportsEffectivePlaybackRateEvents`
+is gated by extension version 7; an older archive stays linkable through the
+existing weak version shim and reports the stream unavailable.
 
 ## Validation pins
 
 - `effective-playback-rate-event-source-check.py`:
-  `9325d0dbeae8e65486f93788865d91b651e94c9be7fbf3e0132166bbe926ea6c`
+  `335a0999ce19577819df1382e8c5260876eab514a8fc460646fb4925e3de2700`
 - `pip_extension_version.py`:
-  `98adb898d64ed8c8a57bbc883bf10dd96eeb399a2f7671c1d2fceb262fad63b5`
+  `71ec748da3b77066514ad6134e980903b925c680b2788a16aef60e5d3fecedd6`
 - `effective-playback-rate-event-abi.c`:
   `cc824316f4cd8044e5976ed36dba61a9dbaff8f2125b5ba1674f342efc5cb94b`
 - `effective-playback-rate-event-abi.cpp`:
@@ -80,7 +83,7 @@ existing weak version shim and reports the event unavailable.
 - `effective-playback-rate-event-probe.c`:
   `e48829e8ac1402d62c12bd96d1d1953523f5c8f3978a92e716fba2d12f3d2d86`
 - `validate-effective-playback-rate-event.sh`:
-  `2ffe175e50aa3dab9a7f0014ff7d85131a7da826430b7bbb54a0908928309205`
+  `ba1a517a365c3d88e45a2dbd943e865e8672fd850df53c9899578a57d73d3650`
 
 The source checker proves append-only enum placement, the frozen event
 envelope, the callback's locked-player contract, authoritative getter payload,

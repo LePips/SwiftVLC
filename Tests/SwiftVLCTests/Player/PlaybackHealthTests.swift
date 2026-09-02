@@ -1,9 +1,114 @@
 @testable import SwiftVLC
+import Observation
 import Testing
 
 extension Integration {
   @Suite(.tags(.mainActor), .serialized)
   @MainActor struct PlaybackHealthTests {
+    @Test
+    func `A timer sample cannot overwrite health after reentrant media replacement`() async throws {
+      let player = Player(instance: TestInstance.makeAudioOnly())
+      try player.load(Media(url: TestMedia.twosecURL))
+      player.state = .playing
+      player.activeVideoOutputs = 1
+      let outgoingGeneration = player.sessionGeneration
+      let successor = try Media(url: TestMedia.silenceURL)
+      let successorMRL = successor.mrl
+      let events = player.playbackHealthEvents
+      var observerRan = false
+
+      withObservationTracking {
+        _ = player.playbackHealth
+      } onChange: {
+        MainActor.assumeIsolated {
+          guard !observerRan else { return }
+          observerRan = true
+          player.load(successor)
+        }
+      }
+
+      let staleSampleCommitted = player._applyPlaybackHealthSampleForTesting(
+        counters: PlaybackHealthCounters(
+          decodedVideoFrames: 999,
+          presentedVideoFrames: 999
+        )
+      )
+      player.playbackHealthEventBridge.terminate()
+      var received: [PlaybackHealthEvent] = []
+      for await event in events {
+        received.append(event)
+      }
+
+      #expect(observerRan)
+      #expect(!staleSampleCommitted)
+      #expect(player.sessionGeneration == outgoingGeneration + 1)
+      #expect(player.currentMedia?.mrl == successorMRL)
+      #expect(player.playbackHealth.generation == player.generation)
+      #expect(player.playbackHealth.state == .idle)
+      #expect(player.playbackHealth.counters.decodedVideoFrames != 999)
+      #expect(player.playbackHealthMonitoringState.previousCounters.decodedVideoFrames != 999)
+      #expect(received.isEmpty, "the rejected predecessor sample must not broadcast events")
+    }
+
+    @Test
+    func `A newer reentrant health sample atomically owns snapshot monitoring state and events`()
+      async throws {
+      let player = Player(instance: TestInstance.makeAudioOnly())
+      try player.load(Media(url: TestMedia.twosecURL))
+      player.state = .playing
+      player.activeVideoOutputs = 1
+      let initialSnapshotRevision = player.playbackHealth.revision
+      let initialPublicationRevision = player.playbackHealthPublicationRevision
+      let events = player.playbackHealthEvents
+      let now = ContinuousClock.now
+      let newerCounters = PlaybackHealthCounters(
+        decodedVideoFrames: 9,
+        presentedVideoFrames: 7
+      )
+      var observerRan = false
+      var newerSampleCommitted = false
+
+      withObservationTracking {
+        _ = player.playbackHealth
+      } onChange: {
+        MainActor.assumeIsolated {
+          guard !observerRan else { return }
+          observerRan = true
+          newerSampleCommitted = player._applyPlaybackHealthSampleForTesting(
+            counters: newerCounters,
+            now: now.advanced(by: .milliseconds(1))
+          )
+        }
+      }
+
+      let olderSampleCommitted = player._applyPlaybackHealthSampleForTesting(
+        counters: PlaybackHealthCounters(
+          decodedVideoFrames: 1,
+          presentedVideoFrames: 1
+        ),
+        now: now
+      )
+      player.playbackHealthEventBridge.terminate()
+      var received: [PlaybackHealthEventKind] = []
+      for await event in events {
+        received.append(event.kind)
+      }
+
+      #expect(observerRan)
+      #expect(newerSampleCommitted)
+      #expect(!olderSampleCommitted)
+      #expect(player.playbackHealth.revision == initialSnapshotRevision + 1)
+      #expect(player.playbackHealthPublicationRevision == initialPublicationRevision + 2)
+      #expect(player.playbackHealth.counters.decodedVideoFrames == 9)
+      #expect(player.playbackHealth.counters.presentedVideoFrames == 7)
+      #expect(player.playbackHealthMonitoringState.previousCounters.decodedVideoFrames == 9)
+      #expect(player.playbackHealthMonitoringState.previousCounters.presentedVideoFrames == 7)
+      #expect(player.playbackHealthMonitoringState.firstDecodedEmitted)
+      #expect(player.playbackHealthMonitoringState.firstPresentedEmitted)
+      #expect(received.filter { $0 == .firstDecodedFrame }.count == 1)
+      #expect(received.filter { $0 == .firstPresentedFrame }.count == 1)
+    }
+
     @Test
     func `First decoded and presented frame fire exactly once per generation`() async throws {
       let player = Player(instance: TestInstance.makeAudioOnly())

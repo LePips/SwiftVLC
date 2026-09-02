@@ -168,6 +168,18 @@ final class NativeSeekEmissionAuthority: Sendable {
     state.withLock { _ in operation() }
   }
 
+  /// Serializes a wrapper lifecycle transaction with callback entry and gives
+  /// it the newest watcher/frame timeline fact already committed on this lane.
+  /// The value is immutable for the duration of `operation`; a later native
+  /// callback receives a strictly later ordering point.
+  func withCallbackOrderingSnapshot<Result: Sendable>(
+    _ operation: @Sendable (NativeTimelineCallbackEmission?) -> Result
+  ) -> Result {
+    state.withLock { state in
+      operation(state.latestTimelineEmission)
+    }
+  }
+
   private static func makeCallbackEntry(
     in state: inout State
   ) -> NativeTimelineCallbackEntry {

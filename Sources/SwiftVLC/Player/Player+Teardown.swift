@@ -2,9 +2,43 @@ import CLibVLC
 import Foundation
 import os
 
+/// Exact transport/control identity of one accepted Stop request.
+///
+/// A native player pointer can be reused for many playback episodes. The
+/// handle generation alone therefore cannot tell a waiter whether a later
+/// same-handle Play has superseded the Stop it is observing.
+struct PlayerPlaybackStopEpisode: Equatable, Sendable {
+  let nativeHandleGeneration: UInt64
+  let playbackGeneration: UInt64
+  let lifecycleControlEpoch: UInt64
+  let playbackControlRevision: UInt64
+  let requiresExplicitStopBarrier: Bool
+}
+
+struct PlayerPlaybackStopReservation {
+  nonisolated(unsafe) let nativePlayer: OpaquePointer
+  let episode: PlayerPlaybackStopEpisode
+  let resumesBeforeStop: Bool
+}
+
+struct PlayerStopAndWaitOperation {
+  let id: UInt64
+  let episode: PlayerPlaybackStopEpisode
+  let task: Task<PlayerStopOutcome, Never>
+}
+
 /// Awaitable stop and full-teardown choreography, plus the per-player
 /// state carried across native-handle replacements.
 extension Player {
+  /// Stops playback and waits for the native stop's bounded drain attempt.
+  ///
+  /// This compatibility action intentionally discards the terminal outcome.
+  /// Use ``stopAndWaitForOutcome()`` before work that requires proof that the
+  /// native outputs were released.
+  public func stopAndWait() async {
+    _ = await stopAndWaitForOutcome()
+  }
+
   /// Stops playback and suspends until the native stop completes and the
   /// audio/video outputs are released.
   ///
@@ -37,8 +71,7 @@ extension Player {
   ///   establishes that the outputs were released; test it directly or
   ///   through ``PlayerStopOutcome/isOutputSafe`` rather than treating a
   ///   returned value as a success flag.
-  @discardableResult
-  public func stopAndWait() async -> PlayerStopOutcome {
+  public func stopAndWaitForOutcome() async -> PlayerStopOutcome {
     // Shutdown already owns the stronger drain. Join it before reporting the
     // only output-safe result; starting a second stop while teardown is between
     // its synchronous shutdown flag and native-handle replacement would either
@@ -49,53 +82,78 @@ extension Player {
       }
       return .stopped
     }
-    // Concurrent callers join one in-flight stop and all observe the same
-    // outcome; a second caller must not be told the outputs are released
-    // just because someone else asked first.
-    if let inFlight = stopAndWaitTask {
-      return await inFlight.value
+    // Concurrent callers join only while they still refer to the exact same
+    // Stop episode. A Play/Resume on this same native handle advances the
+    // lifecycle/control identity, so the next waiter must issue a fresh Stop
+    // instead of inheriting the predecessor's eventual Stopped callback.
+    if
+      let inFlight = stopAndWaitOperation,
+      ownsPlaybackStopEpisode(inFlight.episode) {
+      return await inFlight.task.value
     }
+
+    // Everything through native Stop dispatch is deliberately before the
+    // first suspension. Otherwise a separately queued same-handle Play could
+    // become newer after this caller yields but before its worker reserves the
+    // transport, allowing the older Stop request to kill the successor.
+    let stream = eventBridge.makeSourcedStream(policy: .unbounded)
+    let statuses = playbackStatus
+    guard let episode = requestPlaybackStop() else {
+      return .timedOut
+    }
+    nextStopAndWaitOperationID &+= 1
+    let operationID = nextStopAndWaitOperationID
     let task = Task { @MainActor [self] in
-      let outcome = await performStopAndWait()
-      stopAndWaitTask = nil
+      let outcome = await performStopAndWait(
+        episode: episode,
+        stream: stream,
+        statuses: statuses
+      )
+      if stopAndWaitOperation?.id == operationID {
+        stopAndWaitOperation = nil
+      }
       return outcome
     }
-    stopAndWaitTask = task
+    stopAndWaitOperation = PlayerStopAndWaitOperation(
+      id: operationID,
+      episode: episode,
+      task: task
+    )
     return await task.value
   }
 
-  private func performStopAndWait() async -> PlayerStopOutcome {
+  private func performStopAndWait(
+    episode: PlayerPlaybackStopEpisode,
+    stream: AsyncStream<SourcedPlayerEvent>,
+    statuses: AsyncStream<PlaybackStatus>
+  )
+    async -> PlayerStopOutcome {
+    guard ownsPlaybackStopEpisode(episode) else { return .timedOut }
     // `.error` is deliberately absent here. libVLC reports the error first
-    // and the stopped state that actually releases the outputs afterwards
-    // (see `PlayerEndReachedTests`), so returning on `.error` would promise
-    // output safety while the outputs are still draining.
-    switch nativePlaybackState {
-    case .idle, .stopped:
-      stop()
-      return .stopped
-    default:
-      break
+    // and the stopped state that actually releases the outputs afterwards.
+    if ownsPlaybackStopEpisode(episode) {
+      switch nativeHandlePlaybackState {
+      case .idle, .stopped:
+        return .stopped
+      case .opening, .buffering, .playing, .paused, .stopping, .error:
+        break
+      }
     }
-    let nativeHandleGeneration = eventBridge.currentNativeHandleGeneration
-    let playbackGeneration = PlaybackGeneration(sessionGeneration)
-    let stream = eventBridge.makeSourcedStream(policy: .unbounded)
-    let statuses = playbackStatus
-    // A terminal event that fired between the check above and the
-    // subscription is invisible to the stream — re-check before waiting
-    // so an in-flight stop completing right here costs nothing instead
-    // of the full defensive timeout.
-    switch nativePlaybackState {
-    case .idle, .stopped:
-      stop()
-      return .stopped
-    default:
-      break
-    }
-    stop()
     let outcome = await Self.awaitOutputSafeStop(
       on: stream,
-      nativeHandleGeneration: nativeHandleGeneration
+      nativeHandleGeneration: episode.nativeHandleGeneration,
+      playbackGeneration: episode.playbackGeneration,
+      lifecycleControlEpoch: episode.lifecycleControlEpoch
     )
+    let episodeIsCurrent = ownsPlaybackStopEpisode(episode)
+    let terminal = nativeHandlePlaybackState
+    let resolved = Self.resolveStopOutcome(
+      waitOutcome: outcome,
+      nativeState: terminal,
+      episodeIsCurrent: episodeIsCurrent
+    )
+    guard resolved == .stopped else { return resolved }
+
     // The internal consumer mirrors the same terminal event onto
     // `state` on its own main-actor schedule and may still be draining
     // its backlog when the dedicated wait resumes. Wait for that exact
@@ -103,21 +161,25 @@ extension Player {
     // reconciliation. Publishing immediately lets an older queued
     // `.stopping` overwrite `.stopped` before the consumer reaches its own
     // terminal event.
-    let terminal = nativePlaybackState
+    let playbackGeneration = PlaybackGeneration(episode.playbackGeneration)
     if
       terminal == .stopped || terminal == .error,
       state != terminal,
-      generation == playbackGeneration {
+      generation == playbackGeneration,
+      ownsPlaybackStopEpisode(episode) {
       _ = await Self.awaitPlaybackMirror(
         terminal,
         generation: playbackGeneration,
         on: statuses
       )
-      if state != terminal, generation == playbackGeneration {
+      if
+        state != terminal,
+        generation == playbackGeneration,
+        ownsPlaybackStopEpisode(episode) {
         handleEvent(.stateChanged(terminal))
       }
     }
-    return Self.resolveStopOutcome(waitOutcome: outcome, nativeState: terminal)
+    return ownsPlaybackStopEpisode(episode) ? resolved : .timedOut
   }
 
   /// Waits for the ordinary event consumer to publish the native terminal
@@ -161,9 +223,19 @@ extension Player {
   /// drive (see `TestCondition.canPlayMedia`).
   nonisolated static func resolveStopOutcome(
     waitOutcome: PlayerStopOutcome,
-    nativeState: PlayerState
+    nativeState: PlayerState,
+    episodeIsCurrent: Bool = true
   )
     -> PlayerStopOutcome {
+    guard episodeIsCurrent else { return .timedOut }
+    if waitOutcome == .stopped {
+      switch nativeState {
+      case .idle, .stopped:
+        return .stopped
+      case .opening, .buffering, .playing, .paused, .stopping, .error:
+        return .timedOut
+      }
+    }
     if waitOutcome == .timedOut, nativeState == .error {
       return .failedButStillDraining
     }
@@ -184,6 +256,8 @@ extension Player {
   nonisolated static func awaitOutputSafeStop(
     on stream: AsyncStream<SourcedPlayerEvent>,
     nativeHandleGeneration: UInt64,
+    playbackGeneration: UInt64? = nil,
+    lifecycleControlEpoch: UInt64? = nil,
     timeout: Duration = .seconds(10)
   )
     async -> PlayerStopOutcome {
@@ -192,6 +266,8 @@ extension Player {
         for await sourced in stream {
           guard
             sourced.nativeHandleGeneration == nativeHandleGeneration,
+            playbackGeneration.map({ sourced.playbackGeneration == $0 }) ?? true,
+            lifecycleControlEpoch.map({ sourced.lifecycleControlEpoch == $0 }) ?? true,
             case .stateChanged(let state) = sourced.event
           else { continue }
           // Only `.stopped` ends the wait. An `.error` is ignored here: the
@@ -276,9 +352,6 @@ extension Player {
     supersedePendingSeekSettlement()
     cancelPendingFrameSteps()
     closeNativeFrameResultLaneForTeardown()
-    #if os(iOS)
-    nativePiPVideoOutputRebuildPermit.invalidate()
-    #endif
     pauseTransition = nil
     deferredPauseCommand = nil
     eventBridge.finishCurrentPlaybackGeneration(

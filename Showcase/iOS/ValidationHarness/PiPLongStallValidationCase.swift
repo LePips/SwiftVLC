@@ -150,7 +150,7 @@ struct PiPLongStallValidationCase: View {
     stallObservation = nil
     bufferingBeganAt = nil
     do {
-      guard controller.start() == .accepted else {
+      guard controller.requestStart() == .accepted else {
         throw LongStallQualificationFailure("PiP start was not accepted")
       }
       try await waitUntil("PiP did not become active") { controller.isActive }

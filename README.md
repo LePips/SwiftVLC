@@ -135,9 +135,9 @@ for await event in player.events {
 
 Playback-rate application is asynchronous inside VLC. A successful setter
 return confirms immediate request acceptance, not that the active input kept
-that rate. On extension-v7 builds, `PlayerEvent.rateChanged` reports the
-effective control state without claiming request correlation or measured
-throughput; `player.rate` remains the authoritative live value.
+that rate. On extension-v7 builds, `player.effectivePlaybackRateResolutions`
+reports the effective control state without claiming request correlation or
+measured throughput; `player.rate` remains the authoritative live value.
 
 ## Documentation
 
@@ -370,14 +370,24 @@ Releases advance `main`, but stable releases can only consume an immutable,
 previously prepared and device-qualified candidate. `setup-dev.sh` flips a
 working checkout back to local sources for day-to-day development.
 
+The 1.1.0 release line now requires native extension v9 together with the v8
+Apple audio-session lease refinement. `1.1.0-beta.9` is therefore the first
+eligible candidate; the published beta.8 archive remains usable through the
+fail-closed weak compatibility path but cannot pass the current release gate.
+
 ```bash
 ./scripts/build-libvlc.sh --clean-build --all  # run twice; retain proof above
 ./scripts/release.sh X.Y.Z --dry-run     # strip + zip + checksum, no push
 ./scripts/release.sh X.Y.Z --prepare /absolute/path/to/candidate
 ./scripts/check-qualification.sh X.Y.Z /absolute/path/to/candidate/libvlc.xcframework
+# Stage a non-SemVer candidate tag, authenticated draft, and exact CI branch.
 ./scripts/release.sh X.Y.Z --candidate /absolute/path/to/candidate
-# Optional beta: strict SemVer pre-releases are published as unqualified pre-releases.
-./scripts/release.sh X.Y.Z-beta.1
+# After exact-commit workflows pass, atomically assign the SemVer tag + publish.
+./scripts/release.sh X.Y.Z --candidate /absolute/path/to/candidate --finalize
+# Betas use the same prepared/staged/finalized flow, but skip device qualification.
+./scripts/release.sh X.Y.Z-beta.1 --prepare /absolute/path/to/beta-candidate
+./scripts/release.sh X.Y.Z-beta.1 --candidate /absolute/path/to/beta-candidate
+./scripts/release.sh X.Y.Z-beta.1 --candidate /absolute/path/to/beta-candidate --finalize
 ```
 
 Release mode comes from the validated SemVer tag. A version containing a
@@ -398,16 +408,39 @@ What `release.sh` does:
    rebuild, mutate, or substitute the policy bound to the candidate.
 4. Verifies the prepared zip expands to the qualified XCFramework and that all
    candidate/provenance checksums still match.
-5. Rewrites `Package.swift` to the remote URL and checksum, pins the Showcase
-   app to exact version `X.Y.Z`, commits, and tags the result.
-6. Uploads the zip, both provenance records, reproducibility proof, and candidate
-   manifest to a draft release.
-7. Advances `origin/main`; only after that succeeds does it publish the draft.
+5. Requires repository release immutability to be enabled, rewrites
+   `Package.swift` to the intended final URL/checksum, pins the Showcase app to
+   exact version `X.Y.Z`, and creates the canonical release commit. It does
+   **not** create the final SemVer tag.
+6. Pushes only `swiftvlc-candidate-vX.Y.Z-<full-release-SHA>`, a deliberately
+   non-SemVer tag SwiftPM will not treat as a version. It creates an empty draft,
+   retains exact completed uploads across retries, removes only incomplete
+   `starter` uploads, uploads missing assets, rejects every conflicting asset,
+   and pushes `release-candidates/vX.Y.Z` only after all assets are complete.
+7. Exact-commit CI downloads that draft through authenticated `gh`, proves the
+   candidate branch, non-SemVer tag, release target, checked-out SHA, intended
+   final URL/checksum, and asset digest agree, then uses the verified local
+   `Vendor` tree. The bridge is unavailable to pull requests, `main`, forks, and
+   local consumers. A prematurely created final SemVer tag makes CI fail.
+8. `--finalize` requires successful push runs for Tests, Fixtures, Vendor
+   manifest, Native source contracts, and Sanitizers on that exact commit. One
+   GitHub release update changes the draft to `vX.Y.Z`, targets the exact commit,
+   and publishes it; there is no earlier final-tag push. Before `main` moves, the
+   script verifies GitHub immutability, the signed release attestation and every
+   local asset subject, an anonymous public checksum download, and a clean
+   external SwiftPM consumer build. It rechecks all refs/assets, fast-forwards
+   `main`, verifies the final postcondition, and removes temporary candidate refs.
 
-Candidate preparation and publishing refuse non-`main` branches, any dirty
-working tree, a local `main` that differs from `origin/main`, pre-existing tags,
-and unauthenticated `gh`. If publication fails after asset upload, the release
-remains a non-public draft until it is fixed or removed.
+Candidate preparation and first-time staging refuse non-`main` branches, any
+dirty working tree, a local `main` that differs from `origin/main`, pre-existing
+final release identities, disabled repository release immutability, and
+unauthenticated or under-scoped `gh`. Staging is safe to pause: upload failures
+and missing, pending, or failed CI leave only a non-SemVer tag plus non-public
+draft and do not change `main`. Finalize classifies an uncertain publication
+response before retrying anything. If publication succeeded but the subsequent
+main push failed, the public immutable tag remains usable and the same command
+re-verifies it before retrying only the fast-forward. Never delete, move, or
+reuse a final public release tag.
 
 After publication, verify that Swift Package Index has finished building the
 tagged API reference and that the unversioned documentation link above resolves

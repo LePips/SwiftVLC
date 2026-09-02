@@ -422,6 +422,13 @@ typedef struct swiftvlc_apple_audio_recovery_snapshot_t
     uint64_t broker_failed_deactivation_count;
 } swiftvlc_apple_audio_recovery_snapshot_t;
 
+/** Immutable native-PiP identity copied into one Apple video output. */
+typedef struct swiftvlc_pip_playback_identity_t
+{
+    uint64_t native_handle_identity;
+    uint64_t playback_generation;
+} swiftvlc_pip_playback_identity_t;
+
 /**
  * Version of SwiftVLC's additive pinned-libVLC extensions.
  *
@@ -436,9 +443,17 @@ typedef struct swiftvlc_apple_audio_recovery_snapshot_t
  * the vmem output-attempt boundary. Version 7 adds the public
  * libvlc_MediaPlayerRateChanged event for effective player control-rate
  * resolution notifications. Version 8 adds Apple audio-session ownership,
- * causal reset recovery, and read-only qualification telemetry.
+ * causal reset recovery, and read-only qualification telemetry. Version 9
+ * adds immutable native-handle/playback/output identity for race-free Apple
+ * PiP controller handoff.
  */
 LIBVLC_API unsigned swiftvlc_libvlc_pip_extensions_version( void );
+
+/** Publish the immutable pair future Apple PiP outputs copy at creation. */
+LIBVLC_API bool swiftvlc_libvlc_media_player_set_pip_playback_identity(
+    libvlc_media_player_t *p_mi,
+    uint64_t native_handle_identity,
+    uint64_t playback_generation );
 
 /** Copies a read-only causal Apple audio recovery snapshot. Before calling,
  * initialize version to SWIFTVLC_APPLE_AUDIO_RECOVERY_SNAPSHOT_VERSION and

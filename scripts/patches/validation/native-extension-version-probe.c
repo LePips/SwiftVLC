@@ -1,4 +1,5 @@
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 
@@ -9,7 +10,7 @@
 #endif
 
 #if SWIFTVLC_EXPECTED_PIP_EXTENSIONS_VERSION < 1 \
- || SWIFTVLC_EXPECTED_PIP_EXTENSIONS_VERSION > 8
+ || SWIFTVLC_EXPECTED_PIP_EXTENSIONS_VERSION > 9
 # error "unsupported SwiftVLC native extension version"
 #endif
 
@@ -25,6 +26,11 @@
 #if SWIFTVLC_REQUIRE_APPLE_AUDIO_SESSION_LEASES \
  && SWIFTVLC_EXPECTED_PIP_EXTENSIONS_VERSION < 8
 # error "Apple audio-session leases require extension version 8"
+#endif
+
+#if SWIFTVLC_EXPECTED_PIP_EXTENSIONS_VERSION >= 9 \
+ && !SWIFTVLC_REQUIRE_APPLE_AUDIO_SESSION_LEASES
+# error "extension version 9 inherits the Apple audio-session lease contract"
 #endif
 
 #define SWIFTVLC_ASSERT_FUNCTION_TYPE(function_name, pointer_type) \
@@ -131,6 +137,25 @@ SWIFTVLC_ASSERT_FUNCTION_TYPE(
     swiftvlc_non_authorizing_pause_function_t);
 #endif
 
+#if SWIFTVLC_EXPECTED_PIP_EXTENSIONS_VERSION >= 9
+_Static_assert(sizeof(swiftvlc_pip_playback_identity_t) == 16,
+               "unexpected native PiP playback identity size");
+_Static_assert(_Alignof(swiftvlc_pip_playback_identity_t) == 8,
+               "unexpected native PiP playback identity alignment");
+_Static_assert(offsetof(swiftvlc_pip_playback_identity_t,
+                        native_handle_identity) == 0,
+               "unexpected native-handle identity offset");
+_Static_assert(offsetof(swiftvlc_pip_playback_identity_t,
+                        playback_generation) == 8,
+               "unexpected playback-generation offset");
+
+typedef bool (*swiftvlc_set_pip_playback_identity_function_t)(
+    libvlc_media_player_t *, uint64_t, uint64_t);
+SWIFTVLC_ASSERT_FUNCTION_TYPE(
+    swiftvlc_libvlc_media_player_set_pip_playback_identity,
+    swiftvlc_set_pip_playback_identity_function_t);
+#endif
+
 #if SWIFTVLC_REQUIRE_APPLE_AUDIO_SESSION_LEASES
 _Static_assert(sizeof(swiftvlc_apple_audio_session_lease_t) == sizeof(uint64_t),
                "unexpected Apple audio-session lease width");
@@ -163,6 +188,14 @@ int main(void)
                 expected, actual);
         return 1;
     }
+#if SWIFTVLC_EXPECTED_PIP_EXTENSIONS_VERSION >= 9
+    if (swiftvlc_libvlc_media_player_set_pip_playback_identity(
+            NULL, UINT64_C(1), UINT64_C(1)))
+    {
+        fputs("native PiP identity setter accepted a null player\n", stderr);
+        return 1;
+    }
+#endif
     printf("%u\n", actual);
     return 0;
 }

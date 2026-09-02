@@ -24,6 +24,7 @@ MANIFEST_LINE = re.compile(r"([0-9a-f]{64})  ([!-~]+)")
 # this exact inventory and order, so deleting a line cannot silently remove a
 # validator from artifact provenance.
 ASSET_PATHS = (
+    "scripts/patches/validation/adaptive-es-recycling-source-check.py",
     "scripts/patches/validation/aom-nasm3-detection-probe.cmake",
     "scripts/patches/validation/aom-nasm3-detection-source-check.py",
     "scripts/patches/validation/audio-media-services-reset-source-check.py",
@@ -34,8 +35,14 @@ ASSET_PATHS = (
     "scripts/patches/validation/headless-vout-teardown-probe.c",
     "scripts/patches/validation/headless-vout-teardown-source-check.py",
     "scripts/patches/validation/native-extension-version-probe.c",
+    "scripts/patches/validation/native-pip-output-identity-race.c",
+    "scripts/patches/validation/native-pip-output-identity-source-check.py",
+    "scripts/patches/validation/native-sample-buffer-renderer-immediate-sample.m",
+    "scripts/patches/validation/native-sample-buffer-renderer-recovery.c",
     "scripts/patches/validation/pip-playback-snapshot-probe.c",
     "scripts/patches/validation/pip_extension_version.py",
+    "scripts/patches/validation/sample-buffer-renderer-snapshot-abi.c",
+    "scripts/patches/validation/sample-buffer-renderer-snapshot-abi.cpp",
     "scripts/patches/validation/strict-frame-step-probe.c",
     "scripts/patches/validation/strict-frame-step-source-check.py",
     "scripts/patches/validation/test_pip_extension_version.py",
@@ -51,6 +58,7 @@ ASSET_PATHS = (
     "scripts/validate-native-extension-contract.sh",
     "scripts/validate-native-patch-series-source.sh",
     "scripts/validate-pip-playback-snapshot.sh",
+    "scripts/validate-sample-buffer-renderer-recovery.sh",
     "scripts/validate-strict-frame-step.sh",
     "scripts/validate-vmem-picture-pts.sh",
 )
@@ -69,6 +77,7 @@ EXECUTABLE_ASSET_PATHS = (
     "scripts/validate-native-extension-contract.sh",
     "scripts/validate-native-patch-series-source.sh",
     "scripts/validate-pip-playback-snapshot.sh",
+    "scripts/validate-sample-buffer-renderer-recovery.sh",
     "scripts/validate-strict-frame-step.sh",
     "scripts/validate-vmem-picture-pts.sh",
 )

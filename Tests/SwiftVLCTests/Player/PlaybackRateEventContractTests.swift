@@ -1,5 +1,7 @@
 @testable import SwiftVLC
 import CLibVLC
+import Observation
+import Synchronization
 import Testing
 
 extension Logic {
@@ -10,11 +12,10 @@ extension Logic {
       event.type = Int32(libvlc_MediaPlayerRateChanged.rawValue)
       event.u.media_player_rate_changed.new_rate = 8
 
-      guard case .rateChanged(let rate) = mapEvent(event) else {
-        Issue.record("Expected .rateChanged")
-        return
+      #expect(mapEffectivePlaybackRateResolution(event) == 8)
+      if case .some(let mapped) = mapEvent(event) {
+        Issue.record("Rate unexpectedly entered PlayerEvent as \(mapped)")
       }
-      #expect(rate == 8)
     }
 
     @Test
@@ -51,33 +52,111 @@ extension Logic {
 extension Integration {
   @MainActor struct PlaybackRateEventStreamTests {
     @Test(.timeLimit(.minutes(1)))
-    func `Rapid effective changes remain ordered without implying request IDs`() async {
+    func `Native callback publishes exact rate and provenance`() async throws {
       let player = Player(instance: TestInstance.shared)
       let bridge = player.eventBridge
       let nativeGeneration = bridge.currentNativeHandleGeneration
-      let stream = player.controlEvents
+      let playbackGeneration = bridge.currentPlaybackGeneration
+      let stream = player.effectivePlaybackRateResolutions
+      var iterator = stream.makeAsyncIterator()
 
-      for rate: Float in [0.5, 2, 1.25, 1] {
-        bridge._broadcastForTesting(
-          .rateChanged(rate),
+      var event = libvlc_event_t()
+      event.type = Int32(libvlc_MediaPlayerRateChanged.rawValue)
+      event.u.media_player_rate_changed.new_rate = 8
+      bridge._emitNativeEventForTesting(event)
+
+      let resolution = try #require(await iterator.next())
+      #expect(resolution.effectiveRate == 8)
+      #expect(resolution.nativeGeneration == NativePlayerGeneration(nativeGeneration))
+      #expect(resolution.playbackGeneration == PlaybackGeneration(playbackGeneration))
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func `Unified mirror lane adopts media before following rate resolution`() async throws {
+      let player = Player(instance: TestInstance.shared)
+      player.eventTask?.cancel()
+      await player.eventTask?.value
+
+      let bridge = player.eventBridge
+      let stream = bridge.makeSourcedPlayerSignalStream(policy: .unbounded)
+      var iterator = stream.makeAsyncIterator()
+      let nativeGeneration = bridge.currentNativeHandleGeneration
+      let successorValue = bridge.synchronizePlaybackGeneration(
+        player.sessionGeneration &+ 1,
+        media: nil
+      )
+      let successor = PlaybackGeneration(successorValue)
+
+      bridge._broadcastForTesting(
+        .mediaChanged,
+        nativeHandleGeneration: nativeGeneration,
+        playbackGeneration: successorValue
+      )
+      bridge._broadcastEffectivePlaybackRateResolutionForTesting(
+        1.5,
+        nativeHandleGeneration: nativeGeneration,
+        playbackGeneration: successorValue
+      )
+
+      let first = try #require(await iterator.next())
+      guard
+        case .event(let sourcedMediaChange) = first,
+        case .mediaChanged = sourcedMediaChange.event
+      else {
+        Issue.record("MediaChanged was not first on the unified mirror lane")
+        return
+      }
+      #expect(sourcedMediaChange.playbackGeneration == successorValue)
+      player.handleSourcedPlayerSignal(first)
+      #expect(player.generation == successor)
+
+      let rateInvalidated = Mutex(false)
+      withObservationTracking {
+        _ = player.rate
+      } onChange: {
+        rateInvalidated.withLock { $0 = true }
+      }
+
+      let second = try #require(await iterator.next())
+      guard case .effectivePlaybackRateResolution(let resolution) = second else {
+        Issue.record("Effective rate did not follow MediaChanged on the unified mirror lane")
+        return
+      }
+      #expect(resolution.playbackGeneration == successor)
+      player.handleSourcedPlayerSignal(second)
+
+      #expect(player.generation == successor)
+      #expect(rateInvalidated.withLock { $0 })
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func `Rapid effective changes remain ordered without implying request IDs`() async throws {
+      let player = Player(instance: TestInstance.shared)
+      let bridge = player.eventBridge
+      let nativeGeneration = bridge.currentNativeHandleGeneration
+      let stream = player.effectivePlaybackRateResolutions
+      var iterator = stream.makeAsyncIterator()
+      let expected: [Float] = [0.5, 2, 1.25, 1]
+
+      for rate in expected {
+        bridge._broadcastEffectivePlaybackRateResolutionForTesting(
+          rate,
           nativeHandleGeneration: nativeGeneration
         )
       }
-      bridge._broadcastForTesting(
-        .mediaChanged,
-        nativeHandleGeneration: nativeGeneration
-      )
 
-      var rates: [Float] = []
-      for await event in stream {
-        if case .rateChanged(let rate) = event {
-          rates.append(rate)
-        } else if case .mediaChanged = event {
-          break
-        }
+      var received: [EffectivePlaybackRateResolution] = []
+      for _ in expected {
+        try received.append(#require(await iterator.next()))
       }
 
-      #expect(rates == [0.5, 2, 1.25, 1])
+      #expect(received.map(\.effectiveRate) == expected)
+      #expect(received.allSatisfy {
+        $0.nativeGeneration == NativePlayerGeneration(nativeGeneration)
+      })
+      #expect(received.allSatisfy {
+        $0.playbackGeneration == PlaybackGeneration(bridge.currentPlaybackGeneration)
+      })
     }
   }
 }

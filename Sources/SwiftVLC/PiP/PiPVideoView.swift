@@ -51,19 +51,23 @@ public struct PiPVideoView: UIViewRepresentable {
 
   /// Creates a PiP-capable video view while preserving the pre-1.1 call shape.
   ///
-  /// Audio-session ownership is now instance-scoped. If this legacy value
-  /// disagrees with ``Player/appleAudioSessionPolicy``, the instance policy
-  /// wins and the resulting controller records a diagnostic.
+  /// This legacy value still selects this view's `PiPController` managed-audio
+  /// path. It does not reconfigure the immutable
+  /// ``Player/appleAudioSessionPolicy`` or bundled libVLC audio output. Create
+  /// the player's ``VLCInstance`` with
+  /// ``AppleAudioSessionPolicy/applicationManaged`` when the application must
+  /// own every audio-session mutation. A disagreement is retained on the
+  /// controller as a compatibility diagnostic.
   @available(
     *,
     deprecated,
-    message: "Set VLCInstance.appleAudioSessionPolicy; the Player instance policy wins conflicts."
+    message: "Controller-only compatibility flag; use VLCInstance(..., appleAudioSessionPolicy: .applicationManaged) for a complete SwiftVLC and libVLC opt-out."
   )
   public init(
     _ player: Player,
     controller: Binding<PiPController?>? = nil,
     startsAutomaticallyFromInline: Bool = true,
-    managesAudioSession: Bool
+    managesAudioSession: Bool = true
   ) {
     self.player = player
     controllerBinding = controller
@@ -218,18 +222,20 @@ public struct PiPVideoView: NSViewRepresentable {
     legacyManagesAudioSessionOverride = nil
   }
 
-  /// Preserves the pre-1.1 cross-platform call shape. The inherited instance
-  /// policy wins if `managesAudioSession` disagrees with it.
+  /// Preserves the pre-1.1 cross-platform call shape. This legacy value is
+  /// controller-local and does not reconfigure the immutable instance policy
+  /// or bundled libVLC audio output. Use an `.applicationManaged` instance for
+  /// a complete opt-out on Apple platforms.
   @available(
     *,
     deprecated,
-    message: "Set VLCInstance.appleAudioSessionPolicy; the Player instance policy wins conflicts."
+    message: "Controller-only compatibility flag; use VLCInstance(..., appleAudioSessionPolicy: .applicationManaged) for a complete SwiftVLC and libVLC opt-out."
   )
   public init(
     _ player: Player,
     controller: Binding<PiPController?>? = nil,
     startsAutomaticallyFromInline: Bool = true,
-    managesAudioSession: Bool
+    managesAudioSession: Bool = true
   ) {
     self.player = player
     controllerBinding = controller

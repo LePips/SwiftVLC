@@ -79,7 +79,7 @@ struct NativeSubtitleMatrixValidationCase: View {
       guard controller?.overlaySupport == .composited else {
         throw SubtitleMatrixFailure("Linked native backend does not advertise overlay composition")
       }
-      guard controller?.start() == .accepted else {
+      guard controller?.requestStart() == .accepted else {
         throw SubtitleMatrixFailure("Native PiP start was not accepted")
       }
       try await waitUntil("Native PiP did not become active", timeout: .seconds(30)) {

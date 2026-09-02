@@ -40,6 +40,35 @@ struct SourcedPlayerEvent: Sendable {
   }
 }
 
+/// Exact callback-entry provenance retained when event detachment wins the
+/// race with an EOS callback's ordered `Stopped` transition.
+struct RetiredNaturalEndEmission: Sendable {
+  let nativeHandleGeneration: UInt64
+  let playbackGeneration: UInt64
+  let timelineRevision: UInt64
+  let nativeSeekEmissionStamp: NativeSeekEmissionStamp
+  let lifecycleControlEpoch: UInt64
+}
+
+/// One ordered input to the Player observable mirror.
+///
+/// Effective-rate resolutions cannot live in `PlayerEvent` without breaking
+/// exhaustive switches compiled against the stable enum. Keeping them in the
+/// same private broadcaster still preserves native callback order relative to
+/// media changes and every other mirrored event.
+///
+/// This relies narrowly on the production boundary that matters here:
+/// `MediaChanged` and the patched effective-rate notification are both
+/// `vlc_player_cbs` callbacks invoked while the same `vlc_player_t` lock is
+/// held. They cannot overlap for one player. `Broadcaster` is thread-safe but
+/// intentionally does not impose an order on concurrent producers because it
+/// yields outside its mutex. The pinned-source proof for that native boundary
+/// lives in `scripts/patches/validation/0031-effective-playback-rate-event-provenance.md`.
+enum SourcedPlayerSignal: Sendable {
+  case event(SourcedPlayerEvent)
+  case effectivePlaybackRateResolution(EffectivePlaybackRateResolution)
+}
+
 /// Immutable identity and shared fan-out context for one native attachment.
 /// A fresh retained token is passed to libVLC on every handle replacement;
 /// callbacks can therefore never acquire a successor's generation by reading
@@ -47,10 +76,24 @@ struct SourcedPlayerEvent: Sendable {
 final class EventBridgeCallbackAttachment: Sendable {
   let context: EventBridgeCallbackContext
   let nativeHandleGeneration: UInt64
+  private let active: Mutex<Bool>
 
-  init(context: EventBridgeCallbackContext, nativeHandleGeneration: UInt64) {
+  init(
+    context: EventBridgeCallbackContext,
+    nativeHandleGeneration: UInt64,
+    active: Bool = true
+  ) {
     self.context = context
     self.nativeHandleGeneration = nativeHandleGeneration
+    self.active = Mutex(active)
+  }
+
+  var isActive: Bool {
+    active.withLock { $0 }
+  }
+
+  func activate() {
+    active.withLock { $0 = true }
   }
 }
 
@@ -80,6 +123,9 @@ final class EventBridgeCallbackContext: Sendable {
   private let events = Broadcaster<PlayerEvent>(defaultBufferSize: 64)
   private let eventEnvelopes = Broadcaster<PlayerEventEnvelope>(defaultBufferSize: 64)
   private let sourcedEvents = Broadcaster<SourcedPlayerEvent>(defaultBufferSize: 64)
+  private let sourcedPlayerSignals = Broadcaster<SourcedPlayerSignal>(defaultBufferSize: 64)
+  private let effectivePlaybackRateResolutions =
+    Broadcaster<EffectivePlaybackRateResolution>(defaultBufferSize: 16)
   private let terminalOutcomes = Broadcaster<PlaybackTerminalOutcome>(defaultBufferSize: 16)
   private struct TerminalOutcomePublicationState: Sendable {
     var pending: [UInt64: PlaybackTerminalOutcome] = [:]
@@ -187,6 +233,12 @@ final class EventBridgeCallbackContext: Sendable {
   private struct PlaybackLifecycleState: Sendable {
     var currentGeneration: UInt64 = 0
     var currentMediaIdentity: UInt?
+    var currentNativeHandleGeneration: UInt64 = 1
+    /// Playback start is monotonic for both identities. A stopped list-driven
+    /// handle is still used, and a later media generation on that handle is
+    /// independently unstarted until an accepted play or Opening callback.
+    var startedNativeHandleGeneration: UInt64?
+    var startedPlaybackGeneration: UInt64?
     var mediaGenerations: [UInt: UInt64] = [:]
     /// Wrapper-initiated `set_media` calls echo through `MediaChanged`. This
     /// token distinguishes that echo from an external change which happens to
@@ -206,12 +258,37 @@ final class EventBridgeCallbackContext: Sendable {
     var terminalReservations: [UInt64: TerminalCallbackReservation] = [:]
     var lastEmittedGeneration: UInt64 = 0
     var pendingStoppedGeneration: UInt64?
+    /// A deferred drawable-media load has committed this Swift generation,
+    /// but intentionally has not installed it on the retiring native handle.
+    /// Every callback from the still-attached handle remains owned by the
+    /// exact prior generation until `EventBridge.reattach(to:)` clears both.
+    var dormantSuccessorGeneration: UInt64?
+    var dormantRetiringGeneration: UInt64?
+    /// Natural-end delivery deferred across handle replacement until Player's
+    /// pointer/lifetime/session transaction is fully committed.
+    var pendingNaturalEndEmission: RetiredNaturalEndEmission?
     /// Monotonic barrier separating callbacks emitted before and after an
     /// explicit transport boundary on the same playback generation.
     var lifecycleControlEpoch: UInt64 = 0
     /// A stop quarantine remains active for its exact generation until a new
     /// generation is adopted or a native Play attempt is accepted.
     var explicitStopGeneration: UInt64?
+    var nextRecastLeaseID: UInt64 = 0
+    var nextRecastMutationPermitID: UInt64 = 0
+    var activeRecastLease: RecastLeaseIdentity?
+    var activeRecastMutationPermit: RecastMutationPermitIdentity?
+  }
+
+  private struct RecastLeaseIdentity: Equatable, Sendable {
+    let id: UInt64
+    let playbackGeneration: UInt64
+    let nativeHandleGeneration: UInt64
+    let ownershipEpoch: UInt64
+  }
+
+  private struct RecastMutationPermitIdentity: Equatable, Sendable {
+    let id: UInt64
+    let lease: RecastLeaseIdentity
   }
 
   private let playbackLifecycle = Mutex(PlaybackLifecycleState())
@@ -242,6 +319,17 @@ final class EventBridgeCallbackContext: Sendable {
     sourcedEvents.subscribe(policy: policy)
   }
 
+  func makeSourcedPlayerSignalStream(
+    policy: EventBufferingPolicy
+  ) -> AsyncStream<SourcedPlayerSignal> {
+    sourcedPlayerSignals.subscribe(policy: policy)
+  }
+
+  func makeEffectivePlaybackRateResolutionStream()
+    -> AsyncStream<EffectivePlaybackRateResolution> {
+    effectivePlaybackRateResolutions.subscribe(policy: .unbounded)
+  }
+
   func makeEnvelopeStream(
     policy: EventBufferingPolicy?,
     filter: (@Sendable (PlayerEventEnvelope) -> Bool)?
@@ -257,11 +345,297 @@ final class EventBridgeCallbackContext: Sendable {
     playbackLifecycle.withLock { $0.terminalCauses[playbackGeneration] }
   }
 
+  var currentNativeHandleHasStartedPlayback: Bool {
+    playbackLifecycle.withLock { state in
+      state.startedNativeHandleGeneration == state.currentNativeHandleGeneration
+    }
+  }
+
+  var currentPlaybackGenerationHasStartedPlayback: Bool {
+    playbackLifecycle.withLock { state in
+      state.startedPlaybackGeneration == state.currentGeneration
+    }
+  }
+
+  /// Records native acceptance before callback delivery. This is monotonic for
+  /// the exact handle and playback generation and therefore remains true after
+  /// stopped/error, including when playback was driven by MediaListPlayer.
+  func recordAcceptedPlaybackStart(
+    playbackGeneration: UInt64,
+    nativeHandleGeneration: UInt64
+  ) {
+    nativeSeekEmissionAuthority.withCallbackOrdering {
+      self.playbackLifecycle.withLock { state in
+        guard
+          playbackGeneration == state.currentGeneration,
+          nativeHandleGeneration == state.currentNativeHandleGeneration
+        else { return }
+        state.startedNativeHandleGeneration = nativeHandleGeneration
+        state.startedPlaybackGeneration = playbackGeneration
+      }
+    }
+  }
+
+  func commitRecastReplacementIfCurrent(
+    expectation: RecastReplacementExpectation,
+    successorPlaybackGeneration: UInt64,
+    successorNativeHandleGeneration: UInt64
+  ) -> RecastReplacementCommitResult {
+    let result = nativeSeekEmissionAuthority.withCallbackOrderingSnapshot { latest in
+      self.playbackLifecycle.withLock { state -> (
+        RecastReplacementCommitResult,
+        PlaybackTerminalOutcome?
+      ) in
+        guard
+          state.currentGeneration == expectation.playbackGeneration,
+          state.currentNativeHandleGeneration == expectation.nativeHandleGeneration,
+          state.lifecycleControlEpoch == expectation.lifecycleControlEpoch,
+          state.currentMediaIdentity == expectation.mediaIdentity,
+          expectation.playbackGeneration < UInt64.max,
+          expectation.nativeHandleGeneration < UInt64.max,
+          successorPlaybackGeneration == expectation.playbackGeneration + 1,
+          successorNativeHandleGeneration == expectation.nativeHandleGeneration + 1
+        else {
+          return ((.interrupted(.superseded)), nil)
+        }
+        if
+          let interruption = self.recastInterruption(
+            generation: expectation.playbackGeneration,
+            in: state
+          ) {
+          return ((.interrupted(interruption)), nil)
+        }
+
+        self.mergeNativeTimelineCallbackEmission(
+          latest,
+          playbackGeneration: expectation.playbackGeneration,
+          in: &state
+        )
+        let outgoingTimeline = (state.snapshots[expectation.playbackGeneration]
+          ?? TimelineSnapshot()).publicValue
+        let outcome = self.makeOutcome(
+          in: &state,
+          generation: expectation.playbackGeneration,
+          cause: .replacement,
+          nativeHandleGeneration: expectation.nativeHandleGeneration
+        )
+
+        state.currentGeneration = successorPlaybackGeneration
+        self.advanceLifecycleControlEpoch(in: &state)
+        state.explicitStopGeneration = nil
+        state.currentMediaIdentity = expectation.mediaIdentity
+        state.pendingWrapperMediaChangedGeneration = successorPlaybackGeneration
+        if let identity = expectation.mediaIdentity {
+          state.mediaGenerations[identity] = successorPlaybackGeneration
+        }
+        let successorSnapshot = TimelineSnapshot()
+        state.snapshots[successorPlaybackGeneration] = successorSnapshot
+        self.terminalTimelineAuthority.store(
+          successorSnapshot,
+          generation: successorPlaybackGeneration
+        )
+
+        // From this point until old-listener detach returns, every active token
+        // is the retiring handle. Route all of its callbacks to the frozen
+        // predecessor even though the successor carries the same media.
+        state.dormantSuccessorGeneration = successorPlaybackGeneration
+        state.dormantRetiringGeneration = expectation.playbackGeneration
+        state.currentNativeHandleGeneration = successorNativeHandleGeneration
+        precondition(state.nextRecastLeaseID < UInt64.max, "Recast lease exhausted")
+        state.nextRecastLeaseID += 1
+        let identity = RecastLeaseIdentity(
+          id: state.nextRecastLeaseID,
+          playbackGeneration: successorPlaybackGeneration,
+          nativeHandleGeneration: successorNativeHandleGeneration,
+          ownershipEpoch: expectation.ownershipEpoch
+        )
+        state.activeRecastLease = identity
+        state.activeRecastMutationPermit = nil
+        return ((.committed(RecastReplacementLease(
+          id: identity.id,
+          playbackGeneration: identity.playbackGeneration,
+          nativeHandleGeneration: identity.nativeHandleGeneration,
+          ownershipEpoch: identity.ownershipEpoch,
+          outgoingTimeline: outgoingTimeline
+        ))), outcome)
+      }
+    }
+    if result.1 != nil {
+      publishPendingTerminalOutcomes()
+    }
+    return result.0
+  }
+
+  func reserveRecastMutation(
+    for lease: RecastReplacementLease
+  ) -> RecastMutationReservation {
+    nativeSeekEmissionAuthority.withCallbackOrderingSnapshot { latest in
+      self.playbackLifecycle.withLock { state in
+        guard
+          self.recastLeaseIdentity(for: lease) == state.activeRecastLease,
+          state.currentGeneration == lease.playbackGeneration,
+          state.currentNativeHandleGeneration == lease.nativeHandleGeneration
+        else { return .interrupted(.superseded) }
+        self.mergeNativeTimelineCallbackEmission(
+          latest,
+          playbackGeneration: lease.playbackGeneration,
+          in: &state
+        )
+        if
+          let interruption = self.recastInterruption(
+            generation: lease.playbackGeneration,
+            in: state
+          ) {
+          state.activeRecastLease = nil
+          return .interrupted(interruption)
+        }
+        precondition(
+          state.nextRecastMutationPermitID < UInt64.max,
+          "Recast mutation permit exhausted"
+        )
+        guard state.activeRecastMutationPermit == nil else {
+          return .interrupted(.superseded)
+        }
+        state.nextRecastMutationPermitID += 1
+        let permit = RecastMutationPermit(
+          id: state.nextRecastMutationPermitID,
+          lease: lease
+        )
+        state.activeRecastMutationPermit = RecastMutationPermitIdentity(
+          id: permit.id,
+          lease: self.recastLeaseIdentity(for: permit.lease)
+        )
+        return .permitted(permit)
+      }
+    }
+  }
+
+  func currentRecastInterruption(
+    for lease: RecastReplacementLease
+  ) -> RecastTransactionInterruption? {
+    playbackLifecycle.withLock { state in
+      guard
+        recastLeaseIdentity(for: lease) == state.activeRecastLease,
+        state.currentGeneration == lease.playbackGeneration,
+        state.currentNativeHandleGeneration == lease.nativeHandleGeneration
+      else { return .superseded }
+      return recastInterruption(generation: lease.playbackGeneration, in: state)
+    }
+  }
+
+  func finishRecastMutation(
+    _ permit: RecastMutationPermit
+  ) -> RecastTransactionInterruption? {
+    nativeSeekEmissionAuthority.withCallbackOrderingSnapshot { latest in
+      self.playbackLifecycle.withLock { state in
+        let permitIdentity = RecastMutationPermitIdentity(
+          id: permit.id,
+          lease: self.recastLeaseIdentity(for: permit.lease)
+        )
+        guard state.activeRecastMutationPermit == permitIdentity else {
+          return .superseded
+        }
+        state.activeRecastMutationPermit = nil
+        guard
+          self.recastLeaseIdentity(for: permit.lease) == state.activeRecastLease,
+          state.currentGeneration == permit.lease.playbackGeneration,
+          state.currentNativeHandleGeneration == permit.lease.nativeHandleGeneration
+        else { return .superseded }
+        self.mergeNativeTimelineCallbackEmission(
+          latest,
+          playbackGeneration: permit.lease.playbackGeneration,
+          in: &state
+        )
+        if
+          let interruption = self.recastInterruption(
+            generation: permit.lease.playbackGeneration,
+            in: state
+          ) {
+          state.activeRecastLease = nil
+          return interruption
+        }
+        return nil
+      }
+    }
+  }
+
+  /// Makes the final `.settled` decision and relinquishes mutation authority
+  /// in the same critical section. A terminal cause can therefore be either
+  /// before this decision or after it, never hidden between check and return.
+  func settleRecast(
+    _ lease: RecastReplacementLease
+  ) -> RecastTransactionInterruption? {
+    nativeSeekEmissionAuthority.withCallbackOrderingSnapshot { latest in
+      self.playbackLifecycle.withLock { state in
+        guard
+          self.recastLeaseIdentity(for: lease) == state.activeRecastLease,
+          state.currentGeneration == lease.playbackGeneration,
+          state.currentNativeHandleGeneration == lease.nativeHandleGeneration,
+          state.activeRecastMutationPermit == nil
+        else { return .superseded }
+        self.mergeNativeTimelineCallbackEmission(
+          latest,
+          playbackGeneration: lease.playbackGeneration,
+          in: &state
+        )
+        let interruption = self.recastInterruption(
+          generation: lease.playbackGeneration,
+          in: state
+        )
+        state.activeRecastLease = nil
+        return interruption
+      }
+    }
+  }
+
+  func abandonRecast(_ lease: RecastReplacementLease) {
+    playbackLifecycle.withLock { state in
+      guard recastLeaseIdentity(for: lease) == state.activeRecastLease else { return }
+      state.activeRecastLease = nil
+      if state.activeRecastMutationPermit?.lease == recastLeaseIdentity(for: lease) {
+        state.activeRecastMutationPermit = nil
+      }
+    }
+  }
+
+  private func recastLeaseIdentity(
+    for lease: RecastReplacementLease
+  ) -> RecastLeaseIdentity {
+    RecastLeaseIdentity(
+      id: lease.id,
+      playbackGeneration: lease.playbackGeneration,
+      nativeHandleGeneration: lease.nativeHandleGeneration,
+      ownershipEpoch: lease.ownershipEpoch
+    )
+  }
+
+  private func recastInterruption(
+    generation: UInt64,
+    in state: PlaybackLifecycleState
+  ) -> RecastTransactionInterruption? {
+    if let reservation = state.terminalReservations[generation] {
+      return .terminal(reservation.cause)
+    }
+    if
+      let cause = state.terminalCauses[generation]
+      ?? state.terminalIntents[generation] {
+      return .terminal(cause)
+    }
+    if state.explicitStopGeneration == generation {
+      return .terminal(.requestedStop)
+    }
+    if generation <= state.lastEmittedGeneration {
+      return .terminal(.unknownNativeStop)
+    }
+    return nil
+  }
+
   func synchronizePlaybackGeneration(
     _ generation: UInt64,
     media: OpaquePointer?,
     nativeHandleGeneration: UInt64,
-    retiringNativeHandle: Bool
+    retiringNativeHandle: Bool,
+    expectRetiringHandleStopped: Bool
   ) -> UInt64 {
     let mediaIdentity = Self.identity(of: media)
     let result = nativeSeekEmissionAuthority.withCallbackOrdering {
@@ -279,6 +653,20 @@ final class EventBridgeCallbackContext: Sendable {
         state.currentGeneration = adoptedGeneration
         self.advanceLifecycleControlEpoch(in: &state)
         state.explicitStopGeneration = nil
+        if retiringNativeHandle, outgoing > 0 {
+          // Deferred drawable-media replacement stops the still-attached old
+          // handle only after committing the successor in Swift. libVLC
+          // normally emits MediaStopping first, but every callback in the
+          // teardown tail still describes the native media that preceded the
+          // dormant successor. Preserve the original retiring generation
+          // across repeated deferred loads on the same un-replaced handle.
+          let retiringGeneration = state.dormantRetiringGeneration ?? outgoing
+          state.dormantSuccessorGeneration = adoptedGeneration
+          state.dormantRetiringGeneration = retiringGeneration
+          if expectRetiringHandleStopped {
+            state.pendingStoppedGeneration = retiringGeneration
+          }
+        }
         state.currentMediaIdentity = mediaIdentity
         state.pendingWrapperMediaChangedGeneration = adoptedGeneration
         if let identity = state.currentMediaIdentity {
@@ -360,6 +748,29 @@ final class EventBridgeCallbackContext: Sendable {
         if
           playbackGeneration == state.currentGeneration,
           let identity = state.currentMediaIdentity {
+          state.retiredMediaGenerations[identity] = nil
+        }
+      }
+    }
+  }
+
+  /// Establishes the current generation's Stop quarantine and, when that
+  /// generation is eligible to emit a terminal outcome, records its requested
+  /// cause in the same callback-ordering critical section. Generation zero is
+  /// a valid externally driven initial episode even though it is also the
+  /// terminal-outcome sentinel, so it still receives the quarantine.
+  func beginRequestedStopBarrier(playbackGeneration: UInt64) {
+    nativeSeekEmissionAuthority.withCallbackOrdering {
+      self.playbackLifecycle.withLock { state in
+        guard playbackGeneration == state.currentGeneration else { return }
+        if state.explicitStopGeneration != playbackGeneration {
+          self.advanceLifecycleControlEpoch(in: &state)
+          state.explicitStopGeneration = playbackGeneration
+        }
+        guard playbackGeneration > state.lastEmittedGeneration else { return }
+        state.terminalIntents[playbackGeneration] = .requestedStop
+        state.pendingStoppedGeneration = playbackGeneration
+        if let identity = state.currentMediaIdentity {
           state.retiredMediaGenerations[identity] = nil
         }
       }
@@ -534,21 +945,25 @@ final class EventBridgeCallbackContext: Sendable {
     )
     // Each broadcaster is gated on its own emptiness so a libVLC event
     // with no consumers costs neither the lock-and-snapshot nor the
-    // sourced-wrapper construction. The sourced broadcast (the player's
+    // sourced-wrapper construction. The signal broadcast (the player's
     // internal observable mirror; never carries user filters) runs
     // first, so a slow user filter on the public stream can only delay
     // public delivery — internal state is already on its way.
-    if !sourcedEvents.isEmpty {
-      sourcedEvents.broadcast(
-        SourcedPlayerEvent(
-          nativeHandleGeneration: nativeHandleGeneration,
-          playbackGeneration: playbackGeneration,
-          event: event,
-          timelineRevision: emittedTimelineRevision,
-          nativeSeekEmissionStamp: nativeSeekEmissionStamp,
-          lifecycleControlEpoch: lifecycleControlEpoch
-        )
+    if !sourcedPlayerSignals.isEmpty || !sourcedEvents.isEmpty {
+      let sourcedEvent = SourcedPlayerEvent(
+        nativeHandleGeneration: nativeHandleGeneration,
+        playbackGeneration: playbackGeneration,
+        event: event,
+        timelineRevision: emittedTimelineRevision,
+        nativeSeekEmissionStamp: nativeSeekEmissionStamp,
+        lifecycleControlEpoch: lifecycleControlEpoch
       )
+      if !sourcedPlayerSignals.isEmpty {
+        sourcedPlayerSignals.broadcast(.event(sourcedEvent))
+      }
+      if !sourcedEvents.isEmpty {
+        sourcedEvents.broadcast(sourcedEvent)
+      }
     }
     if !eventEnvelopes.isEmpty {
       eventEnvelopes.broadcast(
@@ -561,6 +976,31 @@ final class EventBridgeCallbackContext: Sendable {
     }
     if !events.isEmpty {
       events.broadcast(event)
+    }
+  }
+
+  /// Publishes one native effective-rate resolution with provenance frozen at
+  /// callback entry. The private signal and public stream receive the exact
+  /// same immutable value, so observation invalidation cannot disagree with
+  /// what API consumers saw.
+  func broadcastEffectivePlaybackRateResolution(
+    _ effectiveRate: Float,
+    nativeHandleGeneration: UInt64,
+    playbackGeneration: UInt64
+  ) {
+    guard
+      !sourcedPlayerSignals.isEmpty || !effectivePlaybackRateResolutions.isEmpty
+    else { return }
+    let resolution = EffectivePlaybackRateResolution(
+      effectiveRate: effectiveRate,
+      nativeGeneration: NativePlayerGeneration(nativeHandleGeneration),
+      playbackGeneration: PlaybackGeneration(playbackGeneration)
+    )
+    if !sourcedPlayerSignals.isEmpty {
+      sourcedPlayerSignals.broadcast(.effectivePlaybackRateResolution(resolution))
+    }
+    if !effectivePlaybackRateResolutions.isEmpty {
+      effectivePlaybackRateResolutions.broadcast(resolution)
     }
   }
 
@@ -603,65 +1043,119 @@ final class EventBridgeCallbackContext: Sendable {
         let playbackGeneration: UInt64
         let terminalReservation: TerminalCallbackReservation?
         let lifecycleOutcome: PlaybackTerminalOutcome?
-        switch lifecycleFact {
-        case .mediaChanged(let mediaIdentity):
-          self.mergeNativeTimelineCallbackEmission(
-            nativeEntry.latestTimelineEmission,
-            playbackGeneration: state.currentGeneration,
-            in: &state
-          )
-          let classification = self.classifyMediaChangedAtCallbackEntry(
-            mediaIdentity: mediaIdentity,
+        if
+          state.dormantSuccessorGeneration == state.currentGeneration,
+          let retiringGeneration = state.dormantRetiringGeneration {
+          // The successor exists only in Swift until a fresh handle is
+          // installed. Consequently every event from this attachment still
+          // belongs to its original retiring media — including MediaChanged,
+          // active-state progress, capability/track/vout changes, and the
+          // post-Stopped vout(0) tail. Never clear this quarantine from a
+          // callback; only detach/reattach proves the old producer is gone.
+          playbackGeneration = retiringGeneration
+          lifecycleOutcome = nil
+          switch lifecycleFact {
+          case .terminal(let terminalFact):
+            let checkpoint = self.terminalTimelineAuthority.capture()
+            let timelineSnapshot = self.makeTerminalTimelineSnapshot(
+              from: checkpoint,
+              folding: nativeEntry.latestTimelineEmission,
+              playbackGeneration: playbackGeneration
+            )
+            terminalReservation = self.reserveTerminalCallback(
+              terminalFact,
+              playbackGeneration: playbackGeneration,
+              nativeHandleGeneration: nativeHandleGeneration,
+              timelineSnapshot: timelineSnapshot,
+              in: &state
+            )
+          case .mediaChanged, .currentGenerationProgress, .other:
+            self.mergeNativeTimelineCallbackEmission(
+              nativeEntry.latestTimelineEmission,
+              playbackGeneration: playbackGeneration,
+              in: &state
+            )
+            terminalReservation = nil
+          }
+        } else {
+          switch lifecycleFact {
+          case .mediaChanged(let mediaIdentity):
+            self.mergeNativeTimelineCallbackEmission(
+              nativeEntry.latestTimelineEmission,
+              playbackGeneration: state.currentGeneration,
+              in: &state
+            )
+            let classification = self.classifyMediaChangedAtCallbackEntry(
+              mediaIdentity: mediaIdentity,
+              nativeHandleGeneration: nativeHandleGeneration,
+              in: &state
+            )
+            playbackGeneration = classification.playbackGeneration
+            lifecycleOutcome = classification.outcome
+            terminalReservation = nil
+
+          case .currentGenerationProgress:
+            playbackGeneration = state.currentGeneration
+            self.mergeNativeTimelineCallbackEmission(
+              nativeEntry.latestTimelineEmission,
+              playbackGeneration: playbackGeneration,
+              in: &state
+            )
+            self.noteCurrentGenerationProgress(
+              playbackGeneration,
+              nativeHandleGeneration: nativeHandleGeneration,
+              in: &state
+            )
+            terminalReservation = nil
+            lifecycleOutcome = nil
+
+          case .terminal(let terminalFact):
+            playbackGeneration = self.claimPlaybackGenerationAtCallbackEntry(
+              terminalFact,
+              in: &state
+            )
+            let checkpoint = self.terminalTimelineAuthority.capture()
+            let timelineSnapshot = self.makeTerminalTimelineSnapshot(
+              from: checkpoint,
+              folding: nativeEntry.latestTimelineEmission,
+              playbackGeneration: playbackGeneration
+            )
+            terminalReservation = self.reserveTerminalCallback(
+              terminalFact,
+              playbackGeneration: playbackGeneration,
+              nativeHandleGeneration: nativeHandleGeneration,
+              timelineSnapshot: timelineSnapshot,
+              in: &state
+            )
+            lifecycleOutcome = nil
+
+          case .other:
+            playbackGeneration = state.currentGeneration
+            self.mergeNativeTimelineCallbackEmission(
+              nativeEntry.latestTimelineEmission,
+              playbackGeneration: playbackGeneration,
+              in: &state
+            )
+            terminalReservation = nil
+            lifecycleOutcome = nil
+          }
+        }
+        if
+          state.pendingNaturalEndEmission == nil,
+          case .terminal(.mediaStopping(_, .naturalEnd)) = lifecycleFact,
+          let terminalReservation,
+          terminalReservation.cause == .naturalEnd,
+          playbackGeneration > state.lastEmittedGeneration {
+          // Bind the exact first-winner callback entry before any debug hook,
+          // generation synchronizer, duplicate EOS, or public filter can
+          // advance mutable lifecycle state.
+          state.pendingNaturalEndEmission = RetiredNaturalEndEmission(
             nativeHandleGeneration: nativeHandleGeneration,
-            in: &state
-          )
-          playbackGeneration = classification.playbackGeneration
-          lifecycleOutcome = classification.outcome
-          terminalReservation = nil
-
-        case .currentGenerationProgress:
-          playbackGeneration = state.currentGeneration
-          self.mergeNativeTimelineCallbackEmission(
-            nativeEntry.latestTimelineEmission,
             playbackGeneration: playbackGeneration,
-            in: &state
+            timelineRevision: timelineRevision,
+            nativeSeekEmissionStamp: nativeEntry.seekStamp,
+            lifecycleControlEpoch: state.lifecycleControlEpoch
           )
-          self.noteCurrentGenerationProgress(
-            playbackGeneration,
-            in: &state
-          )
-          terminalReservation = nil
-          lifecycleOutcome = nil
-
-        case .terminal(let terminalFact):
-          playbackGeneration = self.claimPlaybackGenerationAtCallbackEntry(
-            terminalFact,
-            in: &state
-          )
-          let checkpoint = self.terminalTimelineAuthority.capture()
-          let timelineSnapshot = self.makeTerminalTimelineSnapshot(
-            from: checkpoint,
-            folding: nativeEntry.latestTimelineEmission,
-            playbackGeneration: playbackGeneration
-          )
-          terminalReservation = self.reserveTerminalCallback(
-            terminalFact,
-            playbackGeneration: playbackGeneration,
-            nativeHandleGeneration: nativeHandleGeneration,
-            timelineSnapshot: timelineSnapshot,
-            in: &state
-          )
-          lifecycleOutcome = nil
-
-        case .other:
-          playbackGeneration = state.currentGeneration
-          self.mergeNativeTimelineCallbackEmission(
-            nativeEntry.latestTimelineEmission,
-            playbackGeneration: playbackGeneration,
-            in: &state
-          )
-          terminalReservation = nil
-          lifecycleOutcome = nil
         }
         return NativeCallbackLifecycleClaim(
           timelineRevision: timelineRevision,
@@ -757,6 +1251,8 @@ final class EventBridgeCallbackContext: Sendable {
     events.terminate()
     eventEnvelopes.terminate()
     sourcedEvents.terminate()
+    sourcedPlayerSignals.terminate()
+    effectivePlaybackRateResolutions.terminate()
     terminalOutcomes.terminate()
   }
 
@@ -766,6 +1262,38 @@ final class EventBridgeCallbackContext: Sendable {
 
   var currentLifecycleControlEpoch: UInt64 {
     playbackLifecycle.withLock { $0.lifecycleControlEpoch }
+  }
+
+  /// Whether one exact callback/control identity still owns nonterminal
+  /// playback. Terminal callbacks reserve their generation synchronously at
+  /// callback entry, before their observable Player state can reach the main
+  /// actor; consulting that reservation closes the queued-delivery window.
+  func ownsNonterminalPlayback(
+    playbackGeneration: UInt64,
+    nativeHandleGeneration: UInt64,
+    lifecycleControlEpoch: UInt64
+  ) -> Bool {
+    playbackLifecycle.withLock { state in
+      guard
+        state.currentGeneration == playbackGeneration,
+        state.currentNativeHandleGeneration == nativeHandleGeneration,
+        state.lifecycleControlEpoch == lifecycleControlEpoch
+      else { return false }
+      if recastInterruption(generation: playbackGeneration, in: state) == nil {
+        return true
+      }
+      // Zero is both the initial playable generation and the sentinel below
+      // `lastEmittedGeneration`. It has not ended merely because 0 <= 0. Keep
+      // synthetic/external initial-handle playback valid while still rejecting
+      // every terminal marker that can exist for that generation.
+      return playbackGeneration == 0
+        && state.lastEmittedGeneration == 0
+        && state.terminalReservations[0] == nil
+        && state.terminalCauses[0] == nil
+        && state.terminalIntents[0] == nil
+        && state.pendingStoppedGeneration != 0
+        && state.explicitStopGeneration != 0
+    }
   }
 
   func hasExplicitStopBarrier(playbackGeneration: UInt64) -> Bool {
@@ -993,8 +1521,8 @@ final class EventBridgeCallbackContext: Sendable {
     playbackGeneration: UInt64,
     nativeHandleGeneration: UInt64,
     terminalTimelineSnapshot: TimelineSnapshot
-  ) -> UInt64 {
-    let result = playbackLifecycle.withLock { state -> (UInt64, PlaybackTerminalOutcome?) in
+  ) -> (playbackGeneration: UInt64, consumedNaturalEndEmission: Bool) {
+    let result = playbackLifecycle.withLock { state in
       let outcome = makeOutcome(
         in: &state,
         generation: playbackGeneration,
@@ -1002,12 +1530,17 @@ final class EventBridgeCallbackContext: Sendable {
         nativeHandleGeneration: nativeHandleGeneration,
         terminalTimelineSnapshot: terminalTimelineSnapshot
       )
-      return (playbackGeneration, outcome)
+      let consumedNaturalEndEmission = state.pendingNaturalEndEmission?
+        .playbackGeneration == playbackGeneration
+      if consumedNaturalEndEmission {
+        state.pendingNaturalEndEmission = nil
+      }
+      return (playbackGeneration, consumedNaturalEndEmission, outcome)
     }
-    if result.1 != nil {
+    if result.2 != nil {
       publishPendingTerminalOutcomes()
     }
-    return result.0
+    return (result.0, result.1)
   }
 
   #if DEBUG
@@ -1045,17 +1578,29 @@ final class EventBridgeCallbackContext: Sendable {
   }
   #endif
 
-  func noteCurrentGenerationProgress(_ generation: UInt64) {
+  func noteCurrentGenerationProgress(
+    _ generation: UInt64,
+    nativeHandleGeneration: UInt64
+  ) {
     playbackLifecycle.withLock { state in
-      noteCurrentGenerationProgress(generation, in: &state)
+      noteCurrentGenerationProgress(
+        generation,
+        nativeHandleGeneration: nativeHandleGeneration,
+        in: &state
+      )
     }
   }
 
   private func noteCurrentGenerationProgress(
     _ generation: UInt64,
+    nativeHandleGeneration: UInt64,
     in state: inout PlaybackLifecycleState
   ) {
     guard generation == state.currentGeneration else { return }
+    state.startedNativeHandleGeneration = nativeHandleGeneration
+    if nativeHandleGeneration == state.currentNativeHandleGeneration {
+      state.startedPlaybackGeneration = generation
+    }
     if let identity = state.currentMediaIdentity {
       // Native callbacks are serialized. Once the successor opens or plays,
       // every stopping callback ordered before that progress has arrived, so
@@ -1072,11 +1617,36 @@ final class EventBridgeCallbackContext: Sendable {
     }
   }
 
-  func clearPendingStopForNativeHandleReplacement() {
+  func completeNativeHandleReplacement(nativeHandleGeneration: UInt64) {
     playbackLifecycle.withLock { state in
       state.pendingStoppedGeneration = nil
+      state.dormantSuccessorGeneration = nil
+      state.dormantRetiringGeneration = nil
+      state.pendingNaturalEndEmission = nil
       state.pendingWrapperMediaChangedGeneration = nil
       state.retiredMediaGenerations.removeAll()
+      state.currentNativeHandleGeneration = nativeHandleGeneration
+      if state.startedNativeHandleGeneration != nativeHandleGeneration {
+        state.startedNativeHandleGeneration = nil
+      }
+      state.startedPlaybackGeneration = nil
+    }
+  }
+
+  /// Claims the exact retiring playback generation whose authoritative EOS
+  /// was already frozen but whose ordered `Stopped` callback did not arrive
+  /// before event detachment. Returning the emission consumes this handoff;
+  /// a later replacement cannot synthesize the same natural end again.
+  func consumePendingNaturalEndForNativeHandleReplacement()
+    -> RetiredNaturalEndEmission? {
+    playbackLifecycle.withLock { state in
+      guard
+        let emission = state.pendingNaturalEndEmission,
+        state.pendingStoppedGeneration == emission.playbackGeneration
+      else { return nil }
+      state.pendingNaturalEndEmission = nil
+      state.pendingStoppedGeneration = nil
+      return emission
     }
   }
 
@@ -1156,8 +1726,11 @@ final class EventBridgeCallbackContext: Sendable {
       ?? TimelineSnapshot()
     state.terminalCauses[generation] = resolvedCause
     let oldestRetainedGeneration = generation > 32 ? generation - 32 : 0
+    let pendingNaturalEndGeneration = state.pendingNaturalEndEmission?
+      .playbackGeneration
     state.terminalCauses = state.terminalCauses.filter {
       $0.key >= oldestRetainedGeneration
+        || $0.key == pendingNaturalEndGeneration
     }
     state.terminalReservations = state.terminalReservations.filter {
       $0.key > generation

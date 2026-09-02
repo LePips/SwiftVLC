@@ -204,12 +204,31 @@ section "Validating headless video-output teardown lifecycle"
     --source-root "$VLC_SOURCE_ROOT" \
     --work-root "$REPLAY_DIR/headless-vout-teardown-validation"
 
-section "Validating exact integrated extension version 8"
+section "Validating adaptive ES codec-configuration recycling"
+python3 -B \
+    "$SCRIPT_DIR/patches/validation/adaptive-es-recycling-source-check.py" \
+    "$VLC_SOURCE_ROOT" \
+    "$SCRIPT_DIR/patches/0042-adaptive-es-recycling-extradata-identity.patch"
+
+section "Validating exact integrated extension version 9"
 "$SCRIPT_DIR/validate-native-extension-contract.sh" \
     --source-root "$VLC_SOURCE_ROOT" \
-    --expected-version 8 \
+    --expected-version 9 \
     --require-apple-audio-session-leases \
     --run-mutations
+
+section "Validating native PiP output identity and race semantics"
+python3 -B \
+    "$SCRIPT_DIR/patches/validation/native-pip-output-identity-source-check.py" \
+    "$VLC_SOURCE_ROOT" \
+    "$SCRIPT_DIR/patches/0041-native-pip-output-identity.patch"
+pip_race_compiler="${CC:-cc}"
+command -v "$pip_race_compiler" >/dev/null 2>&1 \
+    || fail "C compiler not found for native PiP race proof: $pip_race_compiler"
+"$pip_race_compiler" -std=c11 -O2 -Wall -Wextra -Werror -pthread \
+    "$SCRIPT_DIR/patches/validation/native-pip-output-identity-race.c" \
+    -o "$REPLAY_DIR/native-pip-output-identity-race"
+"$REPLAY_DIR/native-pip-output-identity-race"
 
 section "Validating strict frame-step source semantics"
 python3 -B \
@@ -234,4 +253,4 @@ python3 -B \
 section "Native patch-series source contracts passed"
 echo "Pinned VLC commit: $actual_commit"
 echo "Applied patches:   ${#patch_names[@]}"
-echo "Extension version: 8 (apple-audio-session-leases required)"
+echo "Extension version: 9 (apple-audio-session-leases required)"

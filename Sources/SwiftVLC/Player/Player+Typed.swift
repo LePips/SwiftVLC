@@ -43,7 +43,7 @@ extension Player {
   /// A successful return means libVLC accepted the command into its control
   /// path, not that the active input ultimately applied it. Unsupported media
   /// can asynchronously fall back to another ``Player/rate``. Observe
-  /// ``PlayerEvent/rateChanged(_:)`` for effective resolutions when
+  /// ``Player/effectivePlaybackRateResolutions`` for effective resolutions when
   /// ``Player/supportsEffectivePlaybackRateEvents`` is true. The native event
   /// has no request identifier. An unchanged queued active-input resolution is
   /// omitted, while an idle or failed-queue notification can repeat the

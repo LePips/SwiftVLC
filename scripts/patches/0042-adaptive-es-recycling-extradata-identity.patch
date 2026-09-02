@@ -1,0 +1,232 @@
+diff --git a/modules/demux/Makefile.am b/modules/demux/Makefile.am
+index 1a733fc..2c9c9c6 100644
+--- a/modules/demux/Makefile.am
++++ b/modules/demux/Makefile.am
+@@ -238,6 +238,7 @@ libmp4_plugin_la_SOURCES = demux/mp4/mp4.c demux/mp4/mp4.h \
+ 			   packetizer/mpeg4systems.h \
+                            packetizer/iso_color_tables.h \
+                            meta_engine/ID3Genres.h
++noinst_HEADERS += demux/codec_configuration.h
+ libmp4_plugin_la_LIBADD = libvlc_mp4.la
+ libmp4_plugin_la_LDFLAGS = $(AM_LDFLAGS)
+ demux_LTLIBRARIES += libmp4_plugin.la
+diff --git a/modules/demux/codec_configuration.h b/modules/demux/codec_configuration.h
+new file mode 100644
+index 0000000..eb0b7c2
+--- /dev/null
++++ b/modules/demux/codec_configuration.h
+@@ -0,0 +1,33 @@
++/*****************************************************************************
++ * codec_configuration.h: demux codec-configuration identity helpers
++ *****************************************************************************
++ * Copyright (C) 2026 VideoLAN and VLC Authors
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU Lesser General Public License as published by
++ * the Free Software Foundation; either version 2.1 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++ * GNU Lesser General Public License for more details.
++ ******************************************************************************/
++
++#ifndef VLC_DEMUX_CODEC_CONFIGURATION_H
++#define VLC_DEMUX_CODEC_CONFIGURATION_H
++
++#include <vlc_es.h>
++
++#include <string.h>
++
++static inline bool
++demux_IsCodecExtraDataIdentical( const es_format_t *left,
++                                 const es_format_t *right )
++{
++    return left->i_extra == right->i_extra &&
++           (left->i_extra == 0 ||
++            memcmp( left->p_extra, right->p_extra, left->i_extra ) == 0);
++}
++
++#endif
+diff --git a/modules/demux/adaptive/plumbing/FakeESOutID.cpp b/modules/demux/adaptive/plumbing/FakeESOutID.cpp
+index 6d1179c..3361912 100644
+--- a/modules/demux/adaptive/plumbing/FakeESOutID.cpp
++++ b/modules/demux/adaptive/plumbing/FakeESOutID.cpp
+@@ -24,6 +24,7 @@
+ 
+ #include "FakeESOutID.hpp"
+ #include "FakeESOut.hpp"
++#include "../../codec_configuration.h"
+ 
+ using namespace adaptive;
+ 
+@@ -118,7 +119,7 @@ bool FakeESOutID::isCompatible( const FakeESOutID *p_other ) const
+             if(fmt.i_extra && p_other->fmt.i_extra &&
+                fmt.i_extra == p_other->fmt.i_extra)
+             {
+-               return !!memcmp(fmt.p_extra, p_other->fmt.p_extra, fmt.i_extra);
++               return demux_IsCodecExtraDataIdentical(&fmt, &p_other->fmt);
+             }
+             else return false; /* no extra, can't tell anything */
+         }
+diff --git a/modules/demux/adaptive/test/plumbing/FakeEsOut.cpp b/modules/demux/adaptive/test/plumbing/FakeEsOut.cpp
+index c3621c2..cb183a1 100644
+--- a/modules/demux/adaptive/test/plumbing/FakeEsOut.cpp
++++ b/modules/demux/adaptive/test/plumbing/FakeEsOut.cpp
+@@ -34,6 +34,8 @@
+ #include <list>
+ #include <algorithm>
+ #include <cassert>
++#include <cstdlib>
++#include <cstring>
+ 
+ using namespace adaptive;
+ 
+@@ -375,6 +377,105 @@ static int check3(es_out_t *out, DummyEsOut *dummy, FakeESOut *fakees)
+     return 0;
+ }
+ 
++static int check4(es_out_t *out, DummyEsOut *dummy, FakeESOut *fakees)
++{
++    static const uint8_t extra[] = { 1, 100, 0, 31, 0xff, 0xe1 };
++    static const vlc_fourcc_t codecs[] = {
++        VLC_CODEC_H264, VLC_CODEC_HEVC, VLC_CODEC_VC1, VLC_CODEC_AV1
++    };
++
++    try
++    {
++        for(const vlc_fourcc_t codec : codecs)
++        {
++            es_format_t candidate;
++            es_format_Init(&candidate, VIDEO_ES, codec);
++            candidate.p_extra = malloc(sizeof(extra));
++            if(!candidate.p_extra)
++            {
++                es_format_Clean(&candidate);
++                return 1;
++            }
++            memcpy(candidate.p_extra, extra, sizeof(extra));
++            candidate.i_extra = sizeof(extra);
++
++            const SrcID source = SrcID::make();
++            FakeESOutID original(fakees, &candidate, source);
++            FakeESOutID identical(fakees, &candidate, source);
++            Expect(original.isCompatible(&identical));
++            FakeESOutID discontinuity(fakees, &candidate, SrcID::make());
++            Expect(!original.isCompatible(&discontinuity));
++
++            candidate.i_extra = 0;
++            FakeESOutID missingExtra(fakees, &candidate, source);
++            Expect(!original.isCompatible(&missingExtra));
++            candidate.i_extra = sizeof(extra);
++            candidate.i_extra--;
++            FakeESOutID shorter(fakees, &candidate, source);
++            Expect(!original.isCompatible(&shorter));
++            candidate.i_extra++;
++            static_cast<uint8_t *>(candidate.p_extra)[3] ^= 1;
++            FakeESOutID changed(fakees, &candidate, source);
++            Expect(!original.isCompatible(&changed));
++            es_format_Clean(&candidate);
++        }
++    } catch (...) {
++        return 1;
++    }
++
++    es_format_t fmt;
++    es_format_Init(&fmt, VIDEO_ES, VLC_CODEC_H264);
++    fmt.p_extra = malloc(sizeof(extra));
++    if(!fmt.p_extra)
++    {
++        es_format_Clean(&fmt);
++        return 1;
++    }
++    memcpy(fmt.p_extra, extra, sizeof(extra));
++    fmt.i_extra = sizeof(extra);
++
++    try
++    {
++        es_out_id_t *id = es_out_Add(out, &fmt);
++        Expect(id != nullptr);
++        fakees->commandsQueue()->Commit();
++        fakees->commandsQueue()->Process(drainTimes);
++        Expect(dummy->eslist.size() == 1);
++        dummy->eslist.front()->b_selected = true;
++
++        /* A seek that restarts the adaptive demux with identical codec
++         * configuration must retain the real ES, decoder and video output. */
++        fakees->recycleAll();
++        id = es_out_Add(out, &fmt);
++        Expect(id != nullptr);
++        fakees->commandsQueue()->Commit();
++        fakees->commandsQueue()->Process(drainTimes);
++        Expect(dummy->eslist.size() == 1);
++        fakees->gc();
++        Expect(dummy->eslist.size() == 1);
++        Expect(dummy->eslist.front()->b_selected == true);
++
++        /* Same-sized but different codec configuration must not borrow the
++         * previous decoder. The selected replacement survives collection. */
++        fakees->recycleAll();
++        static_cast<uint8_t *>(fmt.p_extra)[3] ^= 1;
++        id = es_out_Add(out, &fmt);
++        Expect(id != nullptr);
++        fakees->commandsQueue()->Commit();
++        fakees->commandsQueue()->Process(drainTimes);
++        Expect(dummy->eslist.size() == 2);
++        fakees->gc();
++        Expect(dummy->eslist.size() == 1);
++        Expect(dummy->eslist.front()->b_selected == true);
++    } catch (...) {
++        es_format_Clean(&fmt);
++        return 1;
++    }
++
++    es_format_Clean(&fmt);
++    return 0;
++}
++
+ 
+ static int check2(es_out_t *out, DummyEsOut *, FakeESOut *fakees)
+ {
+@@ -632,9 +733,9 @@ int FakeEsOut_test()
+             .esout = { .cbs = &dummycbs }
+     };
+ 
+-    int(* const tests[4])(es_out_t *, DummyEsOut *, FakeESOut *)
+-            = { check0, check1, check2, check3 };
+-    for(size_t i=0; i<4; i++)
++    int(* const tests[5])(es_out_t *, DummyEsOut *, FakeESOut *)
++            = { check0, check1, check2, check3, check4 };
++    for(size_t i=0; i<5; i++)
+     {
+         CommandsFactory *factory = new CommandsFactory();
+         CommandsQueue *queue = new CommandsQueue();
+diff --git a/modules/demux/mp4/mp4.c b/modules/demux/mp4/mp4.c
+index 6ec1772..709e444 100644
+--- a/modules/demux/mp4/mp4.c
++++ b/modules/demux/mp4/mp4.c
+@@ -27,6 +27,7 @@
+  * Preamble
+  *****************************************************************************/
+ #include "mp4.h"
++#include "../codec_configuration.h"
+ 
+ #include <vlc_arrays.h>
+ #include <vlc_demux.h>
+@@ -3647,12 +3648,9 @@ static bool FormatIsCompatible( const es_format_t *p_fmt1, const es_format_t *p_
+     if( (p_fmt1->i_extra > 0) ^ (p_fmt2->i_extra > 0) )
+         return false;
+ 
+-    if( p_fmt1->i_codec == p_fmt2->i_codec &&
+-        p_fmt1->i_extra && p_fmt2->i_extra &&
+-        p_fmt1->i_extra == p_fmt2->i_extra )
+-    {
+-       return !!memcmp( p_fmt1->p_extra, p_fmt2->p_extra, p_fmt1->i_extra );
+-    }
++    if( p_fmt1->i_extra && p_fmt2->i_extra )
++        return p_fmt1->i_codec == p_fmt2->i_codec &&
++               demux_IsCodecExtraDataIdentical( p_fmt1, p_fmt2 );
+ 
+     if( p_fmt1->i_cat == AUDIO_ES )
+     {

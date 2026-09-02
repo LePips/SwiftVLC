@@ -9,11 +9,10 @@
 #   - A completely clean, up-to-date main checkout
 #
 # Usage:
-#   ./scripts/release.sh 0.1.0
-#   ./scripts/release.sh 1.1.0-beta.1             # always a GitHub pre-release
 #   ./scripts/release.sh 0.1.0 --prepare /path/to/candidate
 #   ./scripts/release.sh 0.1.0 --candidate /path/to/candidate
-#   ./scripts/release.sh 0.1.0 --dry-run            # strip/zip/checksum only, no push
+#   ./scripts/release.sh 0.1.0 --candidate /path/to/candidate --finalize
+#   ./scripts/release.sh 0.1.0 --dry-run          # strip/zip/checksum only, no push
 #
 set -euo pipefail
 
@@ -56,6 +55,7 @@ CANDIDATE_SOURCE_COMMIT=""
 CANDIDATE_SOURCE_DIGEST=""
 CANDIDATE_MATRIX_CHECKSUM=""
 CANDIDATE_FEATURE_MANIFEST_CHECKSUM=""
+FINALIZE=false
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -74,9 +74,12 @@ while [[ $# -gt 0 ]]; do
       [[ $# -ge 2 ]] || { echo "Error: --candidate requires a directory." >&2; exit 2; }
       CANDIDATE_DIR="$2"
       shift 2 ;;
+    --finalize)
+      FINALIZE=true
+      shift ;;
     --allow-dirty-branch)
       echo "Error: --allow-dirty-branch is no longer supported." >&2
-      echo "  Releases advance origin/main and must be run from main." >&2
+      echo "  Releases are staged from main and merged only through a protected PR." >&2
       exit 1 ;;
     --help|-h)
       sed -n 's/^# \{0,1\}//p' "$0" | sed -n '/^Usage:/,/^$/p'
@@ -122,6 +125,7 @@ elif [[ "$UNQUALIFIED" == true ]]; then
 fi
 
 TAG="v${VERSION}"
+RELEASE_BRANCH="release-candidates/${TAG}"
 RELEASE_URL="https://github.com/$REPO/releases/download/$TAG/$ZIP_NAME"
 cd "$ROOT_DIR"
 
@@ -129,10 +133,14 @@ if [[ -n "$PREPARE_DIR" && -n "$CANDIDATE_DIR" ]]; then
   echo "Error: --prepare and --candidate are mutually exclusive." >&2
   exit 2
 fi
-if [[ "$DRY_RUN" == false && "$UNQUALIFIED" == false && -z "$CANDIDATE_DIR" ]]; then
-  echo "Error: a qualified release must consume a prepared candidate directory." >&2
+if [[ "$FINALIZE" == true && ( "$DRY_RUN" == true || -n "$PREPARE_DIR" ) ]]; then
+  echo "Error: --finalize requires --candidate and cannot be a dry run." >&2
+  exit 2
+fi
+if [[ "$DRY_RUN" == false && -z "$CANDIDATE_DIR" ]]; then
+  echo "Error: every published release must consume a prepared candidate directory." >&2
   echo "  First: $0 $VERSION --prepare /path/to/candidate" >&2
-  echo "  Then qualify that directory and release with --candidate." >&2
+  echo "  Then stage with --candidate and publish with --candidate --finalize." >&2
   exit 1
 fi
 if [[ -n "$CANDIDATE_DIR" ]]; then
@@ -415,6 +423,181 @@ snapshot_release_inputs() {
 
 snapshot_release_inputs
 
+# Keep this helper above preflight: both staging and the last publication
+# boundary call it, and Bash resolves functions only after their definition has
+# executed.
+verify_immutable_releases_enabled() {
+  local enabled
+  if ! enabled=$(gh api \
+      -H 'Accept: application/vnd.github+json' \
+      -H 'X-GitHub-Api-Version: 2026-03-10' \
+      "repos/$REPO/immutable-releases" \
+      --jq '.enabled == true' 2>/dev/null) \
+      || [[ "$enabled" != "true" ]]; then
+    echo "Error: repository immutable releases must be enabled." >&2
+    echo "  Enable release immutability in repository Settings, then rerun." >&2
+    echo "  This script never changes repository settings." >&2
+    return 1
+  fi
+}
+
+# Publishing is allowed only while the repository's live default-branch
+# contract matches the checked-in policy. This is intentionally read-only:
+# enabling or repairing the ruleset is a separate, reviewed administration
+# action, and a release fails closed when policy or token visibility drifts.
+verify_main_governance() {
+  local rulesets="$WORK_DIR/main-rulesets.json"
+  local ruleset="$WORK_DIR/main-ruleset.json"
+  local repository="$WORK_DIR/repository-settings.json"
+  local ruleset_id
+
+  if ! gh api \
+      -H 'Accept: application/vnd.github+json' \
+      -H 'X-GitHub-Api-Version: 2022-11-28' \
+      "repos/$REPO" > "$repository"; then
+    echo "Error: cannot read repository merge settings." >&2
+    return 1
+  fi
+  python3 - "$repository" "$REPO" <<'PY'
+import json
+import sys
+
+path, repository = sys.argv[1:]
+try:
+    settings = json.load(open(path))
+except (OSError, ValueError) as error:
+    sys.exit(f"Error: cannot parse repository settings: {error}")
+if settings.get("full_name") != repository or settings.get("default_branch") != "main":
+    sys.exit("Error: repository/default-branch identity drifted")
+if settings.get("archived") is not False or settings.get("disabled") is not False:
+    sys.exit("Error: repository is archived or disabled")
+if settings.get("allow_merge_commit") is not True:
+    sys.exit("Error: repository must allow the ruleset's merge-commit method")
+PY
+  if ! gh api \
+      -H 'Accept: application/vnd.github+json' \
+      -H 'X-GitHub-Api-Version: 2022-11-28' \
+      "repos/$REPO/rulesets?includes_parents=true&per_page=100" \
+      > "$rulesets"; then
+    echo "Error: cannot read repository rulesets; Administration:read is required." >&2
+    return 1
+  fi
+  if ! ruleset_id=$(python3 - "$rulesets" "$REPO" <<'PY'
+import json
+import sys
+
+path, repository = sys.argv[1:]
+try:
+    rulesets = json.load(open(path))
+except (OSError, ValueError) as error:
+    sys.exit(f"Error: cannot parse repository rulesets: {error}")
+if not isinstance(rulesets, list):
+    sys.exit("Error: repository ruleset response is not a list")
+matches = [
+    item for item in rulesets
+    if item.get("name") == "Protect main"
+    and item.get("target") == "branch"
+    and item.get("source_type") == "Repository"
+    and item.get("source") in (None, repository)
+]
+if len(matches) != 1:
+    sys.exit(
+        "Error: expected exactly one repository ruleset named 'Protect main'; "
+        f"found {len(matches)}"
+    )
+identifier = matches[0].get("id")
+if type(identifier) is not int or identifier <= 0:
+    sys.exit("Error: Protect main ruleset has an invalid id")
+print(identifier)
+PY
+  ); then
+    return 1
+  fi
+  if ! gh api \
+      -H 'Accept: application/vnd.github+json' \
+      -H 'X-GitHub-Api-Version: 2022-11-28' \
+      "repos/$REPO/rulesets/$ruleset_id" > "$ruleset"; then
+    echo "Error: cannot read Protect main ruleset details." >&2
+    return 1
+  fi
+  python3 - "$ruleset" "$REPO" <<'PY'
+import json
+import sys
+
+path, repository = sys.argv[1:]
+try:
+    policy = json.load(open(path))
+except (OSError, ValueError) as error:
+    sys.exit(f"Error: cannot parse Protect main ruleset: {error}")
+if (
+    policy.get("name") != "Protect main"
+    or policy.get("target") != "branch"
+    or policy.get("source_type") != "Repository"
+    or policy.get("source") not in (None, repository)
+    or policy.get("enforcement") != "active"
+):
+    sys.exit("Error: Protect main ruleset identity/enforcement drifted")
+if policy.get("bypass_actors") != []:
+    sys.exit("Error: Protect main ruleset must not grant bypass actors")
+conditions = policy.get("conditions") or {}
+refs = conditions.get("ref_name") or {}
+if refs.get("include") != ["~DEFAULT_BRANCH"] or refs.get("exclude") != []:
+    sys.exit("Error: Protect main ruleset must target only the default branch")
+rules = policy.get("rules")
+if not isinstance(rules, list):
+    sys.exit("Error: Protect main rules are unavailable")
+by_type = {}
+for rule in rules:
+    kind = rule.get("type") if isinstance(rule, dict) else None
+    if kind in by_type:
+        sys.exit(f"Error: duplicate Protect main rule: {kind!r}")
+    by_type[kind] = rule
+for required in ("deletion", "non_fast_forward", "pull_request", "required_status_checks"):
+    if required not in by_type:
+        sys.exit(f"Error: Protect main ruleset is missing {required}")
+pull = by_type["pull_request"].get("parameters") or {}
+expected_pull = {
+    "required_approving_review_count": 0,
+    "dismiss_stale_reviews_on_push": False,
+    "require_code_owner_review": False,
+    "require_last_push_approval": False,
+    "required_review_thread_resolution": True,
+}
+for key, expected in expected_pull.items():
+    actual = pull.get(key)
+    if ((type(expected) is bool and actual is not expected) or
+            (type(expected) is not bool and actual != expected)):
+        sys.exit(f"Error: Protect main pull-request parameter drifted: {key}")
+if pull.get("allowed_merge_methods") != ["merge"]:
+    sys.exit("Error: Protect main must allow merge commits only")
+status = by_type["required_status_checks"].get("parameters") or {}
+if status.get("strict_required_status_checks_policy") is not True:
+    sys.exit("Error: Protect main required checks must be strict")
+if status.get("do_not_enforce_on_create") is not False:
+    sys.exit("Error: Protect main checks must be enforced on creation")
+checks = status.get("required_status_checks")
+if not isinstance(checks, list):
+    sys.exit("Error: Protect main required checks are unavailable")
+expected_checks = {"lint", "ios-build", "test"}
+found = {}
+for check in checks:
+    if not isinstance(check, dict) or not isinstance(check.get("context"), str):
+        sys.exit("Error: Protect main contains an invalid required check")
+    context = check["context"]
+    if context in found:
+        sys.exit(f"Error: Protect main duplicates required check {context}")
+    found[context] = check.get("integration_id")
+missing = sorted(expected_checks - set(found))
+if missing:
+    sys.exit("Error: Protect main is missing required checks: " + ", ".join(missing))
+for context in expected_checks:
+    if found[context] != 15368:
+        sys.exit(
+            f"Error: Protect main check {context} is not pinned to GitHub Actions"
+        )
+PY
+}
+
 # A prepared candidate may be released from a later main commit when the
 # release-significant source digest is unchanged. Its native artifact must still
 # prove the exact commit that created the candidate, not merely the current HEAD.
@@ -494,16 +677,17 @@ if ! "$SCRIPT_DIR/check-libvlc-manifest.sh" --xcframework "$XCFW_PATH"; then
   exit 1
 fi
 
-# Release 1.1.0's frozen patch manifest owns extension version 8 plus the 0033
-# Apple audio-session lease refinement. Probe the actual linked macOS archive
-# in this checkout before accepting its recorded provenance; current headers or
-# provenance metadata alone cannot establish the binary's runtime identity.
+# Release 1.1.0's frozen patch manifest owns extension version 9 plus the 0033
+# Apple audio-session lease refinement inherited from version 8. Probe the
+# actual linked macOS archive in this checkout before accepting its recorded
+# provenance; current headers or provenance metadata alone cannot establish the
+# binary's runtime identity.
 echo "Verifying exact linked native extension contract..."
 if ! "$SCRIPT_DIR/validate-native-extension-contract.sh" \
   --xcframework "$XCFW_PATH" \
-  --expected-version 8 \
+  --expected-version 9 \
   --require-apple-audio-session-leases; then
-  echo "Error: release artifact does not implement native extension version 8 with Apple audio-session leases." >&2
+  echo "Error: release artifact does not implement native extension version 9 with Apple audio-session leases." >&2
   echo "  Rebuild it from the current patch manifest before preparing a release." >&2
   exit 1
 fi
@@ -587,39 +771,73 @@ if [[ "$DRY_RUN" == false || -n "$PREPARE_DIR" ]]; then
   CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
   if [[ "$CURRENT_BRANCH" != "main" ]]; then
     echo "Error: refusing to release from branch '$CURRENT_BRANCH'." >&2
-    echo "  Release commits advance origin/main, so rerun from main." >&2
+    echo "  Release PRs must be staged from an exact local main checkout." >&2
     exit 1
   fi
 
-  git fetch --quiet origin main --tags
+  # Remote release identities are inspected with ls-remote and fetched into
+  # private refs below. Do not update local tag names here: a diagnosed remote
+  # tag race must not leave a stale local tag that wedges safe recovery.
+  git fetch --quiet origin main
   LOCAL_HEAD=$(git rev-parse HEAD)
   REMOTE_MAIN=$(git rev-parse origin/main)
   if [[ "$LOCAL_HEAD" != "$REMOTE_MAIN" ]]; then
-    echo "Error: local main is not exactly origin/main." >&2
-    echo "  local:       $LOCAL_HEAD" >&2
-    echo "  origin/main: $REMOTE_MAIN" >&2
-    echo "  Fetch and fast-forward before preparing a release." >&2
-    exit 1
+    # After the release PR is merged, a finalize retry may still be sitting on
+    # its exact head commit. Fast-forward only when origin/main descends from
+    # that commit and has the identical tree (the expected merge-commit shape).
+    if [[ "$FINALIZE" == true ]] \
+        && git merge-base --is-ancestor "$LOCAL_HEAD" "$REMOTE_MAIN" \
+        && git diff --quiet "$LOCAL_HEAD" "$REMOTE_MAIN" --; then
+      git merge --quiet --ff-only origin/main
+      LOCAL_HEAD=$(git rev-parse HEAD)
+    # A stage/finalize retry may resume its one generated release commit.
+    # Canonical byte-for-byte reconstruction validates that commit below.
+    elif ! git merge-base --is-ancestor "$REMOTE_MAIN" "$LOCAL_HEAD" \
+        || [[ $(git rev-list --count "$REMOTE_MAIN..$LOCAL_HEAD") -ne 1 ]]; then
+      echo "Error: local main is not an allowed release state." >&2
+      echo "  local:       $LOCAL_HEAD" >&2
+      echo "  origin/main: $REMOTE_MAIN" >&2
+      echo "  Start staging from exact origin/main, or finalize the one release commit." >&2
+      exit 1
+    fi
   fi
 
-  if git rev-parse "$TAG" &>/dev/null; then
+  if [[ "$FINALIZE" != true ]] && git rev-parse "$TAG" &>/dev/null; then
     echo "Error: tag '$TAG' already exists locally." >&2
-    echo "  If the previous release attempt was partial, clean up:" >&2
-    echo "    git tag -d $TAG && git push origin :refs/tags/$TAG" >&2
+    echo "  Final SemVer tags are never created during candidate staging." >&2
     exit 1
   fi
 
-  if git ls-remote --exit-code --tags origin "refs/tags/$TAG" &>/dev/null; then
+  if [[ "$FINALIZE" != true ]] \
+      && git ls-remote --exit-code --tags origin "refs/tags/$TAG" &>/dev/null; then
     echo "Error: tag '$TAG' already exists on origin." >&2
-    echo "  Finish that release or delete the remote tag before retrying:" >&2
-    echo "    git push origin :refs/tags/$TAG" >&2
+    echo "  Never move, delete, or reuse a public release tag; audit this version." >&2
     exit 1
   fi
 
-  if gh release view "$TAG" --repo "$REPO" &>/dev/null; then
+  if [[ "$FINALIZE" != true ]] \
+      && gh release view "$TAG" --repo "$REPO" &>/dev/null; then
     echo "Error: GitHub Release '$TAG' already exists." >&2
-    echo "  Delete it first or pick a new version." >&2
+    echo "  Audit it with --finalize recovery or choose a new version; never reuse the tag." >&2
     exit 1
+  fi
+
+  # Immutable releases are a publication invariant, not an optional UI
+  # preference. This read-only preflight intentionally fails both when the
+  # setting is disabled and when the token lacks Administration:read.
+  if [[ "$DRY_RUN" == false ]]; then
+    for required_gh_command in \
+      "release edit" \
+      "release verify" \
+      "release verify-asset"; do
+      if ! gh $required_gh_command --help >/dev/null 2>&1; then
+        echo "Error: installed GitHub CLI lacks 'gh $required_gh_command'." >&2
+        echo "  Upgrade gh before staging; these commands are release invariants." >&2
+        exit 1
+      fi
+    done
+    verify_main_governance
+    verify_immutable_releases_enabled
   fi
 fi
 
@@ -1032,100 +1250,1068 @@ if [[ "$DRY_RUN" == true ]]; then
   exit 0
 fi
 
-# ── Release commit on main ───────────────────────────────────────────────────
+# ── Staged publication and exact-commit CI gate ────────────────────────────
 #
-# main should always resolve the most recently published xcframework, and the
-# Showcase app should always resolve the matching Swift package release. Local
-# development can flip both back to repo-local sources via `setup-dev.sh`.
-#
-# Mechanics:
-#   1. Rewrite Package.swift and the Showcase app, commit, and tag.
-#   2. Push the tag and create a draft GitHub Release containing the asset.
-#   3. Fast-forward origin/main to the same commit.
-#   4. Publish the already-uploaded draft. A failed main push therefore never
-#      leaves a public stable release detached from main.
-#
-# If the tag or draft upload succeeds but the main push fails, nothing public
-# has been published. Repair or remove the draft/tag before retrying.
+# Candidate staging deliberately exposes no SemVer tag. SwiftPM discovers
+# versions from Git tags, independently of whether a GitHub Release is a draft,
+# so the only pre-CI tag is `swiftvlc-candidate-vX.Y.Z-<full commit SHA>`.
+# The draft is renamed to the final tag and published in one GitHub release
+# update. The final SemVer tag therefore becomes visible only with public,
+# immutable, already-qualified assets.
 
-echo ""
-echo "Creating release commit on $CURRENT_BRANCH..."
-
-begin_release_file_restore
-
-echo "Pointing Package.swift at $RELEASE_URL..."
-switch_package_to_release_url
-
-echo "Pointing Showcase app at SwiftVLC $TAG..."
-switch_showcase_to_release_version
-
-# Sanity-check: a corrupted regex result would wipe the rest of Package.swift.
-if ! grep -q 'name: "CLibVLC"' Package.swift; then
-  echo "Error: Package.swift corrupted — CLibVLC target missing." >&2
-  exit 1
-fi
-
-if ! grep -q 'kind = exactVersion;' "$SHOWCASE_PROJECT"; then
-  echo "Error: Showcase project was not pinned to an exact SwiftVLC version." >&2
-  exit 1
-fi
-
-git add Package.swift "$SHOWCASE_PROJECT"
-git commit --quiet -m "Release $TAG"
-RELEASE_RESTORE_FILES=false
-TAG_COMMIT=$(git rev-parse HEAD)
-git tag "$TAG" "$TAG_COMMIT"
-
-echo "  Tag $TAG → $TAG_COMMIT (Package.swift pinned to $RELEASE_URL)"
-echo "  Showcase app → exactVersion $VERSION"
-
-echo "Pushing tag..."
-git push origin "$TAG"
-
-# ── GitHub Release ────────────────────────────────────────────────────────────
-
-echo "Creating draft GitHub Release..."
-RELEASE_FLAGS=(--draft)
 RELEASE_ASSETS=(
   "$ZIP_PATH"
   "$RELEASE_FIRST_PROVENANCE"
   "$RELEASE_PROVENANCE"
   "$RELEASE_REPRODUCIBILITY"
+  "$CANDIDATE_DIR/release-candidate.json"
 )
-if [[ -n "$CANDIDATE_DIR" ]]; then
-  RELEASE_ASSETS+=("$CANDIDATE_DIR/release-candidate.json")
-fi
+RELEASE_FLAGS=(--draft)
 QUALIFICATION_NOTE=""
 if [[ "$UNQUALIFIED" == true ]]; then
   RELEASE_FLAGS+=(--prerelease)
   QUALIFICATION_NOTE=$'\n> **Not release-qualified.** The physical-device matrix and required feature policy in `scripts/qualification` have not both been satisfied for this artifact. Published as a pre-release for that reason.\n'
 fi
+CANDIDATE_RELEASE_TITLE="SwiftVLC $TAG candidate"
+CANDIDATE_RELEASE_NOTES=""
+FINAL_RELEASE_TITLE="SwiftVLC $TAG"
+FINAL_RELEASE_NOTES=""
 
-gh release create "$TAG" "${RELEASE_ASSETS[@]}" \
-  --repo "$REPO" \
-  --verify-tag \
-  ${RELEASE_FLAGS[@]+"${RELEASE_FLAGS[@]}"} \
-  --title "SwiftVLC $TAG" \
-  --notes "$(cat <<EOF
+remote_ref_sha() {
+  local ref=$1
+  git ls-remote origin "$ref" | awk -v expected="$ref" \
+    '$2 == expected { print $1; exit }'
+}
+
+verify_remote_ref() {
+  local ref=$1
+  local expected=$2
+  local actual
+  actual=$(remote_ref_sha "$ref")
+  if [[ "$actual" != "$expected" ]]; then
+    echo "Error: remote $ref does not resolve to the release commit." >&2
+    echo "  expected: $expected" >&2
+    echo "  actual:   ${actual:-missing}" >&2
+    return 1
+  fi
+}
+
+verify_remote_ref_absent() {
+  local ref=$1
+  local actual
+  actual=$(remote_ref_sha "$ref")
+  if [[ -n "$actual" ]]; then
+    echo "Error: remote $ref unexpectedly exists at $actual." >&2
+    return 1
+  fi
+}
+
+rollback_reserved_final_tag() {
+  local actual
+  actual=$(remote_ref_sha "refs/tags/$TAG")
+  if [[ -z "$actual" ]]; then
+    return 0
+  fi
+  if [[ "$actual" != "$STAGED_COMMIT" ]]; then
+    echo "Error: cannot roll back $TAG because its identity changed." >&2
+    return 1
+  fi
+  git push \
+    --force-with-lease="refs/tags/$TAG:$STAGED_COMMIT" \
+    origin ":refs/tags/$TAG"
+  verify_remote_ref_absent "refs/tags/$TAG"
+}
+
+candidate_tag_for_commit() {
+  local commit=$1
+  printf 'swiftvlc-candidate-%s-%s\n' "$TAG" "$commit"
+}
+
+# Reconstruct the only two generated files from the release commit's parent.
+# A checksum-looking Package.swift is insufficient: this catches unrelated or
+# malicious edits hidden in either file, including changes normalized out of
+# release-source-digest.py.
+canonical_release_commit_matches() {
+  local commit=$1
+  local parent
+  local reconstruction
+  local actual
+  local changed
+  local expected_changed
+
+  if [[ $(git rev-list --parents -n 1 "$commit" | awk '{ print NF }') -ne 2 ]]; then
+    echo "Error: release commit must have exactly one parent." >&2
+    return 1
+  fi
+  parent=$(git rev-parse "${commit}^")
+  changed=$(git diff --name-only "$parent" "$commit" | LC_ALL=C sort)
+  expected_changed=$(printf '%s\n%s\n' Package.swift "$SHOWCASE_PROJECT" \
+    | LC_ALL=C sort)
+  if [[ "$changed" != "$expected_changed" ]]; then
+    echo "Error: staged release commit changes files outside the canonical rewrite." >&2
+    echo "$changed" >&2
+    return 1
+  fi
+
+  reconstruction=$(make_temp_dir)
+  mkdir -p "$reconstruction/$(dirname "$SHOWCASE_PROJECT")"
+  git show "$parent:Package.swift" > "$reconstruction/Package.swift"
+  git show "$parent:$SHOWCASE_PROJECT" > "$reconstruction/$SHOWCASE_PROJECT"
+  (
+    cd "$reconstruction"
+    SHOWCASE_PROJECT="$SHOWCASE_PROJECT"
+    switch_package_to_release_url
+    switch_showcase_to_release_version
+  )
+
+  actual=$(make_temp_dir)
+  mkdir -p "$actual/$(dirname "$SHOWCASE_PROJECT")"
+  git show "$commit:Package.swift" > "$actual/Package.swift"
+  git show "$commit:$SHOWCASE_PROJECT" > "$actual/$SHOWCASE_PROJECT"
+  if ! cmp -s "$reconstruction/Package.swift" "$actual/Package.swift" \
+      || ! cmp -s "$reconstruction/$SHOWCASE_PROJECT" \
+        "$actual/$SHOWCASE_PROJECT"; then
+    echo "Error: staged release files are not the exact canonical rewrite." >&2
+    rm -rf "$reconstruction" "$actual"
+    return 1
+  fi
+  rm -rf "$reconstruction" "$actual"
+}
+
+verify_github_release() {
+  local release_tag=$1
+  local visibility=$2
+  local immutable=$3
+  local url_tag=$4
+  local expected_commit=$5
+  local expected_name=$6
+  local expected_body=$7
+  local metadata="$WORK_DIR/github-release-${release_tag}.json"
+
+  gh release view "$release_tag" --repo "$REPO" \
+    --json tagName,targetCommitish,isDraft,isImmutable,isPrerelease,name,body,assets \
+    > "$metadata"
+  EXPECTED_PRERELEASE="$UNQUALIFIED" \
+  EXPECTED_RELEASE_NAME="$expected_name" \
+  EXPECTED_RELEASE_BODY="$expected_body" \
+  python3 - \
+    "$metadata" "$release_tag" "$visibility" "$immutable" "$url_tag" \
+    "$REPO" "$expected_commit" "${RELEASE_ASSETS[@]}" <<'PY'
+import hashlib
+import json
+import os
+import sys
+from pathlib import Path
+
+(
+    metadata_path,
+    release_tag,
+    visibility,
+    immutable,
+    url_tag,
+    repository,
+    commit,
+    *asset_paths,
+) = sys.argv[1:]
+release = json.load(open(metadata_path))
+if release.get("tagName") != release_tag:
+    sys.exit(f"Error: GitHub release tag drifted: {release.get('tagName')!r}")
+if release.get("targetCommitish") != commit:
+    sys.exit("Error: GitHub release target does not equal the release commit")
+if bool(release.get("isDraft")) != (visibility == "draft"):
+    sys.exit(f"Error: GitHub release is not {visibility}")
+if bool(release.get("isImmutable")) != (immutable == "immutable"):
+    sys.exit(f"Error: GitHub release immutable state is not {immutable}")
+expected_prerelease = os.environ["EXPECTED_PRERELEASE"] == "true"
+if bool(release.get("isPrerelease")) != expected_prerelease:
+    sys.exit("Error: GitHub pre-release classification drifted")
+if release.get("name") != os.environ["EXPECTED_RELEASE_NAME"]:
+    sys.exit("Error: GitHub release title drifted")
+if release.get("body") != os.environ["EXPECTED_RELEASE_BODY"]:
+    sys.exit("Error: GitHub release notes drifted")
+
+expected = {Path(path).name: Path(path) for path in asset_paths}
+actual_assets = release.get("assets")
+if not isinstance(actual_assets, list):
+    sys.exit("Error: GitHub release assets are unavailable")
+actual = {}
+for asset in actual_assets:
+    name = asset.get("name")
+    if name in actual:
+        sys.exit(f"Error: duplicate GitHub release asset: {name}")
+    actual[name] = asset
+if set(actual) != set(expected):
+    sys.exit(
+        "Error: GitHub release asset set drifted\n"
+        f"  expected: {sorted(expected)}\n"
+        f"  actual:   {sorted(actual)}"
+    )
+for name, path in expected.items():
+    asset = actual[name]
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    if asset.get("state") != "uploaded":
+        sys.exit(f"Error: GitHub release asset is incomplete: {name}")
+    if asset.get("digest") != f"sha256:{digest}":
+        sys.exit(f"Error: GitHub release asset digest drifted: {name}")
+    expected_url = (
+        f"https://github.com/{repository}/releases/download/{url_tag}/{name}"
+    )
+    if asset.get("url") != expected_url:
+        sys.exit(f"Error: GitHub release asset URL drifted: {name}")
+PY
+}
+
+verify_candidate_release_header() {
+  local metadata="$WORK_DIR/candidate-release-header.json"
+  gh release view "$CANDIDATE_TAG" --repo "$REPO" \
+    --json tagName,targetCommitish,isDraft,isImmutable,isPrerelease,name,body,assets \
+    > "$metadata"
+  EXPECTED_PRERELEASE="$UNQUALIFIED" \
+  EXPECTED_RELEASE_NAME="$CANDIDATE_RELEASE_TITLE" \
+  EXPECTED_RELEASE_BODY="$CANDIDATE_RELEASE_NOTES" \
+  python3 - \
+    "$metadata" "$CANDIDATE_TAG" "$STAGED_COMMIT" "${RELEASE_ASSETS[@]}" <<'PY'
+import json
+import os
+import sys
+from pathlib import Path
+
+metadata_path, tag, commit, *asset_paths = sys.argv[1:]
+release = json.load(open(metadata_path))
+if release.get("tagName") != tag:
+    sys.exit("Error: candidate release tag drifted")
+if release.get("targetCommitish") != commit:
+    sys.exit("Error: candidate release target drifted")
+if release.get("isDraft") is not True or release.get("isImmutable") is True:
+    sys.exit("Error: candidate release must remain a mutable draft")
+if bool(release.get("isPrerelease")) != (
+    os.environ["EXPECTED_PRERELEASE"] == "true"
+):
+    sys.exit("Error: candidate pre-release classification drifted")
+if release.get("name") != os.environ["EXPECTED_RELEASE_NAME"]:
+    sys.exit("Error: candidate release title drifted")
+if release.get("body") != os.environ["EXPECTED_RELEASE_BODY"]:
+    sys.exit("Error: candidate release notes drifted")
+
+expected_names = {Path(path).name for path in asset_paths}
+seen = set()
+for asset in release.get("assets", []):
+    name = asset.get("name")
+    if name in seen:
+        sys.exit(f"Error: duplicate candidate asset: {name}")
+    seen.add(name)
+    if name not in expected_names:
+        sys.exit(f"Error: unexpected candidate asset: {name}")
+PY
+}
+
+candidate_asset_status() {
+  local asset_path=$1
+  local metadata="$WORK_DIR/candidate-assets.json"
+  gh release view "$CANDIDATE_TAG" --repo "$REPO" \
+    --json tagName,targetCommitish,isDraft,isImmutable,isPrerelease,assets \
+    > "$metadata"
+  python3 - "$metadata" "$asset_path" "$REPO" "$CANDIDATE_TAG" <<'PY'
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+metadata_path, asset_path, repository, tag = sys.argv[1:]
+path = Path(asset_path)
+release = json.load(open(metadata_path))
+matches = [asset for asset in release.get("assets", []) if asset.get("name") == path.name]
+if not matches:
+    print("missing")
+    raise SystemExit
+if len(matches) != 1:
+    raise SystemExit(f"Error: duplicate candidate asset: {path.name}")
+asset = matches[0]
+state = asset.get("state")
+if state == "starter":
+    api_url = asset.get("apiUrl")
+    expected_prefix = f"https://api.github.com/repos/{repository}/releases/assets/"
+    if not isinstance(api_url, str) or not api_url.startswith(expected_prefix):
+        raise SystemExit(f"Error: incomplete candidate asset has an unsafe API URL: {path.name}")
+    print(f"starter\t{api_url}")
+    raise SystemExit
+if state != "uploaded":
+    raise SystemExit(f"Error: candidate asset has unsupported state {state!r}: {path.name}")
+digest = hashlib.sha256(path.read_bytes()).hexdigest()
+expected_url = f"https://github.com/{repository}/releases/download/{tag}/{path.name}"
+if asset.get("digest") != f"sha256:{digest}" or asset.get("url") != expected_url:
+    raise SystemExit(f"Error: existing candidate asset conflicts with local bytes: {path.name}")
+print("exact")
+PY
+}
+
+reconcile_candidate_assets() {
+  local asset_path
+  local status_line
+  local status
+  local detail
+  local attempt
+
+  verify_candidate_release_header
+  for asset_path in "${RELEASE_ASSETS[@]}"; do
+    status_line=$(candidate_asset_status "$asset_path")
+    IFS=$'\t' read -r status detail <<< "$status_line"
+    if [[ "$status" == "starter" ]]; then
+      echo "Removing incomplete starter upload for $(basename "$asset_path")..."
+      gh api --method DELETE "$detail"
+      status="missing"
+    fi
+    if [[ "$status" == "missing" ]]; then
+      echo "Uploading $(basename "$asset_path")..."
+      if ! gh release upload "$CANDIDATE_TAG" "$asset_path" --repo "$REPO"; then
+        echo "Error: candidate asset upload failed; rerun to resume without replacing completed assets." >&2
+        return 1
+      fi
+    elif [[ "$status" != "exact" ]]; then
+      echo "Error: unsupported candidate asset reconciliation state: $status" >&2
+      return 1
+    fi
+
+    for attempt in 1 2 3 4 5; do
+      status_line=$(candidate_asset_status "$asset_path")
+      if [[ "$status_line" == "exact" ]]; then
+        break
+      fi
+      if [[ "$attempt" -eq 5 ]]; then
+        echo "Error: uploaded candidate asset did not settle to its exact digest: $(basename "$asset_path")" >&2
+        return 1
+      fi
+      sleep 1
+    done
+  done
+  verify_github_release \
+    "$CANDIDATE_TAG" draft mutable "$CANDIDATE_TAG" "$STAGED_COMMIT" \
+    "$CANDIDATE_RELEASE_TITLE" "$CANDIDATE_RELEASE_NOTES"
+}
+
+verify_required_release_workflows() {
+  local required_commit=$1
+  local required_branch=$2
+  local required_event=$3
+  local required_workflows=(
+    test.yml
+    fixtures.yml
+    vendor-manifest.yml
+    native-source-contracts.yml
+    sanitize.yml
+  )
+  local workflow
+  local workflow_json
+  for workflow in "${required_workflows[@]}"; do
+    workflow_json="$WORK_DIR/workflow-${workflow%.yml}.json"
+    if ! gh run list \
+        --repo "$REPO" \
+        --workflow "$workflow" \
+        --commit "$required_commit" \
+        --event "$required_event" \
+        --limit 100 \
+        --json databaseId,attempt,createdAt,status,conclusion,headSha,headBranch,event \
+        > "$workflow_json"; then
+      echo "Error: could not read $workflow workflow runs." >&2
+      return 1
+    fi
+    if ! python3 - \
+        "$workflow_json" "$workflow" "$required_commit" "$required_branch" \
+        "$required_event" <<'PY'
+import json
+from datetime import datetime
+import sys
+
+path, workflow, commit, release_branch, event = sys.argv[1:]
+runs = json.load(open(path))
+if not isinstance(runs, list):
+    sys.exit(f"Error: {workflow} workflow response is not a list")
+exact = []
+seen_ids = set()
+for run in runs:
+    if (
+        run.get("headSha") != commit
+        or run.get("headBranch") != release_branch
+        or run.get("event") != event
+    ):
+        continue
+    identifier = run.get("databaseId")
+    if type(identifier) is not int or identifier <= 0 or identifier in seen_ids:
+        sys.exit(f"Error: {workflow} returned an invalid/duplicate run id")
+    seen_ids.add(identifier)
+    created = run.get("createdAt")
+    if not isinstance(created, str):
+        sys.exit(f"Error: {workflow} exact run has no creation timestamp")
+    try:
+        created_key = datetime.fromisoformat(created.replace("Z", "+00:00"))
+    except ValueError:
+        sys.exit(f"Error: {workflow} exact run has an invalid creation timestamp")
+    if created_key.tzinfo is None:
+        sys.exit(f"Error: {workflow} exact run timestamp has no timezone")
+    attempt = run.get("attempt")
+    if type(attempt) is not int or attempt <= 0:
+        sys.exit(f"Error: {workflow} exact run has an invalid attempt")
+    exact.append((created_key, identifier, run))
+if not exact:
+    sys.exit(
+        f"Error: {workflow} requires a {release_branch}/{event} run for {commit}"
+    )
+# A manual rerun updates one database id in place, while close/reopen or a
+# superseded base event can create another run for the same immutable head.
+# The newest exact event is authoritative: a newer pending/failure blocks, and
+# a later successful recovery can safely supersede stale failures without
+# permanently wedging an otherwise identical release commit.
+_, _, run = max(exact, key=lambda item: (item[0], item[1]))
+if run.get("status") != "completed":
+    sys.exit(f"Error: {workflow} is not complete for {commit}: {run.get('status')!r}")
+if run.get("conclusion") != "success":
+    sys.exit(f"Error: {workflow} did not succeed for {commit}: {run.get('conclusion')!r}")
+print(
+    f"  {workflow}: success (run {run.get('databaseId')}, "
+    f"attempt {run.get('attempt')})"
+)
+PY
+    then
+      return 1
+    fi
+  done
+}
+
+load_release_pr() {
+  local metadata="$WORK_DIR/release-pr-list.json"
+  local values
+
+  gh pr list \
+    --repo "$REPO" \
+    --state all \
+    --base main \
+    --head "$RELEASE_BRANCH" \
+    --limit 100 \
+    --json number,state,isDraft,isCrossRepository,headRefName,headRefOid,baseRefName,baseRefOid,mergedAt,mergeCommit,url \
+    > "$metadata"
+  values=$(python3 - \
+    "$metadata" "$RELEASE_BRANCH" "$STAGED_COMMIT" "$RELEASE_PARENT" <<'PY'
+import json
+import re
+import sys
+
+path, release_branch, staged_commit, release_parent = sys.argv[1:]
+pulls = json.load(open(path))
+if not isinstance(pulls, list):
+    sys.exit("Error: release pull-request response is not a list")
+if len(pulls) != 1:
+    sys.exit(
+        f"Error: expected exactly one pull request for {release_branch}; "
+        f"found {len(pulls)}"
+    )
+pull = pulls[0]
+if type(pull.get("number")) is not int or pull["number"] <= 0:
+    sys.exit("Error: release pull request has an invalid number")
+if pull.get("isCrossRepository") is not False:
+    sys.exit("Error: release pull request must come from this repository")
+if pull.get("headRefName") != release_branch:
+    sys.exit("Error: release pull-request head branch drifted")
+if pull.get("headRefOid") != staged_commit:
+    sys.exit("Error: release pull-request head commit drifted")
+if pull.get("baseRefName") != "main":
+    sys.exit("Error: release pull-request base branch drifted")
+if pull.get("baseRefOid") != release_parent:
+    sys.exit("Error: main advanced after release staging; restage from fresh main")
+if pull.get("isDraft") is not False:
+    sys.exit("Error: release pull request must be ready for review")
+state = pull.get("state")
+if state not in ("OPEN", "MERGED"):
+    sys.exit(f"Error: release pull request has unsupported state {state!r}")
+merge_commit = (pull.get("mergeCommit") or {}).get("oid") or ""
+if merge_commit and re.fullmatch(r"[0-9a-f]{40}", merge_commit) is None:
+    sys.exit("Error: release pull request has an invalid merge commit")
+print(pull["number"])
+print(state)
+print(merge_commit)
+print(pull.get("url") or "")
+PY
+  )
+  RELEASE_PR_NUMBER=$(printf '%s\n' "$values" | sed -n '1p')
+  RELEASE_PR_STATE=$(printf '%s\n' "$values" | sed -n '2p')
+  RELEASE_PR_MERGE_COMMIT=$(printf '%s\n' "$values" | sed -n '3p')
+  RELEASE_PR_URL=$(printf '%s\n' "$values" | sed -n '4p')
+}
+
+verify_release_pr_ready() {
+  local metadata="$WORK_DIR/release-pr-ready.json"
+
+  gh pr view "$RELEASE_PR_NUMBER" --repo "$REPO" \
+    --json number,state,isDraft,isCrossRepository,headRefName,headRefOid,baseRefName,baseRefOid,mergeable,mergeStateStatus,statusCheckRollup \
+    > "$metadata"
+  python3 - \
+    "$metadata" "$RELEASE_BRANCH" "$STAGED_COMMIT" "$RELEASE_PARENT" <<'PY'
+import json
+import sys
+
+path, release_branch, staged_commit, release_parent = sys.argv[1:]
+pull = json.load(open(path))
+if (
+    pull.get("state") != "OPEN"
+    or pull.get("isDraft") is not False
+    or pull.get("isCrossRepository") is not False
+    or pull.get("headRefName") != release_branch
+    or pull.get("headRefOid") != staged_commit
+    or pull.get("baseRefName") != "main"
+    or pull.get("baseRefOid") != release_parent
+):
+    sys.exit("Error: release pull-request identity changed before publication")
+if pull.get("mergeable") != "MERGEABLE" or pull.get("mergeStateStatus") != "CLEAN":
+    sys.exit(
+        "Error: release pull request is not cleanly mergeable: "
+        f"{pull.get('mergeable')!r}/{pull.get('mergeStateStatus')!r}"
+    )
+checks = pull.get("statusCheckRollup")
+if not isinstance(checks, list):
+    sys.exit("Error: release pull-request checks are unavailable")
+required = {"lint", "ios-build", "test", "dynamic-host", "check", "replay"}
+required_rows = {name: [] for name in required}
+for check in checks:
+    name = check.get("name") or check.get("context")
+    if name in required_rows:
+        required_rows[name].append(check)
+missing = sorted(name for name, rows in required_rows.items() if not rows)
+if missing:
+    sys.exit("Error: release pull request is missing checks: " + ", ".join(missing))
+accepted = {"SUCCESS", "SKIPPED", "NEUTRAL"}
+for check in checks:
+    status = check.get("status") or "COMPLETED"
+    conclusion = check.get("conclusion") or check.get("state")
+    if status != "COMPLETED" or conclusion not in accepted:
+        sys.exit(
+            "Error: release pull request has a non-green check: "
+            f"{check.get('name') or check.get('context')}: "
+            f"{status}/{conclusion}"
+        )
+for name, rows in required_rows.items():
+    if len(rows) != 1:
+        sys.exit(f"Error: release pull request duplicates required check {name}")
+    row = rows[0]
+    status = row.get("status") or "COMPLETED"
+    conclusion = row.get("conclusion") or row.get("state")
+    if status != "COMPLETED" or conclusion != "SUCCESS":
+        sys.exit(
+            f"Error: required release check {name} is not successful: "
+            f"{status}/{conclusion}"
+        )
+PY
+}
+
+verify_release_attestation() {
+  local attempt
+  local asset_path
+  local verified=false
+  for attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do
+    if gh release verify "$TAG" --repo "$REPO" --format json \
+        > "$WORK_DIR/release-attestation.json" 2>/dev/null; then
+      verified=true
+      break
+    fi
+    sleep 5
+  done
+  if [[ "$verified" != true ]]; then
+    echo "Error: GitHub did not produce a valid release attestation for $TAG." >&2
+    return 1
+  fi
+  # The release verification binds tag + commit + the complete asset inventory;
+  # verify-asset additionally proves each exact local byte stream is a subject.
+  for asset_path in "${RELEASE_ASSETS[@]}"; do
+    gh release verify-asset "$TAG" "$asset_path" --repo "$REPO" \
+      --format json >/dev/null
+  done
+}
+
+verify_anonymous_public_artifact() {
+  local anonymous_zip="$WORK_DIR/anonymous-$ZIP_NAME"
+  echo "Verifying anonymous public asset download..."
+  (
+    unset GH_TOKEN GITHUB_TOKEN
+    # --disable must be the first curl option; it prevents an operator .curlrc
+    # from silently adding credentials to this anonymous-consumption proof.
+    curl --disable --fail --location --retry 3 --retry-all-errors \
+      --output "$anonymous_zip" "$RELEASE_URL"
+  )
+  local anonymous_checksum
+  anonymous_checksum=$(swift package compute-checksum "$anonymous_zip")
+  if [[ "$anonymous_checksum" != "$CHECKSUM" ]]; then
+    echo "Error: anonymous public asset checksum differs from Package.swift." >&2
+    return 1
+  fi
+}
+
+verify_external_swiftpm_consumer() {
+  local smoke_dir="$WORK_DIR/external-consumer"
+  mkdir -p "$smoke_dir/Sources/SwiftVLCSmoke"
+  cat > "$smoke_dir/Package.swift" <<EOF
+// swift-tools-version: 6.3
+import PackageDescription
+
+let package = Package(
+  name: "SwiftVLCReleaseSmoke",
+  platforms: [.macOS(.v15)],
+  dependencies: [
+    .package(url: "https://github.com/$REPO.git", exact: "$VERSION")
+  ],
+  targets: [
+    .executableTarget(
+      name: "SwiftVLCSmoke",
+      dependencies: [.product(name: "SwiftVLC", package: "SwiftVLC")]
+    )
+  ]
+)
+EOF
+  cat > "$smoke_dir/Sources/SwiftVLCSmoke/main.swift" <<'EOF'
+import SwiftVLC
+
+print("SwiftVLC external release smoke")
+EOF
+  echo "Building a clean external SwiftPM consumer of $TAG..."
+  (
+    unset GH_TOKEN GITHUB_TOKEN GIT_ASKPASS SSH_ASKPASS SSH_AUTH_SOCK
+    # Ignore operator/machine URL rewrites and credential helpers. The smoke
+    # test must prove a public consumer can resolve the tag and artifact, not
+    # accidentally succeed through the maintainer's global Git credentials.
+    GIT_CONFIG_GLOBAL=/dev/null \
+      GIT_CONFIG_SYSTEM=/dev/null \
+      GIT_CONFIG_NOSYSTEM=1 \
+    GIT_CONFIG_COUNT=1 \
+      GIT_CONFIG_KEY_0=credential.helper \
+      GIT_CONFIG_VALUE_0= \
+      GIT_TERMINAL_PROMPT=0 \
+      swift build \
+      --package-path "$smoke_dir" \
+      --scratch-path "$smoke_dir/.build" \
+      --disable-dependency-cache
+  )
+}
+
+echo ""
+
+# Discover an interrupted stage from its exact branch/non-SemVer tag, or an
+# uncertain/completed publication from the final immutable tag. All three refs
+# identify the canonical release-PR head; main is advanced only by GitHub's PR
+# merge path and therefore normally becomes a distinct merge commit.
+REMOTE_MAIN_COMMIT=$(remote_ref_sha refs/heads/main)
+REMOTE_FINAL_TAG_COMMIT=$(remote_ref_sha "refs/tags/$TAG")
+REMOTE_RELEASE_BRANCH_COMMIT=$(remote_ref_sha "refs/heads/$RELEASE_BRANCH")
+CANDIDATE_ROWS=$(git ls-remote --tags origin \
+  "refs/tags/swiftvlc-candidate-${TAG}-*" \
+  | awk '$2 !~ /\^\{\}$/')
+CANDIDATE_ROW_COUNT=$(printf '%s\n' "$CANDIDATE_ROWS" \
+  | awk 'NF { count += 1 } END { print count + 0 }')
+if [[ "$CANDIDATE_ROW_COUNT" -gt 1 ]]; then
+  echo "Error: multiple candidate tags exist for $TAG; audit them manually." >&2
+  exit 1
+fi
+REMOTE_CANDIDATE_TAG_COMMIT=""
+REMOTE_CANDIDATE_TAG_NAME=""
+if [[ "$CANDIDATE_ROW_COUNT" -eq 1 ]]; then
+  REMOTE_CANDIDATE_TAG_COMMIT=$(printf '%s\n' "$CANDIDATE_ROWS" | awk '{ print $1 }')
+  REMOTE_CANDIDATE_TAG_NAME=$(printf '%s\n' "$CANDIDATE_ROWS" \
+    | awk '{ sub("refs/tags/", "", $2); print $2 }')
+  if [[ "$REMOTE_CANDIDATE_TAG_NAME" != \
+      "$(candidate_tag_for_commit "$REMOTE_CANDIDATE_TAG_COMMIT")" ]]; then
+    echo "Error: candidate tag name is not bound to its full commit SHA." >&2
+    exit 1
+  fi
+fi
+
+STAGED_COMMIT=""
+for discovered_commit in \
+  "$REMOTE_FINAL_TAG_COMMIT" \
+  "$REMOTE_RELEASE_BRANCH_COMMIT" \
+  "$REMOTE_CANDIDATE_TAG_COMMIT"; do
+  if [[ -n "$discovered_commit" && -n "$STAGED_COMMIT" \
+      && "$discovered_commit" != "$STAGED_COMMIT" ]]; then
+    echo "Error: release candidate branch/tag identities disagree." >&2
+    exit 1
+  fi
+  if [[ -n "$discovered_commit" ]]; then
+    STAGED_COMMIT="$discovered_commit"
+  fi
+done
+if [[ -z "$STAGED_COMMIT" \
+    && "$(git rev-parse HEAD)" != "$REMOTE_MAIN_COMMIT" ]]; then
+  STAGED_COMMIT=$(git rev-parse HEAD)
+fi
+
+if [[ -n "$STAGED_COMMIT" \
+    && "$(git cat-file -t "$STAGED_COMMIT" 2>/dev/null || true)" != "commit" ]]; then
+  if [[ -n "$REMOTE_FINAL_TAG_COMMIT" ]]; then
+    git fetch --quiet --force origin \
+      "refs/tags/$TAG:refs/swiftvlc-final/$TAG"
+  elif [[ -n "$REMOTE_RELEASE_BRANCH_COMMIT" ]]; then
+    git fetch --quiet --force origin \
+      "refs/heads/$RELEASE_BRANCH:refs/swiftvlc-candidate/$TAG"
+  else
+    git fetch --quiet --force origin \
+      "refs/tags/$REMOTE_CANDIDATE_TAG_NAME:refs/swiftvlc-candidate/$TAG"
+  fi
+fi
+
+if [[ -z "$STAGED_COMMIT" ]]; then
+  if [[ "$(git rev-parse HEAD)" != "$REMOTE_MAIN_COMMIT" ]]; then
+    echo "Error: cannot create a release commit away from exact origin/main." >&2
+    exit 1
+  fi
+  echo "Creating canonical release PR commit on $CURRENT_BRANCH..."
+  begin_release_file_restore
+  switch_package_to_release_url
+  switch_showcase_to_release_version
+  git add Package.swift "$SHOWCASE_PROJECT"
+  git commit --quiet -m "Release $TAG"
+  RELEASE_RESTORE_FILES=false
+  STAGED_COMMIT=$(git rev-parse HEAD)
+elif [[ "$(git rev-parse HEAD)" != "$STAGED_COMMIT" ]]; then
+  if [[ "$(git rev-parse HEAD)" == "$REMOTE_MAIN_COMMIT" \
+      && "$(git rev-parse "${STAGED_COMMIT}^")" == "$REMOTE_MAIN_COMMIT" ]]; then
+    echo "Recovering exact staged release commit $STAGED_COMMIT..."
+    git merge --quiet --ff-only "$STAGED_COMMIT"
+  elif [[ "$FINALIZE" != true ]] \
+      || ! git merge-base --is-ancestor "$STAGED_COMMIT" HEAD \
+      || ! git diff --quiet "$STAGED_COMMIT" HEAD --; then
+    echo "Error: checkout is neither the staged release commit nor its exact-tree PR merge." >&2
+    exit 1
+  fi
+fi
+
+if ! canonical_release_commit_matches "$STAGED_COMMIT"; then
+  exit 1
+fi
+RELEASE_PARENT=$(git rev-parse "${STAGED_COMMIT}^")
+CANDIDATE_TAG=$(candidate_tag_for_commit "$STAGED_COMMIT")
+if [[ -n "$REMOTE_CANDIDATE_TAG_NAME" \
+    && "$REMOTE_CANDIDATE_TAG_NAME" != "$CANDIDATE_TAG" ]]; then
+  echo "Error: discovered candidate tag name differs from the canonical identity." >&2
+  exit 1
+fi
+
+# Recovery recomputes the normalized tree from the actual checkout. The PR
+# merge commit is accepted only when its tree is byte-identical to this staged
+# head, so the same candidate digest covers both commits.
+RELEASE_SOURCE_DIGEST=$("$SCRIPT_DIR/release-source-digest.py" "$VERSION")
+if [[ "$RELEASE_SOURCE_DIGEST" != "$CANDIDATE_SOURCE_DIGEST" ]]; then
+  echo "Error: release checkout does not match the candidate source digest." >&2
+  exit 1
+fi
+
+CANDIDATE_RELEASE_NOTES="$(cat <<EOF
+## libVLC xcframework release candidate
+$QUALIFICATION_NOTE
+Intended final tag: **$TAG**
+Exact release PR commit: **$STAGED_COMMIT**
+Artifact checksum: **$CHECKSUM**
+
+This is a mutable draft under a deliberately non-SemVer tag. Publication is
+allowed only after exact-candidate CI and the protected release PR are green.
+EOF
+)"
+FINAL_RELEASE_NOTES="$(cat <<EOF
 ## libVLC xcframework
 $QUALIFICATION_NOTE
-Pre-built static xcframework for libVLC 4.0.
+Pre-built static XCFramework for libVLC 4.0.
 
-**Platforms:** iOS 18+, macOS 15+, tvOS 18+, visionOS 2+, Mac Catalyst
-**Size:** ${ZIP_SIZE_MB} MB (stripped)
-**Checksum:** \`$CHECKSUM\`
+Exact release commit: **$STAGED_COMMIT**
+Artifact checksum: **$CHECKSUM**
 
-SPM resolves this automatically — just add the package dependency.
+Swift Package Manager resolves this artifact from the immutable tag and checksum.
 EOF
 )"
 
-echo "Pushing $CURRENT_BRANCH to origin/main..."
-git push origin HEAD:main
+FINAL_RELEASE_PRESENT=false
+if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+  FINAL_RELEASE_PRESENT=true
+fi
 
-echo "  origin/main → $TAG_COMMIT"
+if [[ "$FINAL_RELEASE_PRESENT" != true ]]; then
+  if [[ -n "$REMOTE_FINAL_TAG_COMMIT" ]]; then
+    if [[ "$FINALIZE" != true \
+        || "$REMOTE_FINAL_TAG_COMMIT" != "$STAGED_COMMIT" ]]; then
+      echo "Error: unpublished final tag $TAG is not a recoverable reservation." >&2
+      exit 1
+    fi
+    echo "Recovering exact unpublished final-tag reservation $TAG..."
+  else
+    verify_remote_ref_absent "refs/tags/$TAG"
+  fi
 
-echo "Publishing GitHub Release..."
-gh release edit "$TAG" --repo "$REPO" --draft=false
+  REMOTE_CANDIDATE_TAG_COMMIT=$(remote_ref_sha "refs/tags/$CANDIDATE_TAG")
+  if [[ -z "$REMOTE_CANDIDATE_TAG_COMMIT" ]]; then
+    echo "Pushing non-SemVer candidate tag $CANDIDATE_TAG..."
+    git push \
+      --force-with-lease="refs/tags/$CANDIDATE_TAG:" \
+      origin "$STAGED_COMMIT:refs/tags/$CANDIDATE_TAG"
+  elif [[ "$REMOTE_CANDIDATE_TAG_COMMIT" != "$STAGED_COMMIT" ]]; then
+    echo "Error: candidate tag resolves to the wrong commit." >&2
+    exit 1
+  fi
+  verify_remote_ref "refs/tags/$CANDIDATE_TAG" "$STAGED_COMMIT"
+
+  if gh release view "$CANDIDATE_TAG" --repo "$REPO" >/dev/null 2>&1; then
+    verify_candidate_release_header
+  else
+    echo "Creating empty draft candidate release..."
+    gh release create "$CANDIDATE_TAG" \
+      --repo "$REPO" \
+      --verify-tag \
+      --target "$STAGED_COMMIT" \
+      "${RELEASE_FLAGS[@]}" \
+      --title "$CANDIDATE_RELEASE_TITLE" \
+      --notes "$CANDIDATE_RELEASE_NOTES"
+  fi
+  reconcile_candidate_assets
+
+  # Trigger exact-artifact CI only after every draft asset is complete.
+  REMOTE_RELEASE_BRANCH_COMMIT=$(remote_ref_sha "refs/heads/$RELEASE_BRANCH")
+  if [[ -z "$REMOTE_RELEASE_BRANCH_COMMIT" ]]; then
+    echo "Pushing exact release commit to $RELEASE_BRANCH for CI and review..."
+    git push \
+      --force-with-lease="refs/heads/$RELEASE_BRANCH:" \
+      origin "$STAGED_COMMIT:refs/heads/$RELEASE_BRANCH"
+  elif [[ "$REMOTE_RELEASE_BRANCH_COMMIT" != "$STAGED_COMMIT" ]]; then
+    echo "Error: $RELEASE_BRANCH exists at the wrong commit." >&2
+    exit 1
+  fi
+  verify_remote_ref "refs/heads/$RELEASE_BRANCH" "$STAGED_COMMIT"
+  if [[ -z "$(remote_ref_sha "refs/tags/$TAG")" ]]; then
+    verify_remote_ref_absent "refs/tags/$TAG"
+  else
+    verify_remote_ref "refs/tags/$TAG" "$STAGED_COMMIT"
+  fi
+
+  RELEASE_PR_COUNT=$(gh pr list --repo "$REPO" --state all \
+    --base main --head "$RELEASE_BRANCH" --limit 100 --json number --jq length)
+  if [[ "$RELEASE_PR_COUNT" == "0" ]]; then
+    echo "Opening protected-main release pull request..."
+    gh pr create \
+      --repo "$REPO" \
+      --base main \
+      --head "$RELEASE_BRANCH" \
+      --title "Release $TAG" \
+      --body "$(cat <<EOF
+Publishes the already-prepared libVLC candidate for **$TAG**.
+
+- Exact release commit: **$STAGED_COMMIT**
+- Artifact checksum: **$CHECKSUM**
+- The final SemVer tag remains absent until candidate CI and this PR are green.
+EOF
+)" >/dev/null
+  elif [[ "$RELEASE_PR_COUNT" != "1" ]]; then
+    echo "Error: expected at most one release pull request; found $RELEASE_PR_COUNT." >&2
+    exit 1
+  fi
+  load_release_pr
+
+  if [[ "$FINALIZE" != true ]]; then
+    echo ""
+    echo "Release $TAG is staged as non-SemVer candidate $CANDIDATE_TAG."
+    echo "No final SemVer tag exists. CI and $RELEASE_PR_URL must become green."
+    echo "Then rerun:"
+    echo "  $0 $VERSION --candidate <original-candidate-directory> --finalize"
+    exit 0
+  fi
+elif [[ "$FINALIZE" != true ]]; then
+  echo "Error: final release $TAG already exists; only --finalize may audit recovery." >&2
+  exit 1
+fi
+
+echo "Verifying exact candidate workflows for $STAGED_COMMIT..."
+verify_required_release_workflows \
+  "$STAGED_COMMIT" "$RELEASE_BRANCH" pull_request
+load_release_pr
+
+if [[ "$FINAL_RELEASE_PRESENT" != true ]]; then
+  if [[ "$RELEASE_PR_STATE" != "OPEN" ]]; then
+    echo "Error: unpublished release PR is not open; audit the temporary main break." >&2
+    exit 1
+  fi
+  verify_release_pr_ready
+
+  # Close every mutable boundary immediately before one publication update.
+  verify_remote_ref "refs/tags/$CANDIDATE_TAG" "$STAGED_COMMIT"
+  verify_remote_ref "refs/heads/$RELEASE_BRANCH" "$STAGED_COMMIT"
+  if [[ -z "$(remote_ref_sha "refs/tags/$TAG")" ]]; then
+    verify_remote_ref_absent "refs/tags/$TAG"
+  else
+    verify_remote_ref "refs/tags/$TAG" "$STAGED_COMMIT"
+  fi
+  verify_github_release \
+    "$CANDIDATE_TAG" draft mutable "$CANDIDATE_TAG" "$STAGED_COMMIT" \
+    "$CANDIDATE_RELEASE_TITLE" "$CANDIDATE_RELEASE_NOTES"
+  REMOTE_MAIN_COMMIT=$(remote_ref_sha refs/heads/main)
+  if [[ "$REMOTE_MAIN_COMMIT" != "$RELEASE_PARENT" ]]; then
+    echo "Error: origin/main changed after release staging." >&2
+    echo "  expected: $RELEASE_PARENT" >&2
+    echo "  actual:   ${REMOTE_MAIN_COMMIT:-missing}" >&2
+    exit 1
+  fi
+  verify_main_governance
+  verify_immutable_releases_enabled
+
+  # GitHub ignores target_commitish when a tag already exists. Reserve the
+  # final tag with an absent-value lease first, so a concurrent wrong tag can
+  # never be frozen into an immutable release. Candidate CI and the protected
+  # PR are already green; a failed publication rolls this reservation back.
+  if [[ -z "$(remote_ref_sha "refs/tags/$TAG")" ]]; then
+    echo "Reserving exact final tag $TAG..."
+    git push \
+      --force-with-lease="refs/tags/$TAG:" \
+      origin "$STAGED_COMMIT:refs/tags/$TAG"
+  fi
+  verify_remote_ref "refs/tags/$TAG" "$STAGED_COMMIT"
+
+  echo "Publishing the verified draft as $TAG..."
+  PUBLISH_COMMAND_OK=true
+  PUBLISH_PRERELEASE_FLAG="--prerelease=false"
+  if [[ "$UNQUALIFIED" == true ]]; then
+    PUBLISH_PRERELEASE_FLAG="--prerelease"
+  fi
+  if ! gh release edit "$CANDIDATE_TAG" \
+      --repo "$REPO" \
+      --tag "$TAG" \
+      --target "$STAGED_COMMIT" \
+      --title "$FINAL_RELEASE_TITLE" \
+      --notes "$FINAL_RELEASE_NOTES" \
+      "$PUBLISH_PRERELEASE_FLAG" \
+      --draft=false; then
+    PUBLISH_COMMAND_OK=false
+    echo "Publication response was uncertain; classifying remote state..." >&2
+  fi
+
+  if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+    FINAL_RELEASE_PRESENT=true
+  elif gh release view "$CANDIDATE_TAG" --repo "$REPO" >/dev/null 2>&1; then
+    verify_github_release \
+      "$CANDIDATE_TAG" draft mutable "$CANDIDATE_TAG" "$STAGED_COMMIT" \
+      "$CANDIDATE_RELEASE_TITLE" "$CANDIDATE_RELEASE_NOTES"
+    echo "Publication did not commit; rolling back the final-tag reservation." >&2
+    rollback_reserved_final_tag
+    echo "Error: candidate remains a draft; main was not merged." >&2
+    exit 1
+  else
+    echo "Error: publication response left no verifiable release identity." >&2
+    exit 1
+  fi
+  if [[ "$PUBLISH_COMMAND_OK" != true ]]; then
+    echo "Recovered a successful publication after an uncertain response."
+  fi
+fi
+
+# Publication is externally visible but main still changes only through the
+# already-green PR. Verify immutable bytes and public consumption first.
+verify_remote_ref "refs/tags/$TAG" "$STAGED_COMMIT"
+verify_github_release \
+  "$TAG" published immutable "$TAG" "$STAGED_COMMIT" \
+  "$FINAL_RELEASE_TITLE" "$FINAL_RELEASE_NOTES"
+verify_anonymous_public_artifact
+verify_external_swiftpm_consumer
+verify_release_attestation
+
+load_release_pr
+MERGED_DURING_INVOCATION=false
+if [[ "$RELEASE_PR_STATE" == "OPEN" ]]; then
+  verify_release_pr_ready
+  verify_main_governance
+  echo "Merging release PR #$RELEASE_PR_NUMBER through protected main..."
+  MERGE_COMMAND_OK=true
+  if ! gh api \
+      --method PUT \
+      -H 'Accept: application/vnd.github+json' \
+      -H 'X-GitHub-Api-Version: 2026-03-10' \
+      "repos/$REPO/pulls/$RELEASE_PR_NUMBER/merge" \
+      -f "sha=$STAGED_COMMIT" \
+      -f 'merge_method=merge' \
+      > "$WORK_DIR/pr-merge-response.json"; then
+    MERGE_COMMAND_OK=false
+    echo "PR merge response was uncertain; classifying remote state..." >&2
+  elif ! python3 - "$WORK_DIR/pr-merge-response.json" <<'PY'
+import json
+import re
+import sys
+
+try:
+    response = json.load(open(sys.argv[1]))
+except (OSError, ValueError):
+    raise SystemExit(1)
+if response.get("merged") is not True:
+    raise SystemExit(1)
+commit = response.get("sha")
+if not isinstance(commit, str) or re.fullmatch(r"[0-9a-f]{40}", commit) is None:
+    raise SystemExit(1)
+PY
+  then
+    MERGE_COMMAND_OK=false
+    echo "PR merge response was invalid; classifying remote state..." >&2
+  fi
+  git fetch --quiet origin main
+  load_release_pr
+  if [[ "$RELEASE_PR_STATE" != "MERGED" ]]; then
+    echo "Error: release PR remains unmerged; immutable release recovery is required." >&2
+    exit 1
+  fi
+  if [[ "$MERGE_COMMAND_OK" != true ]]; then
+    echo "Recovered a successful protected-main merge after an uncertain response."
+  fi
+  MERGED_DURING_INVOCATION=true
+fi
+
+if [[ "$RELEASE_PR_STATE" != "MERGED" \
+    || -z "$RELEASE_PR_MERGE_COMMIT" ]]; then
+  echo "Error: release PR does not have a verifiable merge commit." >&2
+  exit 1
+fi
+git fetch --quiet origin main
+REMOTE_MAIN_COMMIT=$(remote_ref_sha refs/heads/main)
+if ! git merge-base --is-ancestor "$RELEASE_PR_MERGE_COMMIT" "$REMOTE_MAIN_COMMIT"; then
+  echo "Error: the protected release PR merge is not on origin/main." >&2
+  exit 1
+fi
+if ! git merge-base --is-ancestor "$STAGED_COMMIT" "$RELEASE_PR_MERGE_COMMIT" \
+    || ! git diff --quiet "$STAGED_COMMIT" "$RELEASE_PR_MERGE_COMMIT" --; then
+  echo "Error: protected-main merge does not preserve the exact release tree." >&2
+  exit 1
+fi
+verify_remote_ref "refs/tags/$TAG" "$STAGED_COMMIT"
+verify_github_release \
+  "$TAG" published immutable "$TAG" "$STAGED_COMMIT" \
+  "$FINAL_RELEASE_TITLE" "$FINAL_RELEASE_NOTES"
+
+if [[ "$MERGED_DURING_INVOCATION" == true ]]; then
+  echo ""
+  echo "Release PR merged at $RELEASE_PR_MERGE_COMMIT; exact-main CI is running."
+  echo "Update the local main checkout, wait for CI, then rerun --finalize."
+  exit 0
+fi
+
+echo "Verifying fresh workflows for exact main merge $RELEASE_PR_MERGE_COMMIT..."
+verify_required_release_workflows "$RELEASE_PR_MERGE_COMMIT" main push
+
+# Final postcondition binds immutable public bytes, the release PR head/tree,
+# its exact main merge, and fresh main CI before temporary authorization refs
+# are removed. Compare-and-delete leases prevent cleanup from deleting a ref
+# another actor moved after verification.
+verify_remote_ref "refs/tags/$TAG" "$STAGED_COMMIT"
+verify_github_release \
+  "$TAG" published immutable "$TAG" "$STAGED_COMMIT" \
+  "$FINAL_RELEASE_TITLE" "$FINAL_RELEASE_NOTES"
+if [[ -n "$(remote_ref_sha "refs/heads/$RELEASE_BRANCH")" ]]; then
+  verify_remote_ref "refs/heads/$RELEASE_BRANCH" "$STAGED_COMMIT"
+  git push \
+    --force-with-lease="refs/heads/$RELEASE_BRANCH:$STAGED_COMMIT" \
+    origin ":refs/heads/$RELEASE_BRANCH"
+fi
+if [[ -n "$(remote_ref_sha "refs/tags/$CANDIDATE_TAG")" ]]; then
+  verify_remote_ref "refs/tags/$CANDIDATE_TAG" "$STAGED_COMMIT"
+  git push \
+    --force-with-lease="refs/tags/$CANDIDATE_TAG:$STAGED_COMMIT" \
+    origin ":refs/tags/$CANDIDATE_TAG"
+fi
+verify_remote_ref_absent "refs/heads/$RELEASE_BRANCH"
+verify_remote_ref_absent "refs/tags/$CANDIDATE_TAG"
 
 echo ""
-echo "Release $TAG published: https://github.com/$REPO/releases/tag/$TAG"
+echo "Release $TAG published and merged through PR #$RELEASE_PR_NUMBER: https://github.com/$REPO/releases/tag/$TAG"

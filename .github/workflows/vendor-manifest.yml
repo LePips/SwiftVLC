@@ -44,19 +44,19 @@ jobs:
     # which must understand the manifest's Swift 6.3 tools-version —
     # needs Xcode 26.4+, hence macos-26 (same rationale as test.yml).
     runs-on: macos-26
-    timeout-minutes: 15
+    timeout-minutes: 25
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         timeout-minutes: 2
 
-      - uses: maxim-lobanov/setup-xcode@v1
+      - uses: maxim-lobanov/setup-xcode@ed7a3b1fda3918c0306d1b724322adc0b8cc0a90 # v1
         timeout-minutes: 5
         with:
           xcode-version: "26.4"
 
       # The libvlc xcframework dominates the artifact cache.
       - name: Cache libvlc xcframework
-        uses: actions/cache@v5
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
         timeout-minutes: 5
         with:
           path: Vendor
@@ -66,9 +66,10 @@ jobs:
       # Download the exact released libvlc xcframework declared by Package.swift
       # into Vendor/. setup-dev.sh verifies the tag and GitHub asset digest.
       - name: Set up Vendor + local Swift package
-        timeout-minutes: 5
+        timeout-minutes: 12
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SWIFTVLC_ALLOW_DRAFT_RELEASE: ${{ ((github.event_name == 'push' && startsWith(github.ref, 'refs/heads/release-candidates/')) || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && startsWith(github.head_ref, 'release-candidates/'))) && '1' || '' }}
         run: ./scripts/setup-dev.sh
 
       - name: Check libvlc archive-member manifests

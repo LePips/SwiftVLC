@@ -101,6 +101,43 @@ struct PiPTimebaseRetrackingTests {
     #expect(result.setsRate == nil)
     #expect(result.setsTime == nil)
   }
+
+  @Test
+  func `Rate resolutions use exact handle and playback provenance`() {
+    let currentNative = NativePlayerGeneration(3)
+    let currentPlayback = PlaybackGeneration(7)
+    let current = EffectivePlaybackRateResolution(
+      effectiveRate: 2,
+      nativeGeneration: currentNative,
+      playbackGeneration: currentPlayback
+    )
+    let retiredHandle = EffectivePlaybackRateResolution(
+      effectiveRate: 0.5,
+      nativeGeneration: NativePlayerGeneration(2),
+      playbackGeneration: currentPlayback
+    )
+    let supersededPlayback = EffectivePlaybackRateResolution(
+      effectiveRate: 0.5,
+      nativeGeneration: currentNative,
+      playbackGeneration: PlaybackGeneration(6)
+    )
+
+    #expect(PiPController.shouldObserveEffectivePlaybackRateResolution(
+      current,
+      nativeGeneration: currentNative,
+      authoritativePlaybackGeneration: currentPlayback
+    ))
+    #expect(!PiPController.shouldObserveEffectivePlaybackRateResolution(
+      retiredHandle,
+      nativeGeneration: currentNative,
+      authoritativePlaybackGeneration: currentPlayback
+    ))
+    #expect(!PiPController.shouldObserveEffectivePlaybackRateResolution(
+      supersededPlayback,
+      nativeGeneration: currentNative,
+      authoritativePlaybackGeneration: currentPlayback
+    ))
+  }
 }
 
 extension Integration {
@@ -128,6 +165,26 @@ extension Integration {
         await Task.yield()
       }
       return false
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func `Dedicated rate resolution retracks from its native payload`() async {
+      let player = Player(instance: TestInstance.makeAudioOnly())
+      let controller = PiPController(player: player)
+      let bridge = player.eventBridge
+
+      bridge._broadcastEffectivePlaybackRateResolutionForTesting(
+        1.75,
+        nativeHandleGeneration: bridge.currentNativeHandleGeneration
+      )
+
+      for _ in 0..<2000 {
+        if controller.lastObservedRate == 1.75 {
+          break
+        }
+        await Task.yield()
+      }
+      #expect(controller.lastObservedRate == 1.75)
     }
 
     @Test(.timeLimit(.minutes(1)))
@@ -188,6 +245,75 @@ extension Integration {
       }
 
       #expect(sawTick, "the timing lane stopped delivering clock ticks")
+    }
+
+    /// Player and PiP consume separate streams from one native callback. The
+    /// bridge owns the media generation synchronously, but Player's main-actor
+    /// mirror may not have consumed it when PiP drains the successor's following
+    /// capability events. The whole successor burst must follow bridge
+    /// authority; filtering against only `Player.generation` drops valid one-shot
+    /// payloads and can leave PiP linear for the rest of the session.
+    @Test(.timeLimit(.minutes(1)))
+    func `Bridge-ahead successor capability reaches observer while Player mirror is stalled`() async {
+      let player = Player(instance: TestInstance.makeAudioOnly())
+      // Deliberately hold the Player mirror behind the shared bridge. PiP keeps
+      // its independent subscription, reproducing the scheduling order without
+      // timing guesses about which main-actor task runs first.
+      player.eventTask?.cancel()
+      let outgoing = player.generation
+      let controller = PiPController(player: player)
+      let bridge = player.eventBridge
+      let nativeHandleGeneration = bridge.currentNativeHandleGeneration
+      let successorValue = bridge.synchronizePlaybackGeneration(
+        player.sessionGeneration &+ 1,
+        media: nil
+      )
+      let successor = PlaybackGeneration(successorValue)
+
+      bridge._broadcastForTesting(
+        .mediaChanged,
+        nativeHandleGeneration: nativeHandleGeneration,
+        playbackGeneration: successorValue
+      )
+      bridge._broadcastForTesting(
+        .seekableChanged(true),
+        nativeHandleGeneration: nativeHandleGeneration,
+        playbackGeneration: successorValue
+      )
+      bridge._broadcastForTesting(
+        .lengthChanged(.seconds(9)),
+        nativeHandleGeneration: nativeHandleGeneration,
+        playbackGeneration: successorValue
+      )
+
+      #expect(await drainObserver(of: controller, untilDurationIs: 9000))
+      #expect(
+        player.generation == outgoing,
+        "Player unexpectedly caught up, so this did not exercise the ahead-observer ordering"
+      )
+      #expect(controller.playbackStateObservation.playbackGeneration == successor)
+      #expect(controller.playbackStateObservation.isSeekable)
+
+      // A queued callback from the retired handle may carry the bridge's current
+      // media stamp, so generation alone is insufficient. The exact native
+      // attachment must reject it while a current-handle sentinel proves the
+      // observer drained past it.
+      bridge._broadcastForTesting(
+        .seekableChanged(false),
+        nativeHandleGeneration: nativeHandleGeneration &- 1,
+        playbackGeneration: successorValue
+      )
+      bridge._broadcastForTesting(
+        .lengthChanged(.seconds(11)),
+        nativeHandleGeneration: nativeHandleGeneration,
+        playbackGeneration: successorValue
+      )
+
+      #expect(await drainObserver(of: controller, untilDurationIs: 11000))
+      #expect(
+        controller.playbackStateObservation.isSeekable,
+        "a retired native handle rewrote the successor's PiP capability"
+      )
     }
   }
 }

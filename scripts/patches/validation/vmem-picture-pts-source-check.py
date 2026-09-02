@@ -5,9 +5,17 @@ from pathlib import Path
 import sys
 
 from pip_extension_version import (
+    BASE_SOURCE_KEYS,
+    OPTIONAL_SUCCESSOR_SOURCE_KEYS,
+    read_source_root,
     resolve_extension_version,
     run_negative_mutations,
 )
+
+
+def extension_sources(sources: dict[str, str]) -> dict[str, str]:
+    keys = BASE_SOURCE_KEYS | OPTIONAL_SUCCESSOR_SOURCE_KEYS
+    return {key: sources[key] for key in keys}
 
 
 def function_body(source: str, signature: str) -> str:
@@ -248,12 +256,7 @@ def validate_vmem(vmem: str) -> None:
 
 
 def validate_all(sources: dict[str, str]) -> int:
-    resolution = resolve_extension_version({
-        "media_player": sources["media_player"],
-        "public_header": sources["public_header"],
-        "events_header": sources["events_header"],
-        "exports": sources["exports"],
-    })
+    resolution = resolve_extension_version(extension_sources(sources))
     if resolution.version < 6:
         raise AssertionError(
             "v6 picture-PTS contract requires extension version 6 or newer")
@@ -296,6 +299,7 @@ def main() -> int:
         if not path.is_file():
             raise AssertionError(f"missing v6 source input: {path}")
     sources = {name: path.read_text() for name, path in paths.items()}
+    sources.update(read_source_root(root))
     integrated_extension_version = validate_all(sources)
 
     require_mutation_rejected(
@@ -318,12 +322,8 @@ def main() -> int:
         "configuration->display_status_v2 = source->display_status_v2;",
         "configuration->display_status_v2 = NULL;",
         "v6 callback dropped while cloning a retained generation")
-    run_negative_mutations({
-        "media_player": sources["media_player"],
-        "public_header": sources["public_header"],
-        "events_header": sources["events_header"],
-        "exports": sources["exports"],
-    }, integrated_extension_version)
+    run_negative_mutations(
+        extension_sources(sources), integrated_extension_version)
 
     print("PASS v6 vmem picture-PTS source and mutation contract "
           f"(integrated extension version {integrated_extension_version})")

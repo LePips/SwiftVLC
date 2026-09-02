@@ -16,8 +16,9 @@ usage() {
 Usage: Validate\ SwiftVLC.command [options]
 
 Connect one unlocked iPhone or iPad with Developer Mode enabled, then run the
-complete SwiftVLC physical-device validation suite. A compact, privacy-scrubbed
-ZIP is produced for attaching to a GitHub issue. Raw diagnostics remain local.
+complete applicable SwiftVLC suite by default, or a targeted partial suite with
+--only. A compact, privacy-scrubbed ZIP is produced for attaching to a GitHub
+issue. Raw diagnostics remain local.
 
 Options:
   --team TEAM        Apple Development team identifier (normally auto-detected)
@@ -129,10 +130,13 @@ HOST_ARCH="$(uname -m)" \
 MACOS_VERSION="$(sw_vers -productVersion)" \
 MACOS_BUILD="$(sw_vers -buildVersion)" \
 XCODE_VERSION="$(xcodebuild -version | tr '\n' ' ')" \
-python3 - "$HOST_INFO" <<'PY'
-import json
+python3 - "$HOST_INFO" "$SCRIPT_DIR" <<'PY'
 import os
 import sys
+from pathlib import Path
+
+sys.path.insert(0, sys.argv[2])
+from report_validation import atomic_write_json
 
 value = {
     "formatVersion": 1,
@@ -141,16 +145,16 @@ value = {
     "macOSBuild": os.environ["MACOS_BUILD"],
     "xcode": os.environ["XCODE_VERSION"].strip(),
 }
-with open(sys.argv[1], "w") as output:
-    json.dump(value, output, indent=2, sort_keys=True)
-    output.write("\n")
+atomic_write_json(Path(sys.argv[1]), value)
 PY
 
 echo "Checking the connected device..."
-device_args=(--matrix "$SCRIPT_DIR/matrix.json")
+device_args=(
+  --matrix "$SCRIPT_DIR/matrix.json"
+  --output "$SESSION_ROOT/preflight-device.json"
+)
 [[ -n "$DEVICE_SELECTOR" ]] && device_args+=(--device "$DEVICE_SELECTOR")
-if ! python3 "$SCRIPT_DIR/device-info.py" "${device_args[@]}" \
-  > "$SESSION_ROOT/preflight-device.json"; then
+if ! python3 "$SCRIPT_DIR/device-info.py" "${device_args[@]}"; then
   echo "Error: no ready physical iPhone or iPad was found." >&2
   echo "Connect and unlock it, trust this Mac, and enable Developer Mode." >&2
   exit 2
@@ -160,8 +164,18 @@ DEVICE_DESCRIPTION=$(jq -r \
   '.selected.marketingName + " on iOS/iPadOS " + .selected.osVersion + " (" + .selected.osBuild + ")"' \
   "$SESSION_ROOT/preflight-device.json")
 RUN_MODE=$(jq -r '.mode' "$SESSION_ROOT/preflight-device.json")
+RESOLVED_DEVICE_ID=$(jq -er '.selected.id // .selected.udid' \
+  "$SESSION_ROOT/preflight-device.json")
 echo "Device: $DEVICE_DESCRIPTION"
 echo "Evidence mode: $RUN_MODE"
+if [[ ${#ONLY_SCENARIOS[@]} -eq 0 ]]; then
+  echo "Checklist scope: FULL APPLICABLE DEVICE SUITE"
+else
+  echo "Checklist scope: PARTIAL / TARGETED — NOT A COMPLETE RELEASE CHECKLIST"
+fi
+if [[ "$RUN_MODE" != "qualification" ]]; then
+  echo "Release status: EXPLORATORY — NOT RELEASE-QUALIFYING"
+fi
 echo "Signing team: $DEVELOPMENT_TEAM"
 echo
 echo "The complete applicable suite includes UI, playback, PiP, seeking, live/HLS,"
@@ -178,9 +192,28 @@ finish() {
   status=$?
   trap - EXIT
   set +e
+  plan_scope=unknown
+  plan_mode=unknown
+  plan_eligible=false
+  plan_report_only=false
   run_dir=$(find "$RUNS_ROOT" -mindepth 1 -maxdepth 1 -type d -print | sort | tail -1)
   if [[ -n "$run_dir" ]]; then
-    cp "$HOST_INFO" "$run_dir/host-info.json"
+    if [[ -f "$run_dir/validation-plan.json" ]]; then
+      plan_scope=$(jq -r '.selectionScope // "unknown"' "$run_dir/validation-plan.json")
+      plan_mode=$(jq -r '.mode // "unknown"' "$run_dir/validation-plan.json")
+      plan_eligible=$(jq -r '.qualificationEligibleEnvironment // false' "$run_dir/validation-plan.json")
+      plan_report_only=$(jq -r '.reportOnly // false' "$run_dir/validation-plan.json")
+    fi
+    python3 - "$HOST_INFO" "$run_dir/host-info.json" "$SCRIPT_DIR" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+sys.path.insert(0, sys.argv[3])
+from report_validation import atomic_write_json
+
+atomic_write_json(Path(sys.argv[2]), json.loads(Path(sys.argv[1]).read_text()))
+PY
     share_zip="$SESSION_ROOT/SwiftVLC-Device-Report-$session_id.zip"
     if python3 "$SCRIPT_DIR/package-volunteer-report.py" "$run_dir" \
       --output "$share_zip" >/dev/null; then
@@ -196,7 +229,15 @@ finish() {
     echo "No device run was started; no share report was generated." >&2
   fi
   if [[ "$status" -eq 0 ]]; then
-    echo "Validation completed successfully. Attach the ZIP to the GitHub issue."
+    if [[ "$plan_report_only" == true ]]; then
+      echo "Report-only probe passed; it is NOT RELEASE-QUALIFYING. Attach the ZIP to the GitHub issue."
+    elif [[ "$plan_mode" != qualification || "$plan_eligible" != true ]]; then
+      echo "Exploratory validation passed; it is NOT RELEASE-QUALIFYING. Attach the ZIP to the GitHub issue."
+    elif [[ "$plan_scope" != full ]]; then
+      echo "Targeted validation passed; it is NOT A COMPLETE RELEASE CHECKLIST. Attach the ZIP to the GitHub issue."
+    else
+      echo "The full applicable device checklist passed. Attach the ZIP to the GitHub issue."
+    fi
   else
     echo "Validation did not fully pass (exit $status). The ZIP is still useful; upload it." >&2
   fi
@@ -212,10 +253,10 @@ VERSION=$(python3 "$ROOT_DIR/scripts/release-artifact-info.py" \
 VERSION=${VERSION#v}
 runner_args=(
   --version "$VERSION"
+  --device "$RESOLVED_DEVICE_ID"
   --development-team "$DEVELOPMENT_TEAM"
   --output "$RUNS_ROOT"
 )
-[[ -n "$DEVICE_SELECTOR" ]] && runner_args+=(--device "$DEVICE_SELECTOR")
 for scenario in "${ONLY_SCENARIOS[@]}"; do
   runner_args+=(--only "$scenario")
 done

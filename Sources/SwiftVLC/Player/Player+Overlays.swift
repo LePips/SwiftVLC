@@ -151,7 +151,19 @@ extension Player {
     guard let page = Int32(exactly: page) else {
       throw .invalidInput("teletext page must fit in Int32")
     }
-    withMutation(keyPath: \.teletextPage) {
+    guard
+      let identity = beginNativeControlMutation(
+        revision: \PlayerIntentRevisions.teletextPage
+      )
+    else { return }
+    _ = performNativeControlMutation(
+      keyPath: \.teletextPage,
+      identity: identity,
+      revision: \PlayerIntentRevisions.teletextPage
+    ) { pointer in
+      #if DEBUG
+      recordObservableControlNativeDispatch(.teletextPage(page), pointer: pointer)
+      #endif
       libvlc_video_set_teletext(pointer, page)
       _teletextPage = page
     }
@@ -159,7 +171,19 @@ extension Player {
 
   /// Sends a teletext color/action key.
   public func sendTeletextKey(_ key: TeletextKey) {
-    withMutation(keyPath: \.teletextPage) {
+    guard
+      let identity = beginNativeControlMutation(
+        revision: \PlayerIntentRevisions.teletextPage
+      )
+    else { return }
+    _ = performNativeControlMutation(
+      keyPath: \.teletextPage,
+      identity: identity,
+      revision: \PlayerIntentRevisions.teletextPage
+    ) { pointer in
+      #if DEBUG
+      recordObservableControlNativeDispatch(.teletextKey(key), pointer: pointer)
+      #endif
       libvlc_video_set_teletext(pointer, key.cValue)
     }
   }

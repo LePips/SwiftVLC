@@ -766,6 +766,7 @@ chromecast_load_transition_patch_listed=no
 apple_assembly_metadata_patch_listed=no
 aom_nasm3_detection_patch_listed=no
 headless_vout_teardown_patch_listed=no
+adaptive_es_recycling_patch_listed=no
 swiftvlc_manifest_extension_version=""
 swiftvlc_apple_audio_session_leases_listed=no
 
@@ -807,6 +808,8 @@ if [ -n "${PATCHES_DIR}" ] && [ -d "${PATCHES_DIR}" ]; then
                 manifest_extension_candidate=8 ;;
             0033-apple-audio-session-policy-leases.patch)
                 swiftvlc_apple_audio_session_leases_listed=yes ;;
+            0041-native-pip-output-identity.patch)
+                manifest_extension_candidate=9 ;;
         esac
         if [ -n "$manifest_extension_candidate" ] &&
            { [ -z "$swiftvlc_manifest_extension_version" ] ||
@@ -830,6 +833,9 @@ if [ -n "${PATCHES_DIR}" ] && [ -d "${PATCHES_DIR}" ]; then
         fi
         if [ "$manifest_entry" = "0040-headless-vout-teardown-deadlock.patch" ]; then
             headless_vout_teardown_patch_listed=yes
+        fi
+        if [ "$manifest_entry" = "0042-adaptive-es-recycling-extradata-identity.patch" ]; then
+            adaptive_es_recycling_patch_listed=yes
         fi
     done <<< "$manifest_listing"
     info "Patch manifest verified: ${#manifest_order[@]} patches"
@@ -984,6 +990,14 @@ if [ -n "${PATCHES_DIR}" ] && [ -d "${PATCHES_DIR}" ]; then
             --work-root "${BUILD_DIR}/validation/0040-headless-vout-teardown"
     fi
 
+    if [ "$adaptive_es_recycling_patch_listed" = yes ]; then
+        info "Validating adaptive ES codec-configuration recycling contract..."
+        python3 -B \
+            "${SCRIPT_DIR}/patches/validation/adaptive-es-recycling-source-check.py" \
+            "${VLC_SRC}" \
+            "${SCRIPT_DIR}/patches/0042-adaptive-es-recycling-extradata-identity.patch"
+    fi
+
     # Patches 0035–0037 deliberately change no public API, so they have no
     # additive source marker that can trigger a validator. Every successor
     # owns the inherited proof at its exact predecessor boundary, so run only
@@ -1012,8 +1026,14 @@ fi
 unset SWIFTVLC_EXPECTED_EXTENSION_VERSION
 unset SWIFTVLC_REQUIRE_APPLE_AUDIO_SESSION_LEASES
 if [ "$swiftvlc_apple_audio_session_leases_listed" = yes ] &&
-   [ "$swiftvlc_manifest_extension_version" != 8 ]; then
-    error "Patch 0033 requires the manifest-owned extension version 8 from patch 0032."
+   { [ -z "$swiftvlc_manifest_extension_version" ] ||
+     [ "$swiftvlc_manifest_extension_version" -lt 8 ]; }; then
+    error "Patch 0033 requires manifest-owned extension version 8 or newer from patch 0032 and its successors."
+fi
+if [ -n "$swiftvlc_manifest_extension_version" ] &&
+   [ "$swiftvlc_manifest_extension_version" -ge 9 ] &&
+   [ "$swiftvlc_apple_audio_session_leases_listed" != yes ]; then
+    error "Extension version 9 or newer requires the inherited patch 0033 Apple audio-session lease refinement."
 fi
 if [ -n "$swiftvlc_manifest_extension_version" ]; then
     export SWIFTVLC_EXPECTED_EXTENSION_VERSION="$swiftvlc_manifest_extension_version"

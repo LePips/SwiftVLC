@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from unittest import mock
 from pathlib import Path
 
@@ -30,6 +31,47 @@ assemble_record = load_script("assemble-record.py")
 
 
 class QualificationPolicyTests(unittest.TestCase):
+    def test_report_timing_enforces_exact_duration_and_stable_freshness(self):
+        now = datetime(2026, 9, 2, 12, 0, tzinfo=timezone.utc)
+        completed = now - timedelta(
+            seconds=policy.MAXIMUM_STABLE_REPORT_AGE_SECONDS
+        )
+        started = completed - timedelta(seconds=75)
+        report = {
+            "startedAtUTC": started.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "completedAtUTC": completed.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "wallDurationSeconds": 75,
+        }
+        policy.validate_report_timing(report, stable=True, now_utc=now)
+
+        stale = self.clone(report)
+        stale_completed = completed - timedelta(seconds=1)
+        stale_started = stale_completed - timedelta(seconds=75)
+        stale["startedAtUTC"] = stale_started.strftime("%Y-%m-%dT%H:%M:%SZ")
+        stale["completedAtUTC"] = stale_completed.strftime("%Y-%m-%dT%H:%M:%SZ")
+        with self.assertRaisesRegex(policy.QualificationPolicyError, "is stale"):
+            policy.validate_report_timing(stale, stable=True, now_utc=now)
+
+        mismatched = self.clone(report)
+        mismatched["wallDurationSeconds"] = 74
+        with self.assertRaisesRegex(
+            policy.QualificationPolicyError, "does not match its UTC interval"
+        ):
+            policy.validate_report_timing(mismatched, stable=True, now_utc=now)
+
+    def test_report_timing_rejects_excessive_future_clock_skew(self):
+        now = datetime(2026, 9, 2, 12, 0, tzinfo=timezone.utc)
+        completed = now + timedelta(
+            seconds=policy.MAXIMUM_REPORT_CLOCK_SKEW_SECONDS + 1
+        )
+        report = {
+            "startedAtUTC": completed.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "completedAtUTC": completed.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "wallDurationSeconds": 0,
+        }
+        with self.assertRaisesRegex(policy.QualificationPolicyError, "in the future"):
+            policy.validate_report_timing(report, stable=False, now_utc=now)
+
     @staticmethod
     def seek_frame_evidence() -> dict:
         return {
@@ -93,6 +135,25 @@ class QualificationPolicyTests(unittest.TestCase):
     @staticmethod
     def clone(value):
         return json.loads(json.dumps(value))
+
+    @staticmethod
+    def native_hls_seek_identity_evidence() -> dict:
+        identity = {
+            "nativeHandleIdentity": 101,
+            "playbackGeneration": 7,
+            "outputIdentity": 303,
+        }
+        return {
+            "nativeOutputIdentityStable": True,
+            "commandEvidence": {
+                command: {
+                    "mediaGeneration": 7,
+                    "baselinePiPOutputIdentity": dict(identity),
+                    "landingPiPOutputIdentity": dict(identity),
+                }
+                for command in ("forward", "backward", "absolute")
+            },
+        }
 
     @staticmethod
     def catalog_bound_terminal_log_fixture(root: Path) -> dict:
@@ -1957,6 +2018,61 @@ class QualificationPolicyTests(unittest.TestCase):
         ]
         with self.assertRaises(policy.QualificationPolicyError):
             policy.validate_release_catalog_partition(mutated, sorted(catalog))
+
+    def test_native_hls_seek_requires_one_exact_ready_output_identity(self):
+        scenario = {
+            "id": "native-hls-seek-continuity",
+            "requiredEvidenceFields": [],
+        }
+        evidence = self.native_hls_seek_identity_evidence()
+        policy.validate_evidence_semantics(evidence, scenario)
+
+        mutations = {
+            "unproven-stability": lambda value: value.__setitem__(
+                "nativeOutputIdentityStable", False
+            ),
+            "missing-command": lambda value: value["commandEvidence"].pop(
+                "backward"
+            ),
+            "extra-command": lambda value: value["commandEvidence"].__setitem__(
+                "reload", dict(value["commandEvidence"]["forward"])
+            ),
+            "zero-output": lambda value: value["commandEvidence"]["forward"][
+                "landingPiPOutputIdentity"
+            ].__setitem__("outputIdentity", 0),
+            "boolean-handle": lambda value: value["commandEvidence"]["forward"][
+                "baselinePiPOutputIdentity"
+            ].__setitem__("nativeHandleIdentity", True),
+            "oversized-generation": lambda value: value["commandEvidence"][
+                "forward"
+            ]["landingPiPOutputIdentity"].__setitem__(
+                "playbackGeneration", 1 << 64
+            ),
+            "relabelled-landing": lambda value: value["commandEvidence"][
+                "backward"
+            ]["landingPiPOutputIdentity"].__setitem__("nativeHandleIdentity", 102),
+            "wrong-media-generation": lambda value: value["commandEvidence"][
+                "absolute"
+            ].__setitem__("mediaGeneration", 8),
+            "cross-command-rebuild": lambda value: [
+                value["commandEvidence"]["backward"][phase].__setitem__(
+                    "outputIdentity", 304
+                )
+                for phase in (
+                    "baselinePiPOutputIdentity",
+                    "landingPiPOutputIdentity",
+                )
+            ],
+            "extended-identity-schema": lambda value: value["commandEvidence"][
+                "absolute"
+            ]["baselinePiPOutputIdentity"].__setitem__("dynamicGeneration", 7),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(name=name):
+                invalid = self.clone(evidence)
+                mutate(invalid)
+                with self.assertRaises(policy.QualificationPolicyError):
+                    policy.validate_evidence_semantics(invalid, scenario)
 
     def test_adaptive_oracle_rejects_frozen_counters_and_visual_gaps(self):
         evidence = self.adaptive_oracle_evidence()

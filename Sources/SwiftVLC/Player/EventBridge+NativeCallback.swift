@@ -62,7 +62,32 @@ func playerEventCallback(
 
   let attachment = Unmanaged<EventBridgeCallbackAttachment>.fromOpaque(opaque)
     .takeUnretainedValue()
+  // Candidate replacements preattach their complete listener set while the
+  // token is inactive. No successor fact may enter the shared lifecycle until
+  // the old attachment is detached and the Player transaction commits.
+  guard attachment.isActive else { return }
   let context = attachment.context
+  // Freeze list-player suppression at the authoritative MediaStopping
+  // callback-entry boundary. Pinned VLC `lib/event.c::libvlc_event_send`
+  // holds this media player's event-manager mutex across the complete
+  // callback, so no
+  // same-handle Stopped can interleave between this coordinator write and the
+  // lifecycle reservation below. This entry segment makes no native call,
+  // observer delivery, or test-hook invocation that could recursively send an
+  // event through that recursive native mutex. `captureNativeTimelineCallbackEntry`
+  // can still block behind a wrapper lifecycle transaction, while list
+  // attachment is independently mutable on the main actor. Waiting until
+  // after that work would let a later detach turn a list-item EOS into a
+  // public natural end, or a later attach hide a direct EOS.
+  let stoppingReason: PlaybackEndCoordinator.PendingStoppingReason? = if
+    event.pointee.type
+    == Int32(libvlc_MediaPlayerMediaStopping.rawValue) {
+    context.endCoordinator.captureStoppingReason(
+      event.pointee.u.media_player_media_stopping.reason
+    )
+  } else {
+    nil
+  }
   let lifecycleFact = nativeLifecycleCallbackFact(event.pointee)
   // Reserve native order, playback ownership, authoritative cause, and the
   // complete timeline before any competing generation finalizer can proceed.
@@ -81,12 +106,32 @@ func playerEventCallback(
   context.invokeNativeEventCallbackBeforePlaybackClaimHookForTesting()
   #endif
   let callbackEntryPlaybackGeneration = callbackTimelineEntry.playbackGeneration
+  if let stoppingReason {
+    context.endCoordinator.noteStoppingReason(
+      stoppingReason,
+      playbackGeneration: callbackEntryPlaybackGeneration
+    )
+  }
   let terminalTimelineSnapshot = callbackTimelineEntry
     .terminalReservation?.timelineSnapshot
     ?? EventBridgeCallbackContext.TimelineSnapshot()
   #if DEBUG
   context.invokeNativeEventCallbackEntryHookForTesting()
   #endif
+
+  // Rate resolutions have their own additive stream so extending the pinned
+  // native ABI does not add a case to the source-exhaustive PlayerEvent enum.
+  // Attribute the payload with the same immutable callback-entry ownership as
+  // every sourced event; reading mutable generations here would let a delayed
+  // predecessor callback masquerade as its successor.
+  if let effectiveRate = mapEffectivePlaybackRateResolution(event.pointee) {
+    context.broadcastEffectivePlaybackRateResolution(
+      effectiveRate,
+      nativeHandleGeneration: attachment.nativeHandleGeneration,
+      playbackGeneration: callbackEntryPlaybackGeneration
+    )
+    return
+  }
 
   guard let mapped = mapEvent(event.pointee) else { return }
   let coordinator = context.endCoordinator
@@ -103,7 +148,6 @@ func playerEventCallback(
 
   case .mediaStopping:
     let stopping = event.pointee.u.media_player_media_stopping
-    coordinator.noteStoppingReason(stopping.reason)
     playbackGeneration = context.noteMediaStopping(
       playbackGeneration: callbackEntryPlaybackGeneration,
       reason: stopping.reason,
@@ -124,21 +168,35 @@ func playerEventCallback(
     shouldSynthesizeEnd = false
 
   case .stateChanged(.stopped):
-    playbackGeneration = context.noteStopped(
+    let stopped = context.noteStopped(
       playbackGeneration: callbackEntryPlaybackGeneration,
       nativeHandleGeneration: attachment.nativeHandleGeneration,
       terminalTimelineSnapshot: terminalTimelineSnapshot
     )
-    shouldSynthesizeEnd = coordinator.consumeStoppedShouldSynthesizeEnd()
+    playbackGeneration = stopped.playbackGeneration
+    // The reason coordinator is intentionally generation-blind, so its EOS
+    // bit alone cannot distinguish a late retiring-handle callback from the
+    // already-committed replacement. Require the callback-entry generation's
+    // immutable terminal outcome too. A natural-end reservation that entered
+    // before replacement freezes `.naturalEnd`; an EOS arriving afterwards
+    // sees the already-frozen `.replacement` and cannot fabricate endReached.
+    let coordinatorConfirmedEnd = coordinator.consumeStoppedShouldSynthesizeEnd(
+      playbackGeneration: playbackGeneration
+    )
+    shouldSynthesizeEnd = coordinatorConfirmedEnd
+      && stopped.consumedNaturalEndEmission
+      && context.terminalCause(for: playbackGeneration) == .naturalEnd
 
   default:
     playbackGeneration = callbackEntryPlaybackGeneration
     shouldSynthesizeEnd = false
   }
 
-  // Both emissions are made from the same immutable attachment token. Every
-  // subscriber therefore observes `.stopped` then `.endReached` with one
-  // generation, independent of consumer lag or native pointer reuse.
+  // On the normal callback path, both emissions use the same immutable
+  // attachment token. Every subscriber therefore observes `.stopped` then
+  // `.endReached` with one generation, independent of consumer lag or native
+  // pointer reuse. EventBridge's documented replacement-boundary path handles
+  // the sole case where detachment makes this Stopped unobservable.
   context.broadcast(
     mapped,
     nativeHandleGeneration: attachment.nativeHandleGeneration,

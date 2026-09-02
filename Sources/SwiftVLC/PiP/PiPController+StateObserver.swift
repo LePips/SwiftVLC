@@ -19,8 +19,8 @@ import Synchronization
 extension PiPController {
   /// Drives the control timebase and PiP UI from player events.
   ///
-  /// Subscribes to *both* lanes, one task each, because this observer needs
-  /// what each lane guarantees and neither alone is sufficient:
+  /// Subscribes to both event lanes plus the dedicated effective-rate stream,
+  /// one task each, because this observer needs all three guarantees:
   ///
   /// - Control events (`.mediaChanged`, `.lengthChanged`, `.seekableChanged`,
   ///   `.stateChanged`) are one-shot. Losing one leaves PiP permanently wrong
@@ -28,16 +28,20 @@ extension PiPController {
   ///   conservative media-changed reset, which is linear playback with no skip
   ///   controls. That lane is unbounded.
   /// - `.timeChanged` is the clock tick that drives capability convergence and
-  ///   rate retracking. Steady playback can run without another state
-  ///   transition, so those have to be reachable from a tick as well. Only the
-  ///   newest tick means anything, so that lane stays coalesced.
+  ///   fallback rate polling. Steady playback can run without another state
+  ///   transition, so capability has to be reachable from a tick as well. Only
+  ///   the newest tick means anything, so that lane stays coalesced.
+  /// - Effective-rate resolutions are lossless, ordered, and carry exact
+  ///   native-handle plus playback-generation provenance. They retrack the
+  ///   timebase immediately from the native payload without changing the
+  ///   source-exhaustive `PlayerEvent` enum.
   ///
   /// One merged stream cannot express both: a merge has a single buffer, so it
   /// either grows without bound under a stalled main actor or evicts control
   /// events. Previously this observer read the mixed `events` stream and took
   /// the second failure.
   ///
-  /// Both tasks are `@MainActor`, so they serialize on this actor: the shared
+  /// All three tasks are `@MainActor`, so they serialize on this actor: the shared
   /// observation state is mutated between events, never during one. Cross-lane
   /// ordering is not guaranteed, which is why capability reconciliation is
   /// generation-guarded rather than order-dependent (see
@@ -49,8 +53,9 @@ extension PiPController {
   /// only a weak reference in scope, so an observer never prevents the
   /// controller from deinitializing.
   func startStateObserver() {
-    let controlEvents = player.controlEvents
-    let timingEvents = player.timingEvents
+    let controlEvents = player.controlEventEnvelopes
+    let timingEvents = player.timingEventEnvelopes
+    let rateResolutions = player.effectivePlaybackRateResolutions
     let initialActive = player.isPlaybackRequestedActive
     let initialNativeActive = player.isActive
     pipPlaybackActive = initialActive
@@ -60,21 +65,108 @@ extension PiPController {
     lastObservedRate = 1.0
     playbackStateObservation = PlaybackStateObservationState(
       duration: player.duration,
-      isSeekable: player.isSeekable
+      isSeekable: player.isSeekable,
+      playbackGeneration: player.generation
     )
 
     stateObserverTask = Task { @MainActor [weak self] in
-      for await event in controlEvents {
+      for await envelope in controlEvents {
         guard let self else { return }
-        handleStateObserverEvent(event)
+        handleStateObserverEnvelope(envelope)
       }
     }
     timingObserverTask = Task { @MainActor [weak self] in
-      for await event in timingEvents {
+      for await envelope in timingEvents {
         guard let self else { return }
-        handleStateObserverEvent(event)
+        handleStateObserverEnvelope(envelope)
       }
     }
+    effectivePlaybackRateObserverTask = Task { @MainActor [weak self] in
+      for await resolution in rateResolutions {
+        guard let self else { return }
+        handleEffectivePlaybackRateResolution(resolution)
+      }
+    }
+  }
+
+  /// The newest authority among Player, its callback bridge, and this observer.
+  /// The bridge can legitimately lead both main-actor consumers while a
+  /// successor's native callback burst is queued.
+  private var authoritativeObservedPlaybackGeneration: PlaybackGeneration {
+    let bridgePlaybackGeneration = PlaybackGeneration(
+      player.eventBridge.currentPlaybackGeneration
+    )
+    let observerPlaybackGeneration = playbackStateObservation.playbackGeneration
+      ?? player.generation
+    return max(
+      player.generation,
+      max(bridgePlaybackGeneration, observerPlaybackGeneration)
+    )
+  }
+
+  /// Rejects callbacks that were emitted by a retired native handle or for a
+  /// superseded media session before they can mutate AVKit's policy.
+  ///
+  /// The raw event streams deliberately omit this provenance. That was unsafe
+  /// here: an active `play(_:)` can replace the native player, and its retiring
+  /// handle may still deliver a late VOD length/seekability callback after the
+  /// successor live stream is current. Applying that callback made live PiP
+  /// finite and interactive until another capability event happened to repair
+  /// it. Envelope filtering makes the session boundary explicit instead of
+  /// relying on callback order.
+  private func handleStateObserverEnvelope(_ envelope: PlayerEventEnvelope) {
+    guard
+      Self.shouldObservePlaybackStateEnvelope(
+        envelope,
+        nativeGeneration: player.nativeEventGeneration,
+        authoritativePlaybackGeneration: authoritativeObservedPlaybackGeneration
+      )
+    else { return }
+
+    let capability = player.capabilitySnapshot.withLock { $0 }
+    if
+      let update = playbackStateObservation.adoptPlaybackGeneration(
+        envelope.playbackGeneration,
+        capability: capability
+      ) {
+      applyObservedPlaybackStateUpdate(update)
+      // The generation adoption performed the exact conservative work of a
+      // media-change event. Avoid publishing the same reset twice when the
+      // successor did emit that callback.
+      if case .mediaChanged = envelope.event {
+        return
+      }
+    }
+    handleStateObserverEvent(envelope.event)
+  }
+
+  /// Retracks from the effective native payload while applying the same exact
+  /// stale-handle/session rejection as ordinary event envelopes.
+  private func handleEffectivePlaybackRateResolution(
+    _ resolution: EffectivePlaybackRateResolution
+  ) {
+    guard
+      Self.shouldObserveEffectivePlaybackRateResolution(
+        resolution,
+        nativeGeneration: player.nativeEventGeneration,
+        authoritativePlaybackGeneration: authoritativeObservedPlaybackGeneration
+      )
+    else { return }
+
+    let capability = player.capabilitySnapshot.withLock { $0 }
+    if
+      let update = playbackStateObservation.adoptPlaybackGeneration(
+        resolution.playbackGeneration,
+        capability: capability
+      ) {
+      applyObservedPlaybackStateUpdate(update)
+    }
+    applyObservedPlaybackStateUpdate(
+      playbackStateObservation.consumeEffectivePlaybackRateResolution(
+        capability: capability
+      )
+    )
+    handleObservedPlayerState(rate: resolution.effectiveRate)
   }
 
   /// The body both lane tasks run. Identical work either way: what differs
@@ -85,13 +177,20 @@ extension PiPController {
         event,
         suppressingRawCapabilityEvents: player.isSuppressingRawCapabilityEvents
       ) else { return }
-    let active = player.isActive
     let rate = player.rate
     let playbackStateUpdate = playbackStateObservation.consume(
       event,
       capability: player.capabilitySnapshot.withLock { $0 }
     )
     applyObservedPlaybackStateUpdate(playbackStateUpdate)
+
+    handleObservedPlayerState(rate: rate)
+  }
+
+  /// Applies activity, rate, and clock tracking for either an ordinary player
+  /// event or an effective-rate resolution.
+  private func handleObservedPlayerState(rate: Float) {
+    let active = player.isActive
 
     // State transition: sync the timebase rate.
     if active != lastObservedNativeActive {
@@ -171,9 +270,9 @@ extension PiPController {
   ///
   /// The rules:
   /// - A rate change retracks the scrubber, which would otherwise advance at
-  ///   1.0× while the player runs at 2.0× or 0.5×. `player.rate` has no
-  ///   dedicated libVLC event, so this is picked up from whatever event
-  ///   arrives next — clock ticks, during playback.
+  ///   1.0× while the player runs at 2.0× or 0.5×. The native extension's
+  ///   dedicated resolution stream applies it immediately; ordinary events
+  ///   keep polling `player.rate` as a fallback for older linked archives.
   /// - A large position divergence resyncs the timebase, which is how a seek
   ///   made from the app's own controls reaches the PiP scrubber.
   /// - Neither applies within a second of a PiP-issued skip, whose own

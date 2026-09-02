@@ -208,7 +208,7 @@ struct MatrixScreenD: View {
     append("recast(to: \(label)) at \(player.currentTime.formatted)")
     Task {
       do {
-        let outcome = try await player.recast(to: renderer)
+        let outcome = try await player.recastAndWaitForOutcome(to: renderer)
         if outcome.isSettled {
           append("recast → \(label) settled, currentTime = \(player.currentTime.formatted)")
         } else {

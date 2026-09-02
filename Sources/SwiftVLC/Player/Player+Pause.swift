@@ -125,12 +125,19 @@ extension Player {
   func issueManagedAudioPause(
     playbackGeneration requestedGeneration: UInt64? = nil
   ) -> Bool {
-    guard isPlaybackRequestedActive else { return false }
+    guard
+      isPlaybackRequestedActive,
+      nativeHandleRepresentsCurrentMedia
+    else { return false }
     preservesPlaybackIntentForManagedAudioSuspension = true
     let issued = issuePause(
       playbackGeneration: requestedGeneration,
       recordsPlaybackControlIntent: false
     )
+    guard nativeHandleRepresentsCurrentMedia else {
+      preservesPlaybackIntentForManagedAudioSuspension = false
+      return false
+    }
     publishPlaybackIntent(true)
     let ownsPause = issued
       || pauseTransition == .pausing
@@ -145,7 +152,9 @@ extension Player {
 
   @discardableResult
   func issueManagedAudioResume() -> Bool {
+    guard nativeHandleRepresentsCurrentMedia else { return false }
     let accepted = issueResume(recordsPlaybackControlIntent: false)
+    guard nativeHandleRepresentsCurrentMedia else { return false }
     if accepted {
       preservesPlaybackIntentForManagedAudioSuspension = false
     }
@@ -157,6 +166,7 @@ extension Player {
     playbackGeneration requestedGeneration: UInt64? = nil,
     recordsPlaybackControlIntent: Bool = true
   ) -> Bool {
+    guard nativeHandleRepresentsCurrentMedia else { return false }
     if recordsPlaybackControlIntent {
       clearManagedAudioSuspensionForExplicitControl()
     }
@@ -173,6 +183,7 @@ extension Player {
     // stabilizes, retain the fresh request for the newest generation instead
     // of spinning on the main actor or dropping it.
     for probeAttempt in 0..<3 {
+      guard nativeHandleRepresentsCurrentMedia else { return false }
       let generationBeforeProbe = eventBridge.currentPlaybackGeneration
       guard
         let revalidatedGeneration = Self.revalidatedPauseGeneration(
@@ -333,6 +344,7 @@ extension Player {
         )
         return false
       }
+      guard nativeHandleRepresentsCurrentMedia else { return false }
       guard nativeCanPause, nativePauseIsSafe else {
         retainDeferredPause(
           playbackGeneration: playbackGeneration,
@@ -347,6 +359,10 @@ extension Player {
       }
       publishPauseIntent()
       let issuedPlaybackControlRevision = playbackControlIntentRevision
+      guard nativeHandleRepresentsCurrentMedia else {
+        clearPauseControlState(for: playbackGeneration)
+        return false
+      }
       libvlc_media_player_set_pause(pointer, 1)
       #if os(iOS) || os(macOS)
       recordQualificationNativePauseCommand()
@@ -433,6 +449,7 @@ extension Player {
     recordsPlaybackControlIntent: Bool = true,
     authorizesPlaybackAfterMediaServicesReset: Bool = false
   ) -> Bool {
+    guard nativeHandleRepresentsCurrentMedia else { return false }
     // Every accepted public/AVKit Resume must remain an engine-visible
     // command. The first attempt can clear Swift's intent quarantine while
     // native AVAudioSession activation still fails and retains its own latch;
@@ -449,6 +466,7 @@ extension Player {
     var playbackGeneration = requestedGeneration ?? eventBridge.currentPlaybackGeneration
 
     for probeAttempt in 0..<3 {
+      guard nativeHandleRepresentsCurrentMedia else { return false }
       let generationBeforeProbe = eventBridge.currentPlaybackGeneration
       guard
         let revalidatedGeneration = Self.revalidatedPauseGeneration(
@@ -458,6 +476,7 @@ extension Player {
         )
       else { return false }
       playbackGeneration = revalidatedGeneration
+      let nativeHandleGeneration = eventBridge.currentNativeHandleGeneration
 
       guard pauseTransition == nil else {
         let generation = followsCurrentGeneration
@@ -499,6 +518,10 @@ extension Player {
         prepareForPlaybackResumeBoundary()
         return true
       }
+      guard
+        nativeHandleRepresentsCurrentMedia,
+        nativeHandleGeneration == eventBridge.currentNativeHandleGeneration
+      else { return false }
 
       if
         deferredPauseCommand == .pause,
@@ -544,13 +567,27 @@ extension Player {
         }
         if state == .paused, nativeState.isActive {
           if playbackGeneration == sessionGeneration {
-            publishPlaybackState(nativeState)
+            guard
+              publishPlaybackState(
+                nativeState,
+                ifPlaybackGeneration: playbackGeneration,
+                nativeHandleGeneration: nativeHandleGeneration
+              )
+            else { return false }
           }
           acceptExplicitResumeCommand(
             issuesExplicitNativeResumeCommand,
             issuesNativeResumeCommand: true
           )
-          publishPlaybackIntent(true)
+          guard
+            publishPlaybackIntent(
+              true,
+              ifPlaybackGeneration: playbackGeneration == sessionGeneration
+                ? playbackGeneration
+                : nil,
+              nativeHandleGeneration: nativeHandleGeneration
+            )
+          else { return false }
           prepareForPlaybackResumeBoundary()
           return true
         }
@@ -592,7 +629,21 @@ extension Player {
       if deferredPauseCommandPlaybackGeneration == playbackGeneration {
         deferredPauseCommand = nil
       }
-      publishPlaybackIntent(true)
+      guard
+        publishPlaybackIntent(
+          true,
+          ifPlaybackGeneration: playbackGeneration == sessionGeneration
+            ? playbackGeneration
+            : nil,
+          nativeHandleGeneration: nativeHandleGeneration
+        ),
+        nativeHandleRepresentsCurrentMedia,
+        playbackGeneration == eventBridge.currentPlaybackGeneration,
+        nativeHandleGeneration == eventBridge.currentNativeHandleGeneration
+      else {
+        clearPauseControlState(for: playbackGeneration)
+        return false
+      }
       issueNativeResumeCommand(
         authorizesPlaybackAfterMediaServicesReset:
         authorizesPlaybackAfterMediaServicesReset
@@ -629,6 +680,9 @@ extension Player {
   private func issueNativeResumeCommand(
     authorizesPlaybackAfterMediaServicesReset: Bool
   ) {
+    // The command can be deferred across native probes. Never let a callback
+    // or synchronous observer-triggered load redirect it to a retiring handle.
+    guard nativeHandleRepresentsCurrentMedia else { return }
     #if DEBUG
     if let override = _nativeResumeAuthorizationOverrideForTesting {
       override(authorizesPlaybackAfterMediaServicesReset)
@@ -742,15 +796,29 @@ extension Player {
   /// Retires every pause/resume command when an external owner of the shared
   /// native handle accepts a stop. A stale deferred command must not survive
   /// until a later list adoption and become authoritative again.
-  func clearPlaybackControlForExternalStop() {
-    eventBridge.beginExplicitStopBarrier(
-      playbackGeneration: eventBridge.currentPlaybackGeneration
-    )
+  @discardableResult
+  func clearPlaybackControlForExternalStop(
+    establishesPlaybackBarrier: Bool = true,
+    ifPlaybackGeneration expectedPlaybackGeneration: UInt64? = nil,
+    nativeHandleGeneration expectedNativeHandleGeneration: UInt64? = nil,
+    lifecycleControlEpoch expectedLifecycleControlEpoch: UInt64? = nil
+  ) -> Bool {
+    if establishesPlaybackBarrier {
+      eventBridge.beginExplicitStopBarrier(
+        playbackGeneration: expectedPlaybackGeneration
+          ?? eventBridge.currentPlaybackGeneration
+      )
+    }
     pauseTransition = nil
     deferredPauseCommand = nil
     playbackControlIntent = nil
     clearManagedAudioSuspensionForExplicitControl()
-    publishPlaybackIntent(false)
+    return publishPlaybackIntent(
+      false,
+      ifPlaybackGeneration: expectedPlaybackGeneration,
+      nativeHandleGeneration: expectedNativeHandleGeneration,
+      lifecycleControlEpoch: expectedLifecycleControlEpoch
+    )
   }
 
   private func publishPauseIntent() {

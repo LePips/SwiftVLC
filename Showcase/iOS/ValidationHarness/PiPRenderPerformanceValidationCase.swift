@@ -96,7 +96,7 @@ struct PiPRenderPerformanceValidationCase: View {
       try await waitUntil("Performance fixture did not start", timeout: .seconds(30)) {
         player.state == .playing
       }
-      guard controller.start() == .accepted else {
+      guard controller.requestStart() == .accepted else {
         throw PiPPerformanceFailure("Direct PiP start was not accepted")
       }
       try await waitUntil("Direct PiP did not become active", timeout: .seconds(30)) {

@@ -156,6 +156,13 @@ observes route loss and media-services reset because pausing VLC is a transport
 safety rule, not an `AVAudioSession` mutation; after reset, Apple requires a
 new user action before playback restarts.
 
+The deprecated `PiPVideoView(..., managesAudioSession:)` overload remains
+source- and behavior-compatible with SwiftVLC 1.0: its Boolean controls only
+the PiP controller. It cannot reconfigure the Player's immutable instance or
+make bundled libVLC audio outputs application-managed. Migrate an explicit
+`false` to an `.applicationManaged` ``VLCInstance`` when the application needs
+the complete process-session opt-out described above.
+
 Your app must also declare background modes in its Info.plist:
 
 ```xml
@@ -174,7 +181,7 @@ or when your layout needs more control than ``PiPVideoView`` offers:
 ```swift
 let controller = PiPController(player: player)
 container.layer.addSublayer(controller.layer)
-switch controller.start() {
+switch controller.requestStart() {
 case .accepted:
   // Observe pipEventEnvelopes for the attributed asynchronous outcome.
   break
@@ -188,8 +195,10 @@ A ``PiPStartResult/accepted`` result means only that SwiftVLC issued the
 backend request. AVKit may still reject it asynchronously. Consume
 ``PiPController/pipEventEnvelopes`` when callbacks can outlive a media change
 or controller reconstruction; each envelope carries the media and controller
-generation that owns the lifecycle. ``PiPController/pipEvents`` remains the
-unattributed compatibility stream.
+generation that owns the lifecycle and an extensible
+``PiPEventEnvelope/stopCause`` for stop events. ``PiPController/pipEvents``
+remains the unattributed version-1 compatibility stream; programmatic and
+controller-replacement stops retain its historical `.unknown` reason.
 
 PiP pause requests can be deferred while libVLC is opening or buffering.
 Observe ``PiPController/deferredPauseOutcome`` when your UI needs the terminal

@@ -70,7 +70,7 @@ extension Integration {
       }
       await Task.yield()
 
-      let outcome = await player.stopAndWait()
+      let outcome = await player.stopAndWaitForOutcome()
       await teardown.value
 
       #expect(outcome == .stopped)
@@ -143,6 +143,21 @@ extension Integration {
       #expect(received == 0)
     }
 
+    /// The additive rate stream is owned by the same permanently-terminated
+    /// bridge context as raw events. A post-shutdown subscription must not
+    /// wait forever for a native callback source that no longer exists.
+    @Test
+    func `Effective rate stream requested after shutdown finishes immediately`() async {
+      let player = Player(instance: TestInstance.makeAudioOnly())
+      await player.shutdown()
+
+      var received = 0
+      for await _ in player.effectivePlaybackRateResolutions {
+        received += 1
+      }
+      #expect(received == 0)
+    }
+
     /// Same guarantee for the playback-intent stream.
     @Test
     func `Playback intent stream requested after shutdown finishes immediately`() async {
@@ -193,6 +208,23 @@ extension Integration {
 
       await player.shutdown()
       _ = await drained.value
+    }
+
+    @Test
+    func `Effective rate stream opened before shutdown finishes on shutdown`() async {
+      let player = Player(instance: TestInstance.makeAudioOnly())
+      let stream = player.effectivePlaybackRateResolutions
+
+      let drained = Task {
+        var count = 0
+        for await _ in stream {
+          count += 1
+        }
+        return count
+      }
+
+      await player.shutdown()
+      #expect(await drained.value == 0)
     }
 
     @Test

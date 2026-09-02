@@ -65,22 +65,22 @@ extension Integration {
     }
 
     @Test
-    func `renderer rejection has a dedicated typed error`() throws {
+    func `renderer rejection preserves the version 1 operation error`() throws {
       let player = Player(instance: TestInstance.shared)
       player._nativeSetRendererOverrideForTesting = { _ in -1 }
 
-      #expect(throws: VLCError.rendererFailed) {
+      #expect(throws: VLCError.operationFailed("Set renderer")) {
         try player.setRenderer(nil)
       }
     }
 
     @Test
-    func `replacement player renderer rejection has a dedicated typed error`() throws {
+    func `replacement renderer rejection preserves the version 1 operation error`() throws {
       let player = Player(instance: TestInstance.shared)
       let originalPointer = player.pointer
       player._nativeSetRendererOverrideForTesting = { _ in -1 }
 
-      #expect(throws: VLCError.rendererFailed) {
+      #expect(throws: VLCError.operationFailed("Set renderer")) {
         try player.replaceNativePlayerForDrawablePlayback(target: nil)
       }
       #expect(player.pointer == originalPointer)

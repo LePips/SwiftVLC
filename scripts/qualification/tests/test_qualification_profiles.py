@@ -367,6 +367,41 @@ class QualificationProfileTests(unittest.TestCase):
         self.assertNotIn("--require-complete", full)
         self.assertEqual(release[-1], "--require-complete")
 
+    def test_only_release_runner_can_claim_canonical_full_suite_selection(self):
+        arguments = Namespace(
+            runner=QUALIFICATION / "run-device-tests.sh",
+            version="1.1.0",
+            development_team="ABCDE12345",
+            candidate_app=None,
+            candidate_metadata=None,
+            xctestrun=None,
+            derived_data=None,
+            work_root=None,
+            fixtures=None,
+            exploratory_current_only=False,
+            skip_build=False,
+        )
+        selected_device = "00008101-FIXTURE"
+        for profile_name in ("full", "release"):
+            with self.subTest(profile=profile_name):
+                profile = self.profiles.profiles[profile_name]
+                command = qualify.build_runner_command(
+                    arguments,
+                    profile,
+                    selected_device,
+                    profile.scenarios,
+                    Path("/tmp/qualification-output"),
+                    profile.stable_environment_required,
+                )
+                if profile_name == "release":
+                    self.assertIn("--full-suite-selection", command)
+                else:
+                    self.assertNotIn("--full-suite-selection", command)
+        self.assertNotIn(
+            "--full-suite-selection",
+            qualify._device_command(selected_device, require_stable=True),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -2,6 +2,7 @@
 import CLibVLC
 import CustomDump
 import Dispatch
+import Observation
 import Testing
 
 private enum FrozenNonterminalCallback: CaseIterable, Sendable {
@@ -216,6 +217,75 @@ extension Integration {
       )
     }
 
+    @Test
+    func `External media adoption publishes the outgoing stopped boundary before successor progress`()
+      async throws {
+      let player = Player(instance: TestInstance.makeAudioOnly())
+      player.eventTask?.cancel()
+      player.eventTask = nil
+      let bridge = player.eventBridge
+      let first = try Media(url: TestMedia.twosecURL)
+      let successor = try Media(url: TestMedia.testMP4URL)
+      player.load(first)
+      let outgoingGeneration = player.sessionGeneration
+      let outgoingLifecycleEpoch = bridge.currentLifecycleControlEpoch
+      let transitions = player.stateTransitions
+      var iterator = transitions.makeAsyncIterator()
+
+      player._handleEventForTesting(.stateChanged(.stopping))
+      libvlc_media_player_set_media(player.pointer, successor.pointer)
+      try #require(
+        await poll(timeout: .seconds(1)) {
+          bridge.currentPlaybackGeneration > outgoingGeneration
+        },
+        "the native MediaChanged callback did not reserve the successor"
+      )
+      let successorGeneration = bridge.currentPlaybackGeneration
+      let successorLifecycleEpoch = bridge.currentLifecycleControlEpoch
+
+      player.handleSourcedEvent(
+        SourcedPlayerEvent(
+          nativeHandleGeneration: bridge.currentNativeHandleGeneration,
+          playbackGeneration: successorGeneration,
+          event: .mediaChanged,
+          lifecycleControlEpoch: successorLifecycleEpoch
+        )
+      )
+      player.handleSourcedEvent(
+        SourcedPlayerEvent(
+          nativeHandleGeneration: bridge.currentNativeHandleGeneration,
+          playbackGeneration: successorGeneration,
+          event: .stateChanged(.opening),
+          lifecycleControlEpoch: successorLifecycleEpoch
+        )
+      )
+      player.handleSourcedEvent(
+        SourcedPlayerEvent(
+          nativeHandleGeneration: bridge.currentNativeHandleGeneration,
+          playbackGeneration: outgoingGeneration,
+          event: .stateChanged(.stopped),
+          lifecycleControlEpoch: outgoingLifecycleEpoch
+        )
+      )
+      player.handleSourcedEvent(
+        SourcedPlayerEvent(
+          nativeHandleGeneration: bridge.currentNativeHandleGeneration,
+          playbackGeneration: successorGeneration,
+          event: .stateChanged(.playing),
+          lifecycleControlEpoch: successorLifecycleEpoch
+        )
+      )
+
+      var observed: [PlayerState] = []
+      for _ in 0..<4 {
+        try observed.append(#require(await iterator.next()))
+      }
+      expectNoDifference(observed, [.stopping, .stopped, .opening, .playing])
+      #expect(player.generation == PlaybackGeneration(successorGeneration))
+      #expect(player.currentMedia?.mrl == successor.mrl)
+      #expect(player.state == .playing)
+    }
+
     @Test(arguments: StopQuarantinedCallback.allCases)
     fileprivate func `Stop quarantines active callbacks on both sides of its native call`(
       callbackKind: StopQuarantinedCallback
@@ -327,6 +397,140 @@ extension Integration {
       )
       #expect(player.isPlaybackRequestedActive)
       #expect(!bridge.hasExplicitStopBarrier(playbackGeneration: player.sessionGeneration))
+    }
+
+    @Test
+    func `Stop retries after a synchronously rejected Play from intent observation`() {
+      let player = Player(instance: TestInstance.makeAudioOnly())
+      player._setStateForTesting(
+        state: .playing,
+        nativeState: .playing,
+        isPlaybackRequestedActive: true
+      )
+      player._nativePlaybackStateOverrideForTesting = .playing
+      var stopDispatchCount = 0
+      var rejectedPlayError: VLCError?
+      var observerRan = false
+      player._nativeStopOverrideForTesting = {
+        stopDispatchCount += 1
+      }
+      player._nativePlayOverrideForTesting = { -1 }
+
+      withObservationTracking {
+        _ = player.isPlaybackRequestedActive
+      } onChange: {
+        MainActor.assumeIsolated {
+          guard !observerRan else { return }
+          observerRan = true
+          do {
+            try player.play()
+          } catch let error as VLCError {
+            rejectedPlayError = error
+          } catch {
+            Issue.record("Unexpected rejected Play error: \(error)")
+          }
+        }
+      }
+
+      player.stop()
+
+      #expect(observerRan)
+      #expect(rejectedPlayError != nil)
+      #expect(stopDispatchCount == 1)
+      #expect(!player.isPlaybackRequestedActive)
+      #expect(
+        player.eventBridge.hasExplicitStopBarrier(
+          playbackGeneration: player.sessionGeneration
+        )
+      )
+    }
+
+    @Test
+    func `Synchronously accepted Play from intent observation supersedes Stop`() {
+      let player = Player(instance: TestInstance.makeAudioOnly())
+      player._setStateForTesting(
+        state: .playing,
+        nativeState: .playing,
+        isPlaybackRequestedActive: true
+      )
+      player._nativePlaybackStateOverrideForTesting = .playing
+      var stopDispatchCount = 0
+      var observerRan = false
+      var acceptedPlayError: VLCError?
+      player._nativeStopOverrideForTesting = {
+        stopDispatchCount += 1
+      }
+      player._nativePlayOverrideForTesting = { 0 }
+
+      withObservationTracking {
+        _ = player.isPlaybackRequestedActive
+      } onChange: {
+        MainActor.assumeIsolated {
+          guard !observerRan else { return }
+          observerRan = true
+          do {
+            try player.play()
+          } catch let error as VLCError {
+            acceptedPlayError = error
+          } catch {
+            Issue.record("Unexpected accepted Play error: \(error)")
+          }
+        }
+      }
+
+      player.stop()
+
+      #expect(observerRan)
+      #expect(acceptedPlayError == nil)
+      #expect(stopDispatchCount == 0)
+      #expect(player.isPlaybackRequestedActive)
+      #expect(
+        !player.eventBridge.hasExplicitStopBarrier(
+          playbackGeneration: player.sessionGeneration
+        )
+      )
+    }
+
+    @Test
+    func `Terminal callback entry invalidates external intent restoration inside observation`() throws {
+      let player = Player(instance: TestInstance.makeAudioOnly())
+      try player.load(Media(url: TestMedia.twosecURL))
+      player._setStateForTesting(
+        state: .playing,
+        nativeState: .playing,
+        isPlaybackRequestedActive: false
+      )
+      let lease = try #require(
+        player.makeExternalPlaybackIntentRestorationLease()
+      )
+      var observerRan = false
+
+      withObservationTracking {
+        _ = player.isPlaybackRequestedActive
+      } onChange: {
+        MainActor.assumeIsolated {
+          guard !observerRan else { return }
+          observerRan = true
+          var mediaStopping = libvlc_event_t()
+          mediaStopping.type = Int32(libvlc_MediaPlayerMediaStopping.rawValue)
+          mediaStopping.u.media_player_media_stopping.reason = libvlc_stopping_reason_eos
+          player.eventBridge._emitNativeEventForTesting(mediaStopping)
+          #expect(
+            player.state == .playing,
+            "the terminal callback must still be queued on the event consumer"
+          )
+        }
+      }
+
+      let restored = player.restorePlaybackIntentFromExternalControl(
+        true,
+        ifCurrent: lease
+      )
+
+      #expect(observerRan)
+      #expect(!restored)
+      #expect(!player.isPlaybackRequestedActive)
+      #expect(!player.ownsExternalPlaybackIntentRestoration(lease))
     }
   }
 }

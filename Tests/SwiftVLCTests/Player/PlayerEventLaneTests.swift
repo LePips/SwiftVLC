@@ -27,7 +27,6 @@ struct PlayerEventLaneClassificationTests {
     #expect(PlayerEvent.pausableChanged(true).lane == .control)
     #expect(PlayerEvent.tracksChanged.lane == .control)
     #expect(PlayerEvent.programSelected(unselectedId: 1, selectedId: 2).lane == .control)
-    #expect(PlayerEvent.rateChanged(1.5).lane == .control)
   }
 
   @Test

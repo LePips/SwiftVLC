@@ -2,6 +2,42 @@ import CLibVLC
 import os
 import Synchronization
 
+struct RecastReplacementExpectation: Sendable {
+  let playbackGeneration: UInt64
+  let nativeHandleGeneration: UInt64
+  let lifecycleControlEpoch: UInt64
+  let mediaIdentity: UInt?
+  let ownershipEpoch: UInt64
+}
+
+struct RecastReplacementLease: Equatable, Sendable {
+  let id: UInt64
+  let playbackGeneration: UInt64
+  let nativeHandleGeneration: UInt64
+  let ownershipEpoch: UInt64
+  let outgoingTimeline: PlaybackFinalTimeline
+}
+
+struct RecastMutationPermit: Equatable, Sendable {
+  let id: UInt64
+  let lease: RecastReplacementLease
+}
+
+enum RecastTransactionInterruption: Equatable, Sendable {
+  case superseded
+  case terminal(PlaybackTerminalCause)
+}
+
+enum RecastReplacementCommitResult: Sendable {
+  case committed(RecastReplacementLease)
+  case interrupted(RecastTransactionInterruption)
+}
+
+enum RecastMutationReservation: Sendable {
+  case permitted(RecastMutationPermit)
+  case interrupted(RecastTransactionInterruption)
+}
+
 /// Bridges libVLC C event callbacks to `AsyncStream<PlayerEvent>`.
 ///
 /// Multi-consumer fan-out built on `Broadcaster<PlayerEvent>`. Each call
@@ -10,12 +46,68 @@ import Synchronization
 /// passed to libVLC's `event_attach`, then calls `broadcast(_:)` which
 /// snapshots subscribers under a Mutex and yields outside the lock.
 final class EventBridge: Sendable {
+  final class PreparedReattachment: @unchecked Sendable {
+    private enum State: Equatable {
+      case prepared
+      case installed
+      case activated
+      case cancelled
+    }
+
+    nonisolated(unsafe) let eventManager: OpaquePointer
+    nonisolated(unsafe) let attachmentOpaque: UnsafeMutableRawPointer
+    let attachedEventTypes: [Int32]
+    let nativeHandleGeneration: UInt64
+    private let state = Mutex(State.prepared)
+
+    init(
+      eventManager: OpaquePointer,
+      attachmentOpaque: UnsafeMutableRawPointer,
+      attachedEventTypes: [Int32],
+      nativeHandleGeneration: UInt64
+    ) {
+      self.eventManager = eventManager
+      self.attachmentOpaque = attachmentOpaque
+      self.attachedEventTypes = attachedEventTypes
+      self.nativeHandleGeneration = nativeHandleGeneration
+    }
+
+    func cancel() -> Bool {
+      state.withLock { state in
+        guard state == .prepared else { return false }
+        state = .cancelled
+        return true
+      }
+    }
+
+    func install() -> Bool {
+      state.withLock { state in
+        guard state == .prepared else { return false }
+        state = .installed
+        return true
+      }
+    }
+
+    func activate() -> Bool {
+      state.withLock { state in
+        guard state == .installed else { return false }
+        state = .activated
+        return true
+      }
+    }
+  }
+
   private nonisolated(unsafe) var eventManager: OpaquePointer
   private let context: EventBridgeCallbackContext
   private nonisolated(unsafe) var attachmentOpaque: UnsafeMutableRawPointer?
   private nonisolated(unsafe) var attachedEventTypes: [Int32]
   private let nativeHandleGeneration = Mutex<UInt64>(1)
+  private let retiredNaturalEndEmissions = Mutex<[RetiredNaturalEndEmission]>([])
   private let invalidated = Mutex(false)
+  #if DEBUG
+  private let preparedAttachmentFailureIndexForTesting = Mutex<Int?>(nil)
+  private let preparedAttachmentRollbackCountForTesting = Mutex(0)
+  #endif
 
   init(
     eventManager: OpaquePointer,
@@ -36,7 +128,15 @@ final class EventBridge: Sendable {
     let opaque = Unmanaged.passRetained(attachment).toOpaque()
     attachmentOpaque = opaque
 
-    attachedEventTypes = Self.attachEvents(to: eventManager, opaque: opaque)
+    guard
+      let attachedEventTypes = Self.attachAllEvents(
+        to: eventManager,
+        opaque: opaque
+      ) else {
+      Unmanaged<EventBridgeCallbackAttachment>.fromOpaque(opaque).release()
+      preconditionFailure("Failed to attach the complete libVLC player event set")
+    }
+    self.attachedEventTypes = attachedEventTypes
   }
 
   deinit {
@@ -54,6 +154,9 @@ final class EventBridge: Sendable {
     }
     guard shouldCleanUp else { return }
 
+    retiredNaturalEndEmissions.withLock {
+      $0.removeAll(keepingCapacity: false)
+    }
     guard let attachmentOpaque else { return }
     Self.detachEvents(attachedEventTypes, from: eventManager, opaque: attachmentOpaque)
     attachedEventTypes = []
@@ -71,43 +174,184 @@ final class EventBridge: Sendable {
     context.terminate()
   }
 
-  /// Moves the existing streams to a replacement native media player.
-  ///
-  /// `Player` recreates its libVLC handle after a stopped drawable-backed
-  /// playback because libVLC keeps a "free vout" whose iOS window provider
-  /// still points at the previous UIView. The Swift `Player.events` stream must
-  /// survive that native-handle swap, so this detaches callbacks from the previous
-  /// event manager and attaches the same broadcaster to the new one.
+  /// Attaches a complete, inactive callback set to a candidate player.
+  /// Failure rolls back every listener before returning, so replacement never
+  /// commits with a partially observable successor.
+  func prepareReattachment(
+    to newEventManager: OpaquePointer
+  ) -> PreparedReattachment? {
+    let isInvalidated = invalidated.withLock { $0 }
+    guard !isInvalidated, attachmentOpaque != nil else { return nil }
+
+    let generation = nativeHandleGeneration.withLock { generation in
+      precondition(generation < UInt64.max, "Native handle generation exhausted")
+      return generation + 1
+    }
+    let attachment = EventBridgeCallbackAttachment(
+      context: context,
+      nativeHandleGeneration: generation,
+      active: false
+    )
+    let opaque = Unmanaged.passRetained(attachment).toOpaque()
+    #if DEBUG
+    let forcedFailureAfterAttachedCount = preparedAttachmentFailureIndexForTesting
+      .withLock { $0 }
+    #else
+    let forcedFailureAfterAttachedCount: Int? = nil
+    #endif
+    guard
+      let eventTypes = Self.attachAllEvents(
+        to: newEventManager,
+        opaque: opaque,
+        forcedFailureAfterAttachedCount: forcedFailureAfterAttachedCount,
+        didRollback: { count in
+          #if DEBUG
+          self.preparedAttachmentRollbackCountForTesting.withLock { $0 = count }
+          #endif
+        }
+      ) else {
+      Unmanaged<EventBridgeCallbackAttachment>.fromOpaque(opaque).release()
+      return nil
+    }
+    return PreparedReattachment(
+      eventManager: newEventManager,
+      attachmentOpaque: opaque,
+      attachedEventTypes: eventTypes,
+      nativeHandleGeneration: generation
+    )
+  }
+
+  /// Abandons a candidate callback set before its native player is released.
+  func cancelPreparedReattachment(_ prepared: PreparedReattachment) {
+    guard prepared.cancel() else { return }
+    Self.detachEvents(
+      prepared.attachedEventTypes,
+      from: prepared.eventManager,
+      opaque: prepared.attachmentOpaque
+    )
+    Unmanaged<EventBridgeCallbackAttachment>
+      .fromOpaque(prepared.attachmentOpaque)
+      .release()
+  }
+
+  /// Compatibility path for tests and handle swaps which do not need a
+  /// conditional playback-generation commit. Production replacement prepares
+  /// explicitly so listener completeness is proven before its lifecycle point.
   @discardableResult
   func reattach(to newEventManager: OpaquePointer) -> UInt64 {
-    let isInvalidated = invalidated.withLock { $0 }
-    guard !isInvalidated, let oldAttachmentOpaque = attachmentOpaque else {
-      return nativeHandleGeneration.withLock { $0 }
+    guard let prepared = prepareReattachment(to: newEventManager) else {
+      return currentNativeHandleGeneration
     }
+    let generation = installPreparedReattachment(prepared)
+    activatePreparedReattachment(prepared)
+    return generation
+  }
+
+  /// Installs an already-fully-attached successor without activating it.
+  ///
+  /// Keeping the successor token inactive lets `Player` make its pointer,
+  /// lifetime, generation, transaction flags, and callback snapshots coherent
+  /// before any successor event can enter. The old event-manager lock provides
+  /// quiescence; its token remains active until every detach has returned.
+  @discardableResult
+  func installPreparedReattachment(_ prepared: PreparedReattachment) -> UInt64 {
+    guard let oldAttachmentOpaque = attachmentOpaque else {
+      preconditionFailure("Cannot commit a native reattachment after invalidation")
+    }
+    let outgoingNativeHandleGeneration = currentNativeHandleGeneration
+    precondition(
+      outgoingNativeHandleGeneration < UInt64.max
+        && prepared.nativeHandleGeneration == outgoingNativeHandleGeneration + 1,
+      "Prepared native handle generation is stale"
+    )
+    precondition(prepared.install(), "Prepared native attachment was already consumed")
 
     Self.detachEvents(attachedEventTypes, from: eventManager, opaque: oldAttachmentOpaque)
     Unmanaged<EventBridgeCallbackAttachment>.fromOpaque(oldAttachmentOpaque).release()
 
-    // The retiring handle cannot emit after detach returns. Clear its pending
-    // terminal classification before the successor is attached, so neither an
-    // old late callback nor an early successor callback can cross the reset.
+    // The retiring handle cannot emit after detach returns. If its
+    // authoritative EOS arrived first but Stopped did not, this boundary is
+    // the sole remaining place to deliver that exact natural end. Both claims
+    // are one-shot, and list-player suppression remains authoritative.
+    let pendingNaturalEndEmission = context
+      .consumePendingNaturalEndForNativeHandleReplacement()
+    let shouldSynthesizePendingNaturalEnd = pendingNaturalEndEmission.map {
+      context.endCoordinator.consumeHandleReplacementShouldSynthesizeEnd(
+        playbackGeneration: $0.playbackGeneration
+      )
+    } ?? false
     context.endCoordinator.clearForHandleReplacement()
-    context.clearPendingStopForNativeHandleReplacement()
-
-    let generation = nativeHandleGeneration.withLock { generation in
-      precondition(generation < UInt64.max, "Native handle generation exhausted")
-      generation += 1
-      return generation
+    if
+      shouldSynthesizePendingNaturalEnd,
+      let pendingNaturalEndEmission {
+      retiredNaturalEndEmissions.withLock {
+        $0.append(pendingNaturalEndEmission)
+      }
     }
-    let attachment = EventBridgeCallbackAttachment(
-      context: context,
-      nativeHandleGeneration: generation
+
+    context.completeNativeHandleReplacement(
+      nativeHandleGeneration: prepared.nativeHandleGeneration
     )
-    let newAttachmentOpaque = Unmanaged.passRetained(attachment).toOpaque()
-    eventManager = newEventManager
-    attachmentOpaque = newAttachmentOpaque
-    attachedEventTypes = Self.attachEvents(to: newEventManager, opaque: newAttachmentOpaque)
+    eventManager = prepared.eventManager
+    attachmentOpaque = prepared.attachmentOpaque
+    attachedEventTypes = prepared.attachedEventTypes
+    nativeHandleGeneration.withLock { generation in
+      precondition(generation + 1 == prepared.nativeHandleGeneration)
+      generation = prepared.nativeHandleGeneration
+    }
+    return prepared.nativeHandleGeneration
+  }
+
+  /// Makes a previously installed successor observable to native callbacks.
+  /// This is deliberately separate from listener installation: callers must
+  /// establish every Swift/native identity field before crossing this final
+  /// boundary.
+  func activatePreparedReattachment(_ prepared: PreparedReattachment) {
+    precondition(
+      attachmentOpaque == prepared.attachmentOpaque
+        && eventManager == prepared.eventManager
+        && currentNativeHandleGeneration == prepared.nativeHandleGeneration,
+      "Only the installed native attachment can be activated"
+    )
+    precondition(prepared.activate(), "Prepared native attachment cannot be activated twice")
+    Unmanaged<EventBridgeCallbackAttachment>
+      .fromOpaque(prepared.attachmentOpaque)
+      .takeUnretainedValue()
+      .activate()
+  }
+
+  /// Compatibility spelling for direct callers which do not need a delayed
+  /// activation transaction.
+  @discardableResult
+  func commitPreparedReattachment(_ prepared: PreparedReattachment) -> UInt64 {
+    let generation = installPreparedReattachment(prepared)
+    activatePreparedReattachment(prepared)
     return generation
+  }
+
+  /// Publishes natural ends retired by `reattach(to:)` only after Player's
+  /// replacement transaction has committed its public pointer, lifetime,
+  /// generation, flags, and old-handle release. Public filters are
+  /// synchronous and may reenter Player, so publishing inside `reattach`
+  /// would expose a half-committed replacement.
+  @discardableResult
+  func publishRetiredNaturalEndsAfterHandleReplacement() -> Int {
+    let emissions = retiredNaturalEndEmissions.withLock { emissions in
+      let result = emissions
+      emissions.removeAll(keepingCapacity: true)
+      return result
+    }
+    for emission in emissions {
+      context.broadcast(
+        .endReached,
+        nativeHandleGeneration: emission.nativeHandleGeneration,
+        playbackGeneration: emission.playbackGeneration,
+        emittedTimelineRevision: emission.timelineRevision,
+        nativeSeekEmissionStamp: emission.nativeSeekEmissionStamp,
+        lifecycleControlEpoch: emission.lifecycleControlEpoch
+      )
+    }
+    return emissions.count
   }
 
   /// Monotonic identity of the native player currently feeding this bridge.
@@ -127,9 +371,29 @@ final class EventBridge: Sendable {
     context.currentPlaybackGeneration
   }
 
+  var currentNativeHandleHasStartedPlayback: Bool {
+    context.currentNativeHandleHasStartedPlayback
+  }
+
+  var currentPlaybackGenerationHasStartedPlayback: Bool {
+    context.currentPlaybackGenerationHasStartedPlayback
+  }
+
   /// Playback-control boundary already accepted by the callback lane.
   var currentLifecycleControlEpoch: UInt64 {
     context.currentLifecycleControlEpoch
+  }
+
+  func ownsNonterminalPlayback(
+    playbackGeneration: UInt64,
+    nativeHandleGeneration: UInt64,
+    lifecycleControlEpoch: UInt64
+  ) -> Bool {
+    context.ownsNonterminalPlayback(
+      playbackGeneration: playbackGeneration,
+      nativeHandleGeneration: nativeHandleGeneration,
+      lifecycleControlEpoch: lifecycleControlEpoch
+    )
   }
 
   func hasExplicitStopBarrier(playbackGeneration: UInt64) -> Bool {
@@ -162,6 +426,17 @@ final class EventBridge: Sendable {
     context.makeSourcedStream(policy: policy)
   }
 
+  func makeSourcedPlayerSignalStream(
+    policy: EventBufferingPolicy
+  ) -> AsyncStream<SourcedPlayerSignal> {
+    context.makeSourcedPlayerSignalStream(policy: policy)
+  }
+
+  func makeEffectivePlaybackRateResolutionStream()
+    -> AsyncStream<EffectivePlaybackRateResolution> {
+    context.makeEffectivePlaybackRateResolutionStream()
+  }
+
   func makeEnvelopeStream(
     policy: EventBufferingPolicy?,
     filter: (@Sendable (PlayerEventEnvelope) -> Bool)?
@@ -187,14 +462,20 @@ final class EventBridge: Sendable {
   func synchronizePlaybackGeneration(
     _ generation: UInt64,
     media: OpaquePointer?,
-    outgoingNativeHandleGeneration: UInt64? = nil
+    outgoingNativeHandleGeneration: UInt64? = nil,
+    expectRetiringHandleStopped: Bool = false
   ) -> UInt64 {
-    context.synchronizePlaybackGeneration(
+    precondition(
+      !expectRetiringHandleStopped || outgoingNativeHandleGeneration != nil,
+      "A retiring-handle stop expectation requires the outgoing handle generation"
+    )
+    return context.synchronizePlaybackGeneration(
       generation,
       media: media,
       nativeHandleGeneration: outgoingNativeHandleGeneration
         ?? currentNativeHandleGeneration,
-      retiringNativeHandle: outgoingNativeHandleGeneration != nil
+      retiringNativeHandle: outgoingNativeHandleGeneration != nil,
+      expectRetiringHandleStopped: expectRetiringHandleStopped
     )
   }
 
@@ -220,6 +501,10 @@ final class EventBridge: Sendable {
     context.markRequestedStop(playbackGeneration: playbackGeneration)
   }
 
+  func beginRequestedStopBarrier(playbackGeneration: UInt64) {
+    context.beginRequestedStopBarrier(playbackGeneration: playbackGeneration)
+  }
+
   func beginExplicitStopBarrier(playbackGeneration: UInt64) {
     context.beginExplicitStopBarrier(playbackGeneration: playbackGeneration)
   }
@@ -241,6 +526,59 @@ final class EventBridge: Sendable {
     context.acceptExternalPlaybackActivation(
       playbackGeneration: playbackGeneration
     )
+  }
+
+  func recordAcceptedPlaybackStart(playbackGeneration: UInt64) {
+    context.recordAcceptedPlaybackStart(
+      playbackGeneration: playbackGeneration,
+      nativeHandleGeneration: currentNativeHandleGeneration
+    )
+  }
+
+  func commitRecastReplacementIfCurrent(
+    expectation: RecastReplacementExpectation,
+    successorPlaybackGeneration: UInt64,
+    preparedReattachment: PreparedReattachment
+  ) -> RecastReplacementCommitResult {
+    guard
+      expectation.nativeHandleGeneration < UInt64.max,
+      expectation.nativeHandleGeneration == currentNativeHandleGeneration,
+      preparedReattachment.nativeHandleGeneration
+      == expectation.nativeHandleGeneration + 1
+    else { return .interrupted(.superseded) }
+    return context.commitRecastReplacementIfCurrent(
+      expectation: expectation,
+      successorPlaybackGeneration: successorPlaybackGeneration,
+      successorNativeHandleGeneration: preparedReattachment.nativeHandleGeneration
+    )
+  }
+
+  func reserveRecastMutation(
+    for lease: RecastReplacementLease
+  ) -> RecastMutationReservation {
+    context.reserveRecastMutation(for: lease)
+  }
+
+  func currentRecastInterruption(
+    for lease: RecastReplacementLease
+  ) -> RecastTransactionInterruption? {
+    context.currentRecastInterruption(for: lease)
+  }
+
+  func finishRecastMutation(
+    _ permit: RecastMutationPermit
+  ) -> RecastTransactionInterruption? {
+    context.finishRecastMutation(permit)
+  }
+
+  func settleRecast(
+    _ lease: RecastReplacementLease
+  ) -> RecastTransactionInterruption? {
+    context.settleRecast(lease)
+  }
+
+  func abandonRecast(_ lease: RecastReplacementLease) {
+    context.abandonRecast(lease)
   }
 
   /// Records timeline facts learned synchronously by the wrapper rather than
@@ -315,6 +653,18 @@ final class EventBridge: Sendable {
     )
   }
 
+  func _broadcastEffectivePlaybackRateResolutionForTesting(
+    _ effectiveRate: Float,
+    nativeHandleGeneration: UInt64,
+    playbackGeneration: UInt64? = nil
+  ) {
+    context.broadcastEffectivePlaybackRateResolution(
+      effectiveRate,
+      nativeHandleGeneration: nativeHandleGeneration,
+      playbackGeneration: playbackGeneration ?? currentPlaybackGeneration
+    )
+  }
+
   /// Exercises the complete native callback ordering with a synthetic event.
   func _emitNativeEventForTesting(_ event: libvlc_event_t) {
     guard let attachmentOpaque else { return }
@@ -324,6 +674,21 @@ final class EventBridge: Sendable {
   }
 
   #if DEBUG
+  /// Forces candidate preparation to fail after exactly `count` successful
+  /// listener attachments. This exercises the all-or-nothing rollback without
+  /// depending on a platform-specific libVLC allocation failure.
+  func _forcePreparedAttachmentFailureForTesting(
+    afterAttachedCount count: Int?
+  ) {
+    precondition(count.map { (0...Self.playerEventTypes.count).contains($0) } ?? true)
+    preparedAttachmentFailureIndexForTesting.withLock { $0 = count }
+    preparedAttachmentRollbackCountForTesting.withLock { $0 = 0 }
+  }
+
+  var _preparedAttachmentRollbackCountForTesting: Int {
+    preparedAttachmentRollbackCountForTesting.withLock { $0 }
+  }
+
   /// Pauses a synthetic native callback after a terminal has atomically
   /// reserved playback ownership, cause, and timeline. MainActor mutations
   /// made from this hook are therefore strictly post-entry.
@@ -417,14 +782,30 @@ final class EventBridge: Sendable {
     )
   }
 
-  private static func attachEvents(
+  private static func attachAllEvents(
     to eventManager: OpaquePointer,
-    opaque: UnsafeMutableRawPointer
-  ) -> [Int32] {
+    opaque: UnsafeMutableRawPointer,
+    forcedFailureAfterAttachedCount: Int? = nil,
+    didRollback: (Int) -> Void = { _ in }
+  ) -> [Int32]? {
     var attachedEventTypes: [Int32] = []
-    for eventType in playerEventTypes
-      where libvlc_event_attach(eventManager, eventType, playerEventCallback, opaque) == 0 {
+    for eventType in playerEventTypes {
+      if attachedEventTypes.count == forcedFailureAfterAttachedCount {
+        detachEvents(attachedEventTypes, from: eventManager, opaque: opaque)
+        didRollback(attachedEventTypes.count)
+        return nil
+      }
+      guard libvlc_event_attach(eventManager, eventType, playerEventCallback, opaque) == 0 else {
+        detachEvents(attachedEventTypes, from: eventManager, opaque: opaque)
+        didRollback(attachedEventTypes.count)
+        return nil
+      }
       attachedEventTypes.append(eventType)
+    }
+    if attachedEventTypes.count == forcedFailureAfterAttachedCount {
+      detachEvents(attachedEventTypes, from: eventManager, opaque: opaque)
+      didRollback(attachedEventTypes.count)
+      return nil
     }
     return attachedEventTypes
   }

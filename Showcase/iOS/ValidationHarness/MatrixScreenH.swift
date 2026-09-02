@@ -39,6 +39,18 @@ struct MatrixScreenH: View {
     case absolute
   }
 
+  private struct PiPOutputIdentityEvidence: Codable, Equatable {
+    let nativeHandleIdentity: UInt64
+    let playbackGeneration: UInt64
+    let outputIdentity: UInt64
+
+    init(_ snapshot: NativePiPOutputIdentityQualificationSnapshot) {
+      nativeHandleIdentity = snapshot.nativeHandleIdentity
+      playbackGeneration = snapshot.playbackGeneration
+      outputIdentity = snapshot.outputIdentity
+    }
+  }
+
   private struct SeekQualificationEvidence: Codable {
     let formatVersion: Int
     let command: SeekQualificationKind
@@ -54,6 +66,8 @@ struct MatrixScreenH: View {
     let displayedPicturesAtLanding: UInt64?
     let finalDisplayedPictures: UInt64
     let commandToRecoveryMilliseconds: Int?
+    let baselinePiPOutputIdentity: PiPOutputIdentityEvidence?
+    let landingPiPOutputIdentity: PiPOutputIdentityEvidence?
     let failure: String?
   }
 
@@ -297,9 +311,13 @@ struct MatrixScreenH: View {
     guard
       let pip,
       let baseline = pip.nativePlaybackQualificationSnapshot,
+      let baselinePiPOutput = pip.nativeOutputIdentityQualificationSnapshot,
       baseline.durationMilliseconds > 0,
       baseline.currentTimeMilliseconds >= 0,
-      baseline.isSeekable
+      baseline.isSeekable,
+      baselinePiPOutput.nativeHandleIdentity != 0,
+      baselinePiPOutput.playbackGeneration == baseline.mediaGeneration,
+      baselinePiPOutput.outputIdentity != 0
     else {
       publishSeekEvidence(
         SeekQualificationEvidence(
@@ -317,6 +335,8 @@ struct MatrixScreenH: View {
           displayedPicturesAtLanding: nil,
           finalDisplayedPictures: displayedBeforeCommand,
           commandToRecoveryMilliseconds: nil,
+          baselinePiPOutputIdentity: nil,
+          landingPiPOutputIdentity: nil,
           failure: "native playback snapshot was unavailable or unseekable"
         )
       )
@@ -368,6 +388,8 @@ struct MatrixScreenH: View {
           displayedPicturesAtLanding: nil,
           finalDisplayedPictures: postCommandDisplayed ?? 0,
           commandToRecoveryMilliseconds: nil,
+          baselinePiPOutputIdentity: PiPOutputIdentityEvidence(baselinePiPOutput),
+          landingPiPOutputIdentity: nil,
           failure: "seek command was rejected"
         )
       )
@@ -390,6 +412,8 @@ struct MatrixScreenH: View {
           displayedPicturesAtLanding: nil,
           finalDisplayedPictures: 0,
           commandToRecoveryMilliseconds: nil,
+          baselinePiPOutputIdentity: PiPOutputIdentityEvidence(baselinePiPOutput),
+          landingPiPOutputIdentity: nil,
           failure: "decoder statistics were unavailable after seek dispatch"
         )
       )
@@ -419,6 +443,8 @@ struct MatrixScreenH: View {
           displayedPicturesAtLanding: nil,
           finalDisplayedPictures: postCommandDisplayed,
           commandToRecoveryMilliseconds: nil,
+          baselinePiPOutputIdentity: PiPOutputIdentityEvidence(baselinePiPOutput),
+          landingPiPOutputIdentity: nil,
           failure: "seek target was too close to distinguish dispatch from ordinary playback"
         )
       )
@@ -436,6 +462,35 @@ struct MatrixScreenH: View {
       var landingFrameGate = HLSSeekLandingFrameGate()
       while !Task.isCancelled, ContinuousClock.now < deadline {
         guard ordinal == seekQualificationOrdinal else { return }
+        guard
+          let currentPiPOutput = pip.nativeOutputIdentityQualificationSnapshot,
+          currentPiPOutput == baselinePiPOutput
+        else {
+          publishSeekEvidence(
+            SeekQualificationEvidence(
+              formatVersion: 1,
+              command: command,
+              outcome: "failed",
+              accepted: true,
+              mediaGeneration: baseline.mediaGeneration,
+              durationMilliseconds: baseline.durationMilliseconds,
+              baselineNativeTimeMilliseconds: baseline.currentTimeMilliseconds,
+              expectedTimeMilliseconds: expectedTime,
+              landingToleranceMilliseconds: tolerance,
+              landingNativeTimeMilliseconds: finalTime,
+              postCommandDisplayedPictures: postCommandDisplayed,
+              displayedPicturesAtLanding: landingFrameGate.displayedPicturesAtLanding,
+              finalDisplayedPictures: finalDisplayed,
+              commandToRecoveryMilliseconds: nil,
+              baselinePiPOutputIdentity: PiPOutputIdentityEvidence(baselinePiPOutput),
+              landingPiPOutputIdentity: pip.nativeOutputIdentityQualificationSnapshot.map(
+                PiPOutputIdentityEvidence.init
+              ),
+              failure: "native PiP output identity changed or became unready during seek"
+            )
+          )
+          return
+        }
         if
           let snapshot = pip.nativePlaybackQualificationSnapshot,
           snapshot.mediaGeneration == baseline.mediaGeneration,
@@ -472,6 +527,8 @@ struct MatrixScreenH: View {
                 landingFrameGate.displayedPicturesAtLanding,
                 finalDisplayedPictures: finalDisplayed,
                 commandToRecoveryMilliseconds: elapsed,
+                baselinePiPOutputIdentity: PiPOutputIdentityEvidence(baselinePiPOutput),
+                landingPiPOutputIdentity: PiPOutputIdentityEvidence(currentPiPOutput),
                 failure: nil
               )
             )
@@ -498,6 +555,10 @@ struct MatrixScreenH: View {
           displayedPicturesAtLanding: landingFrameGate.displayedPicturesAtLanding,
           finalDisplayedPictures: finalDisplayed,
           commandToRecoveryMilliseconds: nil,
+          baselinePiPOutputIdentity: PiPOutputIdentityEvidence(baselinePiPOutput),
+          landingPiPOutputIdentity: pip.nativeOutputIdentityQualificationSnapshot.map(
+            PiPOutputIdentityEvidence.init
+          ),
           failure: "native landing or strictly post-landing displayed frame timed out"
         )
       )

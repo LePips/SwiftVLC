@@ -70,6 +70,18 @@ public struct NativePiPPlaybackQualificationSnapshot: Sendable, Equatable {
   public let isSeekable: Bool
 }
 
+/// Immutable identity of the exact native PiP output that completed readiness.
+///
+/// This is qualification SPI. Ordinary same-media seeks must retain all three
+/// values; an intentional media/handle replacement must publish a different
+/// identity instead.
+@_spi(Qualification)
+public struct NativePiPOutputIdentityQualificationSnapshot: Sendable, Equatable {
+  public let nativeHandleIdentity: UInt64
+  public let playbackGeneration: UInt64
+  public let outputIdentity: UInt64
+}
+
 /// Coherent counters from libVLC's native Apple sample-buffer renderer.
 ///
 /// The counters are qualification evidence for renderer recovery mechanics.
@@ -351,6 +363,24 @@ extension PiPController {
     )
   }
 
+  /// The exact native output that synchronously claimed and completed PiP
+  /// readiness, or nil while no genuinely current output exists.
+  @_spi(Qualification)
+  public var nativeOutputIdentityQualificationSnapshot:
+    NativePiPOutputIdentityQualificationSnapshot? {
+    guard
+      let output = nativeBackend?.continuityCoordinator.currentReadyOutputIdentity(),
+      output.binding.nativeHandle == player.nativeHandleLifetime.nativePiPHandleIdentity,
+      output.binding.playbackGeneration.value == player.sessionGeneration,
+      output.binding.playbackGeneration.value == player.eventBridge.currentPlaybackGeneration
+    else { return nil }
+    return NativePiPOutputIdentityQualificationSnapshot(
+      nativeHandleIdentity: output.binding.nativeHandle,
+      playbackGeneration: output.binding.playbackGeneration.value,
+      outputIdentity: output.output
+    )
+  }
+
   /// Native Apple renderer recovery evidence for this controller's player.
   ///
   /// A direct sample-buffer controller returns `nil`, as do older libVLC
@@ -424,7 +454,7 @@ extension PiPController {
   @_spi(Qualification)
   public func performAcceptedStartDelayedFailureQualification() -> PiPStartResult {
     guard nativeBackend == nil else { return .backendUnavailable }
-    let result = start()
+    let result = requestStart()
     guard
       result == .accepted,
       let avController = pipController,
@@ -448,7 +478,7 @@ extension PiPController {
   @_spi(Qualification)
   public func performNativeAcceptedStartFailureQualification() -> PiPStartResult {
     guard let nativeBackend else { return .backendUnavailable }
-    let result = start()
+    let result = requestStart()
     guard result == .accepted else { return result }
     guard nativeBackend.performAcceptedStartFailureQualification() else {
       return .backendUnavailable

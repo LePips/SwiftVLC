@@ -6,7 +6,8 @@ import Testing
 import AVFoundation
 #endif
 
-/// Synchronous-teardown guarantees of `stopAndWait()` and `shutdown()`:
+/// Synchronous-teardown guarantees of `stopAndWaitForOutcome()` and
+/// `shutdown()`:
 /// libVLC's stop is asynchronous, so both APIs exist precisely to give
 /// callers a point in time after which no native output is still
 /// draining. Playback-driving tests are gated on
@@ -15,12 +16,11 @@ import AVFoundation
 extension Integration {
   @Suite(.tags(.mainActor, .async))
   @MainActor struct PlayerStopTeardownTests {
-    /// The whole contract of `stopAndWait()` is that the suspension
-    /// covers the native stop: both the observable mirror and libVLC's
-    /// own state must already be terminal on return, with no polling
-    /// grace period.
+    /// An output-safe outcome means the suspension covered the native stop:
+    /// both the observable mirror and libVLC's own state must already be
+    /// terminal on return, with no polling grace period.
     @Test(.timeLimit(.minutes(1)), .enabled(if: TestCondition.canPlayMedia))
-    func `stopAndWait returns only after the native stop completes`() async throws {
+    func `An output-safe stop returns only after the native stop completes`() async throws {
       let player = Player(instance: TestInstance.makePlayback())
       try player.play(url: TestMedia.twosecURL)
       try #require(
@@ -28,31 +28,35 @@ extension Integration {
         "Waiting for: player.state == .playing"
       )
 
-      await player.stopAndWait()
+      let outcome = await player.stopAndWaitForOutcome()
+
+      try #require(outcome.isOutputSafe, "native stop did not finish: \(outcome)")
 
       #expect(
         player.state == .stopped,
-        "observable state not terminal immediately after stopAndWait: \(player.state)"
+        "observable state not terminal after output-safe stop: \(player.state)"
       )
       #expect(
         player.nativePlaybackState == .stopped,
-        "native handle still draining after stopAndWait: \(player.nativePlaybackState)"
+        "native handle still draining after output-safe stop: \(player.nativePlaybackState)"
       )
     }
 
     /// An idle player has no stop to wait for — the terminal
     /// short-circuit must return without arming the 10-second ceiling.
     @Test(.timeLimit(.minutes(1)))
-    func `stopAndWait on an idle player returns immediately`() async {
+    func `Outcome stop on an idle player returns immediately`() async {
       let player = Player(instance: TestInstance.shared)
 
       let start = ContinuousClock.now
-      await player.stopAndWait()
+      let outcome = await player.stopAndWaitForOutcome()
       let elapsed = ContinuousClock.now - start
+
+      #expect(outcome == .stopped)
 
       #expect(
         elapsed < .milliseconds(500),
-        "stopAndWait suspended \(elapsed) on an idle player — terminal short-circuit regressed"
+        "outcome stop suspended \(elapsed) on an idle player — terminal short-circuit regressed"
       )
     }
 
@@ -61,7 +65,7 @@ extension Integration {
     /// cycle would either hang an iteration or return before the stop
     /// finished.
     @Test(.timeLimit(.minutes(1)), .enabled(if: TestCondition.canPlayMedia))
-    func `stopAndWait is reentrant-safe across rapid cycles`() async throws {
+    func `Outcome stop is reentrant-safe across rapid cycles`() async throws {
       let player = Player(instance: TestInstance.makePlayback())
 
       for cycle in 1...5 {
@@ -70,7 +74,8 @@ extension Integration {
           await poll(until: { player.state == .playing }),
           "Waiting for: player.state == .playing in cycle \(cycle)"
         )
-        await player.stopAndWait()
+        let outcome = await player.stopAndWaitForOutcome()
+        try #require(outcome.isOutputSafe, "cycle \(cycle) did not drain: \(outcome)")
         #expect(
           player.state == .stopped,
           "cycle \(cycle) returned before the native stop completed: \(player.state)"
@@ -141,10 +146,10 @@ extension Integration {
     #if canImport(UIKit) && !os(macOS)
     /// The motivating use case: deactivating a shared `AVAudioSession`
     /// fails session-busy while libVLC's audio output is still alive.
-    /// After `stopAndWait()` returns, deactivation must succeed on the
-    /// first try.
+    /// After an output-safe outcome, deactivation must succeed on the first
+    /// try.
     @Test(.timeLimit(.minutes(1)), .enabled(if: TestCondition.canPlayMedia))
-    func `stopAndWait drains the audio output before session deactivation`() async throws {
+    func `An output-safe stop drains audio before session deactivation`() async throws {
       let session = AVAudioSession.sharedInstance()
       try session.setCategory(.playback)
       try session.setActive(true)
@@ -156,7 +161,8 @@ extension Integration {
         "Waiting for: player.state == .playing"
       )
 
-      await player.stopAndWait()
+      let outcome = await player.stopAndWaitForOutcome()
+      try #require(outcome.isOutputSafe, "audio output did not drain: \(outcome)")
 
       #expect(throws: Never.self, "session deactivation raced the audio-output drain") {
         try AVAudioSession.sharedInstance().setActive(

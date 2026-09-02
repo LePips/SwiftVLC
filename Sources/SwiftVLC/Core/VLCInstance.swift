@@ -279,6 +279,27 @@ public final class VLCInstance: Sendable {
     String(cString: libvlc_get_compiler())
   }
 
+  /// Creates a library-managed libVLC instance using the pre-1.1 call shape.
+  ///
+  /// Use
+  /// ``init(arguments:applicationName:httpUserAgent:appleAudioSessionPolicy:)``
+  /// when the host application owns Apple audio-session policy. Keeping this
+  /// overload exact preserves existing calls and initializer references while
+  /// routing new ownership through one designated initializer.
+  public convenience init(
+    arguments: [String] = VLCInstance.defaultArguments,
+    applicationName: String? = nil,
+    httpUserAgent: String? = nil
+  )
+    throws(VLCError) {
+    try self.init(
+      arguments: arguments,
+      applicationName: applicationName,
+      httpUserAgent: httpUserAgent,
+      appleAudioSessionPolicy: .libraryManaged
+    )
+  }
+
   /// Creates a new libVLC instance with the given arguments.
   ///
   /// - Parameters:
@@ -294,7 +315,7 @@ public final class VLCInstance: Sendable {
   ///     ``setUserAgent(name:http:)`` so it is in place before any
   ///     networking starts.
   ///   - appleAudioSessionPolicy: Who owns Apple audio-session configuration
-  ///     and activation for this instance. Defaults to `.libraryManaged`.
+  ///     and activation for this instance.
   /// - Throws: `VLCError.invalidInput` if too many arguments are supplied or
   ///   `arguments` tries to set the reserved audio-session option directly;
   ///   `VLCError.operationFailed` if `.applicationManaged` is requested from
@@ -304,7 +325,7 @@ public final class VLCInstance: Sendable {
     arguments: [String] = VLCInstance.defaultArguments,
     applicationName: String? = nil,
     httpUserAgent: String? = nil,
-    appleAudioSessionPolicy: AppleAudioSessionPolicy = .libraryManaged
+    appleAudioSessionPolicy: AppleAudioSessionPolicy
   )
     throws(VLCError) {
     let nativeExtensionVersion = swiftvlc_libvlc_pip_extensions_version()

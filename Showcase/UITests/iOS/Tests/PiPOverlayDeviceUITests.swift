@@ -4,6 +4,20 @@ import XCTest
 /// Visual subtitle fidelity, HDR/color behavior, and energy impact still
 /// require the Matrix H operator record on the target hardware.
 final class PiPOverlayDeviceUITests: ShowcaseIOSTestCase {
+  private struct PiPOutputIdentityEvidence: Decodable, Equatable {
+    let nativeHandleIdentity: UInt64
+    let playbackGeneration: UInt64
+    let outputIdentity: UInt64
+
+    var qualificationObject: [String: Any] {
+      [
+        "nativeHandleIdentity": nativeHandleIdentity,
+        "playbackGeneration": playbackGeneration,
+        "outputIdentity": outputIdentity
+      ]
+    }
+  }
+
   private struct HLSSeekEvidence: Decodable {
     let formatVersion: Int
     let command: String
@@ -19,6 +33,8 @@ final class PiPOverlayDeviceUITests: ShowcaseIOSTestCase {
     let displayedPicturesAtLanding: UInt64?
     let finalDisplayedPictures: UInt64
     let commandToRecoveryMilliseconds: Int?
+    let baselinePiPOutputIdentity: PiPOutputIdentityEvidence?
+    let landingPiPOutputIdentity: PiPOutputIdentityEvidence?
     let failure: String?
 
     var qualificationObject: [String: Any] {
@@ -36,7 +52,9 @@ final class PiPOverlayDeviceUITests: ShowcaseIOSTestCase {
         "postCommandDisplayedPictures": postCommandDisplayedPictures,
         "displayedPicturesAtLanding": displayedPicturesAtLanding ?? 0,
         "finalDisplayedPictures": finalDisplayedPictures,
-        "commandToRecoveryMilliseconds": commandToRecoveryMilliseconds ?? -1
+        "commandToRecoveryMilliseconds": commandToRecoveryMilliseconds ?? -1,
+        "baselinePiPOutputIdentity": baselinePiPOutputIdentity?.qualificationObject ?? [:],
+        "landingPiPOutputIdentity": landingPiPOutputIdentity?.qualificationObject ?? [:]
       ]
     }
   }
@@ -138,6 +156,16 @@ final class PiPOverlayDeviceUITests: ShowcaseIOSTestCase {
       XCTAssertTrue(result.accepted)
       let generation = try XCTUnwrap(result.mediaGeneration)
       XCTAssertGreaterThan(generation, 0)
+      let baselinePiPOutput = try XCTUnwrap(result.baselinePiPOutputIdentity)
+      let landingPiPOutput = try XCTUnwrap(result.landingPiPOutputIdentity)
+      XCTAssertGreaterThan(baselinePiPOutput.nativeHandleIdentity, 0)
+      XCTAssertGreaterThan(baselinePiPOutput.outputIdentity, 0)
+      XCTAssertEqual(baselinePiPOutput.playbackGeneration, generation)
+      XCTAssertEqual(
+        landingPiPOutput,
+        baselinePiPOutput,
+        "\(name) seek rebuilt or relabelled the native PiP output"
+      )
       let duration = try XCTUnwrap(result.durationMilliseconds)
       XCTAssertGreaterThan(duration, 0)
       let baselineTime = try XCTUnwrap(result.baselineNativeTimeMilliseconds)
@@ -223,6 +251,7 @@ final class PiPOverlayDeviceUITests: ShowcaseIOSTestCase {
           "maximumVideoGapMilliseconds": maximumVideoGapMilliseconds
         ],
         "videoContinuityWithinBudget": maximumVideoGapMilliseconds <= 5000,
+        "nativeOutputIdentityStable": true,
         "controls": "pass",
         "libraryErrorCount": 0
       ],

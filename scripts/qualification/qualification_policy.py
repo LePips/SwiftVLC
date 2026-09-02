@@ -23,7 +23,7 @@ import sys
 import tempfile
 import unicodedata
 from collections import Counter
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Mapping, Sequence
 from urllib.parse import unquote, urlparse
@@ -32,6 +32,10 @@ from xml.etree import ElementTree
 
 class QualificationPolicyError(ValueError):
     pass
+
+
+MAXIMUM_STABLE_REPORT_AGE_SECONDS = 30 * 24 * 60 * 60
+MAXIMUM_REPORT_CLOCK_SKEW_SECONDS = 5 * 60
 
 
 SHA1 = re.compile(r"[0-9a-f]{40}")
@@ -790,6 +794,7 @@ REQUIRED_FEATURE_IDS = frozenset(
         "pip-start-failure",
         "pip-replacement-active",
         "pip-native-lifecycle",
+        "pip-system-overlay-controls",
         "audio-background-continuity",
         "audio-system-interruption",
         "audio-physical-route-changes",
@@ -808,6 +813,7 @@ REQUIRED_FEATURE_IDS = frozenset(
         "cast-discovery-identity",
         "cast-receiver-playback",
         "cast-controls-seeking-tracks",
+        "cast-recast-session-isolation",
         "cast-network-loss-recovery",
         "cast-hls-receiver-playback",
         "cast-end-of-stream-drain",
@@ -938,7 +944,7 @@ CANONICAL_REQUIRED_RUNNER_RUNS = frozenset(
     }
 )
 CANONICAL_SCENARIO_CONTRACT_DIGEST = (
-    "047e47ace4ed4a503de7900433ecb7cf350cbf9bb0c5ce665842941dffe81458"
+    "71a6db675e8b8bc3066060d22d1167aee38638cc1118fde33248e5d4f422d246"
 )
 CANONICAL_RUNNER_CONTRACT_DIGEST = (
     "557da6622f2d80d3f40e33971ff746840b36c370e96bdbcb00e800aed4903f11"
@@ -1225,6 +1231,62 @@ def load_json(path: Path, description: str, *, object_required: bool = True):
     if object_required and not isinstance(value, dict):
         raise QualificationPolicyError(f"{description} {path} must be a JSON object")
     return value
+
+
+def _canonical_utc_timestamp(value: object, description: str) -> datetime:
+    if not isinstance(value, str):
+        raise QualificationPolicyError(f"{description} is not a UTC timestamp")
+    try:
+        parsed = datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=timezone.utc
+        )
+    except ValueError as error:
+        raise QualificationPolicyError(
+            f"{description} must use canonical YYYY-MM-DDTHH:MM:SSZ form"
+        ) from error
+    if parsed.strftime("%Y-%m-%dT%H:%M:%SZ") != value:
+        raise QualificationPolicyError(
+            f"{description} must use canonical YYYY-MM-DDTHH:MM:SSZ form"
+        )
+    return parsed
+
+
+def validate_report_timing(
+    report: dict,
+    *,
+    stable: bool,
+    now_utc: datetime | None = None,
+) -> None:
+    started = _canonical_utc_timestamp(
+        report.get("startedAtUTC"), "device report startedAtUTC"
+    )
+    completed = _canonical_utc_timestamp(
+        report.get("completedAtUTC"), "device report completedAtUTC"
+    )
+    duration = report.get("wallDurationSeconds")
+    if isinstance(duration, bool) or not isinstance(duration, int) or duration < 0:
+        raise QualificationPolicyError(
+            "device report wallDurationSeconds must be a non-negative integer"
+        )
+    if completed < started:
+        raise QualificationPolicyError("device report completed before it started")
+    if int((completed - started).total_seconds()) != duration:
+        raise QualificationPolicyError(
+            "device report wallDurationSeconds does not match its UTC interval"
+        )
+    now = now_utc or datetime.now(timezone.utc)
+    if now.tzinfo is None:
+        raise QualificationPolicyError("freshness reference time must be timezone-aware")
+    now = now.astimezone(timezone.utc)
+    age_seconds = (now - completed).total_seconds()
+    if age_seconds < -MAXIMUM_REPORT_CLOCK_SKEW_SECONDS:
+        raise QualificationPolicyError("device report completion time is in the future")
+    if stable and age_seconds > MAXIMUM_STABLE_REPORT_AGE_SECONDS:
+        raise QualificationPolicyError(
+            "stable device report is stale: "
+            f"{int(age_seconds)} seconds old, maximum "
+            f"{MAXIMUM_STABLE_REPORT_AGE_SECONDS}"
+        )
 
 
 def sha256_file(path: Path) -> str:
@@ -1955,6 +2017,8 @@ def validate_evidence_semantics(
                 require_host_artifacts=require_host_artifacts,
             )
         )
+    elif scenario_id == "native-hls-seek-continuity":
+        validate_native_hls_seek_continuity_evidence(evidence)
     elif scenario_id in PERFORMANCE_RESOURCE_BUDGETS:
         validate_performance_evidence(evidence, scenario_id)
     if require_host_artifacts and scenario_id in HOST_TRACE_REQUIREMENTS:
@@ -2014,6 +2078,88 @@ def _integer(value: object, description: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         raise QualificationPolicyError(f"{description} must be an integer")
     return value
+
+
+NATIVE_HLS_SEEK_COMMANDS = ("forward", "backward", "absolute")
+NATIVE_PIP_OUTPUT_IDENTITY_KEYS = {
+    "nativeHandleIdentity",
+    "playbackGeneration",
+    "outputIdentity",
+}
+
+
+def _positive_identity_integer(value: object, description: str) -> int:
+    result = _integer(value, description)
+    if result <= 0 or result > (1 << 64) - 1:
+        raise QualificationPolicyError(
+            f"{description} must be a nonzero UInt64"
+        )
+    return result
+
+
+def validate_native_hls_seek_continuity_evidence(evidence: dict) -> None:
+    scenario_id = "native-hls-seek-continuity"
+    if evidence.get("nativeOutputIdentityStable") is not True:
+        raise QualificationPolicyError(
+            f"{scenario_id} has no exact stable native-output identity proof"
+        )
+    commands = _exact_object(
+        evidence.get("commandEvidence"),
+        set(NATIVE_HLS_SEEK_COMMANDS),
+        f"{scenario_id} commandEvidence",
+    )
+    row_identity: tuple[int, int, int] | None = None
+    for command_name in NATIVE_HLS_SEEK_COMMANDS:
+        command = commands[command_name]
+        if not isinstance(command, dict):
+            raise QualificationPolicyError(
+                f"{scenario_id} {command_name} command evidence is malformed"
+            )
+        media_generation = _positive_identity_integer(
+            command.get("mediaGeneration"),
+            f"{scenario_id} {command_name} mediaGeneration",
+        )
+        snapshots: list[tuple[int, int, int]] = []
+        for phase in ("baseline", "landing"):
+            snapshot = _exact_object(
+                command.get(f"{phase}PiPOutputIdentity"),
+                NATIVE_PIP_OUTPUT_IDENTITY_KEYS,
+                f"{scenario_id} {command_name} {phase} PiP output identity",
+            )
+            snapshots.append(
+                (
+                    _positive_identity_integer(
+                        snapshot["nativeHandleIdentity"],
+                        f"{scenario_id} {command_name} {phase} native handle",
+                    ),
+                    _positive_identity_integer(
+                        snapshot["playbackGeneration"],
+                        f"{scenario_id} {command_name} {phase} playback generation",
+                    ),
+                    _positive_identity_integer(
+                        snapshot["outputIdentity"],
+                        f"{scenario_id} {command_name} {phase} output identity",
+                    ),
+                )
+            )
+        baseline, landing = snapshots
+        if baseline != landing:
+            raise QualificationPolicyError(
+                f"{scenario_id} {command_name} rebuilt or relabelled its native "
+                "PiP output"
+            )
+        if baseline[1] != media_generation:
+            raise QualificationPolicyError(
+                f"{scenario_id} {command_name} PiP playback generation is not "
+                "bound to the seek media generation"
+            )
+        if row_identity is None:
+            row_identity = baseline
+        elif baseline != row_identity:
+            raise QualificationPolicyError(
+                f"{scenario_id} changed native PiP output between ordinary "
+                "same-media seek commands"
+            )
 
 
 APPLE_AUDIO_NATIVE_SNAPSHOT_KEYS = {
@@ -11384,6 +11530,8 @@ def validate_report(
             raise QualificationPolicyError("report has no candidate XCTest catalog")
         validate_release_catalog_partition(matrix, candidate_catalog)
     stable = report.get("mode") == "qualification"
+    if strict_provenance:
+        validate_report_timing(report, stable=stable)
     if stable_required and (
         not stable or report.get("qualificationEligibleEnvironment") is not True
     ):

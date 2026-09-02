@@ -615,18 +615,62 @@ final class MacPrivatePiPDelegate: NSObject, @unchecked Sendable {
   }
 }
 
+extension MacNativePiPMediaController: NativeHandleSnapshotObserver {
+  func refreshNativeHandleSnapshot() {
+    refreshCallbackSnapshot()
+  }
+
+  func invalidateNativeHandleSnapshot() {
+    invalidateCallbackSnapshot()
+  }
+}
+
 final class MacNativePiPMediaController: NSObject, @unchecked Sendable {
   weak var player: Player? {
-    didSet { publishCallbackSnapshot() }
+    didSet {
+      guard oldValue !== player else { return }
+      publishCallbackSnapshot(movingRegistrationFrom: oldValue, to: player)
+    }
   }
 
   /// What AppKit's synchronous queries read instead of blocking on the main
   /// actor. See ``PiPCallbackSnapshot``.
   let callbackSnapshot = Mutex(PiPCallbackSnapshot())
 
+  private struct CallbackCommandIdentity: Sendable, Equatable {
+    let snapshotGeneration: UInt64
+    let playbackGeneration: PlaybackGeneration?
+  }
+
+  private var callbackCommandIdentity: CallbackCommandIdentity {
+    callbackSnapshot.withLock {
+      CallbackCommandIdentity(
+        snapshotGeneration: $0.generation,
+        playbackGeneration: $0.playbackGeneration
+      )
+    }
+  }
+
+  @MainActor
+  private func currentPlayer(for identity: CallbackCommandIdentity) -> Player? {
+    guard
+      callbackSnapshot.withLock({ snapshot in
+        snapshot.generation == identity.snapshotGeneration
+          && snapshot.playbackGeneration == identity.playbackGeneration
+      }),
+      let playbackGeneration = identity.playbackGeneration,
+      let player,
+      player.nativeHandleRepresentsCurrentMedia,
+      player.generation == playbackGeneration,
+      player.eventBridge.currentPlaybackGeneration == playbackGeneration.value
+    else { return nil }
+    return player
+  }
+
   @objc func play() {
+    let issued = callbackCommandIdentity
     Task { @MainActor [weak self] in
-      guard let player = self?.player else { return }
+      guard let self, let player = currentPlayer(for: issued) else { return }
       if player.state == .idle || player.state == .stopped {
         try? player.play()
       } else {
@@ -636,16 +680,19 @@ final class MacNativePiPMediaController: NSObject, @unchecked Sendable {
   }
 
   @objc func pause() {
+    let issued = callbackCommandIdentity
     Task { @MainActor [weak self] in
-      self?.player?.pause()
+      guard let self, let player = currentPlayer(for: issued) else { return }
+      player.pause()
     }
   }
 
   @objc(seekBy:completion:)
   func seek(by offset: Int64, completion: (() -> Void)?) {
     nonisolated(unsafe) let completion = completion
+    let issued = callbackCommandIdentity
     Task { @MainActor [weak self] in
-      guard let player = self?.player else {
+      guard let self, let player = currentPlayer(for: issued) else {
         completion?()
         return
       }
@@ -665,23 +712,35 @@ final class MacNativePiPMediaController: NSObject, @unchecked Sendable {
   }
 
   // These four are queries AppKit expects answered synchronously from its own
-  // threads. They read the snapshot rather than the main-actor `player`, then
-  // call libVLC *after* releasing the lock — libVLC's own locking is
-  // independent of the main actor, so no cycle can form.
+  // threads. They retain the snapshotted handle while holding the publication
+  // lock, then call libVLC after releasing that lock. Replacement can publish
+  // the successor concurrently, but cannot free the retained predecessor
+  // until the query releases it.
+
+  private func retainedCallbackPlayer() -> OpaquePointer? {
+    callbackSnapshot.withLock { snapshot in
+      guard let pointer = snapshot.playerPointer else { return nil }
+      _ = libvlc_media_player_retain(pointer)
+      return pointer
+    }
+  }
 
   @objc func mediaLength() -> Int64 {
-    guard let pointer = callbackSnapshot.withLock({ $0.playerPointer }) else { return -1 }
+    guard let pointer = retainedCallbackPlayer() else { return -1 }
+    defer { libvlc_media_player_release(pointer) }
     let length = libvlc_media_player_get_length(pointer)
     return length > 0 ? length : -1
   }
 
   @objc func mediaTime() -> Int64 {
-    guard let pointer = callbackSnapshot.withLock({ $0.playerPointer }) else { return 0 }
+    guard let pointer = retainedCallbackPlayer() else { return 0 }
+    defer { libvlc_media_player_release(pointer) }
     return max(libvlc_media_player_get_time(pointer), 0)
   }
 
   @objc func isMediaSeekable() -> Bool {
-    guard let pointer = callbackSnapshot.withLock({ $0.playerPointer }) else { return false }
+    guard let pointer = retainedCallbackPlayer() else { return false }
+    defer { libvlc_media_player_release(pointer) }
     return libvlc_media_player_is_seekable(pointer)
   }
 
@@ -696,12 +755,27 @@ final class MacNativePiPMediaController: NSObject, @unchecked Sendable {
   /// Publishes the snapshot without assuming the caller is already on the main
   /// actor. `assumeIsolated` would trap if this class is ever mutated from a
   /// background thread, and it is nominally nonisolated.
-  private func publishCallbackSnapshot() {
+  private func publishCallbackSnapshot(
+    movingRegistrationFrom outgoing: Player? = nil,
+    to incoming: Player? = nil
+  ) {
     if Thread.isMainThread {
-      MainActor.assumeIsolated { refreshCallbackSnapshot() }
+      MainActor.assumeIsolated {
+        moveSnapshotRegistration(from: outgoing, to: incoming)
+        refreshCallbackSnapshot()
+      }
     } else {
-      Task { @MainActor [weak self] in self?.refreshCallbackSnapshot() }
+      Task { @MainActor [weak self] in
+        self?.moveSnapshotRegistration(from: outgoing, to: incoming)
+        self?.refreshCallbackSnapshot()
+      }
     }
+  }
+
+  @MainActor
+  private func moveSnapshotRegistration(from outgoing: Player?, to incoming: Player?) {
+    outgoing?.unregisterNativeHandleSnapshotObserver(self)
+    incoming?.registerNativeHandleSnapshotObserver(self)
   }
 
   /// Republished whenever the attached player or its playback intent changes.
@@ -712,12 +786,28 @@ final class MacNativePiPMediaController: NSObject, @unchecked Sendable {
   func refreshCallbackSnapshot() {
     let pointer = player?.pointer
     let active = player?.isPlaybackRequestedActive ?? false
+    let playbackGeneration = player?.generation
     callbackSnapshot.withLock { snapshot in
-      if snapshot.playerPointer != pointer {
+      if
+        snapshot.playerPointer != pointer
+        || snapshot.playbackGeneration != playbackGeneration {
         snapshot.generation &+= 1
       }
       snapshot.playerPointer = pointer
       snapshot.isPlaybackActive = active
+      snapshot.playbackGeneration = playbackGeneration
+    }
+  }
+
+  @MainActor
+  func invalidateCallbackSnapshot() {
+    callbackSnapshot.withLock { snapshot in
+      if snapshot.playerPointer != nil || snapshot.playbackGeneration != nil {
+        snapshot.generation &+= 1
+      }
+      snapshot.playerPointer = nil
+      snapshot.isPlaybackActive = false
+      snapshot.playbackGeneration = nil
     }
   }
 }

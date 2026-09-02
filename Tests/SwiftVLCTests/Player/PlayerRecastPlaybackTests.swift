@@ -1,7 +1,7 @@
 @testable import SwiftVLC
 import Testing
 
-/// Integration coverage for `recast(to:)`'s replay body on an active
+/// Integration coverage for `recastAndWaitForOutcome(to:)`'s replay body on an active
 /// session: switching renderer mid-playback replaces the native handle
 /// and restarts the current media in place. These drive real playback,
 /// so they gate on `TestCondition.canPlayMedia` and skip on CI (runners
@@ -11,7 +11,7 @@ import Testing
 extension Integration {
   @Suite(.tags(.mainActor, .async))
   @MainActor struct PlayerRecastPlaybackTests {
-    /// `recast(to: nil)` on a playing session replaces the handle (libVLC
+    /// `recastAndWaitForOutcome(to: nil)` on a playing session replaces the handle (libVLC
     /// only applies renderer selection before a handle's first play) and
     /// resumes local playback on the new session.
     @Test(.timeLimit(.minutes(1)), .enabled(if: TestCondition.canPlayMedia))
@@ -25,8 +25,9 @@ extension Integration {
 
       let oldPointer = player.pointer
       let oldGeneration = player.generation
-      try await player.recast(to: nil)
+      let outcome = try await player.recastAndWaitForOutcome(to: nil)
 
+      try #require(outcome == .settled, "recast did not settle: \(outcome)")
       #expect(
         player.pointer != oldPointer,
         "recast did not replace the native handle of an active session"

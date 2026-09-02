@@ -2,7 +2,7 @@
 import Foundation
 import Testing
 
-/// `stopAndWait()` must report output safety truthfully.
+/// `stopAndWaitForOutcome()` must report output safety truthfully.
 ///
 /// The whole point of the API is to give callers a moment after which nothing
 /// is still draining — it is what you call before
@@ -18,13 +18,21 @@ import Testing
 extension Integration {
   @Suite(.tags(.mainActor, .async), .timeLimit(.minutes(2)))
   @MainActor struct PlayerStopOutcomeTests {
+    @Test
+    func `Version 1 stopAndWait remains a Void method reference`() async {
+      let player = Player(instance: TestInstance.makeAudioOnly())
+      let stopAndWait: () async -> Void = player.stopAndWait
+
+      await stopAndWait()
+    }
+
     /// An idle player has nothing draining, so the result is immediately
     /// output-safe.
     @Test
     func `Idle player reports an output-safe stop`() async {
       let player = Player(instance: TestInstance.makeAudioOnly())
 
-      let outcome = await player.stopAndWait()
+      let outcome = await player.stopAndWaitForOutcome()
 
       #expect(outcome == .stopped)
       #expect(outcome.isOutputSafe)
@@ -65,7 +73,7 @@ extension Integration {
         "the unopenable media never reported an error, so the post-error path was not exercised"
       )
 
-      let outcome = await player.stopAndWait()
+      let outcome = await player.stopAndWaitForOutcome()
 
       // Either the stop landed (the normal case, since `.stopped` follows the
       // error) or we are explicitly told the drain never finished. What must
@@ -93,7 +101,7 @@ extension Integration {
 
       var callers: [Task<PlayerStopOutcome, Never>] = []
       for _ in 0..<6 {
-        callers.append(Task { @MainActor in await player.stopAndWait() })
+        callers.append(Task { @MainActor in await player.stopAndWaitForOutcome() })
       }
 
       var outcomes: [PlayerStopOutcome] = []
@@ -109,6 +117,120 @@ extension Integration {
       #expect(outcomes.first == .stopped)
     }
 
+    /// A native handle is not a playback episode. Replay on the same pointer
+    /// must invalidate the predecessor's waiter, and a later waiter must issue
+    /// its own Stop instead of joining the old operation and inheriting its
+    /// eventual Stopped callback.
+    @Test
+    func `Same-handle replay forces a fresh stop episode`() async throws {
+      let player = Player(instance: TestInstance.makeAudioOnly())
+      player._setStateForTesting(
+        state: .playing,
+        nativeState: .playing,
+        isPlaybackRequestedActive: true
+      )
+      player._nativePlaybackStateOverrideForTesting = .playing
+      var nativeStopCount = 0
+      player._nativeStopOverrideForTesting = {
+        nativeStopCount += 1
+      }
+
+      let predecessor = Task { @MainActor in
+        await player.stopAndWaitForOutcome()
+      }
+      try #require(
+        await poll(timeout: .seconds(1)) {
+          nativeStopCount == 1
+            && player.stopAndWaitOperation?.episode.requiresExplicitStopBarrier == true
+        },
+        "the predecessor Stop was never reserved and dispatched"
+      )
+      let predecessorEpisode = try #require(
+        player.stopAndWaitOperation?.episode
+      )
+
+      player._nativePlayOverrideForTesting = { 0 }
+      try player.play()
+      #expect(player.isPlaybackRequestedActive)
+
+      let successor = Task { @MainActor in
+        await player.stopAndWaitForOutcome()
+      }
+      try #require(
+        await poll(timeout: .seconds(1)) {
+          nativeStopCount == 2
+            && player.stopAndWaitOperation?.episode != predecessorEpisode
+        },
+        "the successor waiter joined the predecessor Stop"
+      )
+      let successorEpisode = try #require(
+        player.stopAndWaitOperation?.episode
+      )
+
+      player.eventBridge._broadcastForTesting(
+        .stateChanged(.stopped),
+        nativeHandleGeneration: predecessorEpisode.nativeHandleGeneration,
+        playbackGeneration: predecessorEpisode.playbackGeneration,
+        lifecycleControlEpoch: predecessorEpisode.lifecycleControlEpoch
+      )
+      #expect(await predecessor.value == .timedOut)
+      #expect(
+        player.stopAndWaitOperation?.episode == successorEpisode,
+        "the stale predecessor task cleared the successor operation"
+      )
+
+      player._nativePlaybackStateOverrideForTesting = .stopped
+      player.eventBridge._broadcastForTesting(
+        .stateChanged(.stopped),
+        nativeHandleGeneration: successorEpisode.nativeHandleGeneration,
+        playbackGeneration: successorEpisode.playbackGeneration,
+        lifecycleControlEpoch: successorEpisode.lifecycleControlEpoch
+      )
+      #expect(await successor.value == .stopped)
+      #expect(nativeStopCount == 2)
+    }
+
+    /// Reservation and native dispatch must happen in the caller's
+    /// pre-suspension prefix. A Play already queued on the main actor is newer
+    /// only after Stop has crossed into native code; delegating reservation to
+    /// a child Task reverses that order and lets the older Stop kill playback.
+    @Test
+    func `Stop reservation precedes an already queued Play`() async {
+      let player = Player(instance: TestInstance.makeAudioOnly())
+      player._setStateForTesting(
+        state: .playing,
+        nativeState: .playing,
+        isPlaybackRequestedActive: true
+      )
+      player._nativePlaybackStateOverrideForTesting = .playing
+      var dispatchOrder: [String] = []
+      player._nativeStopOverrideForTesting = {
+        dispatchOrder.append("stop")
+        player._nativePlaybackStateOverrideForTesting = .stopped
+        player.eventBridge._broadcastForTesting(
+          .stateChanged(.stopped),
+          nativeHandleGeneration: player.eventBridge.currentNativeHandleGeneration,
+          playbackGeneration: player.eventBridge.currentPlaybackGeneration,
+          lifecycleControlEpoch: player.eventBridge.currentLifecycleControlEpoch
+        )
+      }
+      player._nativePlayOverrideForTesting = {
+        dispatchOrder.append("play")
+        player._nativePlaybackStateOverrideForTesting = .playing
+        return 0
+      }
+
+      let queuedPlay = Task { @MainActor in
+        try? player.play()
+      }
+      let outcome = await player.stopAndWaitForOutcome()
+      await queuedPlay.value
+
+      #expect(dispatchOrder == ["stop", "play"])
+      #expect(outcome == .timedOut)
+      #expect(player.isPlaybackRequestedActive)
+    }
+
     /// A caller whose task is cancelled must still be told the truth. The
     /// drain is deliberately not abandoned, so the reported state stays
     /// accurate rather than becoming indistinguishable from success.
@@ -121,7 +243,7 @@ extension Integration {
         "Waiting for: player.state == .playing"
       )
 
-      let caller = Task { @MainActor in await player.stopAndWait() }
+      let caller = Task { @MainActor in await player.stopAndWaitForOutcome() }
       caller.cancel()
       let outcome = await caller.value
 
@@ -293,17 +415,26 @@ extension Integration {
       )
     }
 
-    /// An observed stop is output-safe regardless of what the handle reports
-    /// afterwards — the release already happened.
+    /// A Stopped callback is output-safe only while its exact transport
+    /// episode remains current and the native handle still rests at stopped.
+    /// A same-handle successor can already be opening or playing by the time
+    /// the predecessor callback reaches the waiter.
     @Test
-    func `An observed stop is never downgraded`() {
+    func `An observed stop is revalidated against current transport`() {
       #expect(
         Player.resolveStopOutcome(waitOutcome: .stopped, nativeState: .error)
-          == .stopped
+          == .timedOut
       )
       #expect(
         Player.resolveStopOutcome(waitOutcome: .stopped, nativeState: .stopped)
           == .stopped
+      )
+      #expect(
+        Player.resolveStopOutcome(
+          waitOutcome: .stopped,
+          nativeState: .stopped,
+          episodeIsCurrent: false
+        ) == .timedOut
       )
     }
 
@@ -380,7 +511,7 @@ extension Integration {
           "Waiting for: player.state == .playing (cycle \(cycle))"
         )
 
-        let outcome = await player.stopAndWait()
+        let outcome = await player.stopAndWaitForOutcome()
 
         #expect(outcome == .stopped, "cycle \(cycle) was not output-safe")
         #expect(player.nativePlaybackState == .stopped, "cycle \(cycle)")

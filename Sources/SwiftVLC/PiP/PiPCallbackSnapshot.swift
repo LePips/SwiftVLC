@@ -28,12 +28,13 @@ struct PiPCallbackSnapshot: @unchecked Sendable {
   /// Whether PiP should render as playing. Mirrors
   /// ``PiPController/pipPlaybackActive``.
   var isPlaybackActive = false
-  /// Bumped whenever the attached player handle changes.
+  /// Bumped whenever the attached player handle or playback generation
+  /// changes.
   ///
   /// A query reads the whole snapshot under one lock acquisition, so the
-  /// pointer and timebase it works with always belong to the same generation.
-  /// The generation is what makes that guarantee checkable rather than
-  /// incidental.
+  /// pointer, timebase, and media identity it works with always belong to the
+  /// same generation. The generation is what makes that guarantee checkable
+  /// rather than incidental.
   var generation: UInt64 = 0
   /// Media session paired with the cached handle at publication time.
   /// Native activity signals capture this before hopping to the main actor,
@@ -79,7 +80,9 @@ extension PiPController: NativeHandleSnapshotObserver {
     let playbackGeneration = player.generation
 
     callbackSnapshot.withLock { snapshot in
-      if snapshot.playerPointer != pointer {
+      if
+        snapshot.playerPointer != pointer
+        || snapshot.playbackGeneration != playbackGeneration {
         snapshot.generation &+= 1
       }
       snapshot.playerPointer = pointer

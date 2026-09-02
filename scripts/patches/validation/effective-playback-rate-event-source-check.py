@@ -5,9 +5,17 @@ from pathlib import Path
 import sys
 
 from pip_extension_version import (
+    BASE_SOURCE_KEYS,
+    OPTIONAL_SUCCESSOR_SOURCE_KEYS,
+    read_source_root,
     resolve_extension_version,
     run_negative_mutations,
 )
+
+
+def extension_sources(sources: dict[str, str]) -> dict[str, str]:
+    keys = BASE_SOURCE_KEYS | OPTIONAL_SUCCESSOR_SOURCE_KEYS
+    return {key: sources[key] for key in keys}
 
 
 def function_body(source: str, signature: str) -> str:
@@ -184,12 +192,7 @@ def validate_core_resolution(player: str, player_header: str,
 
 
 def validate_all(sources: dict[str, str]) -> int:
-    resolution = resolve_extension_version({
-        "media_player": sources["media_player"],
-        "public_header": sources["media_header"],
-        "events_header": sources["events"],
-        "exports": sources["exports"],
-    })
+    resolution = resolve_extension_version(extension_sources(sources))
     if resolution.version < 7:
         raise AssertionError(
             "effective-rate event requires extension version 7 or newer")
@@ -233,6 +236,7 @@ def main() -> int:
         if not path.is_file():
             raise AssertionError(f"missing effective-rate source input: {path}")
     sources = {name: path.read_text() for name, path in paths.items()}
+    sources.update(read_source_root(root))
     integrated_extension_version = validate_all(sources)
 
     require_mutation_rejected(
@@ -270,12 +274,8 @@ def main() -> int:
         "input_SendEventRate( p_input, param.val.f_float );",
         "input published the requested rather than resolved rate")
 
-    run_negative_mutations({
-        "media_player": sources["media_player"],
-        "public_header": sources["media_header"],
-        "events_header": sources["events"],
-        "exports": sources["exports"],
-    }, integrated_extension_version)
+    run_negative_mutations(
+        extension_sources(sources), integrated_extension_version)
 
     print("PASS effective playback-rate event source and mutation contract "
           f"(integrated extension version {integrated_extension_version})")

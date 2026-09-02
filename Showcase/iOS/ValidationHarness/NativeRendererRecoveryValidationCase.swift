@@ -156,7 +156,7 @@ struct NativeRendererRecoveryValidationCase: View {
           "Linked libVLC does not export native renderer recovery evidence"
         )
       }
-      guard controller.start() == .accepted else {
+      guard controller.requestStart() == .accepted else {
         throw NativeRendererRecoveryFailure("Native PiP start was not accepted")
       }
       try await waitUntil("Native PiP did not become active") {

@@ -15,7 +15,7 @@ ARCHIVE="$XCFRAMEWORK/macos-arm64_x86_64/libvlc.a"
 PUBLIC_HEADER="$REPO_ROOT/Sources/CLibVLC/include/vlc/libvlc_media_player.h"
 EVENTS_HEADER="$REPO_ROOT/Sources/CLibVLC/include/vlc/libvlc_events.h"
 VERSION_RESOLVER="$SCRIPT_DIR/patches/validation/pip_extension_version.py"
-EXPECTED_VERSION_RESOLVER_SHA="98adb898d64ed8c8a57bbc883bf10dd96eeb399a2f7671c1d2fceb262fad63b5"
+EXPECTED_VERSION_RESOLVER_SHA="71ec748da3b77066514ad6134e980903b925c680b2788a16aef60e5d3fecedd6"
 
 actual_version_resolver_sha=$(shasum -a 256 "$VERSION_RESOLVER" | awk '{print $1}')
 if [[ "$actual_version_resolver_sha" != "$EXPECTED_VERSION_RESOLVER_SHA" ]]; then
@@ -29,6 +29,9 @@ fi
 # beta native archive is being rebuilt. Never infer an archive's expected ABI
 # from that header alone. A source-linked invocation resolves and validates the
 # exact source tree; archive-only callers must state their expected version.
+if [[ "$EXPECTED_EXTENSION_VERSION" == 9 ]]; then
+  REQUIRE_APPLE_AUDIO_SESSION_LEASES=yes
+fi
 if [[ -n "$VLC_SOURCE_ROOT" ]]; then
   version_arguments=(--source-root "$VLC_SOURCE_ROOT")
   if [[ -n "$EXPECTED_EXTENSION_VERSION" ]]; then
@@ -42,7 +45,14 @@ if [[ -n "$VLC_SOURCE_ROOT" ]]; then
   EXPECTED_EXTENSION_VERSION=$(
     python3 -B "$VERSION_RESOLVER" "${version_arguments[@]}"
   )
-  if [[ "$EXPECTED_EXTENSION_VERSION" == 8 &&
+  if [[ "$EXPECTED_EXTENSION_VERSION" -ge 9 &&
+        "$REQUIRE_APPLE_AUDIO_SESSION_LEASES" != yes ]]; then
+    REQUIRE_APPLE_AUDIO_SESSION_LEASES=yes
+    version_arguments+=(
+      --require-same-version-group apple-audio-session-leases
+    )
+  fi
+  if [[ "$EXPECTED_EXTENSION_VERSION" -ge 8 &&
         "$REQUIRE_APPLE_AUDIO_SESSION_LEASES" == yes ]]; then
     python3 -B "$VERSION_RESOLVER" "${version_arguments[@]}" \
       --vendored-public-header "$PUBLIC_HEADER" \
@@ -58,13 +68,14 @@ elif [[ "$REQUIRE_APPLE_AUDIO_SESSION_LEASES" == yes ]]; then
 fi
 
 case "$EXPECTED_EXTENSION_VERSION" in
-  4|5|6|7|8) ;;
+  4|5|6|7|8|9) ;;
   *)
-    echo "Expected PiP extension version must be an integer from 4 through 8: $EXPECTED_EXTENSION_VERSION" >&2
+    echo "Expected PiP extension version must be an integer from 4 through 9: $EXPECTED_EXTENSION_VERSION" >&2
     exit 2
     ;;
 esac
 VERSION_DEFINE="-DSWIFTVLC_EXPECTED_PIP_EXTENSIONS_VERSION=$EXPECTED_EXTENSION_VERSION"
+LEASE_DEFINE="-DSWIFTVLC_REQUIRE_APPLE_AUDIO_SESSION_LEASES=$([[ "$REQUIRE_APPLE_AUDIO_SESSION_LEASES" == yes ]] && echo 1 || echo 0)"
 
 if [[ -n "$VLC_SOURCE_ROOT" ]]; then
   python3 -B \
@@ -93,6 +104,7 @@ FRAMEWORKS=(
 
 clang -std=c11 -o "$WORK_DIR/probe" \
   "$VERSION_DEFINE" \
+  "$LEASE_DEFINE" \
   "$SCRIPT_DIR/patches/validation/strict-frame-step-probe.c" \
   -I "$REPO_ROOT/Sources/CLibVLC/include" "$ARCHIVE" \
   "${FRAMEWORKS[@]}"
@@ -125,6 +137,7 @@ if [[ -n "$VLC_SOURCE_ROOT" || -n "$VLC_BUILD_ROOT" ]]; then
 
   clang -std=gnu17 -DHAVE_CONFIG_H -DSWIFTVLC_SOURCE_LINKED_PROBE \
     "$VERSION_DEFINE" \
+    "$LEASE_DEFINE" \
     -o "$WORK_DIR/source-linked-probe" \
     "$SCRIPT_DIR/patches/validation/strict-frame-step-probe.c" \
     -I "$VLC_BUILD_DIR" -I "$VLC_SOURCE_ROOT" \

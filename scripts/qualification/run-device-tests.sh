@@ -21,6 +21,7 @@ REQUIRE_STABLE=false
 EXPLORATORY_CURRENT_ONLY=false
 EXPLORATORY_HARDWARE_ID=""
 SKIP_BUILD=false
+FULL_SUITE_SELECTION=false
 ONLY_SCENARIOS=()
 ADAPTIVE_SOAK_SECONDS="${SWIFTVLC_ADAPTIVE_SOAK_SECONDS:-7200}"
 PIP_PERFORMANCE_SECONDS="${SWIFTVLC_PIP_PERFORMANCE_SECONDS:-900}"
@@ -71,6 +72,8 @@ Options:
                           progressive-http-range-seek, local-file-matrix,
                           audio-only-playback,
                           harness-regressions, ui-failures, thumbnail-preview
+  --full-suite-selection  Mark repeated --only arguments as full only when they
+                          exactly equal the canonical applicable release suite
   --require-stable        Refuse beta/unknown OS or a non-matching matrix row
   --exploratory-current-only
                           Allow iphone-current-only lanes on a newer iPhone OS;
@@ -149,6 +152,7 @@ while [[ $# -gt 0 ]]; do
     --output) OUTPUT_ROOT="$2"; shift 2 ;;
     --work-root) WORK_ROOT="$2"; shift 2 ;;
     --only) ONLY_SCENARIOS+=("$2"); shift 2 ;;
+    --full-suite-selection) FULL_SUITE_SELECTION=true; shift ;;
     --require-stable) REQUIRE_STABLE=true; shift ;;
     --exploratory-current-only) EXPLORATORY_CURRENT_ONLY=true; shift ;;
     --skip-build) SKIP_BUILD=true; shift ;;
@@ -212,6 +216,23 @@ for command in curl ffmpeg ffprobe git jq plutil python3 shasum tar xcodebuild x
   fi
 done
 
+# xcodebuild can outlive XCTest's per-test timeout while resolving packages,
+# communicating with the device, or collecting a result bundle. Bound both the
+# complete subprocess lifetime and periods with no observable command output;
+# the watchdog owns a process group so cleanup cannot strand Xcode helpers.
+run_with_watchdog() {
+  local wall_seconds="$1"
+  local idle_seconds="$2"
+  local output_path="$3"
+  shift 3
+  python3 "$SCRIPT_DIR/run-with-watchdog.py" \
+    --wall-seconds "$wall_seconds" \
+    --idle-seconds "$idle_seconds" \
+    --output "$output_path" \
+    -- "$@"
+}
+
+RUN_STARTED_AT_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 run_id="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 OUTPUT_DIR="$OUTPUT_ROOT/$run_id"
 mkdir -p "$OUTPUT_DIR" "$WORK_ROOT"
@@ -220,6 +241,25 @@ export TMPDIR="$WORK_DIR"
 SERVER_PID=""
 ACTIVE_XCODEBUILD_PID=""
 ACTIVE_XCTRACE_PID=""
+
+stop_fixture_server() {
+  if [[ -z "$SERVER_PID" ]] || ! kill -0 "$SERVER_PID" 2>/dev/null; then
+    SERVER_PID=""
+    return
+  fi
+  kill -TERM "$SERVER_PID" 2>/dev/null || true
+  for _ in {1..50}; do
+    if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+      break
+    fi
+    sleep 0.1
+  done
+  if kill -0 "$SERVER_PID" 2>/dev/null; then
+    kill -KILL "$SERVER_PID" 2>/dev/null || true
+  fi
+  wait "$SERVER_PID" 2>/dev/null || true
+  SERVER_PID=""
+}
 
 cleanup() {
   if [[ -n "$ACTIVE_XCTRACE_PID" ]] && kill -0 "$ACTIVE_XCTRACE_PID" 2>/dev/null; then
@@ -239,10 +279,7 @@ cleanup() {
     kill -TERM "$ACTIVE_XCODEBUILD_PID" 2>/dev/null || true
     wait "$ACTIVE_XCODEBUILD_PID" 2>/dev/null || true
   fi
-  if [[ -n "$SERVER_PID" ]] && kill -0 "$SERVER_PID" 2>/dev/null; then
-    kill "$SERVER_PID" 2>/dev/null || true
-    wait "$SERVER_PID" 2>/dev/null || true
-  fi
+  stop_fixture_server
   rm -rf "$WORK_DIR"
 }
 trap cleanup EXIT
@@ -256,9 +293,10 @@ fi
 if [[ "$REQUIRE_STABLE" == true ]]; then
   device_args+=(--require-stable)
 fi
+device_args+=(--output "$OUTPUT_DIR/device.json")
 
 set +e
-python3 "$SCRIPT_DIR/device-info.py" "${device_args[@]}" > "$OUTPUT_DIR/device.json"
+python3 "$SCRIPT_DIR/device-info.py" "${device_args[@]}"
 device_status=$?
 set -e
 if [[ "$device_status" -ne 0 ]]; then
@@ -269,8 +307,167 @@ fi
 
 DEVICE_UDID=$(jq -r '.selected.udid' "$OUTPUT_DIR/device.json")
 DEVICE_ECID=$(jq -r '.selected.ecidHex' "$OUTPUT_DIR/device.json")
+DEVICE_TUNNEL_IP=$(jq -r '.selected.tunnelIPAddress // empty' "$OUTPUT_DIR/device.json")
 RUN_MODE=$(jq -r '.mode' "$OUTPUT_DIR/device.json")
 echo "Selected $(jq -r '.selected.marketingName' "$OUTPUT_DIR/device.json") on $(jq -r '.selected.osVersion' "$OUTPUT_DIR/device.json") ($RUN_MODE)."
+
+DEFAULT_SCENARIOS=(analyzer ui-suite harness-regressions live-media background-audio continuity capability-convergence vod-controls long-stall failed-start dismissal interruptions native-lifecycle playback-foreground-displaylayer-recovery terminal-outcomes adaptive-hls-soak deferred-pause-rejection hls-seek)
+DEFAULT_SCENARIOS+=(seek-frame-oracles)
+DEFAULT_SCENARIOS+=(progressive-http-range-seek)
+DEFAULT_SCENARIOS+=(local-file-matrix audio-only-playback)
+DEFAULT_SCENARIOS+=(pip-render-performance-1080p60 pip-render-performance-4k60)
+DEFAULT_SCENARIOS+=(cadence-matrix)
+DEFAULT_SCENARIOS+=(native-subtitle-matrix)
+DEFAULT_SCENARIOS+=(timebase-vod-soak timebase-live-soak)
+DEFAULT_SCENARIOS+=(audio-session-ownership audio-media-services-reset)
+IPHONE_CURRENT_ONLY_SCENARIOS=(
+  capability-convergence
+  native-lifecycle
+  playback-foreground-displaylayer-recovery
+  terminal-outcomes
+  adaptive-hls-soak
+  pip-render-performance-1080p60
+  pip-render-performance-4k60
+  cadence-matrix
+  native-subtitle-matrix
+  timebase-vod-soak
+  timebase-live-soak
+  deferred-pause-rejection
+  seek-frame-oracles
+)
+
+scenario_requires_iphone_current() {
+  local candidate="$1"
+  local required
+  for required in "${IPHONE_CURRENT_ONLY_SCENARIOS[@]}"; do
+    if [[ "$candidate" == "$required" ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+SCENARIOS_WERE_EXPLICIT=false
+if [[ ${#ONLY_SCENARIOS[@]} -eq 0 ]]; then
+  ONLY_SCENARIOS=("${DEFAULT_SCENARIOS[@]}")
+  VALIDATION_SELECTION_SCOPE=full
+else
+  SCENARIOS_WERE_EXPLICIT=true
+  VALIDATION_SELECTION_SCOPE=partial
+fi
+for scenario in "${ONLY_SCENARIOS[@]}"; do
+  case "$scenario" in
+    analyzer|ui-suite|native-live|direct-live|live-media|background-audio|continuity|capability-convergence|vod-controls|long-stall|failed-start|dismissal|interruptions|audio-session-ownership|audio-media-services-reset|native-lifecycle|playback-foreground-displaylayer-recovery|terminal-outcomes|adaptive-hls-soak|pip-render-performance-1080p60|pip-render-performance-4k60|cadence-matrix|cadence-semantics-probe|native-subtitle-matrix|timebase-vod-soak|timebase-live-soak|deferred-pause-rejection|hls-seek|seek-frame-oracles|progressive-http-range-seek|local-file-matrix|audio-only-playback|harness-regressions|ui-failures|thumbnail-preview) ;;
+    *) echo "Error: unknown scenario: $scenario" >&2; exit 2 ;;
+  esac
+done
+REQUESTED_SCENARIOS=("${ONLY_SCENARIOS[@]}")
+
+# The semantics probe intentionally has no matrix-owned runner contract. Keep
+# it isolated so the ordinary candidate report can never authorize, materialize,
+# or accidentally inherit release qualification rows from another scenario.
+device_matches_hardware_row() {
+  local hardware_row="$1"
+  jq -e --arg hardware_row "$hardware_row" \
+    '.selected.matchingHardwareRows | index($hardware_row) != null' \
+    "$OUTPUT_DIR/device.json" > /dev/null
+}
+
+can_run_iphone_current_lanes() {
+  device_matches_hardware_row "iphone-current" \
+    || [[ -n "$EXPLORATORY_HARDWARE_ID" ]]
+}
+
+if [[ "$EXPLORATORY_CURRENT_ONLY" == true ]]; then
+  if ! EXPLORATORY_HARDWARE_ID=$(python3 \
+    "$SCRIPT_DIR/exploratory-device-policy.py" \
+    --device-info "$OUTPUT_DIR/device.json" \
+    --matrix "$SCRIPT_DIR/matrix.json"); then
+    echo "Error: --exploratory-current-only requires an exploratory iPhone" >&2
+    echo "  on an OS newer than the matrix's iphone-current row." >&2
+    exit 2
+  fi
+fi
+
+if ! device_matches_hardware_row "iphone-current"; then
+  if [[ -n "$EXPLORATORY_HARDWARE_ID" ]]; then
+    echo "Including iphone-current-only scenarios as exploratory evidence."
+    echo "These results cannot qualify or close any stable matrix row."
+  elif [[ "$SCENARIOS_WERE_EXPLICIT" == true ]]; then
+    for scenario in "${ONLY_SCENARIOS[@]}"; do
+      if scenario_requires_iphone_current "$scenario"; then
+        echo "Error: $scenario requires the iphone-current hardware row." >&2
+        exit 2
+      fi
+    done
+  else
+    FILTERED_SCENARIOS=()
+    for scenario in "${ONLY_SCENARIOS[@]}"; do
+      if ! scenario_requires_iphone_current "$scenario"; then
+        FILTERED_SCENARIOS+=("$scenario")
+      fi
+    done
+    ONLY_SCENARIOS=("${FILTERED_SCENARIOS[@]}")
+    echo "Skipping iphone-current-only qualification scenarios: selected device does not match iphone-current."
+  fi
+fi
+
+# The profile wrapper must pass repeated --only values so it can select the
+# device-applicable subset. Accept a full-scope claim only when that subset is
+# exactly the runner's canonical suite for this device. This keeps arbitrary
+# targeted invocations partial while allowing the canonical release profile to
+# produce an honest full-device validation plan.
+if [[ "$FULL_SUITE_SELECTION" == true ]]; then
+  if [[ "$REPORT_ONLY_RUN" == true ]]; then
+    echo "Error: a report-only probe cannot claim full-suite selection." >&2
+    exit 2
+  fi
+  EXPECTED_FULL_SCENARIOS=()
+  for scenario in "${DEFAULT_SCENARIOS[@]}"; do
+    if device_matches_hardware_row "iphone-current" \
+      || [[ -n "$EXPLORATORY_HARDWARE_ID" ]] \
+      || ! scenario_requires_iphone_current "$scenario"; then
+      EXPECTED_FULL_SCENARIOS+=("$scenario")
+    fi
+  done
+  if ! diff -u \
+      <(printf '%s\n' "${EXPECTED_FULL_SCENARIOS[@]}" | sort) \
+      <(printf '%s\n' "${ONLY_SCENARIOS[@]}" | sort) >/dev/null; then
+    echo "Error: --full-suite-selection does not match the canonical applicable suite." >&2
+    exit 2
+  fi
+  REQUESTED_SCENARIOS=("${DEFAULT_SCENARIOS[@]}")
+  VALIDATION_SELECTION_SCOPE=full
+fi
+
+requested_scenarios_file="$WORK_DIR/requested-scenarios.txt"
+selected_scenarios_file="$WORK_DIR/selected-scenarios.txt"
+printf '%s\n' "${REQUESTED_SCENARIOS[@]}" > "$requested_scenarios_file"
+printf '%s\n' "${ONLY_SCENARIOS[@]}" > "$selected_scenarios_file"
+validation_plan_args=(
+  --device-info "$OUTPUT_DIR/device.json"
+  --matrix "$SCRIPT_DIR/matrix.json"
+  --requested "$requested_scenarios_file"
+  --selected "$selected_scenarios_file"
+  --selection-scope "$VALIDATION_SELECTION_SCOPE"
+  --started-at-utc "$RUN_STARTED_AT_UTC"
+  --output "$OUTPUT_DIR/validation-plan.json"
+)
+if [[ -n "$EXPLORATORY_HARDWARE_ID" ]]; then
+  validation_plan_args+=(--projected-hardware-row iphone-current)
+fi
+if [[ "$REPORT_ONLY_RUN" == true ]]; then
+  validation_plan_args+=(--report-only)
+fi
+python3 "$SCRIPT_DIR/validation-plan.py" "${validation_plan_args[@]}"
+
+# Retain an empty plan-bound ledger before fixture generation, build, install,
+# or runner priming. Any later interruption can still produce a useful and
+# truthfully incomplete checklist.
+RESULTS_TSV="$OUTPUT_DIR/scenario-results.tsv"
+: > "$RESULTS_TSV"
+QUALIFICATION_ROWS="$OUTPUT_DIR/qualification-rows.jsonl"
+: > "$QUALIFICATION_ROWS"
 
 if [[ ! -f "$FIXTURES/manifest.json" \
   || ! -f "$FIXTURES/unsupported-codec.mp4" \
@@ -294,10 +491,25 @@ cp "$FIXTURES/manifest.json" "$OUTPUT_DIR/fixture-manifest.json"
 FIXTURE_MANIFEST_CHECKSUM=$(shasum -a 256 "$FIXTURES/manifest.json" | cut -d' ' -f1)
 
 READY_FILE="$WORK_DIR/server-ready.json"
-python3 "$SCRIPT_DIR/fixture-server.py" \
-  --root "$FIXTURES" \
-  --ready-file "$READY_FILE" \
-  --request-log "$OUTPUT_DIR/fixture-requests.jsonl" \
+fixture_server_args=(
+  --root "$FIXTURES"
+  --ready-file "$READY_FILE"
+  --request-log "$OUTPUT_DIR/fixture-requests.jsonl"
+)
+if [[ -n "$DEVICE_TUNNEL_IP" ]]; then
+  set +e
+  TUNNEL_HOST=$(python3 "$SCRIPT_DIR/tunnel-host.py" \
+    --device-address "$DEVICE_TUNNEL_IP" 2> "$OUTPUT_DIR/tunnel-host.log")
+  tunnel_status=$?
+  set -e
+  if [[ "$tunnel_status" -eq 0 ]]; then
+    fixture_server_args+=(--host :: --advertise-host "$TUNNEL_HOST")
+    echo "Using the wired CoreDevice tunnel for fixture delivery ($TUNNEL_HOST)."
+  else
+    echo "CoreDevice tunnel discovery failed; falling back to the LAN fixture address."
+  fi
+fi
+python3 "$SCRIPT_DIR/fixture-server.py" "${fixture_server_args[@]}" \
   > "$OUTPUT_DIR/fixture-server.log" 2>&1 &
 SERVER_PID=$!
 for _ in {1..100}; do
@@ -364,7 +576,8 @@ if [[ "$SKIP_BUILD" == false ]]; then
     CODE_SIGNING_ALLOWED=YES
     DEVELOPMENT_TEAM="$DEVELOPMENT_TEAM"
   )
-  xcodebuild "${build_args[@]}" > "$OUTPUT_DIR/build.log"
+  run_with_watchdog 7200 900 "$OUTPUT_DIR/build.log" \
+    xcodebuild "${build_args[@]}"
 fi
 
 RUNNER_APP="$DERIVED_DATA/Build/Products/Release-iphoneos/iOSUITests-Runner.app"
@@ -439,15 +652,15 @@ fi
 
 FULL_CATALOG_RAW="$WORK_DIR/full-test-catalog-raw.json"
 FULL_TEST_CATALOG="$OUTPUT_DIR/full-test-catalog.json"
-if ! xcodebuild test-without-building \
+if ! run_with_watchdog 600 180 "$OUTPUT_DIR/enumerate-full-test-catalog.log" \
+    xcodebuild test-without-building \
     -xctestrun "$XCTESTRUN" \
     -derivedDataPath "$DERIVED_DATA" \
     -destination "platform=iOS,id=$DEVICE_UDID" \
     -enumerate-tests \
     -test-enumeration-style flat \
     -test-enumeration-format json \
-    -test-enumeration-output-path "$FULL_CATALOG_RAW" \
-    > "$OUTPUT_DIR/enumerate-full-test-catalog.log" 2>&1; then
+    -test-enumeration-output-path "$FULL_CATALOG_RAW"; then
   echo "Error: XCTest preflight enumeration failed." >&2
   exit 1
 fi
@@ -543,6 +756,17 @@ install_app() {
 install_app "$CANDIDATE_APP" > "$OUTPUT_DIR/install-candidate.log"
 install_app "$RUNNER_APP" > "$OUTPUT_DIR/install-runner.log"
 
+# A freshly installed xctrunner has no data container until its first launch.
+# Xcode can try to place runtime profiles in that container before launching
+# the process, which otherwise fails with ContainerLookupErrorDomain or times
+# out enabling automation. Prime the exact signed runner without presenting UI,
+# then terminate the suspended process before XCTest owns it.
+"$SCRIPT_DIR/prime-xctrunner.sh" \
+  --device "$DEVICE_UDID" \
+  --bundle-identifier "$TEST_RUNNER_BUNDLE_IDENTIFIER" \
+  --work-root "$WORK_DIR" \
+  > "$OUTPUT_DIR/prime-runner.log" 2>&1
+
 STREAMS_FILE="$WORK_DIR/streams.local.json"
 python3 - "$BASE_URL" "$STREAMS_FILE" <<'PY'
 import json
@@ -570,82 +794,6 @@ xcrun devicectl device copy to \
   --source "$STREAMS_FILE" \
   --destination Documents/streams.local.json \
   > "$OUTPUT_DIR/stage-streams.log"
-
-DEFAULT_SCENARIOS=(analyzer ui-suite harness-regressions live-media background-audio continuity capability-convergence vod-controls long-stall failed-start dismissal interruptions native-lifecycle playback-foreground-displaylayer-recovery terminal-outcomes adaptive-hls-soak deferred-pause-rejection hls-seek)
-DEFAULT_SCENARIOS+=(seek-frame-oracles)
-DEFAULT_SCENARIOS+=(progressive-http-range-seek)
-DEFAULT_SCENARIOS+=(local-file-matrix audio-only-playback)
-DEFAULT_SCENARIOS+=(pip-render-performance-1080p60 pip-render-performance-4k60)
-DEFAULT_SCENARIOS+=(cadence-matrix)
-DEFAULT_SCENARIOS+=(native-subtitle-matrix)
-DEFAULT_SCENARIOS+=(timebase-vod-soak timebase-live-soak)
-DEFAULT_SCENARIOS+=(audio-session-ownership audio-media-services-reset)
-SCENARIOS_WERE_EXPLICIT=false
-if [[ ${#ONLY_SCENARIOS[@]} -eq 0 ]]; then
-  ONLY_SCENARIOS=("${DEFAULT_SCENARIOS[@]}")
-else
-  SCENARIOS_WERE_EXPLICIT=true
-fi
-for scenario in "${ONLY_SCENARIOS[@]}"; do
-  case "$scenario" in
-    analyzer|ui-suite|native-live|direct-live|live-media|background-audio|continuity|capability-convergence|vod-controls|long-stall|failed-start|dismissal|interruptions|audio-session-ownership|audio-media-services-reset|native-lifecycle|playback-foreground-displaylayer-recovery|terminal-outcomes|adaptive-hls-soak|pip-render-performance-1080p60|pip-render-performance-4k60|cadence-matrix|cadence-semantics-probe|native-subtitle-matrix|timebase-vod-soak|timebase-live-soak|deferred-pause-rejection|hls-seek|seek-frame-oracles|progressive-http-range-seek|local-file-matrix|audio-only-playback|harness-regressions|ui-failures|thumbnail-preview) ;;
-    *) echo "Error: unknown scenario: $scenario" >&2; exit 2 ;;
-  esac
-done
-
-# The semantics probe intentionally has no matrix-owned runner contract. Keep
-# it isolated so the ordinary candidate report can never authorize, materialize,
-# or accidentally inherit release qualification rows from another scenario.
-device_matches_hardware_row() {
-  local hardware_row="$1"
-  jq -e --arg hardware_row "$hardware_row" \
-    '.selected.matchingHardwareRows | index($hardware_row) != null' \
-    "$OUTPUT_DIR/device.json" > /dev/null
-}
-
-can_run_iphone_current_lanes() {
-  device_matches_hardware_row "iphone-current" \
-    || [[ -n "$EXPLORATORY_HARDWARE_ID" ]]
-}
-
-if [[ "$EXPLORATORY_CURRENT_ONLY" == true ]]; then
-  if ! EXPLORATORY_HARDWARE_ID=$(python3 \
-    "$SCRIPT_DIR/exploratory-device-policy.py" \
-    --device-info "$OUTPUT_DIR/device.json" \
-    --matrix "$SCRIPT_DIR/matrix.json"); then
-    echo "Error: --exploratory-current-only requires an exploratory iPhone" >&2
-    echo "  on an OS newer than the matrix's iphone-current row." >&2
-    exit 2
-  fi
-fi
-
-if ! device_matches_hardware_row "iphone-current"; then
-  if [[ -n "$EXPLORATORY_HARDWARE_ID" ]]; then
-    echo "Including iphone-current-only scenarios as exploratory evidence."
-    echo "These results cannot qualify or close any stable matrix row."
-  elif [[ "$SCENARIOS_WERE_EXPLICIT" == true ]]; then
-    for scenario in "${ONLY_SCENARIOS[@]}"; do
-      if [[ "$scenario" == "capability-convergence" || "$scenario" == "native-lifecycle" || "$scenario" == "terminal-outcomes" || "$scenario" == "adaptive-hls-soak" || "$scenario" == pip-render-performance-* || "$scenario" == "cadence-matrix" || "$scenario" == "native-subtitle-matrix" || "$scenario" == timebase-*-soak || "$scenario" == "deferred-pause-rejection" || "$scenario" == "seek-frame-oracles" ]]; then
-        echo "Error: $scenario requires the iphone-current hardware row." >&2
-        exit 2
-      fi
-    done
-  else
-    FILTERED_SCENARIOS=()
-    for scenario in "${ONLY_SCENARIOS[@]}"; do
-      if [[ "$scenario" != "capability-convergence" && "$scenario" != "native-lifecycle" && "$scenario" != "terminal-outcomes" && "$scenario" != "adaptive-hls-soak" && "$scenario" != pip-render-performance-* && "$scenario" != "cadence-matrix" && "$scenario" != "native-subtitle-matrix" && "$scenario" != timebase-*-soak && "$scenario" != "deferred-pause-rejection" && "$scenario" != "seek-frame-oracles" ]]; then
-        FILTERED_SCENARIOS+=("$scenario")
-      fi
-    done
-    ONLY_SCENARIOS=("${FILTERED_SCENARIOS[@]}")
-    echo "Skipping iphone-current-only qualification scenarios: selected device does not match iphone-current."
-  fi
-fi
-
-RESULTS_TSV="$WORK_DIR/results.tsv"
-: > "$RESULTS_TSV"
-QUALIFICATION_ROWS="$WORK_DIR/qualification-rows.jsonl"
-: > "$QUALIFICATION_ROWS"
 
 export_trace_toc() {
   local trace="$1"
@@ -1167,7 +1315,9 @@ run_scenario() {
 
   local scenario_catalog_raw="$WORK_DIR/$scenario-selected-catalog-raw.json"
   local scenario_expected_catalog="$OUTPUT_DIR/$scenario-expected-test-catalog.json"
-  if ! xcodebuild test-without-building \
+  if ! run_with_watchdog 600 180 \
+      "$OUTPUT_DIR/$scenario-enumerate-tests.log" \
+      xcodebuild test-without-building \
       -xctestrun "$selected_xctestrun" \
       -derivedDataPath "$DERIVED_DATA" \
       -destination "platform=iOS,id=$DEVICE_UDID" \
@@ -1175,8 +1325,7 @@ run_scenario() {
       -enumerate-tests \
       -test-enumeration-style flat \
       -test-enumeration-format json \
-      -test-enumeration-output-path "$scenario_catalog_raw" \
-      > "$OUTPUT_DIR/$scenario-enumerate-tests.log" 2>&1; then
+      -test-enumeration-output-path "$scenario_catalog_raw"; then
     echo "Error: $scenario XCTest preflight enumeration failed." >&2
     return 1
   fi
@@ -1308,7 +1457,9 @@ run_scenario() {
     fi
     set +e
     if [[ "$scenario" == "adaptive-hls-soak" ]]; then
-      xcodebuild test-without-building \
+      run_with_watchdog "$((ADAPTIVE_SOAK_SECONDS + 900))" \
+        "$((ADAPTIVE_SOAK_SECONDS + 600))" "$attempt_log" \
+        xcodebuild test-without-building \
         -xctestrun "$attempt_xctestrun" \
         -derivedDataPath "$DERIVED_DATA" \
         -destination "platform=iOS,id=$DEVICE_UDID" \
@@ -1317,8 +1468,7 @@ run_scenario() {
         -default-test-execution-time-allowance "$((ADAPTIVE_SOAK_SECONDS + 300))" \
         -maximum-test-execution-time-allowance "$((ADAPTIVE_SOAK_SECONDS + 300))" \
         "${test_selection_args[@]}" \
-        -resultBundlePath "$attempt_bundle" \
-        > "$attempt_log" 2>&1 &
+        -resultBundlePath "$attempt_bundle" &
       local xcodebuild_pid=$!
       ACTIVE_XCODEBUILD_PID="$xcodebuild_pid"
       local xctrace_pid=""
@@ -1413,7 +1563,9 @@ PY
         fi
       fi
     elif [[ "$scenario" == pip-render-performance-* ]]; then
-      xcodebuild test-without-building \
+      run_with_watchdog "$((PIP_PERFORMANCE_SECONDS + 900))" \
+        "$((PIP_PERFORMANCE_SECONDS + 600))" "$attempt_log" \
+        xcodebuild test-without-building \
         -xctestrun "$attempt_xctestrun" \
         -derivedDataPath "$DERIVED_DATA" \
         -destination "platform=iOS,id=$DEVICE_UDID" \
@@ -1422,8 +1574,7 @@ PY
         -default-test-execution-time-allowance "$((PIP_PERFORMANCE_SECONDS + 300))" \
         -maximum-test-execution-time-allowance "$((PIP_PERFORMANCE_SECONDS + 300))" \
         "${test_selection_args[@]}" \
-        -resultBundlePath "$attempt_bundle" \
-        > "$attempt_log" 2>&1 &
+        -resultBundlePath "$attempt_bundle" &
       local performance_xcodebuild_pid=$!
       ACTIVE_XCODEBUILD_PID="$performance_xcodebuild_pid"
       local performance_started=false
@@ -1475,7 +1626,9 @@ PY
         performance_trace_status="captured"
       fi
     elif [[ "$scenario" == "cadence-matrix" ]]; then
-      xcodebuild test-without-building \
+      run_with_watchdog "$((CADENCE_SECONDS + 600))" \
+        "$((CADENCE_SECONDS + 300))" "$attempt_log" \
+        xcodebuild test-without-building \
         -xctestrun "$attempt_xctestrun" \
         -derivedDataPath "$DERIVED_DATA" \
         -destination "platform=iOS,id=$DEVICE_UDID" \
@@ -1484,11 +1637,11 @@ PY
         -default-test-execution-time-allowance "$((CADENCE_SECONDS + 300))" \
         -maximum-test-execution-time-allowance "$((CADENCE_SECONDS + 300))" \
         "${test_selection_args[@]}" \
-        -resultBundlePath "$attempt_bundle" \
-        > "$attempt_log" 2>&1
+        -resultBundlePath "$attempt_bundle"
       test_status=$?
     elif [[ "$scenario" == "cadence-semantics-probe" ]]; then
-      xcodebuild test-without-building \
+      run_with_watchdog 600 360 "$attempt_log" \
+        xcodebuild test-without-building \
         -xctestrun "$attempt_xctestrun" \
         -derivedDataPath "$DERIVED_DATA" \
         -destination "platform=iOS,id=$DEVICE_UDID" \
@@ -1497,11 +1650,12 @@ PY
         -default-test-execution-time-allowance 240 \
         -maximum-test-execution-time-allowance 240 \
         "${test_selection_args[@]}" \
-        -resultBundlePath "$attempt_bundle" \
-        > "$attempt_log" 2>&1
+        -resultBundlePath "$attempt_bundle"
       test_status=$?
     elif [[ "$scenario" == "native-subtitle-matrix" ]]; then
-      xcodebuild test-without-building \
+      run_with_watchdog "$((NATIVE_SUBTITLE_SECONDS + 900))" \
+        "$((NATIVE_SUBTITLE_SECONDS + 600))" "$attempt_log" \
+        xcodebuild test-without-building \
         -xctestrun "$attempt_xctestrun" \
         -derivedDataPath "$DERIVED_DATA" \
         -destination "platform=iOS,id=$DEVICE_UDID" \
@@ -1510,8 +1664,7 @@ PY
         -default-test-execution-time-allowance "$((NATIVE_SUBTITLE_SECONDS + 300))" \
         -maximum-test-execution-time-allowance "$((NATIVE_SUBTITLE_SECONDS + 300))" \
         "${test_selection_args[@]}" \
-        -resultBundlePath "$attempt_bundle" \
-        > "$attempt_log" 2>&1 &
+        -resultBundlePath "$attempt_bundle" &
       local subtitle_xcodebuild_pid=$!
       ACTIVE_XCODEBUILD_PID="$subtitle_xcodebuild_pid"
       local subtitle_started=false
@@ -1563,7 +1716,9 @@ PY
         subtitle_trace_status="captured"
       fi
     elif [[ "$scenario" == timebase-*-soak ]]; then
-      xcodebuild test-without-building \
+      run_with_watchdog "$((TIMEBASE_SOAK_SECONDS + 1200))" \
+        "$((TIMEBASE_SOAK_SECONDS + 900))" "$attempt_log" \
+        xcodebuild test-without-building \
         -xctestrun "$attempt_xctestrun" \
         -derivedDataPath "$DERIVED_DATA" \
         -destination "platform=iOS,id=$DEVICE_UDID" \
@@ -1572,8 +1727,7 @@ PY
         -default-test-execution-time-allowance "$((TIMEBASE_SOAK_SECONDS + 600))" \
         -maximum-test-execution-time-allowance "$((TIMEBASE_SOAK_SECONDS + 600))" \
         "${test_selection_args[@]}" \
-        -resultBundlePath "$attempt_bundle" \
-        > "$attempt_log" 2>&1 &
+        -resultBundlePath "$attempt_bundle" &
       local timebase_xcodebuild_pid=$!
       ACTIVE_XCODEBUILD_PID="$timebase_xcodebuild_pid"
       local timebase_started=false
@@ -1610,7 +1764,8 @@ PY
         timebase_trace_status="captured"
       fi
     elif [[ "$scenario" == "audio-session-ownership" ]]; then
-      xcodebuild test-without-building \
+      run_with_watchdog 900 660 "$attempt_log" \
+        xcodebuild test-without-building \
         -xctestrun "$attempt_xctestrun" \
         -derivedDataPath "$DERIVED_DATA" \
         -destination "platform=iOS,id=$DEVICE_UDID" \
@@ -1619,13 +1774,13 @@ PY
         -default-test-execution-time-allowance 600 \
         -maximum-test-execution-time-allowance 600 \
         "${test_selection_args[@]}" \
-        -resultBundlePath "$attempt_bundle" \
-        > "$attempt_log" 2>&1
+        -resultBundlePath "$attempt_bundle"
       test_status=$?
     elif [[ "$scenario" == "audio-media-services-reset" ]]; then
       local reset_readiness_marker="SWIFTVLC_AUDIO_RESET_READY_FOR_OPERATOR:$attempt_token"
       local reset_ready=false
-      xcodebuild test-without-building \
+      run_with_watchdog 1200 660 "$attempt_log" \
+        xcodebuild test-without-building \
         -xctestrun "$attempt_xctestrun" \
         -derivedDataPath "$DERIVED_DATA" \
         -destination "platform=iOS,id=$DEVICE_UDID" \
@@ -1634,8 +1789,7 @@ PY
         -default-test-execution-time-allowance 900 \
         -maximum-test-execution-time-allowance 900 \
         "${test_selection_args[@]}" \
-        -resultBundlePath "$attempt_bundle" \
-        > "$attempt_log" 2>&1 &
+        -resultBundlePath "$attempt_bundle" &
       local reset_xcodebuild_pid=$!
       ACTIVE_XCODEBUILD_PID="$reset_xcodebuild_pid"
       for _ in {1..600}; do
@@ -1678,14 +1832,14 @@ EOF
         test_status=1
       fi
     else
-      xcodebuild test-without-building \
+      run_with_watchdog 1800 900 "$attempt_log" \
+        xcodebuild test-without-building \
         -xctestrun "$attempt_xctestrun" \
         -derivedDataPath "$DERIVED_DATA" \
         -destination "platform=iOS,id=$DEVICE_UDID" \
         -collect-test-diagnostics never \
         "${test_selection_args[@]}" \
-        -resultBundlePath "$attempt_bundle" \
-        > "$attempt_log" 2>&1
+        -resultBundlePath "$attempt_bundle"
       test_status=$?
     fi
     set -e
@@ -2165,7 +2319,10 @@ EOF
         done
         if [[ "$materialized_count" -eq "${#qualification_scenarios[@]}" ]]; then
           evidence_status="captured"
-          if [[ -z "$EXPLORATORY_HARDWARE_ID" ]]; then
+          # Exploratory devices may execute the exact same XCTest leaves, but
+          # they never materialize release-credit rows—even when a beta build
+          # happens to share the current stable OS major.
+          if [[ "$RUN_MODE" == "qualification" ]]; then
             for evidence_index in "${!materialized_scenarios[@]}"; do
               local qualification_duration
               qualification_duration=$(jq -r '.durationSeconds' \
@@ -2234,15 +2391,22 @@ for scenario in "${ONLY_SCENARIOS[@]}"; do
   run_scenario "$scenario"
 done
 
+# Freeze the request transcript and server log before the evidence manifest is
+# calculated. No retained artifact producer may remain alive past this point.
+stop_fixture_server
+
 MATRIX_CHECKSUM=$(shasum -a 256 "$SCRIPT_DIR/matrix.json" | cut -d' ' -f1)
 
 python3 - \
   "$RESULTS_TSV" "$OUTPUT_DIR/report.json" "$OUTPUT_DIR/device.json" \
   "$VERSION" "$SOURCE_COMMIT" "$SOURCE_DIGEST" "$MATRIX_CHECKSUM" \
   "$CANDIDATE_APP_DIGEST" "$ARTIFACT_DIGEST" "$RUN_MODE" "$QUALIFICATION_ROWS" \
-  "$CANDIDATE_IDENTITY" "$REPORT_ONLY_RUN" <<'PY'
+  "$CANDIDATE_IDENTITY" "$REPORT_ONLY_RUN" "$RUN_STARTED_AT_UTC" <<'PY'
 import json
+import os
 import sys
+import tempfile
+from datetime import datetime, timezone
 
 (
     results_path,
@@ -2258,6 +2422,7 @@ import sys
     qualification_rows_path,
     candidate_path,
     report_only_raw,
+    started_at_utc,
 ) = sys.argv[1:]
 report_only = report_only_raw == "true"
 
@@ -2311,9 +2476,16 @@ with open(qualification_rows_path) as source:
     qualification_rows = [json.loads(line) for line in source if line.strip()]
 with open(candidate_path) as source:
     candidate = json.load(source)
+started_at = datetime.strptime(started_at_utc, "%Y-%m-%dT%H:%M:%SZ").replace(
+    tzinfo=timezone.utc
+)
+completed_at = datetime.now(timezone.utc).replace(microsecond=0)
 report = {
     **candidate,
     "formatVersion": 2,
+    "startedAtUTC": started_at_utc,
+    "completedAtUTC": completed_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
+    "wallDurationSeconds": int((completed_at - started_at).total_seconds()),
     "mode": mode,
     "qualificationEligibleEnvironment": device["qualificationEligible"],
     "releaseGateSatisfied": False,
@@ -2328,34 +2500,43 @@ report = {
     "qualificationRows": qualification_rows,
     "result": "pass" if scenarios and all(row["result"] == "pass" for row in scenarios) else "fail",
 }
-with open(output_path, "w") as output:
-    json.dump(report, output, indent=2, sort_keys=True)
-    output.write("\n")
+output_directory = os.path.dirname(output_path)
+descriptor, staged_path = tempfile.mkstemp(
+    prefix=".report.json.", suffix=".tmp", dir=output_directory
+)
+try:
+    with os.fdopen(descriptor, "w") as output:
+        json.dump(report, output, indent=2, sort_keys=True)
+        output.write("\n")
+        output.flush()
+        os.fsync(output.fileno())
+    os.chmod(staged_path, 0o644)
+    os.replace(staged_path, output_path)
+finally:
+    if os.path.exists(staged_path):
+        os.unlink(staged_path)
 PY
 
 report_validation_args=(
-  validate-report
-  --report "$OUTPUT_DIR/report.json"
-  --matrix "$SCRIPT_DIR/matrix.json"
-  --candidate "$CANDIDATE_IDENTITY"
+  validate-and-mark
+  --run-dir "$OUTPUT_DIR"
 )
 if [[ "$REPORT_ONLY_RUN" == true ]]; then
-  # This scenario is deliberately absent from the matrix and release policy.
-  # Prove the generated report cannot claim any row before returning it.
-  jq -e '
-    .reportOnly == true
-    and .releaseGateSatisfied == false
-    and (.qualificationRows | length) == 0
-    and (.scenarios | length) == 1
-    and .scenarios[0].scenario == "cadence-semantics-probe"
-    and .scenarios[0].qualificationEvidence == "report-only"
-  ' "$OUTPUT_DIR/report.json" > /dev/null
+  report_validation_args+=(--report-only)
 else
+  report_validation_args+=(
+    --matrix "$SCRIPT_DIR/matrix.json"
+    --candidate "$CANDIDATE_IDENTITY"
+  )
   if [[ "$REQUIRE_STABLE" == true ]]; then
     report_validation_args+=(--stable-required)
   fi
-  python3 "$SCRIPT_DIR/qualification_policy.py" "${report_validation_args[@]}"
 fi
+
+# Validate one immutable snapshot and bind its exact report and selected plan.
+# A validated FAIL remains complete; a killed, changed, or mismatched run has
+# no matching marker and the volunteer package labels it incomplete.
+python3 "$SCRIPT_DIR/report_validation.py" "${report_validation_args[@]}" > /dev/null
 
 jq '{result, mode, qualificationEligibleEnvironment, releaseGateSatisfied, scenarios}' "$OUTPUT_DIR/report.json"
 echo "Evidence: $OUTPUT_DIR"

@@ -98,9 +98,10 @@ public struct Volume: Sendable, Hashable, Comparable, ExpressibleByFloatLiteral 
 /// Live streams (HLS, UDP) often fall back to `1.0` after a different rate is
 /// requested. `Player.setPlaybackRate(_:)` submits the request; a successful
 /// return is not proof that the active input applied it. When supported by the
-/// linked native extension, `PlayerEvent.rateChanged(_:)` reports effective
-/// state resolutions without claiming request correlation or measured
-/// throughput. An idle notification can repeat an already-reported value.
+/// linked native extension, `Player.effectivePlaybackRateResolutions` reports
+/// effective state resolutions without claiming request correlation or
+/// measured throughput. An idle notification can repeat an already-reported
+/// value.
 ///
 /// ```swift
 /// try player.setPlaybackRate(.normal)     // 1.0

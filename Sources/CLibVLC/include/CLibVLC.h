@@ -131,4 +131,14 @@ bool swiftvlc_strict_frame_step_available(void);
 /// libvlc_MediaPlayerRateChanged for effective control-rate resolutions.
 bool swiftvlc_media_player_rate_changed_event_available(void);
 
+/// Publishes the immutable native-handle/playback pair used by Apple PiP v9.
+/// Returns false without mutation when an older archive is linked.
+bool swiftvlc_media_player_set_pip_playback_identity_if_available(
+    libvlc_media_player_t *player,
+    uint64_t native_handle_identity,
+    uint64_t playback_generation);
+
+/// Returns whether exact handle/playback/output-correlated PiP handoff exists.
+bool swiftvlc_native_pip_handoff_v9_available(void);
+
 #endif /* CLibVLC_h */

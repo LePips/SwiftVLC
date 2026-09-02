@@ -28,7 +28,10 @@ extension Player {
   /// - Returns: A request whose initial result is pending or rejected.
   @discardableResult
   public func requestNextFrame() -> FrameStepRequest {
-    guard !isShutdown else { return FrameStepRequest(resolved: .rejected) }
+    guard
+      !isShutdown,
+      nativeHandleRepresentsCurrentMedia
+    else { return FrameStepRequest(resolved: .rejected) }
     precondition(nextFrameRequestToken < UInt64.max, "Frame-step request token exhausted")
     nextFrameRequestToken += 1
     let resolver = FrameStepOutcomeResolver()
@@ -38,6 +41,7 @@ extension Player {
     pendingFrameSteps.append(PendingFrameStep(
       requestToken: nextFrameRequestToken,
       playbackGeneration: sessionGeneration,
+      nativeHandleGeneration: eventBridge.currentNativeHandleGeneration,
       nativeFrameGeneration: nativeSeekMonitor.frameGeneration,
       resolver: resolver,
       phase: phase,
@@ -54,6 +58,13 @@ extension Player {
   /// callback exactly one logical command to resolve.
   func dispatchNextPendingFrameStepIfNeeded() {
     guard !isShutdown, !pendingFrameSteps.isEmpty else { return }
+    guard nativeHandleRepresentsCurrentMedia else {
+      // This request was accepted before a media-replacement boundary won. It
+      // can no longer target the current media, and must never reach the old
+      // handle under the successor's playback generation.
+      cancelPendingFrameSteps()
+      return
+    }
     startFrontFrameStepDeadlineIfNeeded()
     guard
       pendingSeekSettlement == nil,
@@ -65,8 +76,17 @@ extension Player {
     guard !frame.nativeRequestInFlight else { return }
 
     let currentFrameGeneration = nativeSeekMonitor.frameGeneration
-    guard frame.nativeFrameGeneration == currentFrameGeneration else {
+    guard
+      frame.nativeFrameGeneration == currentFrameGeneration,
+      ownsPlaybackMutation(
+        frame.playbackGeneration,
+        nativeHandleGeneration: frame.nativeHandleGeneration
+      )
+    else {
       cancelPendingFrameSteps(beforeFrameGeneration: currentFrameGeneration)
+      if pendingFrameSteps.contains(where: { $0.requestToken == frame.requestToken }) {
+        cancelPendingFrameSteps()
+      }
       return
     }
 
@@ -123,6 +143,13 @@ extension Player {
   func issueNativeNextFrame(
     _ frame: PendingFrameStep
   ) -> NativeFrameRequestDispatch {
+    guard
+      nativeHandleRepresentsCurrentMedia,
+      ownsPlaybackMutation(
+        frame.playbackGeneration,
+        nativeHandleGeneration: frame.nativeHandleGeneration
+      )
+    else { return .unavailable }
     #if DEBUG
     if let _nativeNextFrameOverrideForTesting {
       return nativeSeekMonitor._requestFrameStepForTesting(
@@ -166,6 +193,7 @@ extension Player {
     let frame = pendingIndex.map { pendingFrameSteps[$0] } ?? committed!.frame
     let identityIsCurrent = !isShutdown
       && frame.playbackGeneration == sessionGeneration
+      && frame.nativeHandleGeneration == eventBridge.currentNativeHandleGeneration
       && frame.nativeFrameGeneration == nativeSeekMonitor.frameGeneration
     let terminalStatus = NativeFrameStepTerminalStatus(rawValue: result.status)
 
@@ -237,19 +265,55 @@ extension Player {
         identityIsCurrent,
         canCommitNativeTimelineEmission(result.emissionSequence) {
         commitNativeTimelineEmission(result.emissionSequence)
-        acceptedTimelineRevision = eventBridge.advanceTimelineRevision()
-        currentTime = .milliseconds(milliseconds)
-        if let eventPosition {
-          withMutation(keyPath: \.position) {
-            _position = eventPosition
+        let lifecycleControlEpoch = eventBridge.currentLifecycleControlEpoch
+        let frameTimelineRevision = eventBridge.advanceTimelineRevision()
+        acceptedTimelineRevision = frameTimelineRevision
+        var timelineMutationIsCurrent = performObservableMutation(
+          keyPath: \.currentTime,
+          ifPlaybackGeneration: frame.playbackGeneration,
+          nativeHandleGeneration: frame.nativeHandleGeneration,
+          timelineRevision: frameTimelineRevision,
+          lifecycleControlEpoch: lifecycleControlEpoch,
+          mutation: {
+            storeCurrentTimeWithoutNestedObservation(.milliseconds(milliseconds))
           }
-        } else {
-          outcomePosition = publishPosition(forTargetMilliseconds: milliseconds)
-        }
-        recordAuthoritativeTimeline(
-          position: outcomePosition,
-          emissionSequence: result.emissionSequence
         )
+        if timelineMutationIsCurrent, let eventPosition {
+          timelineMutationIsCurrent = performObservableMutation(
+            keyPath: \.position,
+            ifPlaybackGeneration: frame.playbackGeneration,
+            nativeHandleGeneration: frame.nativeHandleGeneration,
+            timelineRevision: frameTimelineRevision,
+            lifecycleControlEpoch: lifecycleControlEpoch,
+            mutation: {
+              storePositionWithoutNestedObservation(eventPosition)
+            }
+          )
+        } else if timelineMutationIsCurrent {
+          outcomePosition = publishPosition(
+            forTargetMilliseconds: milliseconds,
+            ifPlaybackGeneration: frame.playbackGeneration,
+            nativeHandleGeneration: frame.nativeHandleGeneration,
+            timelineRevision: frameTimelineRevision,
+            lifecycleControlEpoch: lifecycleControlEpoch
+          )
+          timelineMutationIsCurrent = acceptedTimelineRevision == frameTimelineRevision
+            && lifecycleControlEpoch == eventBridge.currentLifecycleControlEpoch
+            && ownsPlaybackMutation(
+              frame.playbackGeneration,
+              nativeHandleGeneration: frame.nativeHandleGeneration
+            )
+        }
+        if timelineMutationIsCurrent {
+          _ = recordAuthoritativeTimeline(
+            position: outcomePosition,
+            emissionSequence: result.emissionSequence,
+            ifPlaybackGeneration: frame.playbackGeneration,
+            nativeHandleGeneration: frame.nativeHandleGeneration,
+            timelineRevision: frameTimelineRevision,
+            lifecycleControlEpoch: lifecycleControlEpoch
+          )
+        }
       }
 
       resolvedFrame.resolver.resolve(.submitted(

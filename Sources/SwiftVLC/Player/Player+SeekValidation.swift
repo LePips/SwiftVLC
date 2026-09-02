@@ -19,6 +19,9 @@ extension Player {
   }
 
   func checkedSeekMilliseconds(for time: Duration, parameter: String) throws(VLCError) -> Int64 {
+    guard nativeHandleRepresentsCurrentMedia else {
+      throw .invalidState("current media is awaiting its native playback handle")
+    }
     guard isSeekable else {
       throw .invalidState("current media is not seekable")
     }
@@ -49,31 +52,75 @@ extension Player {
   /// target. libVLC emits no `positionChanged` while paused, so without
   /// this the ``position`` shadow would stay stale until playback resumes.
   @discardableResult
-  func publishPosition(forTargetMilliseconds targetMs: Int64) -> Double? {
+  func publishPosition(
+    forTargetMilliseconds targetMs: Int64,
+    ifPlaybackGeneration expectedPlaybackGeneration: UInt64? = nil,
+    nativeHandleGeneration expectedNativeHandleGeneration: UInt64? = nil,
+    timelineRevision expectedTimelineRevision: UInt64? = nil,
+    lifecycleControlEpoch expectedLifecycleControlEpoch: UInt64? = nil
+  ) -> Double? {
     guard
       let duration,
       let durationMs = try? duration.checkedNonnegativeMilliseconds(parameter: "duration"),
       durationMs > 0
     else { return nil }
     let fraction = Swift.min(1.0, Swift.max(0.0, Double(targetMs) / Double(durationMs)))
-    withMutation(keyPath: \.position) {
-      _position = fraction
-    }
+    guard
+      performObservableMutation(
+        keyPath: \.position,
+        ifPlaybackGeneration: expectedPlaybackGeneration,
+        nativeHandleGeneration: expectedNativeHandleGeneration,
+        timelineRevision: expectedTimelineRevision,
+        lifecycleControlEpoch: expectedLifecycleControlEpoch,
+        mutation: {
+          storePositionWithoutNestedObservation(fraction)
+        }
+      )
+    else { return nil }
     return fraction
   }
 
   /// Keeps terminal outcomes aligned with synchronous timeline mutations for
   /// which libVLC does not guarantee a corresponding event.
+  @discardableResult
   func recordAuthoritativeTimeline(
     position: Double?,
-    emissionSequence: UInt64? = nil
-  ) {
+    emissionSequence: UInt64? = nil,
+    ifPlaybackGeneration expectedPlaybackGeneration: UInt64? = nil,
+    nativeHandleGeneration expectedNativeHandleGeneration: UInt64? = nil,
+    timelineRevision expectedTimelineRevision: UInt64? = nil,
+    lifecycleControlEpoch expectedLifecycleControlEpoch: UInt64? = nil
+  ) -> Bool {
+    if let expectedTimelineRevision {
+      guard expectedTimelineRevision == acceptedTimelineRevision else { return false }
+    }
+    if let expectedLifecycleControlEpoch {
+      guard expectedLifecycleControlEpoch == eventBridge.currentLifecycleControlEpoch else {
+        return false
+      }
+    }
+    if let expectedPlaybackGeneration {
+      guard
+        ownsPlaybackMutation(
+          expectedPlaybackGeneration,
+          nativeHandleGeneration: expectedNativeHandleGeneration
+            ?? eventBridge.currentNativeHandleGeneration
+        )
+      else { return false }
+    } else if let expectedNativeHandleGeneration {
+      guard expectedNativeHandleGeneration == eventBridge.currentNativeHandleGeneration else {
+        return false
+      }
+    }
+    let playbackGeneration = expectedPlaybackGeneration ?? sessionGeneration
+    let timelineRevision = expectedTimelineRevision ?? acceptedTimelineRevision
     eventBridge.updateAuthoritativeTimeline(
       time: currentTime,
       position: position,
-      playbackGeneration: sessionGeneration,
-      timelineRevision: acceptedTimelineRevision,
+      playbackGeneration: playbackGeneration,
+      timelineRevision: timelineRevision,
       timelineEmissionSequence: emissionSequence
     )
+    return true
   }
 }

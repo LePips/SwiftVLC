@@ -110,7 +110,7 @@ extension Integration {
 
     @Test
     func `dismantle fallback stops controller and clears binding`() async {
-      #if canImport(AppKit)
+      #if os(macOS)
       let player = Player(instance: TestInstance.shared)
       let storage = Box<PiPController?>(nil)
       let binding = Binding<PiPController?>(
@@ -137,7 +137,7 @@ extension Integration {
       #endif
     }
 
-    #if canImport(AppKit)
+    #if os(macOS)
     private func nativeDrawable(of player: Player) -> UnsafeMutableRawPointer? {
       libvlc_media_player_get_nsobject(player.pointer)
     }
@@ -828,6 +828,28 @@ extension Integration {
       #expect(player.isPlaybackRequestedActive)
     }
 
+    @Test
+    func `macOS queued Play cannot cross a same-player media boundary`() async throws {
+      let player = Player(instance: TestInstance.makeAudioOnly())
+      try player.load(Media(url: TestMedia.twosecURL))
+      player._setStateForTesting(state: .paused, isPlaybackRequestedActive: false)
+      let mediaController = MacNativePiPMediaController()
+      mediaController.player = player
+      let pointer = player.pointer
+
+      mediaController.play()
+      try player.load(Media(url: TestMedia.silenceURL))
+      player._setStateForTesting(state: .paused, isPlaybackRequestedActive: false)
+      #expect(player.pointer == pointer)
+
+      await Task.yield()
+
+      #expect(
+        !player.isPlaybackRequestedActive,
+        "a Play issued for media A resumed media B on the same native handle"
+      )
+    }
+
     @Test(.tags(.async, .media), .enabled(if: TestCondition.canPlayMedia), .timeLimit(.minutes(1)))
     func `macOS native PiP media controller play resumes paused playback`() async throws {
       let player = Player(instance: TestInstance.makePlayback())
@@ -887,112 +909,4 @@ private final class Box<T> {
   }
 }
 
-#if canImport(AppKit)
-@MainActor
-private final class PiPReshapeProbeView: NSView {
-  var reshapeCount = 0
-
-  @objc(reshape)
-  func reshapeForTesting() {
-    reshapeCount += 1
-  }
-}
-
-private final class OpenMacVoutContainerProbe {
-  let container: MacNativePiPDrawableView
-
-  init(container: MacNativePiPDrawableView) {
-    self.container = container
-  }
-}
-
-private final class MacWeakBox<T: AnyObject> {
-  weak var value: T?
-
-  init(_ value: T?) {
-    self.value = value
-  }
-}
-
-@MainActor
-private final class MacPrivatePiPViewControllerProbe: NSViewController {
-  @objc dynamic var delegate: NSObject?
-  @objc dynamic var replacementWindow: NSWindow?
-  @objc dynamic var replacementRect: NSValue?
-  @objc dynamic var playing = false
-  @objc dynamic var aspectRatio: NSValue?
-
-  private(set) var presentedViewController: NSViewController?
-  private(set) var dismissCount = 0
-
-  @objc(presentViewControllerAsPictureInPicture:)
-  func presentAsPictureInPicture(_ viewController: NSViewController) {
-    presentedViewController = viewController
-  }
-
-  @objc(dismissPictureInPictureWithCompletionHandler:)
-  func dismissPictureInPicture(
-    completion: @escaping @convention(block) () -> Void
-  ) {
-    dismissCount += 1
-    completion()
-  }
-}
-
-private struct MacHostChurnResult {
-  let currentHost: MacNativePiPHostView
-  let originalDrawable: MacNativePiPDrawableView
-  let originalBackend: MacNativePiPBackend
-  let nativeHandle: OpaquePointer
-  let retiredHosts: [MacWeakBox<MacNativePiPHostView>]
-}
-
-@MainActor
-private func churnMacHosts(
-  for player: Player,
-  count: Int
-) -> MacHostChurnResult {
-  var currentHost = autoreleasepool {
-    let host = MacNativePiPHostView()
-    host.attach(to: player)
-    return host
-  }
-  let originalDrawable = currentHost.drawableView
-  let originalBackend = currentHost.nativePiPBackend
-  let nativeHandle = player.pointer
-  player.nativePlayerHasStartedPlayback = true
-  var retiredHosts: [MacWeakBox<MacNativePiPHostView>] = []
-
-  for _ in 0..<count {
-    currentHost = autoreleasepool {
-      replaceMacHost(
-        currentHost,
-        for: player,
-        recording: &retiredHosts
-      )
-    }
-  }
-
-  return MacHostChurnResult(
-    currentHost: currentHost,
-    originalDrawable: originalDrawable,
-    originalBackend: originalBackend,
-    nativeHandle: nativeHandle,
-    retiredHosts: retiredHosts
-  )
-}
-
-@MainActor
-private func replaceMacHost(
-  _ retiredHost: MacNativePiPHostView,
-  for player: Player,
-  recording retiredHosts: inout [MacWeakBox<MacNativePiPHostView>]
-) -> MacNativePiPHostView {
-  let successorHost = MacNativePiPHostView()
-  successorHost.attach(to: player)
-  retiredHost.detach()
-  retiredHosts.append(MacWeakBox(retiredHost))
-  return successorHost
-}
-#endif
 #endif

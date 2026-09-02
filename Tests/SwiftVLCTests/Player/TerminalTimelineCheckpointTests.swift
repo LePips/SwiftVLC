@@ -360,7 +360,7 @@ extension Integration {
       let outcome = firstMatchingOutcome(from: setup.outcomes) { _ in true }
       let callback = emitDetached(terminal, on: setup)
       try #require(await wait(gate.entered))
-      await MainActor.run {
+      _ = await MainActor.run {
         setup.player.resetMediaDerivedState()
       }
       try #require(await waitUntil {

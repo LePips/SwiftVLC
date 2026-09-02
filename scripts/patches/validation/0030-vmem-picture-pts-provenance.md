@@ -64,9 +64,9 @@ callback.
 ## Validation pins
 
 - `vmem-picture-pts-source-check.py`:
-  `a9db561a11a24234d7a7984149b1a4ddf0eaaddb1d8ca8e53a02868a610a5e8d`
+  `c3d38d12de458739e95bdacdedfcd5c233b9e41ce4bab922b5142c7cc9a3e8ad`
 - `pip_extension_version.py`:
-  `98adb898d64ed8c8a57bbc883bf10dd96eeb399a2f7671c1d2fceb262fad63b5`
+  `71ec748da3b77066514ad6134e980903b925c680b2788a16aef60e5d3fecedd6`
 - `vmem-picture-pts-probe.c`:
   `65347de5f707e49e0d2208e4c8310f84026a518ff87730c0d17eabe5757d3bb7`
 - `vmem-picture-pts-abi.cpp`:
@@ -74,13 +74,13 @@ callback.
 - `vmem-configuration-race.c`:
   `35b2dfa2e5587b35f7b0966cb079cbaef83828ef33e97f77b9c0f426d7fde3d7`
 - `strict-frame-step-source-check.py`:
-  `c228c1d0988172e2c72bad9b147cf81d28bc952cb254920551bb56c2c68fb845`
+  `c5345a4effcf441089c5b6cfeec003dfb3ad8a7eb127e60358e0d6025aa03ad6`
 - `strict-frame-step-probe.c`:
   `bc9c69c9e86bb90cff568f0b32a0aef75b51330634bf5efeddd00b82a723aaa9`
 - `validate-strict-frame-step.sh`:
-  `974b109d9e76de13f72e6e659ab40b1919f7d0d2167f942f58f2a01a31d6f6e3`
+  `de0e39fbf0696f3c981b40a61e0bfe95bc4209c801048a1e20a4fda1c1ddea27`
 - `validate-vmem-picture-pts.sh`:
-  `a00d24e887e957e3e7797967acf49f581570b063262df201a2835f920e22d7d1`
+  `5be777e7b0d6456a10ab8b9818a8705b09ee91292ab8e66c893bdeb823d94b9b`
 
 The source checker includes negative mutations for scheduled-date
 substitution, missing `VLC_TICK_0` normalization, zero-for-invalid coercion,
@@ -90,10 +90,11 @@ threads. It also forces allocation failure across v4-to-v6 and v6-to-v4
 transitions and verifies that neither callback tuple tears.
 The pre-existing strict-frame checker retains all of its frozen v4 checks. It
 and the vmem checker now share one fail-closed source-composition resolver for
-versions 4 through 8. The resolver requires complete, unique and contiguous
+versions 4 through 9. The resolver requires complete, unique and contiguous
 feature groups plus the exact literal version implementation; the vmem checker
 then requires that the resolved version is at least 6. Patch 0033's audio
-session leases are a separately provable same-version refinement of version 8.
+session leases are a separately provable same-version refinement introduced at
+version 8 and retained unconditionally by version 9.
 Runtime probes receive one exact expected version owned by the ordered patch
 manifest. They neither infer archive identity from the shipped headers nor
 accept an open-ended version range.

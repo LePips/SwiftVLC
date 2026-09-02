@@ -102,7 +102,7 @@ struct PiPCadenceValidationCase: View {
           player.state == .playing && profile.matches(player.videoTracks)
         }
         if index == 0 {
-          guard controller.start() == .accepted else {
+          guard controller.requestStart() == .accepted else {
             throw CadenceFailure("Direct PiP start was not accepted")
           }
           try await waitUntil("Direct PiP did not become active", timeout: .seconds(30)) {

@@ -10,6 +10,7 @@ import json
 import os
 import plistlib
 import re
+import signal
 import subprocess
 import sys
 import tempfile
@@ -17,6 +18,7 @@ import threading
 import time
 import unittest
 import zipfile
+from datetime import datetime, timedelta, timezone
 from unittest import mock
 from pathlib import Path
 
@@ -39,6 +41,9 @@ fixture_server = load_script("fixture-server.py")
 prepare_xctestrun = load_script("prepare-xctestrun.py")
 configure_signing = load_script("configure-signing.py")
 package_volunteer_report = load_script("package-volunteer-report.py")
+report_validation = load_script("report_validation.py")
+validation_plan = load_script("validation-plan.py")
+tunnel_host = load_script("tunnel-host.py")
 verify_fixtures = load_script("verify-fixtures.py")
 candidate_metadata = load_script("candidate-metadata.py")
 materialize_evidence = load_script("materialize-evidence.py")
@@ -47,6 +52,104 @@ augment_performance_traces = load_script("augment-performance-traces.py")
 augment_native_subtitle_traces = load_script("augment-native-subtitle-traces.py")
 augment_timebase_evidence = load_script("augment-timebase-evidence.py")
 assemble_record = load_script("assemble-record.py")
+run_with_watchdog = load_script("run-with-watchdog.py")
+
+
+def load_repository_script(name: str):
+    path = ROOT / name
+    spec = importlib.util.spec_from_file_location(name.replace("-", "_"), path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+release_source_digest = load_repository_script("release-source-digest.py")
+
+
+def write_validated_report(
+    run_dir: Path,
+    value: dict,
+    *,
+    selection_scope: str = "full",
+    mode: str = "qualification",
+    qualification_eligible: bool = True,
+    report_only: bool = False,
+    retained_files: dict[str, str] | None = None,
+) -> None:
+    device_path = run_dir / "device.json"
+    if not device_path.exists():
+        report_validation.atomic_write_json(
+            device_path,
+            {
+                "selected": {
+                    "marketingName": "iPhone",
+                    "productType": "iPhone17,1",
+                    "deviceFamily": "iPhone",
+                    "osVersion": "26.0",
+                    "osBuild": "23A1",
+                    "osReleaseType": "stable",
+                    "matchingHardwareRows": ["iphone-current"],
+                }
+            },
+        )
+    candidate_path = run_dir / "candidate-metadata.json"
+    if not candidate_path.exists():
+        report_validation.atomic_write_json(candidate_path, {"formatVersion": 2})
+    fixture_path = run_dir / "fixture-manifest.json"
+    if not fixture_path.exists():
+        report_validation.atomic_write_json(fixture_path, {"formatVersion": 1})
+    selected_device = json.loads(device_path.read_text())["selected"]
+    fixture_digest = hashlib.sha256(fixture_path.read_bytes()).hexdigest()
+    completed_at = datetime.now(timezone.utc).replace(microsecond=0)
+    started_at = completed_at - timedelta(seconds=1)
+    report = {
+        "formatVersion": 2,
+        "startedAtUTC": started_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "completedAtUTC": completed_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "wallDurationSeconds": 1,
+        "mode": mode,
+        "qualificationEligibleEnvironment": qualification_eligible,
+        "reportOnly": report_only,
+        "releaseGateSatisfied": False,
+        "qualificationRows": [],
+        "device": selected_device,
+        "fixtureManifestChecksum": fixture_digest,
+        **value,
+    }
+    scenario_ids = [row["scenario"] for row in report.get("scenarios", [])]
+    plan = {
+        "formatVersion": 2,
+        "startedAtUTC": report["startedAtUTC"],
+        "mode": report["mode"],
+        "qualificationEligibleEnvironment": report[
+            "qualificationEligibleEnvironment"
+        ],
+        "reportOnly": report["reportOnly"],
+        "selectionScope": selection_scope,
+        "requestedScenarioDrivers": scenario_ids,
+        "selectedScenarioDrivers": scenario_ids,
+        "skippedScenarioDrivers": [],
+        "matrixHardwareRows": ["iphone-current"],
+        "matrixScenarioOutputsPlanned": [],
+        "projectedHardwareRow": None,
+    }
+    report_validation.atomic_write_json(run_dir / "report.json", report)
+    report_validation.atomic_write_json(run_dir / "validation-plan.json", plan)
+    for relative, contents in (retained_files or {}).items():
+        destination = run_dir / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(contents)
+    report_bytes = (run_dir / "report.json").read_bytes()
+    plan_bytes = (run_dir / "validation-plan.json").read_bytes()
+    authority = (
+        report_validation.REPORT_ONLY_AUTHORITY
+        if report_only
+        else report_validation.QUALIFICATION_AUTHORITY
+    )
+    report_validation.write_marker_for_bytes(
+        run_dir, report_bytes, plan_bytes, authority
+    )
 
 
 def timebase_raw_sample(
@@ -161,6 +264,29 @@ class DeviceInfoTests(unittest.TestCase):
         self.assertTrue(normalized["qualificationEligible"])
         self.assertEqual(normalized["matchingHardwareRows"], ["iphone-current"])
 
+    def test_preserves_the_wired_coredevice_tunnel_address(self):
+        device = {
+            "identifier": "core-id",
+            "connectionProperties": {
+                "tunnelState": "connected",
+                "transportType": "wired",
+                "tunnelIPAddress": "fd7d:5ea1:e53f::1",
+            },
+            "deviceProperties": {
+                "ddiServicesAvailable": True,
+                "developerModeStatus": "enabled",
+                "osVersionNumber": "26.6",
+                "osBuildUpdate": "23G80",
+            },
+            "hardwareProperties": {
+                "reality": "physical",
+                "platform": "iOS",
+                "deviceType": "iPhone",
+            },
+        }
+        normalized = device_info.normalize(device, [])
+        self.assertEqual(normalized["tunnelIPAddress"], "fd7d:5ea1:e53f::1")
+
     def test_live_details_replace_a_dormant_list_snapshot(self):
         dormant = {
             "identifier": "core-id",
@@ -186,6 +312,55 @@ class DeviceInfoTests(unittest.TestCase):
             device_info.replace_device_snapshot([], details),
             [details],
         )
+
+
+class TunnelHostTests(unittest.TestCase):
+    def test_finds_the_mac_peer_in_the_device_tunnel_prefix(self):
+        value = tunnel_host.matching_host_address(
+            "fd7d:5ea1:e53f::1",
+            """
+utun4: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST>
+    inet6 fe80::d211:e5ff:fe08:e097%utun4 prefixlen 64
+    inet6 fd7d:5ea1:e53f::2 prefixlen 64
+en0: flags=8863<UP,BROADCAST,RUNNING>
+    inet6 fd00:dead:beef::2 prefixlen 64
+""",
+        )
+        self.assertEqual(value, "fd7d:5ea1:e53f::2")
+
+    def test_rejects_an_ambiguous_or_missing_peer(self):
+        for ifconfig_output in (
+            "",
+            """
+utun4: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST>
+    inet6 fd7d:5ea1:e53f::2 prefixlen 64
+    inet6 fd7d:5ea1:e53f::3 prefixlen 64
+""",
+        ):
+            with self.subTest(ifconfig_output=ifconfig_output):
+                with self.assertRaisesRegex(ValueError, "expected one"):
+                    tunnel_host.matching_host_address(
+                        "fd7d:5ea1:e53f::1", ifconfig_output
+                    )
+
+
+class FixtureServerAddressTests(unittest.TestCase):
+    def test_brackets_ipv6_hosts_in_fixture_urls(self):
+        self.assertEqual(
+            fixture_server.advertised_url("fd7d:5ea1:e53f::2", 8080),
+            "http://[fd7d:5ea1:e53f::2]:8080",
+        )
+
+    def test_ipv6_listener_uses_an_ipv6_socket(self):
+        with tempfile.TemporaryDirectory() as directory:
+            server = fixture_server.FixtureHTTPServer(
+                ("::1", 0), Path(directory), None, 512, 0, False
+            )
+            try:
+                self.assertEqual(server.address_family, fixture_server.socket.AF_INET6)
+                self.assertEqual(server.server_address[0], "::1")
+            finally:
+                server.server_close()
 
 
 class ExploratoryDevicePolicyTests(unittest.TestCase):
@@ -234,13 +409,718 @@ class ExploratoryDevicePolicyTests(unittest.TestCase):
         )
 
 
+class ValidationPlanTests(unittest.TestCase):
+    matrix = json.loads((ROOT / "qualification" / "matrix.json").read_text())
+
+    def build(
+        self,
+        selected,
+        hardware,
+        *,
+        projected=None,
+        report_only=False,
+        selection_scope="partial",
+    ):
+        device_info_value = {
+            "mode": "qualification",
+            "selected": {
+                "qualificationEligible": True,
+                "matchingHardwareRows": hardware,
+            },
+        }
+        return validation_plan.build_plan(
+            device_info_value,
+            self.matrix,
+            list(selected),
+            list(selected),
+            started_at_utc="2026-09-02T00:00:00Z",
+            projected_hardware_row=projected,
+            report_only=report_only,
+            selection_scope=selection_scope,
+        )
+
+    def test_planned_outputs_come_only_from_selected_driver_contracts(self):
+        cases = (
+            ("analyzer", ["analyzer"], ["iphone-current"], None, []),
+            ("ui-suite", ["ui-suite"], ["iphone-current"], None, []),
+            (
+                "dismissal",
+                ["dismissal"],
+                ["iphone-minimum"],
+                None,
+                ["restore", "close"],
+            ),
+            (
+                "continuity-minimum",
+                ["continuity"],
+                ["iphone-minimum"],
+                None,
+                ["replacement"],
+            ),
+            (
+                "continuity-current",
+                ["continuity"],
+                ["iphone-current"],
+                None,
+                ["replacement", "replacement-continuity"],
+            ),
+            (
+                "continuity-projected",
+                ["continuity"],
+                [],
+                "iphone-current",
+                ["replacement", "replacement-continuity"],
+            ),
+            (
+                "failed-start-minimum",
+                ["failed-start"],
+                ["iphone-minimum"],
+                None,
+                ["failed-start"],
+            ),
+            (
+                "failed-start-current",
+                ["failed-start"],
+                ["iphone-current"],
+                None,
+                ["failed-start", "accepted-start-delayed-failure"],
+            ),
+        )
+        for name, selected, hardware, projected, expected in cases:
+            with self.subTest(name=name):
+                plan = self.build(selected, hardware, projected=projected)
+                self.assertEqual(plan["matrixScenarioOutputsPlanned"], expected)
+                self.assertNotIn("matrixRowsRepresented", plan)
+
+    def test_report_only_plan_never_claims_matrix_outputs(self):
+        plan = self.build(["continuity"], ["iphone-current"], report_only=True)
+        self.assertEqual(plan["matrixScenarioOutputsPlanned"], [])
+        self.assertEqual(plan["selectionScope"], "partial")
+
+    def test_report_only_plan_cannot_claim_full_scope(self):
+        with self.assertRaisesRegex(ValueError, "cannot claim full scope"):
+            self.build(
+                ["cadence-semantics-probe"],
+                ["iphone-current"],
+                report_only=True,
+                selection_scope="full",
+            )
+
+    def test_duplicate_driver_plan_is_rejected_before_device_work(self):
+        with self.assertRaisesRegex(ValueError, "non-empty unique"):
+            self.build(["analyzer", "analyzer"], ["iphone-current"])
+
+
+class ReportValidationReceiptTests(unittest.TestCase):
+    def test_receipt_binds_the_exact_report_and_validation_plan(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run = Path(directory)
+            write_validated_report(
+                run,
+                {
+                    "result": "pass",
+                    "scenarios": [{"scenario": "analyzer", "result": "pass"}],
+                },
+            )
+            report_bytes = (run / "report.json").read_bytes()
+            plan_bytes = (run / "validation-plan.json").read_bytes()
+            self.assertTrue(
+                report_validation.is_valid(run, report_bytes, plan_bytes)
+            )
+
+            plan = json.loads(plan_bytes)
+            plan["selectionScope"] = "partial"
+            report_validation.atomic_write_json(run / "validation-plan.json", plan)
+
+            self.assertFalse(report_validation.is_valid(run))
+
+    def test_receipt_binds_every_retained_evidence_entry(self):
+        mutations = {
+            "changed": lambda run: (run / "evidence" / "probe.json").write_text(
+                '{"value":2}\n'
+            ),
+            "deleted": lambda run: (run / "evidence" / "probe.json").unlink(),
+            "added": lambda run: (run / "evidence" / "extra.json").write_text(
+                '{"value":3}\n'
+            ),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                run = Path(directory)
+                write_validated_report(
+                    run,
+                    {
+                        "result": "pass",
+                        "scenarios": [{"scenario": "analyzer", "result": "pass"}],
+                    },
+                    retained_files={"evidence/probe.json": '{"value":1}\n'},
+                )
+                self.assertTrue(report_validation.is_valid(run))
+
+                mutate(run)
+
+                self.assertFalse(report_validation.is_valid(run))
+
+    def test_evidence_manifest_is_deterministic_and_excludes_only_derived_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run = Path(directory)
+            write_validated_report(
+                run,
+                {
+                    "result": "pass",
+                    "scenarios": [{"scenario": "analyzer", "result": "pass"}],
+                },
+                retained_files={"evidence/z.json": "{}\n", "a.log": "proof\n"},
+            )
+            first = (run / report_validation.EVIDENCE_MANIFEST_FILENAME).read_bytes()
+            report_bytes = (run / "report.json").read_bytes()
+            plan_bytes = (run / "validation-plan.json").read_bytes()
+            (run / report_validation.MARKER_FILENAME).unlink()
+            (run / report_validation.EVIDENCE_MANIFEST_FILENAME).unlink()
+
+            report_validation.write_marker_for_bytes(
+                run,
+                report_bytes,
+                plan_bytes,
+                report_validation.QUALIFICATION_AUTHORITY,
+            )
+
+            self.assertEqual(
+                first,
+                (run / report_validation.EVIDENCE_MANIFEST_FILENAME).read_bytes(),
+            )
+            for name in report_validation.POST_VALIDATION_ROOT_FILES:
+                (run / name).write_text("derived\n")
+            self.assertTrue(report_validation.is_valid(run))
+            (run / "unexpected-post-validation.txt").write_text("unbound\n")
+            self.assertFalse(report_validation.is_valid(run))
+
+    def test_failed_revalidation_removes_the_previous_success_receipt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run = Path(directory)
+            write_validated_report(
+                run,
+                {
+                    "result": "pass",
+                    "scenarios": [{"scenario": "analyzer", "result": "pass"}],
+                },
+            )
+            with self.assertRaisesRegex(
+                report_validation.ReportValidationError,
+                "requires matrix and candidate",
+            ):
+                report_validation.validate_and_mark(
+                    run,
+                    matrix_path=None,
+                    candidate_path=None,
+                )
+
+            self.assertFalse((run / report_validation.MARKER_FILENAME).exists())
+            self.assertFalse(
+                (run / report_validation.EVIDENCE_MANIFEST_FILENAME).exists()
+            )
+
+    def test_receipt_rejects_a_report_time_range_not_bound_to_the_plan(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run = Path(directory)
+            write_validated_report(
+                run,
+                {
+                    "result": "pass",
+                    "scenarios": [{"scenario": "analyzer", "result": "pass"}],
+                },
+            )
+            report = json.loads((run / "report.json").read_text())
+            report["startedAtUTC"] = "2026-09-01T00:00:00Z"
+
+            with self.assertRaisesRegex(
+                report_validation.ReportValidationError,
+                "does not match the validation plan",
+            ):
+                report_validation.marker_payload(
+                    json.dumps(report).encode(),
+                    (run / "validation-plan.json").read_bytes(),
+                    report_validation.QUALIFICATION_AUTHORITY,
+                )
+
+    def test_report_driver_mismatch_is_rejected_even_when_both_json_files_parse(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run = Path(directory)
+            write_validated_report(
+                run,
+                {
+                    "result": "pass",
+                    "scenarios": [{"scenario": "analyzer", "result": "pass"}],
+                },
+            )
+            plan = json.loads((run / "validation-plan.json").read_text())
+            plan["requestedScenarioDrivers"] = ["analyzer", "ui-suite"]
+            plan["selectedScenarioDrivers"] = ["ui-suite"]
+            plan["skippedScenarioDrivers"] = [
+                {"scenario": "analyzer", "reason": "test mismatch"}
+            ]
+
+            with self.assertRaisesRegex(
+                report_validation.ReportValidationError,
+                "do not exactly match",
+            ):
+                report_validation.marker_payload(
+                    (run / "report.json").read_bytes(),
+                    json.dumps(plan).encode(),
+                    report_validation.QUALIFICATION_AUTHORITY,
+                )
+
+    def test_plan_selection_must_reconcile_its_skipped_drivers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run = Path(directory)
+            write_validated_report(
+                run,
+                {
+                    "result": "pass",
+                    "scenarios": [{"scenario": "analyzer", "result": "pass"}],
+                },
+            )
+            plan = json.loads((run / "validation-plan.json").read_text())
+            plan["requestedScenarioDrivers"] = ["analyzer", "ui-suite"]
+
+            with self.assertRaisesRegex(
+                report_validation.ReportValidationError,
+                "do not reconcile",
+            ):
+                report_validation.marker_payload(
+                    (run / "report.json").read_bytes(),
+                    json.dumps(plan).encode(),
+                    report_validation.QUALIFICATION_AUTHORITY,
+                )
+
+    def test_marker_write_refuses_a_changed_retained_plan(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run = Path(directory)
+            write_validated_report(
+                run,
+                {
+                    "result": "pass",
+                    "scenarios": [{"scenario": "analyzer", "result": "pass"}],
+                },
+            )
+            report_bytes = (run / "report.json").read_bytes()
+            plan_bytes = (run / "validation-plan.json").read_bytes()
+            (run / report_validation.MARKER_FILENAME).unlink()
+            plan = json.loads(plan_bytes)
+            plan["selectionScope"] = "partial"
+            report_validation.atomic_write_json(run / "validation-plan.json", plan)
+
+            with self.assertRaisesRegex(
+                report_validation.ReportValidationError,
+                "plan changed after validation",
+            ):
+                report_validation.write_marker_for_bytes(
+                    run,
+                    report_bytes,
+                    plan_bytes,
+                    report_validation.QUALIFICATION_AUTHORITY,
+                )
+            self.assertFalse((run / report_validation.MARKER_FILENAME).exists())
+
+    def test_atomic_json_writer_preserves_the_previous_file_on_replace_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "owned.json"
+            path.write_text('{"old":true}\n')
+            with mock.patch.object(
+                report_validation.os,
+                "replace",
+                side_effect=OSError("simulated interruption"),
+            ):
+                with self.assertRaises(OSError):
+                    report_validation.atomic_write_json(path, {"new": True})
+
+            self.assertEqual(path.read_text(), '{"old":true}\n')
+            self.assertEqual(list(path.parent.glob(".owned.json.*.tmp")), [])
+
+    def test_report_only_validation_marks_only_its_narrow_contract(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run = Path(directory)
+            write_validated_report(
+                run,
+                {
+                    "result": "pass",
+                    "scenarios": [
+                        {
+                            "scenario": "cadence-semantics-probe",
+                            "result": "pass",
+                            "qualificationEvidence": "report-only",
+                        }
+                    ],
+                },
+                selection_scope="partial",
+                report_only=True,
+            )
+            (run / report_validation.MARKER_FILENAME).unlink()
+
+            report_validation.validate_and_mark(
+                run,
+                matrix_path=None,
+                candidate_path=None,
+                report_only=True,
+            )
+
+            self.assertTrue(report_validation.is_valid(run))
+
+    def test_duplicate_keys_cannot_forge_a_validation_receipt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run = Path(directory)
+            write_validated_report(
+                run,
+                {
+                    "result": "pass",
+                    "scenarios": [{"scenario": "analyzer", "result": "pass"}],
+                },
+            )
+            marker_path = run / report_validation.MARKER_FILENAME
+            marker = json.loads(marker_path.read_text())
+            marker_path.write_text(
+                "{"
+                '"formatVersion":2,'
+                '"formatVersion":2,'
+                f'"reportSHA256":"{marker["reportSHA256"]}",'
+                f'"validationAuthority":"{marker["validationAuthority"]}",'
+                f'"validationPlanSHA256":"{marker["validationPlanSHA256"]}",'
+                '"validationResult":"passed"'
+                "}\n"
+            )
+
+            self.assertFalse(report_validation.is_valid(run))
+
+
+class QualificationWatchdogTests(unittest.TestCase):
+    def test_success_preserves_combined_output_and_child_exit_code(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "command.log"
+
+            exit_code = run_with_watchdog.run(
+                [
+                    sys.executable,
+                    "-c",
+                    (
+                        "import sys; "
+                        "print('standard output', flush=True); "
+                        "print('standard error', file=sys.stderr, flush=True); "
+                        "raise SystemExit(7)"
+                    ),
+                ],
+                wall_seconds=5,
+                idle_seconds=2,
+                grace_seconds=0.2,
+                output_path=output,
+            )
+
+            self.assertEqual(exit_code, 7)
+            self.assertEqual(
+                output.read_text(), "standard output\nstandard error\n"
+            )
+
+    def test_idle_timeout_is_distinct_and_retained(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "command.log"
+
+            exit_code = run_with_watchdog.run(
+                [
+                    sys.executable,
+                    "-c",
+                    "import time; print('ready', flush=True); time.sleep(30)",
+                ],
+                wall_seconds=5,
+                idle_seconds=0.2,
+                grace_seconds=0.2,
+                output_path=output,
+            )
+
+            self.assertEqual(exit_code, run_with_watchdog.IDLE_TIMEOUT_EXIT)
+            self.assertIn("output-idle timeout", output.read_text())
+
+    def test_wall_timeout_wins_when_output_remains_active(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "command.log"
+            program = (
+                "import time\n"
+                "while True:\n"
+                " print('heartbeat', flush=True)\n"
+                " time.sleep(0.05)\n"
+            )
+
+            exit_code = run_with_watchdog.run(
+                [sys.executable, "-c", program],
+                wall_seconds=0.3,
+                idle_seconds=2,
+                grace_seconds=0.2,
+                output_path=output,
+            )
+
+            self.assertEqual(exit_code, run_with_watchdog.WALL_TIMEOUT_EXIT)
+            self.assertIn("wall-clock timeout", output.read_text())
+
+    def test_reusing_a_log_path_replaces_stale_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "command.log"
+            for value in ("stale", "current"):
+                self.assertEqual(
+                    run_with_watchdog.run(
+                        [sys.executable, "-c", f"print({value!r}, flush=True)"],
+                        wall_seconds=5,
+                        idle_seconds=2,
+                        grace_seconds=0.2,
+                        output_path=output,
+                    ),
+                    0,
+                )
+
+            self.assertEqual(output.read_text(), "current\n")
+
+    def test_termination_signal_cancels_the_complete_child_process_group(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "command.log"
+            child_pid_path = root / "child.pid"
+            program = (
+                "import os,time\n"
+                f"open({str(child_pid_path)!r}, 'w').write(str(os.getpid()))\n"
+                "print('ready', flush=True)\n"
+                "time.sleep(30)\n"
+            )
+            wrapper = subprocess.Popen(
+                [
+                    sys.executable,
+                    str(ROOT / "qualification" / "run-with-watchdog.py"),
+                    "--wall-seconds",
+                    "60",
+                    "--idle-seconds",
+                    "60",
+                    "--grace-seconds",
+                    "0.2",
+                    "--output",
+                    str(output),
+                    "--",
+                    sys.executable,
+                    "-c",
+                    program,
+                ],
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            child_pid = None
+            try:
+                deadline = time.monotonic() + 3
+                while time.monotonic() < deadline and not child_pid_path.exists():
+                    time.sleep(0.02)
+                self.assertTrue(child_pid_path.exists())
+                child_pid = int(child_pid_path.read_text())
+
+                os.kill(wrapper.pid, signal.SIGTERM)
+
+                self.assertEqual(wrapper.wait(timeout=3), 143)
+                deadline = time.monotonic() + 3
+                while time.monotonic() < deadline:
+                    try:
+                        os.kill(child_pid, 0)
+                    except ProcessLookupError:
+                        break
+                    time.sleep(0.02)
+                else:
+                    self.fail("watchdog cancellation left its child process alive")
+                self.assertIn("received signal 15", output.read_text())
+            finally:
+                if wrapper.poll() is None:
+                    wrapper.kill()
+                    wrapper.wait(timeout=3)
+                if wrapper.stderr is not None:
+                    wrapper.stderr.close()
+                if child_pid is not None:
+                    try:
+                        os.kill(child_pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+
+    def test_normal_leader_exit_cannot_leave_a_background_helper_running(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "command.log"
+            helper_pid_path = root / "helper.pid"
+            program = (
+                "import subprocess\n"
+                f"path = {str(helper_pid_path)!r}\n"
+                "helper = subprocess.Popen(['sleep', '30'])\n"
+                "open(path, 'w').write(str(helper.pid))\n"
+                "print('leader complete', flush=True)\n"
+            )
+
+            self.assertEqual(
+                run_with_watchdog.run(
+                    [sys.executable, "-c", program],
+                    wall_seconds=5,
+                    idle_seconds=2,
+                    grace_seconds=0.2,
+                    output_path=output,
+                ),
+                0,
+            )
+            helper_pid = int(helper_pid_path.read_text())
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                try:
+                    os.kill(helper_pid, 0)
+                except ProcessLookupError:
+                    break
+                time.sleep(0.02)
+            else:
+                try:
+                    os.kill(helper_pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                self.fail("watchdog left a background helper running after leader exit")
+
+
+class ReleaseSourceDigestQualificationOutputTests(unittest.TestCase):
+    def test_generated_report_tree_is_outside_the_release_source_digest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "init", "-q", str(root)], check=True)
+            subprocess.run(
+                ["git", "-C", str(root), "config", "user.email", "fixture@example.com"],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(root), "config", "user.name", "Fixture"],
+                check=True,
+            )
+            (root / "README.md").write_text("release source\n")
+            subprocess.run(
+                ["git", "-C", str(root), "add", "README.md"], check=True
+            )
+            subprocess.run(
+                ["git", "-C", str(root), "commit", "-qm", "fixture"], check=True
+            )
+            before = release_source_digest.source_digest(root, "1.1.0")
+            reports = root / "scripts" / "qualification" / "reports" / "1.1.0"
+            reports.mkdir(parents=True)
+            (reports / "assembled-device" / "report.json").parent.mkdir()
+            (reports / "assembled-device" / "report.json").write_text("{}\n")
+
+            after = release_source_digest.source_digest(root, "1.1.0")
+
+            self.assertEqual(before, after)
+            (root / "unreviewed.swift").write_text("fatalError()\n")
+            with self.assertRaisesRegex(SystemExit, "untracked release source"):
+                release_source_digest.source_digest(root, "1.1.0")
+
+
 class QualificationRunnerStorageTests(unittest.TestCase):
+    def test_runner_current_only_filter_matches_release_policy(self):
+        script = (ROOT / "qualification" / "run-device-tests.sh").read_text()
+        match = re.search(
+            r"(?ms)^IPHONE_CURRENT_ONLY_SCENARIOS=\(\n(?P<body>.*?)^\)\n",
+            script,
+        )
+        self.assertIsNotNone(match)
+        shell_scenarios = {
+            line.strip().strip('"\'')
+            for line in match.group("body").splitlines()
+            if line.strip()
+        }
+
+        self.assertEqual(
+            shell_scenarios,
+            set(qualification_policy.IPHONE_CURRENT_ONLY_RUNNER_SCENARIOS),
+        )
+        self.assertIn("playback-foreground-displaylayer-recovery", shell_scenarios)
+        self.assertEqual(
+            script.count('scenario_requires_iphone_current "$scenario"'),
+            3,
+            "rejection, filtering, and full-scope validation must share one helper",
+        )
+
     def test_runner_requires_the_release_oracle_decoder_tools(self):
         script = (ROOT / "qualification" / "run-device-tests.sh").read_text()
         self.assertIn(
             "for command in curl ffmpeg ffprobe git jq plutil python3 shasum tar xcodebuild xcrun",
             script,
         )
+
+    def test_runner_prefers_the_wired_coredevice_tunnel_for_fixture_delivery(self):
+        script = (ROOT / "qualification" / "run-device-tests.sh").read_text()
+        self.assertIn(
+            "DEVICE_TUNNEL_IP=$(jq -r '.selected.tunnelIPAddress // empty'",
+            script,
+        )
+        self.assertIn('python3 "$SCRIPT_DIR/tunnel-host.py"', script)
+        self.assertIn(
+            'fixture_server_args+=(--host :: --advertise-host "$TUNNEL_HOST")',
+            script,
+        )
+        self.assertIn(
+            "CoreDevice tunnel discovery failed; falling back to the LAN fixture address.",
+            script,
+        )
+
+    def test_runner_retains_interrupted_progress_outside_the_cleanup_root(self):
+        script = (ROOT / "qualification" / "run-device-tests.sh").read_text()
+        self.assertIn('REQUESTED_SCENARIOS=("${ONLY_SCENARIOS[@]}")', script)
+        self.assertIn('python3 "$SCRIPT_DIR/validation-plan.py"', script)
+        self.assertIn('--output "$OUTPUT_DIR/validation-plan.json"', script)
+        self.assertIn('--selection-scope "$VALIDATION_SELECTION_SCOPE"', script)
+        self.assertIn(
+            'report_validation_args=(\n  validate-and-mark\n  --run-dir "$OUTPUT_DIR"',
+            script,
+        )
+        self.assertNotIn('report_validation.py" mark', script)
+        self.assertIn(
+            'RESULTS_TSV="$OUTPUT_DIR/scenario-results.tsv"',
+            script,
+        )
+        self.assertIn(
+            'QUALIFICATION_ROWS="$OUTPUT_DIR/qualification-rows.jsonl"',
+            script,
+        )
+        self.assertNotIn('RESULTS_TSV="$WORK_DIR/results.tsv"', script)
+        self.assertNotIn(
+            'QUALIFICATION_ROWS="$WORK_DIR/qualification-rows.jsonl"',
+            script,
+        )
+        plan_index = script.index('python3 "$SCRIPT_DIR/validation-plan.py"')
+        fixture_index = script.index('if [[ ! -f "$FIXTURES/manifest.json"')
+        install_index = script.index('install_app "$RUNNER_APP"')
+        self.assertLess(plan_index, fixture_index)
+        self.assertLess(plan_index, install_index)
+        self.assertEqual(script.count("DEFAULT_SCENARIOS=("), 1)
+
+    def test_fixture_server_is_reaped_before_the_evidence_tree_is_sealed(self):
+        script = (ROOT / "qualification" / "run-device-tests.sh").read_text()
+        final_scenario_loop = script.index(
+            'for scenario in "${ONLY_SCENARIOS[@]}"; do\n  run_scenario "$scenario"'
+        )
+        stop_index = script.index("stop_fixture_server", final_scenario_loop)
+        report_index = script.index('"$RESULTS_TSV" "$OUTPUT_DIR/report.json"', stop_index)
+        receipt_index = script.index(
+            'python3 "$SCRIPT_DIR/report_validation.py"', report_index
+        )
+
+        self.assertLess(stop_index, report_index)
+        self.assertLess(stop_index, receipt_index)
+
+    def test_runner_primes_the_exact_installed_xctrunner_before_tests(self):
+        script = (ROOT / "qualification" / "run-device-tests.sh").read_text()
+        install_index = script.index('install_app "$RUNNER_APP"')
+        prime_index = script.index('"$SCRIPT_DIR/prime-xctrunner.sh"', install_index)
+        test_index = script.index(
+            'for scenario in "${ONLY_SCENARIOS[@]}"; do\n  run_scenario "$scenario"',
+            prime_index,
+        )
+
+        self.assertLess(install_index, prime_index)
+        self.assertLess(prime_index, test_index)
+        prime_source = script[prime_index:test_index]
+        self.assertIn('--device "$DEVICE_UDID"', prime_source)
+        self.assertIn('"$TEST_RUNNER_BUNDLE_IDENTIFIER"', prime_source)
+        self.assertNotIn('"$TEST_RUNNER_BUNDLE_IDENTIFIER.xctrunner"', prime_source)
 
     def test_every_xcode_test_invocation_uses_the_configured_derived_data(self):
         script = (ROOT / "qualification" / "run-device-tests.sh").read_text()
@@ -258,6 +1138,40 @@ class QualificationRunnerStorageTests(unittest.TestCase):
         self.assertGreater(len(commands), 0)
         for command in commands:
             self.assertIn('-derivedDataPath "$DERIVED_DATA"', command)
+
+    def test_every_xcodebuild_invocation_has_wall_and_idle_watchdogs(self):
+        script = (ROOT / "qualification" / "run-device-tests.sh").read_text()
+        command_count = len(
+            re.findall(r"(?m)^\s*xcodebuild(?:\s|$)", script)
+        )
+        watchdog_call_count = len(
+            re.findall(r"(?m)^\s*(?:if ! )?run_with_watchdog\s", script)
+        )
+
+        self.assertGreater(command_count, 0)
+        self.assertEqual(watchdog_call_count, command_count)
+        self.assertIn('python3 "$SCRIPT_DIR/run-with-watchdog.py"', script)
+
+    def test_volunteer_runner_pins_the_exact_preflight_device_identifier(self):
+        volunteer = (ROOT / "qualification" / "volunteer-validation.sh").read_text()
+        resolution = volunteer.index("RESOLVED_DEVICE_ID=$(jq -er")
+        runner = volunteer.index("runner_args=(", resolution)
+        runner_source = volunteer[runner:]
+
+        self.assertIn('--device "$RESOLVED_DEVICE_ID"', runner_source)
+        self.assertNotIn(
+            'runner_args+=(--device "$DEVICE_SELECTOR")', runner_source
+        )
+
+    def test_pull_request_showcase_gate_compiles_ui_tests_without_booting(self):
+        workflow = (ROOT.parent / ".github" / "workflows" / "test.yml").read_text()
+        start = workflow.index("- name: Compile iOS Showcase and qualification UI tests")
+        end = workflow.index("\n  # tvOS test-run gate", start)
+        step = workflow[start:end]
+
+        self.assertIn("xcodebuild build-for-testing", step)
+        self.assertIn('-destination "generic/platform=iOS Simulator"', step)
+        self.assertNotIn("xcodebuild test", step)
 
     def test_disposable_signing_identity_is_used_end_to_end(self):
         script = (ROOT / "qualification" / "run-device-tests.sh").read_text()
@@ -578,7 +1492,8 @@ class QualificationRunnerStorageTests(unittest.TestCase):
         body = branch.group("body")
         marker = "SWIFTVLC_AUDIO_RESET_READY_FOR_OPERATOR:$attempt_token"
         self.assertIn(marker, body)
-        self.assertIn('> "$attempt_log" 2>&1 &', body)
+        self.assertIn('run_with_watchdog 1200 660 "$attempt_log"', body)
+        self.assertIn('-resultBundlePath "$attempt_bundle" &', body)
         self.assertIn('grep -Fq -- "$reset_readiness_marker" "$attempt_log"', body)
         self.assertLess(
             body.index("xcodebuild test-without-building"),
@@ -862,6 +1777,208 @@ class QualificationRunnerStorageTests(unittest.TestCase):
         self.assertIn('export TMPDIR="$WORK_DIR"', script)
 
 
+class PrimeXCTRunnerScriptTests(unittest.TestCase):
+    script = ROOT / "qualification" / "prime-xctrunner.sh"
+
+    def invoke(
+        self,
+        root: Path,
+        *,
+        fail_first_terminate=False,
+        fail_launch=False,
+        fail_first_launch=False,
+        signal_first_launch=False,
+        process_identifier="4321",
+    ):
+        shim_directory = root / "bin"
+        shim_directory.mkdir()
+        call_log = root / "xcrun-calls.jsonl"
+        terminate_state = root / "terminate-count"
+        launch_state = root / "launch-count"
+        shim = shim_directory / "xcrun"
+        shim.write_text("""#!/usr/bin/env python3
+import json
+import os
+import signal
+from pathlib import Path
+import sys
+import time
+
+arguments = sys.argv[1:]
+with open(os.environ["FAKE_XCRUN_LOG"], "a") as output:
+    output.write(json.dumps(arguments) + "\\n")
+
+if "launch" in arguments:
+    state = Path(os.environ["FAKE_XCRUN_LAUNCH_STATE"])
+    count = int(state.read_text()) if state.exists() else 0
+    count += 1
+    state.write_text(str(count))
+    output_path = Path(arguments[arguments.index("--json-output") + 1])
+    if (os.environ.get("FAKE_XCRUN_SIGNAL_FIRST_LAUNCH") == "1"
+            and count == 1):
+        output_path.write_text('{"result":')
+        os.kill(os.getppid(), signal.SIGTERM)
+        time.sleep(0.05)
+        raise SystemExit(143)
+    if os.environ.get("FAKE_XCRUN_FAIL_LAUNCH") == "1":
+        raise SystemExit(42)
+    if (os.environ.get("FAKE_XCRUN_FAIL_FIRST_LAUNCH") == "1"
+            and count == 1):
+        output_path.write_text('{"result":')
+        raise SystemExit(42)
+    process_identifier = os.environ.get("FAKE_XCRUN_PROCESS_IDENTIFIER", "4321")
+    output_path.write_text(json.dumps(
+        {"result": {"process": {"processIdentifier": process_identifier}}}
+    ))
+    raise SystemExit(0)
+
+if "terminate" in arguments:
+    state = Path(os.environ["FAKE_XCRUN_TERMINATE_STATE"])
+    count = int(state.read_text()) if state.exists() else 0
+    count += 1
+    state.write_text(str(count))
+    if os.environ.get("FAKE_XCRUN_FAIL_FIRST_TERMINATE") == "1" and count == 1:
+        raise SystemExit(23)
+    raise SystemExit(0)
+
+raise SystemExit(99)
+""")
+        shim.chmod(0o755)
+        work = root / "work"
+        work.mkdir()
+        environment = dict(os.environ)
+        environment.update(
+            {
+                "PATH": f"{shim_directory}:{environment['PATH']}",
+                "FAKE_XCRUN_LOG": str(call_log),
+                "FAKE_XCRUN_TERMINATE_STATE": str(terminate_state),
+                "FAKE_XCRUN_LAUNCH_STATE": str(launch_state),
+                "FAKE_XCRUN_FAIL_FIRST_TERMINATE": (
+                    "1" if fail_first_terminate else "0"
+                ),
+                "FAKE_XCRUN_FAIL_LAUNCH": "1" if fail_launch else "0",
+                "FAKE_XCRUN_FAIL_FIRST_LAUNCH": (
+                    "1" if fail_first_launch else "0"
+                ),
+                "FAKE_XCRUN_SIGNAL_FIRST_LAUNCH": (
+                    "1" if signal_first_launch else "0"
+                ),
+                "FAKE_XCRUN_PROCESS_IDENTIFIER": process_identifier,
+            }
+        )
+        result = subprocess.run(
+            [
+                str(self.script),
+                "--device",
+                "physical-device",
+                "--bundle-identifier",
+                "com.swiftvlc.tests.xctrunner",
+                "--work-root",
+                str(work),
+            ],
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+        calls = [json.loads(line) for line in call_log.read_text().splitlines()]
+        return result, calls, work
+
+    def test_launches_suspended_runner_then_terminates_it_with_timeouts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result, calls, work = self.invoke(Path(directory))
+            leftovers = list(work.glob("runner-prime*"))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(calls), 2)
+        launch, terminate = calls
+        for argument in ("--start-stopped", "--no-activate", "--terminate-existing"):
+            self.assertIn(argument, launch)
+        self.assertEqual(launch[launch.index("--timeout") + 1], "20")
+        self.assertEqual(launch[-1], "com.swiftvlc.tests.xctrunner")
+        self.assertEqual(terminate[terminate.index("--pid") + 1], "4321")
+        self.assertEqual(terminate[terminate.index("--timeout") + 1], "20")
+        self.assertEqual(leftovers, [])
+
+    def test_failed_termination_is_retried_by_exit_cleanup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result, calls, work = self.invoke(
+                Path(directory), fail_first_terminate=True
+            )
+            leftovers = list(work.glob("runner-prime*"))
+
+        self.assertEqual(result.returncode, 23)
+        terminate_calls = [call for call in calls if "terminate" in call]
+        self.assertEqual(len(terminate_calls), 2)
+        self.assertEqual(
+            terminate_calls[0][terminate_calls[0].index("--timeout") + 1], "20"
+        )
+        self.assertEqual(
+            terminate_calls[1][terminate_calls[1].index("--timeout") + 1], "10"
+        )
+        self.assertIn("--kill", terminate_calls[1])
+        self.assertEqual(leftovers, [])
+
+    def test_launch_failure_attempts_bounded_exact_bundle_recovery(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result, calls, work = self.invoke(Path(directory), fail_launch=True)
+            leftovers = list(work.glob("runner-prime*"))
+
+        self.assertEqual(result.returncode, 42)
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(all("--terminate-existing" in call for call in calls))
+        self.assertEqual(calls[0][calls[0].index("--timeout") + 1], "20")
+        self.assertEqual(calls[1][calls[1].index("--timeout") + 1], "10")
+        self.assertEqual(leftovers, [])
+
+    def test_partial_launch_output_is_recovered_and_force_terminated(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result, calls, work = self.invoke(
+                Path(directory), fail_first_launch=True
+            )
+            leftovers = list(work.glob("runner-prime*"))
+
+        self.assertEqual(result.returncode, 42)
+        self.assertEqual(len(calls), 3)
+        self.assertIn("launch", calls[0])
+        self.assertIn("launch", calls[1])
+        self.assertIn("--terminate-existing", calls[1])
+        self.assertEqual(calls[1][calls[1].index("--timeout") + 1], "10")
+        self.assertIn("terminate", calls[2])
+        self.assertEqual(calls[2][calls[2].index("--pid") + 1], "4321")
+        self.assertIn("--kill", calls[2])
+        self.assertEqual(leftovers, [])
+
+    def test_signal_during_partial_launch_recovers_and_force_terminates(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result, calls, work = self.invoke(
+                Path(directory), signal_first_launch=True
+            )
+            leftovers = list(work.glob("runner-prime*"))
+
+        self.assertEqual(result.returncode, 143)
+        self.assertEqual(len(calls), 3)
+        self.assertIn("launch", calls[1])
+        self.assertEqual(calls[1][calls[1].index("--timeout") + 1], "10")
+        self.assertIn("terminate", calls[2])
+        self.assertIn("--kill", calls[2])
+        self.assertEqual(leftovers, [])
+
+    def test_non_positive_or_non_numeric_process_identifier_is_rejected(self):
+        for process_identifier in ("0", "not-a-pid"):
+            with self.subTest(
+                process_identifier=process_identifier
+            ), tempfile.TemporaryDirectory() as directory:
+                result, calls, work = self.invoke(
+                    Path(directory), process_identifier=process_identifier
+                )
+                leftovers = list(work.glob("runner-prime*"))
+
+                self.assertEqual(result.returncode, 1)
+                self.assertEqual(len(calls), 2)
+                self.assertIn("did not return a positive", result.stderr)
+                self.assertEqual(leftovers, [])
+
+
 class XCTestrunTests(unittest.TestCase):
     app_bundle_identifier = "com.swiftvlc.validation.team.app"
     runner_bundle_identifier = "com.swiftvlc.validation.team.uitests.xctrunner"
@@ -1005,6 +2122,624 @@ PRODUCT_BUNDLE_IDENTIFIER = com.swiftvlc.showcase.macos;
 
 
 class VolunteerReportPrivacyTests(unittest.TestCase):
+    def test_packages_incomplete_progress_and_scrubs_private_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run = root / "run"
+            run.mkdir()
+            (run / "device.json").write_text(
+                json.dumps(
+                    {
+                        "selected": {
+                            "id": "private-core-id",
+                            "udid": "private-udid",
+                            "ecid": 42,
+                            "name": "Person's iPhone",
+                            "marketingName": "iPhone 15 Pro",
+                            "productType": "iPhone16,1",
+                            "deviceFamily": "iPhone",
+                            "osVersion": "27.0",
+                            "osBuild": "24A5390f",
+                            "osReleaseType": "beta",
+                            "transport": "wired",
+                            "tunnelIPAddress": "fd7d:5ea1:e53f::1",
+                        }
+                    }
+                )
+            )
+            (run / "scenario-results.tsv").write_text(
+                "ui-suite\tpass\t0\t0\tcaptured\tnot-applicable\t30\n"
+            )
+            (run / "validation-plan.json").write_text(
+                json.dumps(
+                    {
+                        "selectedScenarioDrivers": [
+                            "ui-suite",
+                            "live-media",
+                            "hls-seek",
+                        ]
+                    }
+                )
+            )
+            (run / "ui-suite-xcodebuild.log").write_text(
+                "Person's iPhone /Users/alice/project "
+                "http://192.168.1.4:8000/file "
+                "http://[fd7d:5ea1:e53f::2]:9000/file "
+                "com.swiftvlc.validation.wnwacjnfdx.app\n"
+            )
+            (run / "configure-signing.log").write_text(
+                "appBundleIdentifier=com.swiftvlc.validation.wnwacjnfdx.app\n"
+                "uiTestBundleIdentifier=com.swiftvlc.validation.wnwacjnfdx.uitests\n"
+            )
+            (run / "build.log").write_text(
+                "DEVELOPMENT_TEAM = WNWACJNFDX\n"
+                "bundle com.swiftvlc.validation.wnwacjnfdx.uitests.xctrunner\n"
+            )
+            evidence = run / "evidence"
+            evidence.mkdir()
+            (evidence / "probe.json").write_text(
+                json.dumps({"id": "measurement-id", "name": "continuity probe"})
+            )
+            output = root / "share.zip"
+
+            package_volunteer_report.package(run, output)
+
+            with zipfile.ZipFile(output) as archive:
+                summary = archive.read("SwiftVLC-Device-Report/SUMMARY.md").decode()
+                device = json.loads(archive.read("SwiftVLC-Device-Report/device.json"))[
+                    "selected"
+                ]
+                log = archive.read(
+                    "SwiftVLC-Device-Report/logs/ui-suite-xcodebuild.log"
+                ).decode()
+                build_log = archive.read(
+                    "SwiftVLC-Device-Report/logs/build.log"
+                ).decode()
+                signing_log = archive.read(
+                    "SwiftVLC-Device-Report/logs/configure-signing.log"
+                ).decode()
+                saved_evidence = json.loads(
+                    archive.read("SwiftVLC-Device-Report/evidence/probe.json")
+                )
+            self.assertIn("INCOMPLETE / INTERRUPTED", summary)
+            self.assertIn("Unfinished scenario drivers: **2**", summary)
+            self.assertEqual(device["name"], "<redacted>")
+            self.assertEqual(device["id"], "<redacted>")
+            self.assertNotIn("udid", device)
+            self.assertNotIn("ecid", device)
+            self.assertNotIn("tunnelIPAddress", device)
+            self.assertNotIn("alice", log)
+            self.assertNotIn("192.168.1.4", log)
+            self.assertNotIn("fd7d:5ea1:e53f", log)
+            self.assertNotIn("WNWACJNFDX", build_log)
+            self.assertNotIn("wnwacjnfdx", log)
+            self.assertNotIn("wnwacjnfdx", signing_log)
+            self.assertEqual(saved_evidence["id"], "measurement-id")
+            self.assertEqual(saved_evidence["name"], "continuity probe")
+
+    def test_reads_current_eleven_field_interrupted_progress(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run = Path(directory)
+            fields = [
+                "progressive-http-range-seek",
+                "pass",
+                "0",
+                "0",
+                "captured",
+                "captured",
+                "45",
+                "/Users/alice/run/expected.json",
+                "/Users/alice/run/execution.json",
+                "/Users/alice/run/attempts.json",
+                "/Users/alice/run/errors.json",
+            ]
+            (run / "scenario-results.tsv").write_text("\t".join(fields) + "\n")
+
+            scenarios, complete = package_volunteer_report.read_scenarios(run)
+
+            self.assertFalse(complete)
+            self.assertEqual(len(scenarios), 1)
+            self.assertEqual(
+                scenarios[0],
+                {
+                    "scenario": "progressive-http-range-seek",
+                    "result": "pass",
+                    "xcodebuildExitCode": 0,
+                    "libraryErrorCount": 0,
+                    "appLog": "captured",
+                    "qualificationEvidence": "captured",
+                    "durationSeconds": 45,
+                },
+            )
+
+    def test_incomplete_final_progress_line_preserves_completed_rows(self):
+        base_fields = [
+            "ui-suite",
+            "pass",
+            "0",
+            "0",
+            "captured",
+            "not-applicable",
+            "30",
+        ]
+        current_evidence_fields = [
+            "/Users/alice/run/expected.json",
+            "/Users/alice/run/execution.json",
+            "/Users/alice/run/attempts.json",
+            "/Users/alice/run/errors.json",
+        ]
+        cases = {
+            "legacy-seven-field": (
+                base_fields,
+                "live-media\tfail\t1",
+            ),
+            "current-eleven-field": (
+                base_fields + current_evidence_fields,
+                "live-media\tfail\t1\t0\tmissing\tmissing\t",
+            ),
+        }
+        for name, (completed_fields, incomplete_line) in cases.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                run = Path(directory)
+                (run / "scenario-results.tsv").write_text(
+                    "\t".join(completed_fields) + "\n" + incomplete_line
+                )
+
+                scenarios, complete = package_volunteer_report.read_scenarios(run)
+
+                self.assertFalse(complete)
+                self.assertEqual([row["scenario"] for row in scenarios], ["ui-suite"])
+                self.assertEqual(scenarios[0]["durationSeconds"], 30)
+
+    def test_complete_report_is_labelled_pass(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run = root / "run"
+            run.mkdir()
+            write_validated_report(
+                run,
+                {
+                    "result": "pass",
+                    "scenarios": [
+                        {
+                            "scenario": "analyzer",
+                            "result": "pass",
+                            "durationSeconds": 1,
+                            "libraryErrorCount": 0,
+                            "qualificationEvidence": "not-applicable",
+                        }
+                    ],
+                },
+            )
+            output = root / "share.zip"
+            package_volunteer_report.package(run, output)
+            with zipfile.ZipFile(output) as archive:
+                summary = archive.read("SwiftVLC-Device-Report/SUMMARY.md").decode()
+            self.assertIn("Report state: **COMPLETE**", summary)
+            self.assertIn("Result: **PASS**", summary)
+            self.assertIn("FULL APPLICABLE DEVICE SUITE", summary)
+            self.assertIn("QUALIFYING DEVICE ENVIRONMENT", summary)
+
+    def test_partial_and_exploratory_passes_are_never_presented_as_release_passes(self):
+        cases = (
+            (
+                "partial",
+                {
+                    "selection_scope": "partial",
+                    "mode": "qualification",
+                    "qualification_eligible": True,
+                },
+                "PASS — PARTIAL SCOPE",
+                "PARTIAL / TARGETED — NOT A COMPLETE RELEASE CHECKLIST",
+            ),
+            (
+                "exploratory",
+                {
+                    "selection_scope": "full",
+                    "mode": "exploratory",
+                    "qualification_eligible": False,
+                },
+                "PASS — NOT RELEASE-QUALIFYING",
+                "EXPLORATORY — NOT RELEASE-QUALIFYING",
+            ),
+        )
+        for name, options, expected_result, expected_label in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                run = root / "run"
+                run.mkdir()
+                write_validated_report(
+                    run,
+                    {
+                        "result": "pass",
+                        "scenarios": [
+                            {"scenario": "analyzer", "result": "pass"}
+                        ],
+                    },
+                    **options,
+                )
+                output = root / "share.zip"
+
+                package_volunteer_report.package(run, output)
+
+                with zipfile.ZipFile(output) as archive:
+                    summary = archive.read(
+                        "SwiftVLC-Device-Report/SUMMARY.md"
+                    ).decode()
+                self.assertIn(f"Result: **{expected_result}**", summary)
+                self.assertIn(expected_label, summary)
+
+    def test_failure_summary_extracts_a_concise_reason(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run = root / "run"
+            run.mkdir()
+            write_validated_report(
+                run,
+                {
+                    "result": "fail",
+                    "scenarios": [
+                        {
+                            "scenario": "analyzer",
+                            "result": "fail",
+                            "durationSeconds": 60,
+                            "libraryErrorCount": 0,
+                            "qualificationEvidence": "not-applicable",
+                        }
+                    ],
+                },
+                retained_files={
+                    "analyzer-xcodebuild.log": (
+                        "Runner encountered an error "
+                        "(Timed out while enabling automation mode.)\n"
+                    )
+                },
+            )
+            output = root / "share.zip"
+            package_volunteer_report.package(run, output)
+            with zipfile.ZipFile(output) as archive:
+                summary = archive.read("SwiftVLC-Device-Report/SUMMARY.md").decode()
+                reasons = json.loads(
+                    archive.read("SwiftVLC-Device-Report/failure-reasons.json")
+                )
+            self.assertIn("Timed out while enabling automation mode", summary)
+            self.assertIn("Report state: **COMPLETE**", summary)
+            self.assertIn("Result: **FAIL**", summary)
+            self.assertEqual(reasons[0]["scenario"], "analyzer")
+
+    def test_unvalidated_or_changed_report_is_never_labelled_complete(self):
+        report = {
+            "result": "pass",
+            "scenarios": [
+                {
+                    "scenario": "analyzer",
+                    "result": "pass",
+                    "durationSeconds": 1,
+                    "libraryErrorCount": 0,
+                    "qualificationEvidence": "not-applicable",
+                }
+            ],
+        }
+        for case in ("missing", "malformed", "digest-mismatch"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                run = root / "run"
+                run.mkdir()
+                (run / "report.json").write_text(json.dumps(report) + "\n")
+                if case == "malformed":
+                    write_validated_report(run, report)
+                    (run / report_validation.MARKER_FILENAME).write_text("{")
+                elif case == "digest-mismatch":
+                    write_validated_report(run, report)
+                    (run / "report.json").write_text(
+                        json.dumps({**report, "postValidationMutation": True}) + "\n"
+                    )
+                output = root / "share.zip"
+
+                package_volunteer_report.package(run, output)
+
+                with zipfile.ZipFile(output) as archive:
+                    summary = archive.read("SwiftVLC-Device-Report/SUMMARY.md").decode()
+                self.assertIn("INCOMPLETE / INTERRUPTED", summary)
+                self.assertIn("Result: **INCOMPLETE**", summary)
+
+    def test_report_plan_mismatch_is_never_labelled_complete(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run = root / "run"
+            run.mkdir()
+            write_validated_report(
+                run,
+                {
+                    "result": "pass",
+                    "scenarios": [{"scenario": "analyzer", "result": "pass"}],
+                },
+            )
+            plan = json.loads((run / "validation-plan.json").read_text())
+            plan["selectedScenarioDrivers"] = ["ui-suite"]
+            report_validation.atomic_write_json(run / "validation-plan.json", plan)
+            output = root / "share.zip"
+
+            package_volunteer_report.package(run, output)
+
+            with zipfile.ZipFile(output) as archive:
+                summary = archive.read("SwiftVLC-Device-Report/SUMMARY.md").decode()
+            self.assertIn("Report state: **INCOMPLETE / INTERRUPTED**", summary)
+            self.assertIn("report/plan contract mismatch", summary)
+
+    def test_malformed_ancillary_json_is_omitted_and_makes_package_incomplete(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run = root / "run"
+            run.mkdir()
+            write_validated_report(
+                run,
+                {
+                    "result": "pass",
+                    "scenarios": [{"scenario": "analyzer", "result": "pass"}],
+                },
+            )
+            (run / "candidate-metadata.json").write_text('{"candidate":')
+            evidence = run / "evidence"
+            evidence.mkdir()
+            (evidence / "partial.json").write_text('{"sample":')
+            output = root / "share.zip"
+
+            package_volunteer_report.package(run, output)
+
+            with zipfile.ZipFile(output) as archive:
+                names = archive.namelist()
+                summary = archive.read("SwiftVLC-Device-Report/SUMMARY.md").decode()
+            self.assertIn("Result: **INCOMPLETE**", summary)
+            self.assertIn("candidate-metadata.json is malformed", summary)
+            self.assertIn("evidence/partial.json is malformed", summary)
+            self.assertNotIn(
+                "SwiftVLC-Device-Report/candidate-metadata.json", names
+            )
+            self.assertNotIn(
+                "SwiftVLC-Device-Report/evidence/partial.json", names
+            )
+
+    def test_changed_identity_sidecars_make_a_validated_package_incomplete(self):
+        cases = (
+            (
+                "candidate",
+                "candidate-metadata.json",
+                {"formatVersion": 2, "version": "different"},
+                "candidate-metadata.json no longer matches",
+            ),
+            (
+                "device",
+                "device.json",
+                {"selected": {"marketingName": "Replacement iPhone"}},
+                "device.json no longer matches",
+            ),
+            (
+                "fixture",
+                "fixture-manifest.json",
+                {"formatVersion": 1, "postValidationMutation": True},
+                "fixture-manifest.json no longer matches",
+            ),
+        )
+        for name, filename, replacement, warning in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                run = root / "run"
+                run.mkdir()
+                write_validated_report(
+                    run,
+                    {
+                        "result": "pass",
+                        "scenarios": [
+                            {"scenario": "analyzer", "result": "pass"}
+                        ],
+                    },
+                )
+                report_validation.atomic_write_json(run / filename, replacement)
+                output = root / "share.zip"
+
+                package_volunteer_report.package(run, output)
+
+                with zipfile.ZipFile(output) as archive:
+                    summary = archive.read(
+                        "SwiftVLC-Device-Report/SUMMARY.md"
+                    ).decode()
+                self.assertIn("Result: **INCOMPLETE**", summary)
+                self.assertIn(warning, summary)
+
+    def test_malformed_device_json_omits_untrusted_diagnostics(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run = root / "run"
+            run.mkdir()
+            write_validated_report(
+                run,
+                {
+                    "result": "pass",
+                    "scenarios": [{"scenario": "analyzer", "result": "pass"}],
+                },
+            )
+            (run / "device.json").write_text('{"selected":')
+            (run / "analyzer-xcodebuild.log").write_text(
+                "Secret Device Name 00008030-001C195E0A90802E\n"
+            )
+            output = root / "share.zip"
+
+            package_volunteer_report.package(run, output)
+
+            with zipfile.ZipFile(output) as archive:
+                names = archive.namelist()
+                summary = archive.read("SwiftVLC-Device-Report/SUMMARY.md").decode()
+                contents = b"\n".join(archive.read(name) for name in names).decode(
+                    errors="replace"
+                )
+            self.assertIn("Result: **INCOMPLETE**", summary)
+            self.assertIn("diagnostic logs and evidence were omitted", summary)
+            self.assertNotIn("analyzer-xcodebuild.log", "\n".join(names))
+            self.assertNotIn("Secret Device Name", contents)
+
+    def test_archive_uses_the_same_report_bytes_as_completion_validation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run = root / "run"
+            run.mkdir()
+            validated_report = {
+                "result": "pass",
+                "scenarios": [
+                    {
+                        "scenario": "analyzer",
+                        "result": "pass",
+                        "durationSeconds": 1,
+                        "libraryErrorCount": 0,
+                        "qualificationEvidence": "not-applicable",
+                    }
+                ],
+            }
+            write_validated_report(
+                run,
+                validated_report,
+                retained_files={
+                    "analyzer-xcodebuild.log": "captured-before-packaging\n"
+                },
+            )
+            original_collect = package_volunteer_report.collect_files
+
+            def mutate_then_collect(
+                run_dir,
+                staging,
+                secrets,
+                structured_values,
+                *,
+                evidence_values,
+                captured_logs,
+            ):
+                (run_dir / "report.json").write_text(
+                    json.dumps(
+                        {
+                            "result": "fail",
+                            "postValidationMutation": True,
+                            "scenarios": [
+                                {
+                                    "scenario": "replacement",
+                                    "result": "fail",
+                                }
+                            ],
+                        }
+                    )
+                    + "\n"
+                )
+                (run_dir / "analyzer-xcodebuild.log").write_text(
+                    "mutated-after-capture\n"
+                )
+                return original_collect(
+                    run_dir,
+                    staging,
+                    secrets,
+                    structured_values,
+                    evidence_values=evidence_values,
+                    captured_logs=captured_logs,
+                )
+
+            output = root / "share.zip"
+            with mock.patch.object(
+                package_volunteer_report,
+                "collect_files",
+                side_effect=mutate_then_collect,
+            ):
+                package_volunteer_report.package(run, output)
+
+            with zipfile.ZipFile(output) as archive:
+                summary = archive.read("SwiftVLC-Device-Report/SUMMARY.md").decode()
+                archived_report = json.loads(
+                    archive.read("SwiftVLC-Device-Report/report.json")
+                )
+                archived_log = archive.read(
+                    "SwiftVLC-Device-Report/logs/analyzer-xcodebuild.log"
+                ).decode()
+            self.assertIn("Report state: **COMPLETE**", summary)
+            self.assertEqual(
+                archived_report["scenarios"], validated_report["scenarios"]
+            )
+            self.assertNotIn("postValidationMutation", archived_report)
+            self.assertEqual(archived_log, "captured-before-packaging\n")
+
+    def test_truncated_report_falls_back_to_completed_tsv_rows(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run = root / "run"
+            run.mkdir()
+            (run / "report.json").write_text('{"result":"pass","scenarios":[')
+            (run / report_validation.MARKER_FILENAME).write_text("{")
+            (run / "scenario-results.tsv").write_text(
+                "ui-suite\tpass\t0\t0\tcaptured\tnot-applicable\t30\n"
+            )
+            output = root / "share.zip"
+
+            package_volunteer_report.package(run, output)
+
+            with zipfile.ZipFile(output) as archive:
+                names = archive.namelist()
+                summary = archive.read("SwiftVLC-Device-Report/SUMMARY.md").decode()
+            self.assertIn("Completed scenarios: **1** (1 passed, 0 failed)", summary)
+            self.assertIn("INCOMPLETE / INTERRUPTED", summary)
+            self.assertNotIn("SwiftVLC-Device-Report/report.json", names)
+            self.assertNotIn(
+                f"SwiftVLC-Device-Report/{report_validation.MARKER_FILENAME}", names
+            )
+
+    def test_unterminated_but_well_formed_tsv_row_is_not_promoted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run = Path(directory)
+            (run / "scenario-results.tsv").write_text(
+                "ui-suite\tpass\t0\t0\tcaptured\tnot-applicable\t30"
+            )
+
+            scenarios, complete = package_volunteer_report.read_scenarios(run)
+
+            self.assertFalse(complete)
+            self.assertEqual(scenarios, [])
+
+    def test_scrubs_real_ipv6_forms_without_destroying_colon_text(self):
+        private_values = (
+            "192.168.001.004",
+            "fd00::2",
+            "fe80::1%utun4",
+            "http://[fe80::1%25utun4]:8080/fixture",
+            "::ffff:192.0.2.1",
+            "fd00::2:49152",
+            "2001:db8:0:0:0:0:0:1:443",
+        )
+        mac_values = (
+            "aa:bb:cc:dd:ee:ff",
+            "00-11-22-33-44-55",
+            "0011.2233.4455",
+            "02:00:00:ff:fe:00:00:01",
+        )
+        public_text = (
+            "12:34:56.789",
+            "2026-09-01T12:34:56.789Z",
+            "123e4567-e89b-12d3-a456-426614174000",
+            "Player.swift:120:34",
+            "ratio 16:9",
+            "SHA256:abcdef0123456789",
+        )
+        scrubbed = package_volunteer_report.scrub_text(
+            " | ".join((*private_values, *mac_values, *public_text))
+            + " | fd00::3. | fd00::4:"
+        )
+
+        for private_value in private_values:
+            self.assertNotIn(private_value, scrubbed)
+        for mac_value in mac_values:
+            self.assertNotIn(mac_value, scrubbed)
+        for retained_value in public_text:
+            self.assertIn(retained_value, scrubbed)
+        self.assertNotIn("fd00::3", scrubbed)
+        self.assertIn("<redacted-ip>.", scrubbed)
+        self.assertNotIn("fd00::4", scrubbed)
+        self.assertIn("<redacted-ip>:", scrubbed)
+        self.assertGreaterEqual(scrubbed.count("<redacted-mac>"), len(mac_values))
+
     def test_team_scoped_app_test_and_runner_identifiers_are_scrubbed(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1079,6 +2814,29 @@ class VolunteerReportPrivacyTests(unittest.TestCase):
                 runner_identifier,
             ):
                 self.assertNotIn(secret, contents)
+
+    def test_evidence_only_bundle_identifiers_are_scrubbed_from_logs_and_json(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run = root / "run"
+            run.mkdir()
+            secret_identifier = "com.example.private-team.device-runner"
+            (run / "device.json").write_text(json.dumps({"selected": {}}))
+            evidence = run / "evidence"
+            evidence.mkdir()
+            (evidence / "probe.json").write_text(
+                json.dumps({"testRunnerBundleIdentifier": secret_identifier})
+            )
+            (run / "probe.log").write_text(f"runner={secret_identifier}\n")
+            output = root / "report.zip"
+
+            package_volunteer_report.package(run, output)
+
+            with zipfile.ZipFile(output) as archive:
+                contents = b"\n".join(
+                    archive.read(name) for name in archive.namelist()
+                ).decode(errors="replace")
+            self.assertNotIn(secret_identifier, contents)
 
 
 class CandidateMetadataTests(unittest.TestCase):
@@ -3506,11 +5264,16 @@ class QualificationRecordAssemblyTests(unittest.TestCase):
                 }
             )
         )
+        completed_at = datetime.now(timezone.utc).replace(microsecond=0)
+        started_at = completed_at - timedelta(seconds=duration)
         report = directory / "report.json"
         report.write_text(
             json.dumps(
                 {
                     **candidate,
+                    "startedAtUTC": started_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "completedAtUTC": completed_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "wallDurationSeconds": duration,
                     "qualificationEligibleEnvironment": release_type == "stable",
                     "device": {"udid": f"fixture-{hardware}"},
                     "mode": (

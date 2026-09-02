@@ -117,7 +117,7 @@ struct PiPVODControlsValidationCase: View {
     playbackError = nil
     completedControls = nil
     do {
-      guard controller.start() == .accepted else {
+      guard controller.requestStart() == .accepted else {
         throw QualificationFailure("PiP start was not accepted")
       }
       try await waitUntil("PiP did not become active") { controller.isActive }

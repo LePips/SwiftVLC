@@ -56,11 +56,6 @@ extension Logic {
     }
 
     @Test
-    func `rateChanged embeds the effective control value`() {
-      #expect(PlayerEvent.rateChanged(1.25).description == "rateChanged(1.25)")
-    }
-
-    @Test
     func `audioDeviceChanged handles both String and nil`() {
       #expect(PlayerEvent.audioDeviceChanged("coreaudio").description == "audioDeviceChanged(coreaudio)")
       #expect(PlayerEvent.audioDeviceChanged(nil).description == "audioDeviceChanged(nil)")

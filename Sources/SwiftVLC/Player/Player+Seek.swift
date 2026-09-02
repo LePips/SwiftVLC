@@ -79,6 +79,7 @@ extension Player {
   struct NativeSeekCommand {
     let nativeSeekToken: UInt64
     let playbackGeneration: UInt64
+    let nativeHandleGeneration: UInt64
     let externalEpoch: UInt64
     var timelineRevision: UInt64?
     var dispatchEmissionSequence: UInt64?
@@ -101,6 +102,7 @@ extension Player {
   struct QuarantinedSeekTimeline {
     let nativeSeekToken: UInt64
     let playbackGeneration: UInt64
+    let nativeHandleGeneration: UInt64
     var time: Duration?
     var timeEmissionSequence: UInt64?
     var position: Double?
@@ -115,6 +117,7 @@ extension Player {
   struct PendingFrameStep {
     let requestToken: UInt64
     let playbackGeneration: UInt64
+    let nativeHandleGeneration: UInt64
     let nativeFrameGeneration: UInt64
     let resolver: FrameStepOutcomeResolver
     var phase: PendingFrameStepPhase
@@ -298,6 +301,13 @@ extension Player {
   /// case this method returns before the native position call is made and the
   /// observable timeline remains at the active seek until dispatch succeeds.
   ///
+  /// - Parameter position: The fractional target in the current media.
+  public func seek(to position: PlaybackPosition) throws(VLCError) {
+    try seek(to: position, fast: false)
+  }
+
+  /// Seeks to a fractional position with explicit keyframe policy.
+  ///
   /// - Parameters:
   ///   - position: The fractional target in the current media.
   ///   - fast: Prefer fast (keyframe) seeking over precise seeking. Interactive
@@ -371,6 +381,9 @@ extension Player {
     guard !isShutdown else {
       throw .invalidState("requestSeek(by:fast:) called on a player that has been shut down")
     }
+    guard nativeHandleRepresentsCurrentMedia else {
+      throw .invalidState("current media is awaiting its native playback handle")
+    }
     guard isSeekable else {
       throw .invalidState("current media is not seekable")
     }
@@ -417,19 +430,73 @@ extension Player {
   /// `revision` is reserved before native dispatch, then adopted only after
   /// the call reports successful dispatch. A defensive nonzero result leaves
   /// `acceptedTimelineRevision` and any older pending request alone.
+  @discardableResult
   func commitSeekTarget(
     milliseconds: Int64,
     revision: UInt64,
-    emissionSequence: UInt64 = 0
-  ) {
+    emissionSequence: UInt64 = 0,
+    ifPlaybackGeneration expectedPlaybackGeneration: UInt64? = nil,
+    nativeHandleGeneration expectedNativeHandleGeneration: UInt64? = nil,
+    lifecycleControlEpoch expectedLifecycleControlEpoch: UInt64? = nil
+  ) -> Bool {
+    let playbackGeneration = expectedPlaybackGeneration ?? sessionGeneration
+    let nativeHandleGeneration = expectedNativeHandleGeneration
+      ?? eventBridge.currentNativeHandleGeneration
+    let lifecycleControlEpoch = expectedLifecycleControlEpoch
+      ?? eventBridge.currentLifecycleControlEpoch
+    func stillOwnsTimeline() -> Bool {
+      acceptedTimelineRevision == revision
+        && lifecycleControlEpoch == eventBridge.currentLifecycleControlEpoch
+        && ownsPlaybackMutation(
+          playbackGeneration,
+          nativeHandleGeneration: nativeHandleGeneration
+        )
+    }
+    guard
+      lifecycleControlEpoch == eventBridge.currentLifecycleControlEpoch,
+      ownsPlaybackMutation(
+        playbackGeneration,
+        nativeHandleGeneration: nativeHandleGeneration
+      )
+    else { return false }
     acceptedTimelineRevision = revision
-    currentTime = .milliseconds(milliseconds)
-    let position = publishPosition(forTargetMilliseconds: milliseconds)
-    recordAuthoritativeTimeline(
-      position: position,
-      emissionSequence: emissionSequence
+    guard
+      performObservableMutation(
+        keyPath: \.currentTime,
+        ifPlaybackGeneration: playbackGeneration,
+        nativeHandleGeneration: nativeHandleGeneration,
+        timelineRevision: revision,
+        lifecycleControlEpoch: lifecycleControlEpoch,
+        mutation: {
+          storeCurrentTimeWithoutNestedObservation(.milliseconds(milliseconds))
+        }
+      )
+    else { return false }
+    let position = publishPosition(
+      forTargetMilliseconds: milliseconds,
+      ifPlaybackGeneration: playbackGeneration,
+      nativeHandleGeneration: nativeHandleGeneration,
+      timelineRevision: revision,
+      lifecycleControlEpoch: lifecycleControlEpoch
     )
-    markPlaybackHealthSeek()
+    guard
+      stillOwnsTimeline(),
+      recordAuthoritativeTimeline(
+        position: position,
+        emissionSequence: emissionSequence,
+        ifPlaybackGeneration: playbackGeneration,
+        nativeHandleGeneration: nativeHandleGeneration,
+        timelineRevision: revision,
+        lifecycleControlEpoch: lifecycleControlEpoch
+      ),
+      markPlaybackHealthSeek(
+        ifPlaybackGeneration: playbackGeneration,
+        nativeHandleGeneration: nativeHandleGeneration,
+        timelineRevision: revision,
+        lifecycleControlEpoch: lifecycleControlEpoch
+      )
+    else { return false }
+    return stillOwnsTimeline()
   }
 
   // MARK: - Lenient Seeking
@@ -637,22 +704,6 @@ extension Player {
     }
     #endif
     return libvlc_media_player_jump_time(pointer, offset)
-  }
-
-  func stageNativePiPVideoOutputRebuildPermit() -> UInt64? {
-    #if os(iOS)
-    return nativePiPVideoOutputRebuildPermit.stage(for: generation)
-    #else
-    return nil
-    #endif
-  }
-
-  func cancelNativePiPVideoOutputRebuildPermit(_ token: UInt64?) {
-    #if os(iOS)
-    if let token {
-      nativePiPVideoOutputRebuildPermit.cancel(token)
-    }
-    #endif
   }
 
   // Accepts one logical seek into the media-player-local single-flight lane.

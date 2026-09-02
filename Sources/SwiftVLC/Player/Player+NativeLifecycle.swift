@@ -2,6 +2,17 @@ import CLibVLC
 import Foundation
 import Synchronization
 
+private let nativePiPHandleIdentitySource = Mutex<UInt64>(0)
+
+private func nextNativePiPHandleIdentity() -> UInt64 {
+  nativePiPHandleIdentitySource.withLock { value in
+    let (next, overflow) = value.addingReportingOverflow(1)
+    precondition(!overflow && next != 0, "Native PiP handle identity exhausted")
+    value = next
+    return next
+  }
+}
+
 /// Owns work that must remain alive until one exact native media-player
 /// handle has finished releasing.
 ///
@@ -65,10 +76,14 @@ final class NativePlayerHandleLifetime: @unchecked Sendable {
   }
 
   let pointer: OpaquePointer
+  /// Process-unique identity that never aliases a later allocation even if
+  /// `libvlc_media_player_t` reuses the same address.
+  let nativePiPHandleIdentity: UInt64
   private let state = Mutex(State())
 
   init(pointer: OpaquePointer) {
     self.pointer = pointer
+    nativePiPHandleIdentity = nextNativePiPHandleIdentity()
   }
 
   /// Registers an action for the end of this handle's native lifetime.
@@ -246,7 +261,7 @@ extension Player {
   /// `pauseTransition`; otherwise a shutdown racing `.pausing` can skip the
   /// resume and stop libVLC while its audio output still has a pending pause.
   var shouldResumeNativePlayerBeforeStop: Bool {
-    pauseTransition == .pausing || nativePlaybackState == .paused
+    pauseTransition == .pausing || nativeHandlePlaybackState == .paused
   }
 
   func releaseNativePlayer(

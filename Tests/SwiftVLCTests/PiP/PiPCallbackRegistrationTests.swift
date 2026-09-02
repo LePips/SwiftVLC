@@ -118,6 +118,25 @@ private final class DirectPiPCallbackRecorder {
   }
 }
 
+@MainActor
+private final class WeakPiPControllerProbe {
+  weak var controller: PiPController?
+
+  init(_ controller: PiPController) {
+    self.controller = controller
+  }
+}
+
+/// Keeps controller construction and release outside the async test's
+/// coroutine frame, whose retained temporaries are not an ARC boundary.
+@MainActor
+private func makeDroppedPiPControllerProbe(player: Player) -> WeakPiPControllerProbe {
+  autoreleasepool {
+    let controller = PiPController(player: player)
+    return WeakPiPControllerProbe(controller)
+  }
+}
+
 extension Integration {
   /// Deterministic coverage for direct `PiPController` vmem registration.
   /// The tests inject native install/clear operations, so ownership races are
@@ -264,29 +283,54 @@ extension Integration {
     }
 
     @Test
-    func `Older PiPController deinit leaves newer controller registered`() async {
+    func `Stale PiPController cleanup cannot clear newer controller registration`() async throws {
       let player = Player(instance: TestInstance.makeAudioOnly())
-      var first: PiPController? = PiPController(player: player)
-      weak let firstProbe = first
+      let first = PiPController(player: player)
       let firstGeneration = player.directPiPVideoCallbackGeneration
 
-      var successor: PiPController? = PiPController(player: player)
-      weak let successorProbe = successor
+      let successor = PiPController(player: player)
+      let successorRegistration = try #require(successor.callbackRegistration)
       let successorGeneration = player.directPiPVideoCallbackGeneration
       #expect(successorGeneration > firstGeneration)
+      #expect(player.directPiPVideoCallbackRegistration === successorRegistration)
 
-      first = nil
+      first.invalidateForLifecycleEnd()
 
-      #expect(firstProbe == nil)
-      #expect(successorProbe != nil)
-      #expect(player.directPiPVideoCallbackRegistration != nil)
+      #expect(player.directPiPVideoCallbackRegistration === successorRegistration)
       #expect(player.directPiPVideoCallbackGeneration == successorGeneration)
 
-      successor = nil
+      // A delayed or duplicated lifecycle signal must remain a no-op after
+      // the stale controller has already relinquished its generation.
+      first.invalidateForLifecycleEnd()
+      #expect(player.directPiPVideoCallbackRegistration === successorRegistration)
+      #expect(player.directPiPVideoCallbackGeneration == successorGeneration)
 
-      #expect(successorProbe == nil)
+      successor.invalidateForLifecycleEnd()
       #expect(player.directPiPVideoCallbackRegistration == nil)
-      #expect(player.directPiPVideoCallbackGeneration > successorGeneration)
+      #expect(player.directPiPVideoCallbackGeneration == successorGeneration &+ 1)
+
+      let clearedGeneration = player.directPiPVideoCallbackGeneration
+      successor.invalidateForLifecycleEnd()
+      #expect(player.directPiPVideoCallbackRegistration == nil)
+      #expect(player.directPiPVideoCallbackGeneration == clearedGeneration)
+
+      await player.shutdown()
+    }
+
+    @Test
+    func `PiPController eventually deallocates after synchronous scoped drop`() async throws {
+      let player = Player(instance: TestInstance.makeAudioOnly())
+      let probe = makeDroppedPiPControllerProbe(player: player)
+
+      #expect(
+        try await poll(
+          every: .milliseconds(10),
+          timeout: .seconds(2),
+          until: { probe.controller == nil }
+        ),
+        "PiPController remained alive after its synchronous creation scope and autorelease pool ended"
+      )
+
       await player.shutdown()
     }
 

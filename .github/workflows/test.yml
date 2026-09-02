@@ -32,7 +32,7 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         timeout-minutes: 2
 
       - name: Install swiftlint and swiftformat
@@ -70,6 +70,7 @@ jobs:
         timeout-minutes: 2
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SWIFTVLC_ALLOW_DRAFT_RELEASE: ${{ ((github.event_name == 'push' && startsWith(github.ref, 'refs/heads/release-candidates/')) || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && startsWith(github.head_ref, 'release-candidates/'))) && '1' || '' }}
         run: ./scripts/tests/release-integrity.sh
 
       # Reports engine patches that are in the tree but not in the exact binary
@@ -116,7 +117,7 @@ jobs:
     # through `-toolchain`. SwiftVLC's manifest requires Swift 6.3, so the
     # Showcase matrix must run on an image with Xcode 26.4+.
     runs-on: macos-26
-    timeout-minutes: 30
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
@@ -131,10 +132,10 @@ jobs:
           - scheme: visionOS
             destination: "generic/platform=visionOS"
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         timeout-minutes: 2
 
-      - uses: maxim-lobanov/setup-xcode@v1
+      - uses: maxim-lobanov/setup-xcode@ed7a3b1fda3918c0306d1b724322adc0b8cc0a90 # v1
         timeout-minutes: 5
         with:
           xcode-version: "26.4"
@@ -147,7 +148,7 @@ jobs:
 
       # The libvlc xcframework dominates the artifact cache.
       - name: Cache libvlc xcframework
-        uses: actions/cache@v5
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
         timeout-minutes: 5
         with:
           path: Vendor
@@ -157,9 +158,10 @@ jobs:
       # Download the libvlc xcframework + flip the Showcase project to
       # the local SwiftVLC checkout so we compile against in-PR code.
       - name: Set up Vendor + local Swift package
-        timeout-minutes: 5
+        timeout-minutes: 12
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SWIFTVLC_ALLOW_DRAFT_RELEASE: ${{ ((github.event_name == 'push' && startsWith(github.ref, 'refs/heads/release-candidates/')) || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && startsWith(github.head_ref, 'release-candidates/'))) && '1' || '' }}
         run: ./scripts/setup-dev.sh
 
       - name: Build Showcase (${{ matrix.scheme }})
@@ -189,18 +191,21 @@ jobs:
     # must understand the manifest's Swift 6.3 tools-version — needs Xcode
     # 26.4+, hence macos-26 (same rationale as the showcase job above).
     runs-on: macos-26
-    timeout-minutes: 30
+    # Pull requests have 67 minutes of explicit per-step ceilings below. Keep
+    # one provisioned runner, but leave enough job-level headroom for every
+    # bounded step to complete instead of cutting the job off at 30 minutes.
+    timeout-minutes: 85
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         timeout-minutes: 2
 
-      - uses: maxim-lobanov/setup-xcode@v1
+      - uses: maxim-lobanov/setup-xcode@ed7a3b1fda3918c0306d1b724322adc0b8cc0a90 # v1
         timeout-minutes: 5
         with:
           xcode-version: "26.4"
 
       - name: Cache libvlc xcframework
-        uses: actions/cache@v5
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
         timeout-minutes: 5
         with:
           path: Vendor
@@ -208,9 +213,10 @@ jobs:
           enableCrossOsArchive: false
 
       - name: Set up Vendor + local Swift package
-        timeout-minutes: 5
+        timeout-minutes: 12
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SWIFTVLC_ALLOW_DRAFT_RELEASE: ${{ ((github.event_name == 'push' && startsWith(github.ref, 'refs/heads/release-candidates/')) || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && startsWith(github.head_ref, 'release-candidates/'))) && '1' || '' }}
         run: ./scripts/setup-dev.sh
 
       # build-for-testing (not plain build) so the SwiftVLCTests target is
@@ -229,17 +235,60 @@ jobs:
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGNING_ALLOWED=NO
 
-      # Reuse this already-provisioned Xcode/Vendor job for the one Showcase
-      # build required on a pull request. The other Apple platforms run in the
-      # post-merge/manual matrix above.
-      - name: Build iOS Showcase against pull-request sources
+      # Pull requests need compile evidence for platform-gated source and test
+      # code without booting more runtimes. All three destinations use
+      # build-for-testing so SwiftVLCTests is type-checked; runtime tvOS
+      # execution remains in tvos-test.
+      - name: Compile Mac Catalyst and tvOS/visionOS tests
         if: github.event_name == 'pull_request'
         timeout-minutes: 15
         run: |
-          xcodebuild build \
+          xcodebuild build-for-testing \
+            -scheme SwiftVLC \
+            -destination "generic/platform=macOS,variant=Mac Catalyst" \
+            -configuration Debug \
+            -skipPackagePluginValidation \
+            -skipMacroValidation \
+            ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO
+
+          xcodebuild build-for-testing \
+            -scheme SwiftVLC \
+            -destination "generic/platform=tvOS Simulator" \
+            -configuration Debug \
+            -skipPackagePluginValidation \
+            -skipMacroValidation \
+            ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO
+
+          xcodebuild build-for-testing \
+            -scheme SwiftVLC \
+            -destination "generic/platform=visionOS" \
+            -configuration Debug \
+            -skipPackagePluginValidation \
+            -skipMacroValidation \
+            ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO
+
+      # Reuse this already-provisioned Xcode/Vendor job for the one Showcase
+      # build required on a pull request. The other Apple platforms run in the
+      # post-merge/manual matrix above.
+      # build-for-testing also compiles the iOSUITests qualification target;
+      # it does not boot a simulator or add another billed runner.
+      - name: Compile iOS Showcase and qualification UI tests
+        if: github.event_name == 'pull_request'
+        timeout-minutes: 15
+        run: |
+          xcodebuild build-for-testing \
             -project Showcase/SwiftVLCShowcase.xcodeproj \
             -scheme iOS \
-            -destination "generic/platform=iOS" \
+            -destination "generic/platform=iOS Simulator" \
             -configuration Debug \
             -skipPackagePluginValidation \
             -skipMacroValidation \
@@ -261,18 +310,18 @@ jobs:
     # Xcode's built-in SwiftPM, which must understand the manifest's Swift
     # 6.3 tools-version — needs Xcode 26.4+, hence macos-26.
     runs-on: macos-26
-    timeout-minutes: 30
+    timeout-minutes: 40
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         timeout-minutes: 2
 
-      - uses: maxim-lobanov/setup-xcode@v1
+      - uses: maxim-lobanov/setup-xcode@ed7a3b1fda3918c0306d1b724322adc0b8cc0a90 # v1
         timeout-minutes: 5
         with:
           xcode-version: "26.4"
 
       - name: Cache libvlc xcframework
-        uses: actions/cache@v5
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
         timeout-minutes: 5
         with:
           path: Vendor
@@ -280,9 +329,10 @@ jobs:
           enableCrossOsArchive: false
 
       - name: Set up Vendor + local Swift package
-        timeout-minutes: 5
+        timeout-minutes: 12
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SWIFTVLC_ALLOW_DRAFT_RELEASE: ${{ ((github.event_name == 'push' && startsWith(github.ref, 'refs/heads/release-candidates/')) || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && startsWith(github.head_ref, 'release-candidates/'))) && '1' || '' }}
         run: ./scripts/setup-dev.sh
 
       # TEST_RUNNER_CI=true is load-bearing: xcodebuild strips the
@@ -332,10 +382,10 @@ jobs:
     # Absolute ceiling — the job CANNOT run longer than this. The wrapper
     # script and step timeouts below enforce tighter bounds; this is the
     # last line of defense if those fail.
-    timeout-minutes: 20
+    timeout-minutes: 35
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         timeout-minutes: 2
 
       # Pin Xcode for SDKs / linker / simulators. Current GHA runners
@@ -343,7 +393,7 @@ jobs:
       # install the Swift 6.3.1 open-source toolchain separately below
       # and invoke it through
       # `xcrun --toolchain`.
-      - uses: maxim-lobanov/setup-xcode@v1
+      - uses: maxim-lobanov/setup-xcode@ed7a3b1fda3918c0306d1b724322adc0b8cc0a90 # v1
         timeout-minutes: 5
         with:
           xcode-version: latest-stable
@@ -356,7 +406,7 @@ jobs:
       # or @v1 so a compromised or breaking release of the action cannot
       # silently affect our CI. Bump deliberately via Dependabot or a
       # manual PR.
-      - uses: SwiftyLab/setup-swift@v1.14.0
+      - uses: SwiftyLab/setup-swift@38f54a76b70d989321de9dc7c840618c08cf56e9 # v1.14.0
         timeout-minutes: 8
         with:
           swift-version: "6.3.1"
@@ -365,6 +415,19 @@ jobs:
         timeout-minutes: 1
         run: xcrun --toolchain "$TOOLCHAINS" swift --version
 
+      # Restore before candidate verification so setup-dev validates any cached
+      # Vendor tree and replaces it on checksum/tree-digest mismatch. Restoring
+      # after verification could overwrite the bytes that were just checked.
+      - name: Cache libvlc xcframework
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        timeout-minutes: 5
+        with:
+          path: |
+            .build/artifacts
+            Vendor
+          key: libvlc-xcf-${{ hashFiles('Package.swift') }}
+          enableCrossOsArchive: false
+
       # CI tests the exact published xcframework declared by this checkout (or
       # SWIFTVLC_RELEASE_TAG), regardless of whether a developer had previously
       # flipped Package.swift to Vendor/ locally.
@@ -372,47 +435,40 @@ jobs:
       # edits are preserved.
       - name: Select declared libvlc release
         id: xcf
-        timeout-minutes: 1
+        timeout-minutes: 12
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SWIFTVLC_ALLOW_DRAFT_RELEASE: ${{ ((github.event_name == 'push' && startsWith(github.ref, 'refs/heads/release-candidates/')) || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && startsWith(github.head_ref, 'release-candidates/'))) && '1' || '' }}
         run: ./scripts/ci-use-released-xcframework.sh
-
-      # The xcframework is the dominant artifact (~1.2 GB unzipped). Keying
-      # on the checksum means the cache only invalidates when the binary
-      # actually changes — unrelated Package.swift edits don't bust it.
-      - name: Cache libvlc xcframework
-        uses: actions/cache@v5
-        timeout-minutes: 5
-        with:
-          path: .build/artifacts
-          key: libvlc-xcf-${{ steps.xcf.outputs.sha }}
-          enableCrossOsArchive: false
 
       # Compiled outputs — safe to cache across runs with the same toolchain
       # and source state.
       - name: Cache build products
-        uses: actions/cache@v5
+        if: ${{ !((github.event_name == 'push' && startsWith(github.ref, 'refs/heads/release-candidates/')) || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && startsWith(github.head_ref, 'release-candidates/'))) }}
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
         timeout-minutes: 3
         with:
           path: |
             .build/debug
             .build/arm64-apple-macosx
             .build/x86_64-apple-macosx
-          key: spm-build-${{ runner.os }}-${{ hashFiles('Package.swift', 'Sources/**/*.swift', 'Sources/**/*.c', 'Sources/**/*.h', 'Tests/**/*.swift') }}
-          restore-keys: |
-            spm-build-${{ runner.os }}-
+          key: spm-build-${{ runner.os }}-${{ steps.xcf.outputs.sha }}-${{ hashFiles('Package.swift', 'Sources/**/*.swift', 'Sources/**/*.c', 'Sources/**/*.h', 'Tests/**/*.swift') }}
 
       - name: Cache SPM dependencies
-        uses: actions/cache@v5
+        if: ${{ !((github.event_name == 'push' && startsWith(github.ref, 'refs/heads/release-candidates/')) || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && startsWith(github.head_ref, 'release-candidates/'))) }}
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
         timeout-minutes: 2
         with:
           path: |
             .build/checkouts
             .build/repositories
             .build/workspace-state.json
-          key: spm-deps-${{ runner.os }}-${{ hashFiles('Package.swift', 'Package.resolved') }}
-          restore-keys: |
-            spm-deps-${{ runner.os }}-
+          key: spm-deps-${{ runner.os }}-${{ steps.xcf.outputs.sha }}-${{ hashFiles('Package.swift', 'Package.resolved') }}
+
+      - name: Clean candidate build links
+        if: ${{ (github.event_name == 'push' && startsWith(github.ref, 'refs/heads/release-candidates/')) || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && startsWith(github.head_ref, 'release-candidates/')) }}
+        timeout-minutes: 2
+        run: xcrun --toolchain "$TOOLCHAINS" swift package clean
 
       # swift test is run through ci-run-with-timeouts.py which enforces
       # both a wall-clock ceiling and an idle watchdog. If either fires
@@ -469,7 +525,7 @@ jobs:
 
       - name: Upload test execution accounting
         if: ${{ always() }}
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: swiftpm-test-accounting
           path: .build/ci-results
@@ -481,7 +537,7 @@ jobs:
         run: ./scripts/export-lcov.sh
 
       - name: Upload coverage reports to Codecov
-        uses: codecov/codecov-action@v5
+        uses: codecov/codecov-action@0fb7174895f61a3b6b78fc075e0cd60383518dac # v5
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: .build/local-quality/coverage/lcov.info

@@ -41,6 +41,7 @@ Showcase/iOS/ValidationHarness/streams.local.json
 .qualification-work/
 .device-test-build/
 SwiftVLC Device Reports/
+/scripts/qualification/reports/
 
 # Local working documents (not part of the repo)
 CLAUDE.md

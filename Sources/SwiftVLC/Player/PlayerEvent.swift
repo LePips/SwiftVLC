@@ -23,15 +23,6 @@ public enum PlayerEvent: Sendable, CustomStringConvertible {
   case encounteredError
   /// Audio volume changed. The value is normalized (0.0 = silent, 1.0 = 100%).
   case volumeChanged(Float)
-  /// VLC reported an effective player control-rate resolution.
-  ///
-  /// For a queued active-input request, this is the asynchronously resolved
-  /// input rate, not measured decoded or presented throughput. VLC suppresses
-  /// that notification when the resolved rate is unchanged. With no active
-  /// input, or if native control queuing fails, the authoritative effective
-  /// state is reported immediately and may repeat. Events do not carry request
-  /// identifiers and are not request completions.
-  case rateChanged(Float)
   /// Audio was muted.
   case muted
   /// Audio was unmuted.
@@ -57,10 +48,15 @@ public enum PlayerEvent: Sendable, CustomStringConvertible {
   /// same `.stateChanged(.stopped)` transition; SwiftVLC synthesizes this
   /// event only when the engine's preceding stopping reason identifies a
   /// clean end of stream. An unattributed stop is never treated as EOF.
-  /// Always delivered immediately after the `.stateChanged(.stopped)` it
-  /// belongs to, from the same native handle. Not emitted while a ``MediaListPlayer``
-  /// drives this player — list advancement stops the handle between
-  /// items.
+  /// Normally delivered immediately after the `.stateChanged(.stopped)` it
+  /// belongs to, from the same native handle. One replacement-boundary
+  /// exception preserves an already-authoritative EOS when committing a new
+  /// native handle makes the outgoing handle's ordered `Stopped` callback
+  /// unobservable: SwiftVLC emits this event once after the replacement
+  /// transaction commits, with the outgoing handle and playback generation in
+  /// its ``PlayerEventEnvelope``. That exception does not assert that an
+  /// output-safe stop was observed. Not emitted while a ``MediaListPlayer``
+  /// drives this player — list advancement stops the handle between items.
   case endReached
   /// Number of active video outputs changed.
   case voutChanged(Int)
@@ -97,7 +93,6 @@ public enum PlayerEvent: Sendable, CustomStringConvertible {
     case .mediaChanged: "mediaChanged"
     case .encounteredError: "encounteredError"
     case .volumeChanged(let volume): "volumeChanged(\(volume))"
-    case .rateChanged(let rate): "rateChanged(\(rate))"
     case .muted: "muted"
     case .unmuted: "unmuted"
     case .corked: "corked"
@@ -209,15 +204,6 @@ extension PlayerEvent {
   /// `Float` if this event is `.volumeChanged`, otherwise `nil`.
   public var volumeChanged: Float? {
     if case .volumeChanged(let value) = self {
-      value
-    } else {
-      nil
-    }
-  }
-
-  /// Effective control rate if this event is `.rateChanged`, otherwise `nil`.
-  public var rateChanged: Float? {
-    if case .rateChanged(let value) = self {
       value
     } else {
       nil

@@ -6,11 +6,18 @@ extension Player {
     evidence: SeekSettlementEvidence,
     publication: SeekOptimisticPublication
   ) -> SeekRequest? {
+    // A deferred drawable-safe load has already made the successor current in
+    // Swift, but its native player does not exist until `play()`. Reserving a
+    // token here would stamp a command against that successor while dispatching
+    // it to the retiring handle.
+    guard nativeHandleRepresentsCurrentMedia else { return nil }
+    intentRevisions.seek &+= 1
     let nativeSeekToken = nativeSeekMonitor.reserveCommand()
     let resolver = SeekOutcomeResolver()
     let command = NativeSeekCommand(
       nativeSeekToken: nativeSeekToken,
       playbackGeneration: sessionGeneration,
+      nativeHandleGeneration: eventBridge.currentNativeHandleGeneration,
       externalEpoch: nativeSeekMonitor.externalSeekEpoch,
       timelineRevision: nil,
       dispatchEmissionSequence: nil,
@@ -43,12 +50,10 @@ extension Player {
       dispatchedCommand.dispatchEmissionSequence = eventBridge
         .advanceNativeTimelineEmissionSequence()
       activeNativeSeek = makeActiveNativeSeek(for: dispatchedCommand)
-      let pipRebuildPermit = stageNativePiPVideoOutputRebuildPermit()
       guard issueNativeSeekCommand(dispatchedCommand) == 0 else {
         activeNativeSeek = nil
         nativeSeekMonitor.cancelCommand(nativeSeekToken)
         nativeSeekMonitor.cancelStagedCommand(nativeSeekToken)
-        cancelNativePiPVideoOutputRebuildPermit(pipRebuildPermit)
         resolver.resolve(.rejected)
         return nil
       }
@@ -64,7 +69,6 @@ extension Player {
         activeNativeSeek = nil
         nativeSeekMonitor.cancelCommand(nativeSeekToken)
         nativeSeekMonitor.cancelStagedCommand(nativeSeekToken)
-        cancelNativePiPVideoOutputRebuildPermit(pipRebuildPermit)
         resolver.resolve(.superseded)
         return SeekRequest(resolver: resolver)
       }
@@ -175,7 +179,15 @@ extension Player {
       pollingTask: nil
     )
     if deadlinePhase == .dispatched {
-      publishDispatchedSeekCommand(command)
+      guard publishDispatchedSeekCommand(command) else { return }
+      guard
+        pendingSeekSettlement?.nativeSeekToken == command.nativeSeekToken,
+        pendingSeekSettlement?.resolver === command.resolver,
+        ownsPlaybackMutation(
+          command.playbackGeneration,
+          nativeHandleGeneration: command.nativeHandleGeneration
+        )
+      else { return }
       beginRawTimelineQuarantine(for: command)
     }
     startPendingSeekTimeout(command, phase: deadlinePhase)
@@ -220,42 +232,93 @@ extension Player {
     pendingSeekSettlement?.timeoutTask = timeoutTask
   }
 
-  func publishDispatchedSeekCommand(_ command: NativeSeekCommand) {
+  @discardableResult
+  func publishDispatchedSeekCommand(_ command: NativeSeekCommand) -> Bool {
     guard
       let timelineRevision = command.timelineRevision,
       let dispatchEmissionSequence = command.dispatchEmissionSequence
     else {
       assertionFailure("A queued seek cannot publish before native dispatch")
-      return
+      return false
     }
+    guard
+      ownsPlaybackMutation(
+        command.playbackGeneration,
+        nativeHandleGeneration: command.nativeHandleGeneration
+      )
+    else { return false }
+    let lifecycleControlEpoch = eventBridge.currentLifecycleControlEpoch
     commitNativeTimelineEmission(dispatchEmissionSequence)
     switch command.publication {
     case .time(let milliseconds):
-      commitSeekTarget(
+      return commitSeekTarget(
         milliseconds: milliseconds,
         revision: timelineRevision,
-        emissionSequence: dispatchEmissionSequence
+        emissionSequence: dispatchEmissionSequence,
+        ifPlaybackGeneration: command.playbackGeneration,
+        nativeHandleGeneration: command.nativeHandleGeneration,
+        lifecycleControlEpoch: lifecycleControlEpoch
       )
     case .position(let position, let timeMilliseconds):
       acceptedTimelineRevision = timelineRevision
-      withMutation(keyPath: \.position) {
-        _position = position
-      }
+      guard
+        performObservableMutation(
+          keyPath: \.position,
+          ifPlaybackGeneration: command.playbackGeneration,
+          nativeHandleGeneration: command.nativeHandleGeneration,
+          timelineRevision: timelineRevision,
+          lifecycleControlEpoch: lifecycleControlEpoch,
+          mutation: {
+            storePositionWithoutNestedObservation(position)
+          }
+        )
+      else { return false }
       if let timeMilliseconds {
-        currentTime = .milliseconds(timeMilliseconds)
+        guard
+          performObservableMutation(
+            keyPath: \.currentTime,
+            ifPlaybackGeneration: command.playbackGeneration,
+            nativeHandleGeneration: command.nativeHandleGeneration,
+            timelineRevision: timelineRevision,
+            lifecycleControlEpoch: lifecycleControlEpoch,
+            mutation: {
+              storeCurrentTimeWithoutNestedObservation(.milliseconds(timeMilliseconds))
+            }
+          )
+        else { return false }
       }
-      recordAuthoritativeTimeline(
-        position: position,
-        emissionSequence: dispatchEmissionSequence
+      guard
+        recordAuthoritativeTimeline(
+          position: position,
+          emissionSequence: dispatchEmissionSequence,
+          ifPlaybackGeneration: command.playbackGeneration,
+          nativeHandleGeneration: command.nativeHandleGeneration,
+          timelineRevision: timelineRevision,
+          lifecycleControlEpoch: lifecycleControlEpoch
+        ) else { return false }
+      return markPlaybackHealthSeek(
+        ifPlaybackGeneration: command.playbackGeneration,
+        nativeHandleGeneration: command.nativeHandleGeneration,
+        timelineRevision: timelineRevision,
+        lifecycleControlEpoch: lifecycleControlEpoch
       )
-      markPlaybackHealthSeek()
     case .revisionOnly:
       acceptedTimelineRevision = timelineRevision
-      recordAuthoritativeTimeline(
-        position: position,
-        emissionSequence: dispatchEmissionSequence
+      guard
+        recordAuthoritativeTimeline(
+          position: position,
+          emissionSequence: dispatchEmissionSequence,
+          ifPlaybackGeneration: command.playbackGeneration,
+          nativeHandleGeneration: command.nativeHandleGeneration,
+          timelineRevision: timelineRevision,
+          lifecycleControlEpoch: lifecycleControlEpoch
+        ) else { return false }
+      return markPlaybackHealthSeek(
+        ifPlaybackGeneration: command.playbackGeneration,
+        nativeHandleGeneration: command.nativeHandleGeneration,
+        timelineRevision: timelineRevision,
+        lifecycleControlEpoch: lifecycleControlEpoch
       )
-      markPlaybackHealthSeek()
     }
   }
 
@@ -267,6 +330,7 @@ extension Player {
     quarantinedSeekTimeline = QuarantinedSeekTimeline(
       nativeSeekToken: command.nativeSeekToken,
       playbackGeneration: command.playbackGeneration,
+      nativeHandleGeneration: command.nativeHandleGeneration,
       time: nil,
       timeEmissionSequence: nil,
       position: nil,
@@ -333,6 +397,12 @@ extension Player {
     _ timeline: QuarantinedSeekTimeline,
     afterEmissionSequence minimumSequence: UInt64 = 0
   ) {
+    guard
+      ownsPlaybackMutation(
+        timeline.playbackGeneration,
+        nativeHandleGeneration: timeline.nativeHandleGeneration
+      )
+    else { return }
     var samples: [(sequence: UInt64, event: PlayerEvent)] = []
     if
       let time = timeline.time,
@@ -348,12 +418,31 @@ extension Player {
     }
     samples.sort { lhs, rhs in lhs.sequence < rhs.sequence }
     for sample in samples where canCommitNativeTimelineEmission(sample.sequence) {
+      guard
+        ownsPlaybackMutation(
+          timeline.playbackGeneration,
+          nativeHandleGeneration: timeline.nativeHandleGeneration
+        )
+      else { return }
+      let timelineRevision = acceptedTimelineRevision
+      let lifecycleControlEpoch = eventBridge.currentLifecycleControlEpoch
       commitNativeTimelineEmission(sample.sequence)
-      handleEvent(sample.event)
-      recordAuthoritativeTimeline(
-        position: position,
-        emissionSequence: sample.sequence
+      handleEvent(
+        sample.event,
+        sourcePlaybackGeneration: timeline.playbackGeneration,
+        sourceNativeHandleGeneration: timeline.nativeHandleGeneration,
+        expectedTimelineRevision: timelineRevision,
+        sourceLifecycleControlEpoch: lifecycleControlEpoch
       )
+      guard
+        recordAuthoritativeTimeline(
+          position: position,
+          emissionSequence: sample.sequence,
+          ifPlaybackGeneration: timeline.playbackGeneration,
+          nativeHandleGeneration: timeline.nativeHandleGeneration,
+          timelineRevision: timelineRevision,
+          lifecycleControlEpoch: lifecycleControlEpoch
+        ) else { return }
     }
   }
 
@@ -368,7 +457,16 @@ extension Player {
   }
 
   func issueNativeSeekCommand(_ command: NativeSeekCommand) -> Int32 {
-    nativeSeekMonitor.withCausalSeekInvocation(token: command.nativeSeekToken) {
+    // Recheck at the actual dispatch boundary. Finalizing a queued command can
+    // synchronously read native state and replacement can win before the setter.
+    guard
+      nativeHandleRepresentsCurrentMedia,
+      ownsPlaybackMutation(
+        command.playbackGeneration,
+        nativeHandleGeneration: command.nativeHandleGeneration
+      )
+    else { return -1 }
+    return nativeSeekMonitor.withCausalSeekInvocation(token: command.nativeSeekToken) {
       let result: Int32 = switch command.operation {
       case .time(let milliseconds, let fast):
         issueNativeSeek(toMilliseconds: milliseconds, fast: fast)
@@ -399,362 +497,6 @@ extension Player {
       #endif
       return result
     }
-  }
-
-  /// Rebases the first queued relative request on the active command's intended
-  /// target so later relative aggregation describes the user's command chain,
-  /// not the optimistic clock value captured before A was accepted.
-  func rebaseRelativeSeekIfSafe(
-    _ command: NativeSeekCommand,
-    after active: NativeSeekCommand?
-  ) -> NativeSeekCommand {
-    guard
-      let active,
-      command.playbackGeneration == active.playbackGeneration,
-      command.externalEpoch == active.externalEpoch,
-      case .relative(let offset) = command.operation,
-      let activeTarget = active.evidence.requestedTimeMilliseconds,
-      let target = clampedRelativeTarget(
-        baselineMilliseconds: activeTarget,
-        offsetMilliseconds: offset
-      )
-    else { return command }
-
-    var rebased = command
-    rebased.evidence = makeComposedSeekEvidence(
-      baseline: command.evidence,
-      requestedTimeMilliseconds: target
-    )
-    if case .time = command.publication {
-      rebased.publication = .time(milliseconds: target)
-    }
-    return rebased
-  }
-
-  /// Merges a queued replacement without applying enqueue-time duration to a
-  /// target which will only enter VLC later. Pure relative chains retain native
-  /// jump semantics. Absolute/fractional intent followed by relative commands
-  /// retains its base plus every offset and resolves them once, immediately
-  /// before dispatch, against the then-current duration.
-  func mergeQueuedSeekReplacement(
-    _ replacement: NativeSeekCommand,
-    replacing previous: NativeSeekCommand
-  ) -> NativeSeekCommand {
-    guard
-      replacement.playbackGeneration == previous.playbackGeneration,
-      replacement.externalEpoch == previous.externalEpoch
-    else { return replacement }
-
-    if
-      case .strictRelative(let replacementIntent) = replacement.operation,
-      case .strictRelative(var previousIntent) = previous.operation {
-      previousIntent.offsetsMilliseconds.append(
-        contentsOf: replacementIntent.offsetsMilliseconds
-      )
-      // The newest strict request owns the public resolver and therefore its
-      // precision policy controls the one aggregate native dispatch.
-      previousIntent.fast = replacementIntent.fast
-      var aggregate = replacement
-      aggregate.operation = .strictRelative(previousIntent)
-      let target = resolveStrictRelativeSeekIntent(previousIntent)
-      aggregate.evidence = makeComposedSeekEvidence(
-        baseline: previous.evidence,
-        requestedTimeMilliseconds: target
-      )
-      aggregate.publication = target.map {
-        .time(milliseconds: $0)
-      } ?? .revisionOnly
-      return aggregate
-    }
-
-    guard case .relative(let replacementOffset) = replacement.operation else {
-      return replacement
-    }
-
-    switch previous.operation {
-    case .relative(let previousOffset):
-      let aggregate = previousOffset.addingReportingOverflow(replacementOffset)
-      guard !aggregate.overflow else {
-        var rejected = replacement
-        rejected.operation = .composed(DeferredSeekComposition(
-          base: .invalid,
-          relativeOffsetsMilliseconds: []
-        ))
-        return rejected
-      }
-
-      var composed = replacement
-      composed.operation = .relative(milliseconds: aggregate.partialValue)
-      let targetMilliseconds: Int64? = if
-        let previousTarget = previous.evidence.requestedTimeMilliseconds {
-        clampedRelativeTarget(
-          baselineMilliseconds: previousTarget,
-          offsetMilliseconds: replacementOffset
-        )
-      } else {
-        nil
-      }
-      composed.evidence = makeComposedSeekEvidence(
-        baseline: previous.evidence,
-        requestedTimeMilliseconds: targetMilliseconds
-      )
-      if case .time = replacement.publication, let targetMilliseconds {
-        composed.publication = .time(milliseconds: targetMilliseconds)
-      }
-      return composed
-
-    case .time(let milliseconds, _):
-      return makeDeferredSeekComposition(
-        base: .absoluteMilliseconds(milliseconds),
-        previous: previous,
-        replacement: replacement,
-        offsetMilliseconds: replacementOffset
-      )
-
-    case .position(let position, _):
-      return makeDeferredSeekComposition(
-        base: .position(position),
-        previous: previous,
-        replacement: replacement,
-        offsetMilliseconds: replacementOffset
-      )
-
-    case .composed(var composition):
-      composition.relativeOffsetsMilliseconds.append(replacementOffset)
-      return makeDeferredSeekComposition(
-        composition: composition,
-        previous: previous,
-        replacement: replacement
-      )
-
-    case .strictRelative:
-      // A lenient native jump replacing strict VOD intent remains the latest
-      // command. Its raw relative semantics are intentionally preserved.
-      return replacement
-    }
-  }
-
-  /// Applies every accepted strict relative offset before clamping once to the
-  /// playable timeline visible at actual native dispatch. Overflow rejects the
-  /// aggregate instead of silently dropping an earlier button press.
-  func resolveStrictRelativeSeekIntent(
-    _ intent: StrictRelativeSeekIntent
-  ) -> Int64? {
-    var target = intent.baseMilliseconds
-    for offset in intent.offsetsMilliseconds {
-      let addition = target.addingReportingOverflow(offset)
-      guard !addition.overflow else { return nil }
-      target = addition.partialValue
-    }
-    target = max(0, target)
-    if let durationMilliseconds = currentDurationMilliseconds {
-      target = min(target, durationMilliseconds)
-    }
-    return target
-  }
-
-  func makeDeferredSeekComposition(
-    base: DeferredSeekCompositionBase,
-    previous: NativeSeekCommand,
-    replacement: NativeSeekCommand,
-    offsetMilliseconds: Int64
-  ) -> NativeSeekCommand {
-    makeDeferredSeekComposition(
-      composition: DeferredSeekComposition(
-        base: base,
-        relativeOffsetsMilliseconds: [offsetMilliseconds]
-      ),
-      previous: previous,
-      replacement: replacement
-    )
-  }
-
-  func makeDeferredSeekComposition(
-    composition: DeferredSeekComposition,
-    previous: NativeSeekCommand,
-    replacement: NativeSeekCommand
-  ) -> NativeSeekCommand {
-    var composed = replacement
-    composed.operation = .composed(composition)
-    let estimatedTarget = resolveDeferredSeekComposition(composition)
-    composed.evidence = makeComposedSeekEvidence(
-      baseline: previous.evidence,
-      requestedTimeMilliseconds: estimatedTarget
-    )
-    if case .time = replacement.publication, let estimatedTarget {
-      composed.publication = .time(milliseconds: estimatedTarget)
-    }
-    return composed
-  }
-
-  /// Resolves a composition using one duration snapshot and clamps only after
-  /// every offset is applied. Any arithmetic overflow is rejected rather than
-  /// silently dropping earlier user intent.
-  func resolveDeferredSeekComposition(
-    _ composition: DeferredSeekComposition
-  ) -> Int64? {
-    let baseMilliseconds: Int64
-    switch composition.base {
-    case .absoluteMilliseconds(let milliseconds):
-      baseMilliseconds = milliseconds
-    case .position(let position):
-      guard let durationMilliseconds = currentDurationMilliseconds else { return nil }
-      baseMilliseconds = checkedMilliseconds(
-        for: PlaybackPosition(position),
-        durationMs: durationMilliseconds
-      )
-    case .invalid:
-      return nil
-    }
-
-    var target = baseMilliseconds
-    for offset in composition.relativeOffsetsMilliseconds {
-      let result = target.addingReportingOverflow(offset)
-      guard !result.overflow else { return nil }
-      target = result.partialValue
-    }
-    target = max(0, target)
-    if let durationMilliseconds = currentDurationMilliseconds {
-      target = min(target, durationMilliseconds)
-    }
-    return target
-  }
-
-  func clampedRelativeTarget(
-    baselineMilliseconds: Int64,
-    offsetMilliseconds: Int64
-  ) -> Int64? {
-    let target = baselineMilliseconds.addingReportingOverflow(offsetMilliseconds)
-    guard !target.overflow else { return nil }
-    var clamped = max(0, target.partialValue)
-    if
-      let duration,
-      let durationMilliseconds = try? duration.checkedNonnegativeMilliseconds(
-        parameter: "duration"
-      ) {
-      clamped = min(clamped, durationMilliseconds)
-    }
-    return clamped
-  }
-
-  func makeComposedSeekEvidence(
-    baseline: SeekSettlementEvidence,
-    requestedTimeMilliseconds: Int64?
-  ) -> SeekSettlementEvidence {
-    let requestedPosition: Double? = if
-      let requestedTimeMilliseconds,
-      let duration,
-      let durationMilliseconds = try? duration.checkedNonnegativeMilliseconds(
-        parameter: "duration"
-      ),
-      durationMilliseconds > 0 {
-      min(1, max(0, Double(requestedTimeMilliseconds) / Double(durationMilliseconds)))
-    } else {
-      nil
-    }
-    return SeekSettlementEvidence(
-      baselineTimeMilliseconds: baseline.baselineTimeMilliseconds,
-      baselinePosition: baseline.baselinePosition,
-      requestedTimeMilliseconds: requestedTimeMilliseconds,
-      requestedPosition: requestedPosition
-    )
-  }
-
-  /// Re-reads native evidence at the actual dispatch boundary. A queued
-  /// command can wait behind a keyframe-adjusted landing for nearly its full
-  /// queue deadline; enqueue-time getters then describe the previous episode
-  /// and can make that landing look like stable evidence for the successor.
-  func finalizeSeekCommandForDispatch(
-    _ command: NativeSeekCommand
-  ) -> NativeSeekCommand {
-    var finalized = command
-    let baseline = nativeSeekClockPointForEvidence()
-
-    switch command.operation {
-    case .time(let milliseconds, _):
-      finalized.evidence = makeSeekSettlementEvidence(
-        baseline: baseline,
-        requestedTimeMilliseconds: milliseconds
-      )
-      if case .time = command.publication {
-        finalized.publication = .time(milliseconds: milliseconds)
-      }
-
-    case .position(let position, _):
-      let requestedTimeMilliseconds = currentDurationMilliseconds.map {
-        checkedMilliseconds(for: PlaybackPosition(position), durationMs: $0)
-      }
-      finalized.evidence = makeSeekSettlementEvidence(
-        baseline: baseline,
-        requestedTimeMilliseconds: requestedTimeMilliseconds,
-        requestedPosition: position
-      )
-      finalized.publication = .position(
-        position,
-        timeMilliseconds: requestedTimeMilliseconds
-      )
-
-    case .relative(let milliseconds):
-      let requestedTimeMilliseconds = baseline.timeMilliseconds.flatMap {
-        clampedRelativeTarget(
-          baselineMilliseconds: $0,
-          offsetMilliseconds: milliseconds
-        )
-      }
-      finalized.evidence = makeSeekSettlementEvidence(
-        baseline: baseline,
-        requestedTimeMilliseconds: requestedTimeMilliseconds
-      )
-      if case .time = command.publication {
-        finalized.publication = requestedTimeMilliseconds.map {
-          .time(milliseconds: $0)
-        } ?? .revisionOnly
-      }
-
-    case .strictRelative(let intent):
-      guard let requestedTimeMilliseconds = resolveStrictRelativeSeekIntent(intent) else {
-        finalized.evidence = makeSeekSettlementEvidence(
-          baseline: baseline,
-          requestedTimeMilliseconds: nil
-        )
-        return finalized
-      }
-      finalized.operation = .time(
-        milliseconds: requestedTimeMilliseconds,
-        fast: intent.fast
-      )
-      finalized.evidence = makeSeekSettlementEvidence(
-        baseline: baseline,
-        requestedTimeMilliseconds: requestedTimeMilliseconds
-      )
-      finalized.publication = .time(milliseconds: requestedTimeMilliseconds)
-
-    case .composed(let composition):
-      guard let requestedTimeMilliseconds = resolveDeferredSeekComposition(composition) else {
-        finalized.evidence = makeSeekSettlementEvidence(
-          baseline: baseline,
-          requestedTimeMilliseconds: nil
-        )
-        return finalized
-      }
-      finalized.operation = .time(
-        milliseconds: requestedTimeMilliseconds,
-        fast: false
-      )
-      finalized.evidence = makeSeekSettlementEvidence(
-        baseline: baseline,
-        requestedTimeMilliseconds: requestedTimeMilliseconds
-      )
-      if case .time = command.publication {
-        finalized.publication = .time(milliseconds: requestedTimeMilliseconds)
-      }
-    }
-    return finalized
-  }
-
-  var currentDurationMilliseconds: Int64? {
-    guard let duration else { return nil }
-    return try? duration.checkedNonnegativeMilliseconds(parameter: "duration")
   }
 
   func dispatchQueuedNativeSeekIfPossible() {
@@ -790,12 +532,10 @@ extension Player {
       .advanceNativeTimelineEmissionSequence()
     queuedNativeSeek = nil
     activeNativeSeek = makeActiveNativeSeek(for: command)
-    let pipRebuildPermit = stageNativePiPVideoOutputRebuildPermit()
     guard issueNativeSeekCommand(command) == 0 else {
       activeNativeSeek = nil
       nativeSeekMonitor.cancelCommand(command.nativeSeekToken)
       nativeSeekMonitor.cancelStagedCommand(command.nativeSeekToken)
-      cancelNativePiPVideoOutputRebuildPermit(pipRebuildPermit)
       finishCurrentPublicSeek(
         nativeSeekToken: command.nativeSeekToken,
         resolver: command.resolver,
@@ -811,7 +551,6 @@ extension Player {
       activeNativeSeek = nil
       nativeSeekMonitor.cancelCommand(command.nativeSeekToken)
       nativeSeekMonitor.cancelStagedCommand(command.nativeSeekToken)
-      cancelNativePiPVideoOutputRebuildPermit(pipRebuildPermit)
       finishCurrentPublicSeek(
         nativeSeekToken: command.nativeSeekToken,
         resolver: command.resolver,
@@ -823,6 +562,10 @@ extension Player {
       latestWrapperDispatchExternalSeekEpoch,
       command.externalEpoch
     )
+    // Publication is an Observation reentrancy boundary. A callback can queue
+    // a newer seek while this command remains the sole native owner, so arm its
+    // native-owner deadline before publishing any optimistic timeline value.
+    startActiveNativeSeekDeadline(command)
     if
       pendingSeekSettlement?.nativeSeekToken == command.nativeSeekToken,
       pendingSeekSettlement?.resolver === command.resolver {
@@ -835,9 +578,16 @@ extension Player {
         command.evidence.requestedTimeMilliseconds
       pendingSeekSettlement?.requestedPosition = command.evidence.requestedPosition
     }
-    publishDispatchedSeekCommand(command)
+    guard publishDispatchedSeekCommand(command) else { return }
+    guard
+      activeNativeSeek?.command.nativeSeekToken == command.nativeSeekToken,
+      pendingSeekSettlement?.nativeSeekToken == command.nativeSeekToken,
+      ownsPlaybackMutation(
+        command.playbackGeneration,
+        nativeHandleGeneration: command.nativeHandleGeneration
+      )
+    else { return }
     beginRawTimelineQuarantine(for: command)
-    startActiveNativeSeekDeadline(command)
     startPendingSeekTimeout(command, phase: .dispatched)
   }
 

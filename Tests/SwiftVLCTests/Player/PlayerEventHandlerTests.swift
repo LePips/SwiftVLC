@@ -246,10 +246,11 @@ extension Integration {
       #expect(fired.withLock { $0 })
     }
 
-    /// The payload is exposed on the event stream, while observation re-reads
-    /// the effective native rate so the two cannot silently diverge.
+    /// The payload is exposed on the dedicated resolution stream, while
+    /// observation re-reads the effective native rate so the two cannot
+    /// silently diverge.
     @Test
-    func `rateChanged invalidates the rate observer`() {
+    func `Current effective rate resolution invalidates the rate observer`() {
       let player = Player(instance: TestInstance.shared)
       let fired = Mutex(false)
       withObservationTracking {
@@ -258,9 +259,44 @@ extension Integration {
         fired.withLock { $0 = true }
       }
 
-      player._handleEventForTesting(.rateChanged(1.5))
+      player.handleEffectivePlaybackRateResolution(
+        EffectivePlaybackRateResolution(
+          effectiveRate: 1.5,
+          nativeGeneration: player.nativeEventGeneration,
+          playbackGeneration: player.generation
+        )
+      )
 
       #expect(fired.withLock { $0 })
+    }
+
+    @Test(arguments: [true, false])
+    func `Noncurrent effective rate resolution cannot invalidate rate`(
+      hasCurrentNativeHandle: Bool
+    ) {
+      let player = Player(instance: TestInstance.shared)
+      let fired = Mutex(false)
+      withObservationTracking {
+        _ = player.rate
+      } onChange: {
+        fired.withLock { $0 = true }
+      }
+
+      let nativeGeneration = hasCurrentNativeHandle
+        ? player.nativeEventGeneration
+        : NativePlayerGeneration(player.nativeEventGeneration.value &- 1)
+      let playbackGeneration = hasCurrentNativeHandle
+        ? PlaybackGeneration(player.generation.value &+ 1)
+        : player.generation
+      player.handleEffectivePlaybackRateResolution(
+        EffectivePlaybackRateResolution(
+          effectiveRate: 1.5,
+          nativeGeneration: nativeGeneration,
+          playbackGeneration: playbackGeneration
+        )
+      )
+
+      #expect(!fired.withLock { $0 })
     }
 
     @Test

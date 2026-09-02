@@ -22,6 +22,8 @@ extension Player {
       let activeNativeSeek,
       activeNativeSeek.command.nativeSeekToken == landing.token,
       activeNativeSeek.command.playbackGeneration == sessionGeneration,
+      activeNativeSeek.command.nativeHandleGeneration
+      == eventBridge.currentNativeHandleGeneration,
       hasAuthoritativeTime || hasAuthoritativePosition
     else { return }
 
@@ -68,38 +70,80 @@ extension Player {
       // that entered after dispatch but before seek-start still carry the
       // accepted request revision; advancing here prevents those queued old
       // clock samples from overwriting the landed point after settlement.
-      acceptedTimelineRevision = eventBridge.advanceTimelineRevision()
+      let lifecycleControlEpoch = eventBridge.currentLifecycleControlEpoch
+      let landingTimelineRevision = eventBridge.advanceTimelineRevision()
+      acceptedTimelineRevision = landingTimelineRevision
       commitNativeTimelineEmission(landing.emissionSequence)
       let authoritativePosition: Double?
       if hasAuthoritativeTime {
-        currentTime = .milliseconds(landing.timeMilliseconds)
+        guard
+          performObservableMutation(
+            keyPath: \.currentTime,
+            ifPlaybackGeneration: command.playbackGeneration,
+            nativeHandleGeneration: command.nativeHandleGeneration,
+            timelineRevision: landingTimelineRevision,
+            lifecycleControlEpoch: lifecycleControlEpoch,
+            mutation: {
+              storeCurrentTimeWithoutNestedObservation(
+                .milliseconds(landing.timeMilliseconds)
+              )
+            }
+          )
+        else { return }
       } else if
         let duration,
         let durationMilliseconds = try? duration.checkedNonnegativeMilliseconds(
           parameter: "duration"
         ) {
-        currentTime = .milliseconds(checkedMilliseconds(
+        let landedTime = Duration.milliseconds(checkedMilliseconds(
           for: PlaybackPosition(landing.position),
           durationMs: durationMilliseconds
         ))
+        guard
+          performObservableMutation(
+            keyPath: \.currentTime,
+            ifPlaybackGeneration: command.playbackGeneration,
+            nativeHandleGeneration: command.nativeHandleGeneration,
+            timelineRevision: landingTimelineRevision,
+            lifecycleControlEpoch: lifecycleControlEpoch,
+            mutation: {
+              storeCurrentTimeWithoutNestedObservation(landedTime)
+            }
+          )
+        else { return }
       }
       if hasAuthoritativePosition {
-        withMutation(keyPath: \.position) {
-          _position = landing.position
-        }
+        guard
+          performObservableMutation(
+            keyPath: \.position,
+            ifPlaybackGeneration: command.playbackGeneration,
+            nativeHandleGeneration: command.nativeHandleGeneration,
+            timelineRevision: landingTimelineRevision,
+            lifecycleControlEpoch: lifecycleControlEpoch,
+            mutation: {
+              storePositionWithoutNestedObservation(landing.position)
+            }
+          )
+        else { return }
         authoritativePosition = landing.position
       } else {
         authoritativePosition = publishPosition(
-          forTargetMilliseconds: landing.timeMilliseconds
+          forTargetMilliseconds: landing.timeMilliseconds,
+          ifPlaybackGeneration: command.playbackGeneration,
+          nativeHandleGeneration: command.nativeHandleGeneration,
+          timelineRevision: landingTimelineRevision,
+          lifecycleControlEpoch: lifecycleControlEpoch
         )
       }
-      eventBridge.updateAuthoritativeTimeline(
-        time: currentTime,
-        position: authoritativePosition,
-        playbackGeneration: sessionGeneration,
-        timelineRevision: acceptedTimelineRevision,
-        timelineEmissionSequence: landing.emissionSequence
-      )
+      guard
+        recordAuthoritativeTimeline(
+          position: authoritativePosition,
+          emissionSequence: landing.emissionSequence,
+          ifPlaybackGeneration: command.playbackGeneration,
+          nativeHandleGeneration: command.nativeHandleGeneration,
+          timelineRevision: landingTimelineRevision,
+          lifecycleControlEpoch: lifecycleControlEpoch
+        ) else { return }
       if let postLandingTimeline {
         applyQuarantinedSeekTimeline(
           postLandingTimeline,
@@ -211,36 +255,75 @@ extension Player {
       return
     }
     commitNativeTimelineEmission(landing.emissionSequence)
+    let lifecycleControlEpoch = eventBridge.currentLifecycleControlEpoch
     let revision = eventBridge.advanceTimelineRevision()
     acceptedTimelineRevision = revision
     if hasAuthoritativeTime {
-      currentTime = .milliseconds(landing.timeMilliseconds)
+      guard
+        performObservableMutation(
+          keyPath: \.currentTime,
+          ifPlaybackGeneration: landing.playbackGeneration,
+          nativeHandleGeneration: landing.nativeHandleGeneration,
+          timelineRevision: revision,
+          lifecycleControlEpoch: lifecycleControlEpoch,
+          mutation: {
+            storeCurrentTimeWithoutNestedObservation(.milliseconds(landing.timeMilliseconds))
+          }
+        )
+      else { return }
     } else if
       let durationMilliseconds = currentDurationMilliseconds,
       durationMilliseconds > 0 {
-      currentTime = .milliseconds(checkedMilliseconds(
+      let landedTime = Duration.milliseconds(checkedMilliseconds(
         for: PlaybackPosition(landing.position),
         durationMs: durationMilliseconds
       ))
+      guard
+        performObservableMutation(
+          keyPath: \.currentTime,
+          ifPlaybackGeneration: landing.playbackGeneration,
+          nativeHandleGeneration: landing.nativeHandleGeneration,
+          timelineRevision: revision,
+          lifecycleControlEpoch: lifecycleControlEpoch,
+          mutation: {
+            storeCurrentTimeWithoutNestedObservation(landedTime)
+          }
+        )
+      else { return }
     }
     let authoritativePosition: Double?
     if hasAuthoritativePosition {
-      withMutation(keyPath: \.position) {
-        _position = landing.position
-      }
+      guard
+        performObservableMutation(
+          keyPath: \.position,
+          ifPlaybackGeneration: landing.playbackGeneration,
+          nativeHandleGeneration: landing.nativeHandleGeneration,
+          timelineRevision: revision,
+          lifecycleControlEpoch: lifecycleControlEpoch,
+          mutation: {
+            storePositionWithoutNestedObservation(landing.position)
+          }
+        )
+      else { return }
       authoritativePosition = landing.position
     } else {
       authoritativePosition = publishPosition(
-        forTargetMilliseconds: landing.timeMilliseconds
+        forTargetMilliseconds: landing.timeMilliseconds,
+        ifPlaybackGeneration: landing.playbackGeneration,
+        nativeHandleGeneration: landing.nativeHandleGeneration,
+        timelineRevision: revision,
+        lifecycleControlEpoch: lifecycleControlEpoch
       )
     }
-    eventBridge.updateAuthoritativeTimeline(
-      time: currentTime,
-      position: authoritativePosition,
-      playbackGeneration: sessionGeneration,
-      timelineRevision: revision,
-      timelineEmissionSequence: landing.emissionSequence
-    )
+    guard
+      recordAuthoritativeTimeline(
+        position: authoritativePosition,
+        emissionSequence: landing.emissionSequence,
+        ifPlaybackGeneration: landing.playbackGeneration,
+        nativeHandleGeneration: landing.nativeHandleGeneration,
+        timelineRevision: revision,
+        lifecycleControlEpoch: lifecycleControlEpoch
+      ) else { return }
     dispatchQueuedNativeSeekIfPossible()
     dispatchNextPendingFrameStepIfNeeded()
   }
@@ -691,7 +774,7 @@ extension Player {
   /// established or terminal input. Only `.idle` is ambiguous enough to use
   /// the synchronous active-intent fallback for a same-turn play request.
   var hasLenientSeekSession: Bool {
-    guard !isShutdown else { return false }
+    guard !isShutdown, nativeHandleRepresentsCurrentMedia else { return false }
     switch nativePlaybackState {
     case .opening, .buffering, .playing, .paused:
       return true

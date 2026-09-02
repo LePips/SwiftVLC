@@ -321,7 +321,10 @@ extension Integration {
 
       let request = player.requestJump(by: .seconds(10))
       let monitorGeneration = player.nativeSeekMonitor._timelineGenerationForTesting
-      player.sessionGeneration &+= 1
+      player.sessionGeneration = player.eventBridge.synchronizePlaybackGeneration(
+        player.sessionGeneration &+ 1,
+        media: player.currentMedia?.pointer
+      )
 
       #expect(await request.outcome == .superseded)
       #expect(player.nativeSeekMonitor._timelineGenerationForTesting > monitorGeneration)

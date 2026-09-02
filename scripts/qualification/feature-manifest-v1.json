@@ -499,6 +499,16 @@
       ]
     },
     {
+      "id": "pip-system-overlay-controls",
+      "category": "picture-in-picture",
+      "title": "Real system PiP controls drive the candidate player",
+      "description": "An operator presses the visible SpringBoard Picture in Picture play, pause, forward, and backward controls and observes both the system overlay state and candidate media clock settle after every command.",
+      "releaseRequirement": "required",
+      "execution": "operator-assisted",
+      "evidenceLevel": "system-output",
+      "blocker": "The current automated VOD lane invokes app-exposed qualification controls; it does not press the real SpringBoard PiP transport controls, and no operator-evidence row is implemented yet."
+    },
+    {
       "id": "audio-background-continuity",
       "category": "audio-lifecycle",
       "title": "Audio output advances while the app is backgrounded",
@@ -754,6 +764,16 @@
       "blocker": "The current qualification matrix has no receiver-side control or recast restoration evidence."
     },
     {
+      "id": "cast-recast-session-isolation",
+      "category": "casting",
+      "title": "Rapid same-receiver recast cannot be stopped by the old session",
+      "description": "An operator starts local media A, casts A to one physical receiver, rapidly recasts media B to that same receiver, then observes receiver telemetry and audio or video for 30–60 seconds to prove B remains playing and no late STOP or CLOSE from A interrupts it.",
+      "releaseRequirement": "required",
+      "execution": "external-lab",
+      "evidenceLevel": "receiver-output",
+      "blocker": "Requires a physical receiver and candidate-bound receiver-side session/telemetry capture; local player events or sender state cannot satisfy this row, and that external-lab lane is not implemented."
+    },
+    {
       "id": "cast-network-loss-recovery",
       "category": "casting",
       "title": "Receiver and network loss produce truthful recovery outcomes",
@@ -816,8 +836,8 @@
     {
       "id": "native-extension-version-contract",
       "title": "Exact native extension source, header, symbol, and archive contract",
-      "description": "One fail-closed resolver binds the ordered patch intent to a contiguous v4-v8 public surface, an exact side-effect-free version function, complete native definitions and exports, and the checked-in vendored headers. Every declared XCFramework slice and architecture must then contain exactly one strong definition of every version-owned symbol and no partial or future group; the host macOS slice also executes the version probe. Patch 0033's same-version Apple audio lease refinement is required explicitly and cannot hide behind version 8 alone.",
-      "command": "./scripts/validate-native-extension-contract.sh --source-root /path/to/patched-vlc-source --xcframework /path/to/libvlc.xcframework --expected-version 8 --require-apple-audio-session-leases --run-mutations"
+      "description": "One fail-closed resolver binds the ordered patch intent to a contiguous v4-v9 public surface, an exact side-effect-free version function, complete native definitions and exports, and the checked-in vendored headers. Its v9 semantic proof requires a transactional nonzero, write-once native-handle/playback publication; immutable identity nodes retained until every output joins media-player deletion; one retained drawable and copied identity pair before module mapping; a process-unique nonwrapping output identity; the complete output-scoped handoff selector surface and exact lifecycle preflight; synchronous preserved-before-rebind and fresh-after-construction controller claims; timeout arming before publication; and exact cancellation and fresh-reservation rollback. Every declared XCFramework slice and architecture must then contain exactly one strong definition of every version-owned symbol and no partial, weak-only, or future group; the host macOS slice also executes the version, type-layout, signature, and null-player probe. The checked-in weak compatibility shim must return false without side effects below v9. Patch 0033's Apple audio lease refinement remains an explicit optional profile only at the historical v8 boundary and is inherited unconditionally by v9.",
+      "command": "./scripts/validate-native-extension-contract.sh --source-root /path/to/patched-vlc-source --xcframework /path/to/libvlc.xcframework --expected-version 9 --require-apple-audio-session-leases --run-mutations"
     },
     {
       "id": "apple-assembly-metadata-contract",

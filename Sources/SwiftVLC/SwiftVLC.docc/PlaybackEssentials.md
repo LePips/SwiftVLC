@@ -108,11 +108,14 @@ after the transition when the effective control setting matters. That value is
 still not a measurement of decoded or presented frame throughput.
 
 When ``Player/supportsEffectivePlaybackRateEvents`` is true,
-``PlayerEvent/rateChanged(_:)`` reports effective control-rate resolutions and
-invalidates the observable ``Player/rate``. It is not a completion for a
-specific request: rapid requests carry no IDs. A queued active-input request
-is silent when its resolved rate is unchanged; with no input, or if native
-queuing fails, the event may instead repeat the current effective value.
+``Player/effectivePlaybackRateResolutions`` reports
+``EffectivePlaybackRateResolution`` values and invalidates the observable
+``Player/rate``. Each value carries the exact native-handle and playback
+generation captured at callback entry, so queued work can reject a retired
+handle or superseded media session. It is not a completion for a specific
+request: rapid requests carry no IDs. A queued active-input request is silent
+when its resolved rate is unchanged; with no input, or if native queuing fails,
+the stream may instead repeat the current effective value.
 
 The typed wrappers — ``PlaybackPosition``, ``Volume``, ``PlaybackRate``,
 ``SubtitleScale``, ``EqualizerGain`` — are `Hashable`, `Comparable`,

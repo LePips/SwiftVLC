@@ -175,10 +175,32 @@ extension PiPController {
       ownedPlaybackControlRevision,
       .resume
     )
-    setDeferredPauseOutcome(.rejected)
-    guard player.state.isActive else { return }
-    player.setPlaybackIntentFromExternalControl(true)
+    guard let playerRestorationLease = player.makeExternalPlaybackIntentRestorationLease()
+    else {
+      setDeferredPauseOutcome(.cancelled)
+      return
+    }
+    guard let outcomeRevision = setDeferredPauseOutcome(.rejected) else { return }
+    guard
+      ownsDeferredPauseOutcomePublication(outcomeRevision),
+      player.ownsExternalPlaybackIntentRestoration(playerRestorationLease),
+      player.restorePlaybackIntentFromExternalControl(
+        true,
+        ifCurrent: playerRestorationLease
+      ),
+      ownsDeferredPauseOutcomePublication(outcomeRevision),
+      player.ownsExternalPlaybackIntentRestoration(playerRestorationLease)
+    else { return }
     pipPlaybackActive = true
+    guard
+      ownsDeferredPauseOutcomePublication(outcomeRevision),
+      player.ownsExternalPlaybackIntentRestoration(playerRestorationLease)
+    else {
+      if ownsDeferredPauseOutcomePublication(outcomeRevision) {
+        pipPlaybackActive = false
+      }
+      return
+    }
     invalidatePictureInPicturePlaybackState()
   }
 

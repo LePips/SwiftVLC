@@ -20,9 +20,9 @@ struct AuthoritativeStopReasonTests {
   @Test
   func `An end-of-stream reason confirms a natural end`() {
     let coordinator = PlaybackEndCoordinator()
-    coordinator.noteStoppingReason(libvlc_stopping_reason_eos)
+    coordinator.noteStoppingReason(libvlc_stopping_reason_eos, playbackGeneration: 1)
 
-    #expect(coordinator.consumeStoppedShouldSynthesizeEnd())
+    #expect(coordinator.consumeStoppedShouldSynthesizeEnd(playbackGeneration: 1))
   }
 
   /// The case the inference got wrong. Nothing here marked a library stop or
@@ -31,10 +31,10 @@ struct AuthoritativeStopReasonTests {
   @Test
   func `An error reason is not a natural end even with no other cause recorded`() {
     let coordinator = PlaybackEndCoordinator()
-    coordinator.noteStoppingReason(libvlc_stopping_reason_error)
+    coordinator.noteStoppingReason(libvlc_stopping_reason_error, playbackGeneration: 1)
 
     #expect(
-      !coordinator.consumeStoppedShouldSynthesizeEnd(),
+      !coordinator.consumeStoppedShouldSynthesizeEnd(playbackGeneration: 1),
       "a stop the engine attributed to an error was reported as a natural end"
     )
   }
@@ -42,9 +42,9 @@ struct AuthoritativeStopReasonTests {
   @Test
   func `A user-requested stop is not a natural end`() {
     let coordinator = PlaybackEndCoordinator()
-    coordinator.noteStoppingReason(libvlc_stopping_reason_user)
+    coordinator.noteStoppingReason(libvlc_stopping_reason_user, playbackGeneration: 1)
 
-    #expect(!coordinator.consumeStoppedShouldSynthesizeEnd())
+    #expect(!coordinator.consumeStoppedShouldSynthesizeEnd(playbackGeneration: 1))
   }
 
   /// List-player suppression still wins: advancing a playlist ends one media
@@ -53,9 +53,9 @@ struct AuthoritativeStopReasonTests {
   func `List-player suppression outranks an end-of-stream reason`() {
     let coordinator = PlaybackEndCoordinator()
     coordinator.setSuppressed(true)
-    coordinator.noteStoppingReason(libvlc_stopping_reason_eos)
+    coordinator.noteStoppingReason(libvlc_stopping_reason_eos, playbackGeneration: 1)
 
-    #expect(!coordinator.consumeStoppedShouldSynthesizeEnd())
+    #expect(!coordinator.consumeStoppedShouldSynthesizeEnd(playbackGeneration: 1))
   }
 
   /// The reason describes one stop only. Leaking it into the next would let a
@@ -63,12 +63,12 @@ struct AuthoritativeStopReasonTests {
   @Test
   func `A reason does not carry into the next stop`() {
     let coordinator = PlaybackEndCoordinator()
-    coordinator.noteStoppingReason(libvlc_stopping_reason_eos)
-    #expect(coordinator.consumeStoppedShouldSynthesizeEnd())
+    coordinator.noteStoppingReason(libvlc_stopping_reason_eos, playbackGeneration: 1)
+    #expect(coordinator.consumeStoppedShouldSynthesizeEnd(playbackGeneration: 1))
 
     // No reason supplied for this one, and no other cause recorded.
     #expect(
-      !coordinator.consumeStoppedShouldSynthesizeEnd(),
+      !coordinator.consumeStoppedShouldSynthesizeEnd(playbackGeneration: 2),
       "an unattributed successor stop was promoted to a confirmed end"
     )
   }
@@ -78,7 +78,7 @@ struct AuthoritativeStopReasonTests {
   func `A library-issued stop without a reason is still not a natural end`() {
     let coordinator = PlaybackEndCoordinator()
 
-    #expect(!coordinator.consumeStoppedShouldSynthesizeEnd())
+    #expect(!coordinator.consumeStoppedShouldSynthesizeEnd(playbackGeneration: 1))
   }
 
   /// A reason belongs to the handle that produced it.
@@ -90,12 +90,12 @@ struct AuthoritativeStopReasonTests {
   @Test
   func `A reason does not survive a handle replacement`() {
     let coordinator = PlaybackEndCoordinator()
-    coordinator.noteStoppingReason(libvlc_stopping_reason_eos)
+    coordinator.noteStoppingReason(libvlc_stopping_reason_eos, playbackGeneration: 1)
 
     coordinator.clearForHandleReplacement()
 
     #expect(
-      !coordinator.consumeStoppedShouldSynthesizeEnd(),
+      !coordinator.consumeStoppedShouldSynthesizeEnd(playbackGeneration: 2),
       "an end-of-stream reason from a replaced handle confirmed the successor's stop as a natural end"
     )
   }
@@ -108,11 +108,14 @@ struct AuthoritativeStopReasonTests {
   func `The stopping reason is recorded before the raw event is exposed`() {
     let player = Player(instance: TestInstance.makeAudioOnly())
     let coordinator = player.endCoordinator
+    let playbackGeneration = player.eventBridge.currentPlaybackGeneration
     let classificationObservedByFilter = Mutex<Bool?>(nil)
     let stream = player.events(policy: .unbounded) { event in
       guard case .mediaStopping = event else { return false }
       classificationObservedByFilter.withLock {
-        $0 = coordinator.consumeStoppedShouldSynthesizeEnd()
+        $0 = coordinator.consumeStoppedShouldSynthesizeEnd(
+          playbackGeneration: playbackGeneration
+        )
       }
       return true
     }

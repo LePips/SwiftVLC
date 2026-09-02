@@ -17,7 +17,7 @@ RUN_MUTATIONS=no
 
 usage() {
     cat >&2 <<EOF
-Usage: $0 --expected-version <1..8> [--source-root <patched-vlc>] \\
+Usage: $0 --expected-version <1..9> [--source-root <patched-vlc>] \\
   [--xcframework <candidate>] [--require-apple-audio-session-leases] \\
   [--run-mutations]
 EOF
@@ -60,22 +60,52 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if [[ ! "$EXPECTED_VERSION" =~ ^[1-8]$ ]]; then
-    echo "An exact expected extension version from 1 through 8 is required." >&2
+if [[ ! "$EXPECTED_VERSION" =~ ^[1-9]$ ]]; then
+    echo "An exact expected extension version from 1 through 9 is required." >&2
     exit 2
 fi
 if [[ "$REQUIRE_LEASES" = yes ]] && (( EXPECTED_VERSION < 8 )); then
-    echo "Apple audio-session leases require extension version 8." >&2
+    echo "Apple audio-session leases require extension version 8 or newer." >&2
     exit 2
+fi
+if (( EXPECTED_VERSION >= 9 )); then
+    # v9 succeeds the final v8+0033 profile. Do not let omission of an optional
+    # command-line flag turn an inherited safety contract back into an option.
+    REQUIRE_LEASES=yes
 fi
 if [[ -z "$SOURCE_ROOT" && -z "$XCFRAMEWORK" ]]; then
     echo "At least one of --source-root or --xcframework is required." >&2
     exit 2
 fi
 
+# SwiftVLC deliberately keeps weak definitions so an older released static
+# archive remains linkable. Prove those compatibility paths cannot advertise
+# v9 or mutate identity before evaluating either a source tree or an archive.
+python3 -B - "$RESOLVER" "$REPO_ROOT/Sources/CLibVLC/shim.c" <<'PY'
+import importlib.util
+from pathlib import Path
+import sys
+
+resolver_path = Path(sys.argv[1])
+shim_path = Path(sys.argv[2])
+spec = importlib.util.spec_from_file_location(
+    "swiftvlc_pip_extension_version", resolver_path
+)
+if spec is None or spec.loader is None:
+    raise SystemExit(f"cannot import native extension resolver: {resolver_path}")
+resolver = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(resolver)
+try:
+    resolver.validate_weak_compatibility_shim(
+        shim_path.read_text(encoding="utf-8")
+    )
+except (OSError, resolver.ExtensionVersionError) as error:
+    raise SystemExit(f"FAIL native extension weak compatibility: {error}")
+PY
+
 if [[ -n "$SOURCE_ROOT" ]]; then
     if (( EXPECTED_VERSION < 4 )); then
-        echo "Source composition proof is defined for extension versions 4 through 8." >&2
+        echo "Source composition proof is defined for extension versions 4 through 9." >&2
         exit 2
     fi
     if [[ ! -d "$SOURCE_ROOT" ]]; then
@@ -275,6 +305,9 @@ PY
         swiftvlc_libvlc_media_player_get_apple_audio_recovery_snapshot
         swiftvlc_libvlc_media_player_set_pause_without_reset_authorization
     )
+    VERSION_9_SYMBOLS=(
+        swiftvlc_libvlc_media_player_set_pip_playback_identity
+    )
     LEASE_SYMBOLS=(
         swiftvlc_libvlc_media_player_acquire_apple_audio_session_lease
         swiftvlc_libvlc_media_player_release_apple_audio_session_lease
@@ -306,6 +339,11 @@ PY
         REQUIRED_SYMBOLS+=("${VERSION_8_SYMBOLS[@]}")
     else
         FUTURE_SYMBOLS+=("${VERSION_8_SYMBOLS[@]}")
+    fi
+    if (( EXPECTED_VERSION >= 9 )); then
+        REQUIRED_SYMBOLS+=("${VERSION_9_SYMBOLS[@]}")
+    else
+        FUTURE_SYMBOLS+=("${VERSION_9_SYMBOLS[@]}")
     fi
 
     symbol_definition_counts() {
@@ -377,9 +415,9 @@ PY
                 fi
             done
             # Bash 3.2 treats expansion of an explicitly empty array as an
-            # unbound variable under `set -u`. Version 8 has no future group,
+            # unbound variable under `set -u`. Version 9 has no future group,
             # so guard the only empty-array boundary before expanding it.
-            if (( EXPECTED_VERSION < 8 )); then
+            if (( EXPECTED_VERSION < 9 )); then
                 for symbol in "${FUTURE_SYMBOLS[@]}"; do
                     counts=$(symbol_definition_counts "$nm_output" "$symbol")
                     definition_count=${counts#*:}

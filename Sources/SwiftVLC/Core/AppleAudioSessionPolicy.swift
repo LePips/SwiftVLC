@@ -1,9 +1,12 @@
 /// Selects who owns Apple audio-session policy for one ``VLCInstance``.
 ///
 /// The choice is immutable and inherited by every ``Player`` created from
-/// the instance. Keeping ownership instance-scoped prevents a PiP view or
-/// controller from silently choosing a different owner than libVLC's audio
-/// output.
+/// the instance. Current PiP construction inherits it too, keeping SwiftVLC's
+/// controller and libVLC's audio output under one ownership policy.
+///
+/// The deprecated `PiPVideoView` `managesAudioSession` argument is a narrow
+/// compatibility exception: it preserves that controller-local behavior from
+/// SwiftVLC 1.0 but cannot change this instance policy or native audio output.
 public enum AppleAudioSessionPolicy: Sendable, Equatable, Hashable {
   /// SwiftVLC and its bundled libVLC configure, activate, and recover the
   /// process audio session as playback requires.
@@ -54,10 +57,7 @@ extension AppleAudioSessionPolicy {
     _ requestedManagement: Bool?
   ) -> AppleAudioSessionPolicyResolution {
     let inheritedManagement = managesAudioSession
-    guard
-      let requestedManagement,
-      requestedManagement != inheritedManagement
-    else {
+    guard let requestedManagement else {
       return AppleAudioSessionPolicyResolution(
         managesAudioSession: inheritedManagement,
         diagnostic: nil
@@ -65,11 +65,13 @@ extension AppleAudioSessionPolicy {
     }
 
     return AppleAudioSessionPolicyResolution(
-      managesAudioSession: inheritedManagement,
-      diagnostic: .ignoredLegacyPiPOverride(
-        requestedManagement: requestedManagement,
-        inheritedPolicy: self
-      )
+      managesAudioSession: requestedManagement,
+      diagnostic: requestedManagement == inheritedManagement
+        ? nil
+        : .appliedLegacyPiPControllerOverride(
+          requestedManagement: requestedManagement,
+          inheritedPolicy: self
+        )
     )
   }
 }
@@ -80,7 +82,7 @@ struct AppleAudioSessionPolicyResolution: Sendable, Equatable {
 }
 
 enum AppleAudioSessionPolicyDiagnostic: Sendable, Equatable {
-  case ignoredLegacyPiPOverride(
+  case appliedLegacyPiPControllerOverride(
     requestedManagement: Bool,
     inheritedPolicy: AppleAudioSessionPolicy
   )

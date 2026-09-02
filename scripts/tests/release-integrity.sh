@@ -65,6 +65,32 @@ grep -q 'native validator asset hash mismatch' \
   "$temp_dir/validator-assets-drift.log" || \
   fail "native validator drift did not produce a fail-closed diagnostic"
 
+# The renderer recovery wrapper delegates its release decision to four source
+# fixtures. Prove that neither the entry point nor any transitive input can
+# drift outside the closed asset inventory.
+renderer_validator_assets=(
+  scripts/patches/validation/native-sample-buffer-renderer-immediate-sample.m
+  scripts/patches/validation/native-sample-buffer-renderer-recovery.c
+  scripts/patches/validation/sample-buffer-renderer-snapshot-abi.c
+  scripts/patches/validation/sample-buffer-renderer-snapshot-abi.cpp
+  scripts/validate-sample-buffer-renderer-recovery.sh
+)
+renderer_asset_index=0
+for renderer_asset in "${renderer_validator_assets[@]}"; do
+  renderer_asset_index=$((renderer_asset_index + 1))
+  renderer_drift_root="$temp_dir/validator-assets-renderer-drift-$renderer_asset_index"
+  cp -R "$validator_asset_fixture" "$renderer_drift_root"
+  printf 'renderer recovery drift\n' >> "$renderer_drift_root/$renderer_asset"
+  if python3 "$SCRIPT_DIR/verify-native-validator-assets.py" \
+    --root "$renderer_drift_root" \
+    >"$renderer_drift_root.log" 2>&1; then
+    fail "renderer validator asset drift was accepted: $renderer_asset"
+  fi
+  grep -Fq "native validator asset hash mismatch: $renderer_asset" \
+    "$renderer_drift_root.log" || \
+    fail "renderer validator drift did not identify its asset: $renderer_asset"
+done
+
 cp -R "$validator_asset_fixture" "$temp_dir/validator-assets-mode-drift"
 chmod 0755 \
   "$temp_dir/validator-assets-mode-drift/scripts/tests/test_pip_extension_version.py"
@@ -76,6 +102,20 @@ fi
 grep -q 'native validator asset mode mismatch' \
   "$temp_dir/validator-assets-mode-drift.log" || \
   fail "native validator mode drift did not produce a fail-closed diagnostic"
+
+cp -R "$validator_asset_fixture" \
+  "$temp_dir/validator-assets-renderer-wrapper-mode-drift"
+chmod 0644 \
+  "$temp_dir/validator-assets-renderer-wrapper-mode-drift/scripts/validate-sample-buffer-renderer-recovery.sh"
+if python3 "$SCRIPT_DIR/verify-native-validator-assets.py" \
+  --root "$temp_dir/validator-assets-renderer-wrapper-mode-drift" \
+  >"$temp_dir/validator-assets-renderer-wrapper-mode-drift.log" 2>&1; then
+  fail "non-executable renderer recovery validator was accepted"
+fi
+grep -Fq \
+  'native validator asset mode mismatch: scripts/validate-sample-buffer-renderer-recovery.sh' \
+  "$temp_dir/validator-assets-renderer-wrapper-mode-drift.log" || \
+  fail "renderer recovery wrapper mode drift was not diagnosed"
 
 cp -R "$validator_asset_fixture" "$temp_dir/validator-assets-omission"
 sed '1d' \
@@ -107,6 +147,303 @@ grep -q 'duplicate native validator asset' \
 
 python3 -B -m unittest discover \
   -s "$SCRIPT_DIR/tests" -p 'test_release_version_policy.py'
+python3 -B "$SCRIPT_DIR/tests/test_pip_extension_version.py"
+python3 -B "$SCRIPT_DIR/patches/validation/test_pip_extension_version.py"
+
+# Pull-request CI must compile every Apple UI platform's source and tests
+# without paying to boot additional runtimes. Keep this scoped to ios-build so
+# a destination elsewhere cannot make the contract green.
+python3 - \
+  "$ROOT_DIR/.github/workflows/test.yml" \
+  "$ROOT_DIR/.github/workflows/fixtures.yml" \
+  "$ROOT_DIR/.github/workflows/vendor-manifest.yml" \
+  "$ROOT_DIR/.github/workflows/sanitize.yml" \
+  "$ROOT_DIR/.github/workflows/native-source-contracts.yml" <<'PY'
+import re
+import sys
+
+workflow = open(sys.argv[1]).read()
+draft_authorization = (
+    "          SWIFTVLC_ALLOW_DRAFT_RELEASE: "
+    "${{ ((github.event_name == 'push' && "
+    "startsWith(github.ref, 'refs/heads/release-candidates/')) || "
+    "(github.event_name == 'pull_request' && "
+    "github.event.pull_request.head.repo.full_name == github.repository && "
+    "startsWith(github.head_ref, 'release-candidates/'))) && '1' || '' }}\n"
+)
+expected_counts = (5, 1, 1, 1, 0)
+if len(sys.argv[1:]) != len(expected_counts):
+    sys.exit("release workflow integrity invocation is incomplete")
+for path, expected_count in zip(sys.argv[1:], expected_counts):
+    source = open(path).read()
+    count = source.count(draft_authorization)
+    if count != expected_count:
+        sys.exit(
+            f"{path} must scope draft authorization to each of its "
+            f"{expected_count} release-asset steps; found {count}"
+        )
+    if "  pull_request:\n    branches: [main]\n" not in source:
+        sys.exit(f"{path} does not run protected release-candidate PR CI")
+    if "  push:\n    branches: [main]\n" not in source:
+        sys.exit(f"{path} does not run exact-main post-merge CI")
+    if re.search(
+        r"SWIFTVLC_ALLOW_DRAFT_RELEASE:\s*(?:['\"]?1['\"]?)?\s*$",
+        source,
+        re.MULTILINE,
+    ):
+        sys.exit(f"{path} grants unconditional draft release access")
+    if expected_count and (
+        "github.event.pull_request.head.repo.full_name == github.repository"
+        not in source
+        or "startsWith(github.head_ref, 'release-candidates/')" not in source
+    ):
+        sys.exit(f"{path} does not authenticate same-repository candidate PRs")
+    for action in re.findall(r"(?m)^\s*-?\s*uses:\s*([^\s#]+)", source):
+        if not re.fullmatch(r"[^@]+@[0-9a-f]{40}", action):
+            sys.exit(f"{path} contains an unpinned authorizing action: {action}")
+native_contracts = open(sys.argv[5]).read()
+native_pr_trigger = native_contracts.split("  push:\n", 1)[0]
+native_push_trigger = native_contracts.split("  push:\n", 1)[1].split(
+    "\npermissions:\n", 1
+)[0]
+if "      - Package.swift\n" not in native_pr_trigger:
+    sys.exit("release PR commits do not trigger exact-SHA native source contracts")
+if "      - Package.swift\n" not in native_push_trigger:
+    sys.exit("release merges do not trigger exact-main native source contracts")
+for cache_workflow in (workflow, open(sys.argv[4]).read()):
+    if "restore-keys:" in cache_workflow:
+        sys.exit("release-authorizing compiled caches retain a broad restore key")
+    for marker in (
+        "${{ steps.xcf.outputs.sha }}-${{ hashFiles(",
+        "path: |\n            .build/artifacts\n            Vendor\n",
+        "Clean candidate build links",
+    ):
+        if marker not in cache_workflow:
+            sys.exit(f"release-authorizing cache policy is incomplete: {marker}")
+    for legacy in (
+        "if: ${{ !startsWith(github.ref, 'refs/heads/release-candidates/') }}",
+        "if: ${{ startsWith(github.ref, 'refs/heads/release-candidates/') }}",
+    ):
+        if legacy in cache_workflow:
+            sys.exit("candidate PR cache isolation still relies only on github.ref")
+
+
+def job(name):
+    matches = list(
+        re.finditer(
+            rf"(?ms)^  {re.escape(name)}:\n.*?(?=^  [A-Za-z0-9_-]+:\n|\Z)",
+            workflow,
+        )
+    )
+    if len(matches) != 1:
+        sys.exit(f"expected exactly one {name} workflow job, found {len(matches)}")
+    return matches[0].group(0)
+
+
+def named_step(job_source, name):
+    marker = f"      - name: {name}\n"
+    if job_source.count(marker) != 1:
+        sys.exit(f"expected exactly one {name!r} step in ios-build")
+    remainder = job_source.split(marker, 1)[1]
+    next_step = re.search(r"(?m)^      - (?:name:|uses:)", remainder)
+    if next_step is not None:
+        remainder = remainder[: next_step.start()]
+    return marker + remainder
+
+
+workflow_header = workflow.split("\njobs:\n", 1)[0]
+for trigger in (
+    "  workflow_dispatch:\n",
+    "  pull_request:\n    branches: [main]\n",
+    "  push:\n    branches: [main]\n",
+):
+    if trigger not in workflow_header:
+        sys.exit(f"test workflow lost required release trigger: {trigger.strip()}")
+
+ios_build = job("ios-build")
+ios_header = ios_build.split("\n    steps:\n", 1)[0]
+if re.search(r"(?m)^    if:", ios_header):
+    sys.exit("ios-build must remain enabled for pull requests")
+
+job_timeout_match = re.search(
+    r"(?m)^    timeout-minutes: ([0-9]+)$", ios_header
+)
+if job_timeout_match is None:
+    sys.exit("ios-build lost its job-level timeout")
+job_timeout = int(job_timeout_match.group(1))
+step_timeouts = tuple(
+    int(timeout)
+    for timeout in re.findall(
+        r"(?m)^        timeout-minutes: ([0-9]+)$", ios_build
+    )
+)
+step_ceiling = sum(step_timeouts)
+if job_timeout < step_ceiling + 5:
+    sys.exit(
+        "ios-build job timeout must leave at least five minutes above its "
+        f"{step_ceiling}-minute explicit step ceiling: {job_timeout}"
+    )
+
+compile_step_name = "Compile Mac Catalyst and tvOS/visionOS tests"
+compile_step = named_step(ios_build, compile_step_name)
+if compile_step.count("        if: github.event_name == 'pull_request'\n") != 1:
+    sys.exit("cross-platform compile step must be pull-request-only")
+if compile_step.count("        timeout-minutes: 15\n") != 1:
+    sys.exit("cross-platform compile step must retain its 15-minute cost bound")
+
+setup_marker = "      - name: Set up Vendor + local Swift package\n"
+compile_marker = f"      - name: {compile_step_name}\n"
+if ios_build.index(setup_marker) > ios_build.index(compile_marker):
+    sys.exit("cross-platform compile checks run before Vendor/package setup")
+
+commands = []
+lines = compile_step.splitlines()
+for index, line in enumerate(lines):
+    command_match = re.fullmatch(
+        r"          xcodebuild ([a-z-]+) \\", line
+    )
+    if command_match is None:
+        continue
+    arguments = []
+    for argument_line in lines[index + 1 :]:
+        if not argument_line.startswith("            "):
+            break
+        argument = argument_line.strip()
+        if argument.endswith("\\"):
+            argument = argument[:-1].rstrip()
+        arguments.append(argument)
+    commands.append((command_match.group(1), tuple(arguments)))
+
+common_arguments = (
+    "-scheme SwiftVLC",
+    "-configuration Debug",
+    "-skipPackagePluginValidation",
+    "-skipMacroValidation",
+    "ONLY_ACTIVE_ARCH=NO",
+    'CODE_SIGN_IDENTITY=""',
+    "CODE_SIGNING_REQUIRED=NO",
+    "CODE_SIGNING_ALLOWED=NO",
+)
+expected_argument_sets = (
+    (
+        common_arguments[0],
+        '-destination "generic/platform=macOS,variant=Mac Catalyst"',
+        *common_arguments[1:],
+    ),
+    *(
+        (
+            common_arguments[0],
+            f'-destination "generic/platform={destination}"',
+            *common_arguments[1:],
+        )
+        for destination in ("tvOS Simulator", "visionOS")
+    ),
+)
+if (
+    len(commands) != 3
+    or tuple(command[0] for command in commands)
+    != ("build-for-testing",) * 3
+    or tuple(command[1] for command in commands) != expected_argument_sets
+):
+    sys.exit(
+        "ios-build must contain exact Catalyst/tvOS/visionOS test-target "
+        "compiles, all signing-disabled: "
+        f"{commands}"
+    )
+
+xcodebuild_lines = [
+    line.strip() for line in lines if re.search(r"\bxcodebuild\b", line)
+]
+if (
+    len(xcodebuild_lines) != 3
+    or xcodebuild_lines != ["xcodebuild build-for-testing \\"] * 3
+):
+    sys.exit("cross-platform pull-request step lost its exact test-compile shape")
+for forbidden in (
+    r"(?m)^\s*xcrun\s+simctl\b",
+    r"(?m)^\s*xcrun\s+devicectl\b",
+    r"(?m)^\s*xcodebuild\s+(?:test|test-without-building)\b",
+):
+    if re.search(forbidden, ios_build):
+        sys.exit("ios-build must compile only and never boot or run a test runtime")
+
+tvos_test = job("tvos-test")
+tvos_header = tvos_test.split("\n    steps:\n", 1)[0]
+if tvos_header.count("    if: github.event_name != 'pull_request'\n") != 1:
+    sys.exit("tvos-test runtime job must remain post-merge/manual, not pull-request CI")
+if "xcrun simctl boot \"$udid\"" not in tvos_test or "xcodebuild test \\" not in tvos_test:
+    sys.exit("tvos-test no longer contains the post-merge tvOS runtime evidence")
+PY
+
+# Keep automated Copilot review traffic from creating misleading red Claude
+# workflow rows. GitHub applies contributor approval before evaluating a job's
+# `if`, so review events that do not mention Claude still become zero-job
+# `action_required` runs. PR conversation comments remain the supported entry
+# point for explicit `@claude` requests.
+python3 - "$ROOT_DIR/.github/workflows/claude.yml" <<'PY'
+import re
+import sys
+
+workflow = open(sys.argv[1]).read()
+header = workflow.split("\njobs:\n", 1)[0]
+if "  issue_comment:\n    types: [created]\n" not in header:
+    sys.exit("Claude workflow lost its PR conversation-comment trigger")
+for forbidden in ("pull_request_review:", "pull_request_review_comment:"):
+    if forbidden in header:
+        sys.exit(f"Claude workflow restored noisy review trigger: {forbidden}")
+if "github.event_name == 'issue_comment'" not in workflow or "'@claude'" not in workflow:
+    sys.exit("Claude workflow lost its explicit mention filter")
+for action in re.findall(r"(?m)^\s*-?\s*uses:\s*([^\s#]+)", workflow):
+    if not re.fullmatch(r"[^@]+@[0-9a-f]{40}", action):
+        sys.exit(f"privileged Claude workflow contains an unpinned action: {action}")
+PY
+
+# This payload is the solo-maintainer governance contract applied out of band
+# after the current release PR is green. Keep it exact so the release script's
+# live verifier and the administrator handoff cannot silently diverge.
+python3 - "$ROOT_DIR/.github/rulesets/protect-main.json" <<'PY'
+import json
+import sys
+
+policy = json.load(open(sys.argv[1]))
+expected = {
+    "name": "Protect main",
+    "target": "branch",
+    "enforcement": "active",
+    "bypass_actors": [],
+    "conditions": {
+        "ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}
+    },
+    "rules": [
+        {"type": "deletion"},
+        {"type": "non_fast_forward"},
+        {
+            "type": "pull_request",
+            "parameters": {
+                "required_approving_review_count": 0,
+                "dismiss_stale_reviews_on_push": False,
+                "require_code_owner_review": False,
+                "require_last_push_approval": False,
+                "required_review_thread_resolution": True,
+                "allowed_merge_methods": ["merge"],
+            },
+        },
+        {
+            "type": "required_status_checks",
+            "parameters": {
+                "strict_required_status_checks_policy": True,
+                "do_not_enforce_on_create": False,
+                "required_status_checks": [
+                    {"context": context, "integration_id": 15368}
+                    for context in ("lint", "ios-build", "test")
+                ],
+            },
+        },
+    ],
+}
+if policy != expected:
+    sys.exit(f"Protect main ruleset payload drifted:\n{policy!r}")
+PY
 
 checksum="03a57454a6159c455406889c7867e0b284db028d2734a10bdf85a6a7285c862f"
 cat > "$temp_dir/Package.swift" <<EOF
@@ -136,6 +473,447 @@ if python3 "$SCRIPT_DIR/release-artifact-info.py" \
   "$temp_dir/LocalPackage.swift" >/dev/null 2>&1; then
   fail "local binary target was treated as a released artifact"
 fi
+
+# Draft release resolution is an internal, authenticated bridge used only by
+# exact release-commit CI. The candidate tag is deliberately non-SemVer and is
+# derived from the intended final tag plus all 40 commit hex digits.
+resolver_root="$temp_dir/draft-resolver"
+resolver_repo="$resolver_root/repository"
+resolver_origin="$resolver_root/origin.git"
+resolver_bin="$resolver_root/bin"
+mkdir -p "$resolver_repo/scripts" "$resolver_bin"
+cp "$SCRIPT_DIR/resolve-release-artifact.sh" \
+  "$SCRIPT_DIR/release-artifact-info.py" \
+  "$resolver_repo/scripts/"
+cp "$temp_dir/Package.swift" "$resolver_repo/Package.swift"
+git -C "$resolver_repo" init -q
+git -C "$resolver_repo" branch -M main
+git -C "$resolver_repo" config user.name "SwiftVLC Resolver Test"
+git -C "$resolver_repo" config user.email \
+  "swiftvlc-resolver-test@example.invalid"
+git -C "$resolver_repo" add .
+git -C "$resolver_repo" commit -qm "release commit"
+resolver_commit=$(git -C "$resolver_repo" rev-parse HEAD)
+git -C "$resolver_repo" tag v1.1.0-beta.1
+git clone -q --bare "$resolver_repo" "$resolver_origin"
+git -C "$resolver_repo" remote add origin "$resolver_origin"
+
+cat > "$resolver_bin/gh" <<'SH'
+#!/bin/sh
+set -eu
+
+if [ "${1:-}" = auth ] && [ "${2:-}" = status ]; then
+  [ "${RESOLVER_AUTH_FAIL:-}" != 1 ]
+  exit
+fi
+if [ "${1:-}" = release ] && [ "${2:-}" = view ]; then
+  requested_tag=$3
+  commit=$(/usr/bin/git rev-parse HEAD)
+  python3 - "$requested_tag" "$commit" <<'PY'
+import json
+import os
+import sys
+
+checksum = "03a57454a6159c455406889c7867e0b284db028d2734a10bdf85a6a7285c862f"
+digest = os.environ.get("RESOLVER_RELEASE_DIGEST", checksum)
+requested_tag, commit = sys.argv[1:]
+tag = os.environ.get("RESOLVER_RELEASE_TAG", requested_tag)
+print(
+    json.dumps(
+        {
+            "tagName": tag,
+            "targetCommitish": os.environ.get("RESOLVER_RELEASE_TARGET", commit),
+            "isDraft": os.environ.get("RESOLVER_RELEASE_DRAFT") == "1",
+            "isPrerelease": True,
+            "assets": [
+                {
+                    "name": "libvlc.xcframework.zip",
+                    "digest": f"sha256:{digest}",
+                    "url": (
+                        "https://github.com/harflabs/SwiftVLC/releases/"
+                        f"download/{requested_tag}/libvlc.xcframework.zip"
+                    ),
+                    "size": 1,
+                }
+            ],
+        }
+    )
+)
+PY
+  exit 0
+fi
+exit 2
+SH
+chmod +x "$resolver_bin/gh"
+
+(
+  cd "$resolver_repo"
+  PATH="$resolver_bin:$PATH" \
+    RESOLVER_RELEASE_DRAFT=0 \
+    ./scripts/resolve-release-artifact.sh >/dev/null
+)
+
+# Candidate staging removes the final SemVer tag from the equation entirely.
+# Install only the deterministic candidate tag and exact candidate branch.
+git -C "$resolver_repo" tag -d v1.1.0-beta.1 >/dev/null
+git --git-dir="$resolver_origin" update-ref -d refs/tags/v1.1.0-beta.1
+resolver_candidate_tag="swiftvlc-candidate-v1.1.0-beta.1-$resolver_commit"
+git -C "$resolver_repo" tag "$resolver_candidate_tag" "$resolver_commit"
+git --git-dir="$resolver_origin" update-ref \
+  "refs/tags/$resolver_candidate_tag" "$resolver_commit"
+git --git-dir="$resolver_origin" update-ref \
+  refs/heads/release-candidates/v1.1.0-beta.1 "$resolver_commit"
+
+if (
+  cd "$resolver_repo"
+  PATH="$resolver_bin:$PATH" \
+    RESOLVER_RELEASE_DRAFT=1 \
+    ./scripts/resolve-release-artifact.sh >/dev/null 2>&1
+); then
+  fail "draft release resolved without the explicit CI authorization"
+fi
+
+resolver_ci_env=(
+  "GITHUB_ACTIONS=true"
+  "GITHUB_EVENT_NAME=push"
+  "GITHUB_REPOSITORY=harflabs/SwiftVLC"
+  "GITHUB_REF=refs/heads/release-candidates/v1.1.0-beta.1"
+  "GITHUB_SHA=$resolver_commit"
+  "GITHUB_HEAD_REF="
+  "GITHUB_BASE_REF="
+  "SWIFTVLC_ALLOW_DRAFT_RELEASE=1"
+  "RESOLVER_RELEASE_DRAFT=1"
+)
+(
+  cd "$resolver_repo"
+  env "${resolver_ci_env[@]}" PATH="$resolver_bin:$PATH" \
+    ./scripts/resolve-release-artifact.sh \
+    | python3 -c 'import json,sys; value=json.load(sys.stdin); assert value["isDraft"] and value["downloadTag"].startswith("swiftvlc-candidate-")'
+)
+
+if (
+  cd "$resolver_repo"
+  env "${resolver_ci_env[@]}" \
+    GITHUB_EVENT_NAME=pull_request \
+    GITHUB_REF=refs/pull/1/merge \
+    GITHUB_HEAD_REF=release-attack \
+    PATH="$resolver_bin:$PATH" \
+    ./scripts/resolve-release-artifact.sh >/dev/null 2>&1
+); then
+  fail "an unauthenticated pull-request context opted into a draft release"
+fi
+if (
+  cd "$resolver_repo"
+  env "${resolver_ci_env[@]}" \
+    GITHUB_REF=refs/heads/main \
+    PATH="$resolver_bin:$PATH" \
+    ./scripts/resolve-release-artifact.sh >/dev/null 2>&1
+); then
+  fail "main CI opted into a draft-only artifact"
+fi
+if (
+  cd "$resolver_repo"
+  env "${resolver_ci_env[@]}" \
+    GITHUB_REF=refs/heads/release-candidates/v1.1.0-beta.2 \
+    PATH="$resolver_bin:$PATH" \
+    ./scripts/resolve-release-artifact.sh >/dev/null 2>&1
+); then
+  fail "an adjacent release-candidate branch opted into the draft"
+fi
+if (
+  cd "$resolver_repo"
+  env "${resolver_ci_env[@]}" \
+    GITHUB_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
+    PATH="$resolver_bin:$PATH" \
+    ./scripts/resolve-release-artifact.sh >/dev/null 2>&1
+); then
+  fail "draft release resolved for the wrong CI commit"
+fi
+if (
+  cd "$resolver_repo"
+  env "${resolver_ci_env[@]}" \
+    RESOLVER_RELEASE_TAG=v1.1.0-beta.2 \
+    PATH="$resolver_bin:$PATH" \
+    ./scripts/resolve-release-artifact.sh >/dev/null 2>&1
+); then
+  fail "draft release resolved when GitHub returned the wrong tag"
+fi
+if (
+  cd "$resolver_repo"
+  env "${resolver_ci_env[@]}" \
+    RESOLVER_RELEASE_TARGET=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+    PATH="$resolver_bin:$PATH" \
+    ./scripts/resolve-release-artifact.sh >/dev/null 2>&1
+); then
+  fail "draft release resolved when GitHub targeted the wrong commit"
+fi
+if (
+  cd "$resolver_repo"
+  env "${resolver_ci_env[@]}" \
+    RESOLVER_RELEASE_DIGEST=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+    PATH="$resolver_bin:$PATH" \
+    ./scripts/resolve-release-artifact.sh >/dev/null 2>&1
+); then
+  fail "draft release resolved after asset digest drift"
+fi
+if (
+  cd "$resolver_repo"
+  env "${resolver_ci_env[@]}" \
+    RESOLVER_AUTH_FAIL=1 \
+    PATH="$resolver_bin:$PATH" \
+    ./scripts/resolve-release-artifact.sh >/dev/null 2>&1
+); then
+  fail "draft release resolved without authenticated GitHub CLI access"
+fi
+
+# Even the otherwise exact candidate context must fail once a final SemVer tag
+# appears; otherwise SwiftPM clients could select an unpublished package.
+git --git-dir="$resolver_origin" update-ref \
+  refs/tags/v1.1.0-beta.1 "$resolver_commit"
+if (
+  cd "$resolver_repo"
+  env "${resolver_ci_env[@]}" PATH="$resolver_bin:$PATH" \
+    ./scripts/resolve-release-artifact.sh >/dev/null 2>&1
+); then
+  fail "candidate CI accepted a prematurely exposed final SemVer tag"
+fi
+git --git-dir="$resolver_origin" update-ref -d refs/tags/v1.1.0-beta.1
+
+# The protected release PR checks out GitHub's synthetic merge commit rather
+# than its candidate head. Authenticate the same-repository event payload,
+# bind the draft tag/release/remote branch to the exact head, and require the
+# synthetic checkout to preserve that head's complete tree.
+git -C "$resolver_repo" commit --allow-empty -qm "synthetic PR merge"
+resolver_merge_commit=$(git -C "$resolver_repo" rev-parse HEAD)
+resolver_event="$resolver_root/pull-request.json"
+resolver_fork_event="$resolver_root/pull-request-fork.json"
+resolver_wrong_head_event="$resolver_root/pull-request-wrong-head.json"
+resolver_wrong_base_event="$resolver_root/pull-request-wrong-base.json"
+python3 - \
+  "$resolver_event" \
+  "$resolver_fork_event" \
+  "$resolver_wrong_head_event" \
+  "$resolver_wrong_base_event" \
+  "$resolver_commit" <<'PY'
+import copy
+import json
+import sys
+
+valid_path, fork_path, wrong_head_path, wrong_base_path, commit = sys.argv[1:]
+valid = {
+    "repository": {"full_name": "harflabs/SwiftVLC"},
+    "pull_request": {
+        "number": 17,
+        "head": {
+            "ref": "release-candidates/v1.1.0-beta.1",
+            "sha": commit,
+            "repo": {"full_name": "harflabs/SwiftVLC"},
+        },
+        "base": {
+            "ref": "main",
+            "repo": {"full_name": "harflabs/SwiftVLC"},
+        },
+    },
+}
+
+
+def write(path, value):
+    with open(path, "w") as output:
+        json.dump(value, output)
+
+
+write(valid_path, valid)
+fork = copy.deepcopy(valid)
+fork["pull_request"]["head"]["repo"]["full_name"] = "attacker/SwiftVLC"
+write(fork_path, fork)
+wrong_head = copy.deepcopy(valid)
+wrong_head["pull_request"]["head"]["sha"] = "b" * 40
+write(wrong_head_path, wrong_head)
+wrong_base = copy.deepcopy(valid)
+wrong_base["pull_request"]["base"]["ref"] = "develop"
+write(wrong_base_path, wrong_base)
+PY
+
+resolver_pr_env=(
+  "GITHUB_ACTIONS=true"
+  "GITHUB_EVENT_NAME=pull_request"
+  "GITHUB_REPOSITORY=harflabs/SwiftVLC"
+  "GITHUB_REF=refs/pull/17/merge"
+  "GITHUB_SHA=$resolver_merge_commit"
+  "GITHUB_HEAD_REF=release-candidates/v1.1.0-beta.1"
+  "GITHUB_BASE_REF=main"
+  "GITHUB_EVENT_PATH=$resolver_event"
+  "SWIFTVLC_ALLOW_DRAFT_RELEASE=1"
+  "RESOLVER_RELEASE_DRAFT=1"
+  "RESOLVER_RELEASE_TARGET=$resolver_commit"
+)
+(
+  cd "$resolver_repo"
+  env "${resolver_pr_env[@]}" PATH="$resolver_bin:$PATH" \
+    ./scripts/resolve-release-artifact.sh \
+    | python3 -c 'import json,sys; value=json.load(sys.stdin); assert value["isDraft"] and value["releaseCommit"] == sys.argv[1]' "$resolver_commit"
+)
+
+for resolver_bad_event in \
+  "$resolver_fork_event" \
+  "$resolver_wrong_head_event" \
+  "$resolver_wrong_base_event"; do
+  if (
+    cd "$resolver_repo"
+    env "${resolver_pr_env[@]}" \
+      GITHUB_EVENT_PATH="$resolver_bad_event" \
+      PATH="$resolver_bin:$PATH" \
+      ./scripts/resolve-release-artifact.sh >/dev/null 2>&1
+  ); then
+    fail "candidate PR accepted forged event identity: $resolver_bad_event"
+  fi
+done
+
+printf 'changed merge tree\n' > "$resolver_repo/pr-tree-drift.txt"
+git -C "$resolver_repo" add pr-tree-drift.txt
+git -C "$resolver_repo" commit -qm "synthetic PR merge tree drift"
+resolver_drift_merge_commit=$(git -C "$resolver_repo" rev-parse HEAD)
+if (
+  cd "$resolver_repo"
+  env "${resolver_pr_env[@]}" \
+    GITHUB_SHA="$resolver_drift_merge_commit" \
+    PATH="$resolver_bin:$PATH" \
+    ./scripts/resolve-release-artifact.sh >/dev/null 2>&1
+); then
+  fail "candidate PR accepted a synthetic merge with a different tree"
+fi
+
+# Candidate authorization must never be derived from Vendor cache metadata
+# stored beside cached bytes. Forge a perfectly self-consistent malicious tree
+# and install record, then prove draft setup redownloads the checksum-bound ZIP.
+# Preserve the normal public-release cache fast path to avoid needless CI cost.
+cache_root="$temp_dir/candidate-cache"
+cache_repo="$cache_root/repository"
+cache_bin="$cache_root/bin"
+cache_good="$cache_root/good/libvlc.xcframework"
+cache_zip="$cache_root/libvlc.xcframework.zip"
+cache_downloads="$cache_root/downloads.log"
+mkdir -p "$cache_repo/scripts" "$cache_repo/Vendor/libvlc.xcframework" \
+  "$cache_bin" "$cache_good"
+cp "$SCRIPT_DIR/setup-dev.sh" \
+  "$SCRIPT_DIR/artifact-tree-digest.py" \
+  "$cache_repo/scripts/"
+printf '#!/bin/sh\n[ -d "$2" ]\n' > \
+  "$cache_repo/scripts/fix-duplicate-symbols.sh"
+chmod +x "$cache_repo/scripts/fix-duplicate-symbols.sh"
+printf 'trusted release bytes\n' > "$cache_good/payload.txt"
+ditto -c -k --keepParent "$cache_good" "$cache_zip"
+cache_zip_checksum=$(shasum -a 256 "$cache_zip" | awk '{ print $1 }')
+printf 'poisoned cache bytes\n' > \
+  "$cache_repo/Vendor/libvlc.xcframework/payload.txt"
+cache_poison_digest=$(
+  "$cache_repo/scripts/artifact-tree-digest.py" \
+    "$cache_repo/Vendor/libvlc.xcframework"
+)
+python3 - \
+  "$cache_repo/Vendor/.swiftvlc-release.json" \
+  "$cache_zip_checksum" \
+  "$cache_poison_digest" <<'PY'
+import json
+import sys
+
+path, checksum, digest = sys.argv[1:]
+with open(path, "w") as output:
+    json.dump(
+        {
+            "tag": "v1.1.0-beta.1",
+            "url": "https://example.invalid/libvlc.xcframework.zip",
+            "checksum": checksum,
+            "treeDigest": digest,
+        },
+        output,
+    )
+PY
+cat > "$cache_repo/scripts/resolve-release-artifact.sh" <<'SH'
+#!/bin/sh
+set -eu
+python3 - <<'PY'
+import json
+import os
+
+draft = os.environ.get("CACHE_IS_DRAFT") == "1"
+tag = "v1.1.0-beta.1"
+print(
+    json.dumps(
+        {
+            "tag": tag,
+            "downloadTag": (
+                "swiftvlc-candidate-v1.1.0-beta.1-" + "a" * 40
+                if draft
+                else tag
+            ),
+            "url": "https://example.invalid/libvlc.xcframework.zip",
+            "checksum": os.environ["CACHE_ZIP_CHECKSUM"],
+            "isDraft": draft,
+        }
+    )
+)
+PY
+SH
+cat > "$cache_bin/gh" <<'SH'
+#!/bin/sh
+set -eu
+if [ "${1:-}" = auth ] && [ "${2:-}" = status ]; then
+  exit 0
+fi
+if [ "${1:-}" = release ] && [ "${2:-}" = download ]; then
+  destination=""
+  while [ "$#" -gt 0 ]; do
+    if [ "$1" = --dir ]; then
+      destination=$2
+      shift 2
+    else
+      shift
+    fi
+  done
+  [ -n "$destination" ]
+  cp "$CACHE_ASSET" "$destination/libvlc.xcframework.zip"
+  printf 'download\n' >> "$CACHE_DOWNLOADS"
+  exit 0
+fi
+exit 2
+SH
+cat > "$cache_bin/swift" <<'SH'
+#!/bin/sh
+set -eu
+[ "$1" = package ]
+[ "$2" = compute-checksum ]
+shasum -a 256 "$3" | awk '{ print $1 }'
+SH
+chmod +x "$cache_repo/scripts/resolve-release-artifact.sh" \
+  "$cache_bin/gh" "$cache_bin/swift"
+printf '// cache fixture\n' > "$cache_repo/Package.swift"
+: > "$cache_downloads"
+(
+  cd "$cache_repo"
+  PATH="$cache_bin:$PATH" \
+    CACHE_IS_DRAFT=1 \
+    CACHE_ZIP_CHECKSUM="$cache_zip_checksum" \
+    CACHE_ASSET="$cache_zip" \
+    CACHE_DOWNLOADS="$cache_downloads" \
+    ./scripts/setup-dev.sh --artifact-only >/dev/null
+)
+grep -q '^trusted release bytes$' \
+  "$cache_repo/Vendor/libvlc.xcframework/payload.txt" || \
+  fail "draft candidate setup retained poisoned cached Vendor bytes"
+[[ $(wc -l < "$cache_downloads" | tr -d ' ') == 1 ]] || \
+  fail "draft candidate setup did not redownload exactly once"
+(
+  cd "$cache_repo"
+  PATH="$cache_bin:$PATH" \
+    CACHE_IS_DRAFT=0 \
+    CACHE_ZIP_CHECKSUM="$cache_zip_checksum" \
+    CACHE_ASSET="$cache_zip" \
+    CACHE_DOWNLOADS="$cache_downloads" \
+    ./scripts/setup-dev.sh --artifact-only >/dev/null
+)
+[[ $(wc -l < "$cache_downloads" | tr -d ' ') == 1 ]] || \
+  fail "verified public Vendor cache lost its non-candidate fast path"
 
 mkdir -p "$temp_dir/tree-a/Headers" "$temp_dir/tree-b/Headers"
 printf 'binary' > "$temp_dir/tree-a/libvlc.a"
@@ -1035,7 +1813,12 @@ python3 - \
   "$SCRIPT_DIR/libvlc-provenance.py" \
   "$SCRIPT_DIR/validate-strict-frame-step.sh" \
   "$SCRIPT_DIR/patches/validation/effective-playback-rate-event-probe.c" \
-  "$SCRIPT_DIR/patches/validation/vmem-picture-pts-probe.c" <<'PY'
+  "$SCRIPT_DIR/patches/validation/vmem-picture-pts-probe.c" \
+  "$SCRIPT_DIR/validate-native-extension-contract.sh" \
+  "$SCRIPT_DIR/patches/validation/native-extension-version-probe.c" \
+  "$SCRIPT_DIR/patches/validation/pip_extension_version.py" \
+  "$ROOT_DIR/Sources/CLibVLC/shim.c" \
+  "$SCRIPT_DIR/validate-native-patch-series-source.sh" <<'PY'
 import ast
 import re
 import sys
@@ -1055,6 +1838,11 @@ provenance_tool = open(sys.argv[10]).read()
 strict_frame_validator = open(sys.argv[11]).read()
 effective_rate_probe = open(sys.argv[12]).read()
 vmem_pts_probe = open(sys.argv[13]).read()
+native_extension_validator = open(sys.argv[14]).read()
+native_extension_probe = open(sys.argv[15]).read()
+extension_resolver = open(sys.argv[16]).read()
+clibvlc_shim = open(sys.argv[17]).read()
+native_patch_series_validator = open(sys.argv[18]).read()
 manifest_lines = [
     line.strip() for line in open(sys.argv[3]) if line.strip() and not line.lstrip().startswith("#")
 ]
@@ -1063,15 +1851,18 @@ expected_manifest_tail = [
     "5f1a58d162c798b2d6f5c2a2fdac9f728279f195ef192405b80272bc2f164c59  0038-apple-assembly-metadata.patch",
     "f78050944caf0c291cac76e28cc4238b3e407d104446e2876c6e0213923d3581  0039-aom-3.13.2-nasm-detection.patch",
     "a4945772122ce3d02f9a5c0c7136fa5dae940f251081238260b760b86c834681  0040-headless-vout-teardown-deadlock.patch",
+    "3587daa9ccd017cf109e3c809315b09e8f378d63b8d17600bd6c0366dbd750c8  0041-native-pip-output-identity.patch",
+    "6675edb052faa037c763451b6c9aae9b43dc42769d9311332371eda8bd788611  0042-adaptive-es-recycling-extradata-identity.patch",
 ]
-if manifest_lines[-4:] != expected_manifest_tail:
+if manifest_lines[-6:] != expected_manifest_tail:
     sys.exit(
-        "patch manifest must end with frozen 0037/0038/0039 followed by "
-        "headless teardown 0040: "
-        f"got {manifest_lines[-4:]}"
+        "patch manifest must end with frozen 0037 through 0040, native PiP "
+        "output identity 0041, then adaptive ES recycling 0042: "
+        f"got {manifest_lines[-6:]}"
     )
 
 required_validator_assets = (
+    "scripts/patches/validation/adaptive-es-recycling-source-check.py",
     "scripts/patches/validation/aom-nasm3-detection-probe.cmake",
     "scripts/patches/validation/aom-nasm3-detection-source-check.py",
     "scripts/patches/validation/audio-media-services-reset-source-check.py",
@@ -1082,8 +1873,14 @@ required_validator_assets = (
     "scripts/patches/validation/headless-vout-teardown-probe.c",
     "scripts/patches/validation/headless-vout-teardown-source-check.py",
     "scripts/patches/validation/native-extension-version-probe.c",
+    "scripts/patches/validation/native-pip-output-identity-race.c",
+    "scripts/patches/validation/native-pip-output-identity-source-check.py",
+    "scripts/patches/validation/native-sample-buffer-renderer-immediate-sample.m",
+    "scripts/patches/validation/native-sample-buffer-renderer-recovery.c",
     "scripts/patches/validation/pip-playback-snapshot-probe.c",
     "scripts/patches/validation/pip_extension_version.py",
+    "scripts/patches/validation/sample-buffer-renderer-snapshot-abi.c",
+    "scripts/patches/validation/sample-buffer-renderer-snapshot-abi.cpp",
     "scripts/patches/validation/strict-frame-step-probe.c",
     "scripts/patches/validation/strict-frame-step-source-check.py",
     "scripts/patches/validation/test_pip_extension_version.py",
@@ -1099,6 +1896,7 @@ required_validator_assets = (
     "scripts/validate-native-extension-contract.sh",
     "scripts/validate-native-patch-series-source.sh",
     "scripts/validate-pip-playback-snapshot.sh",
+    "scripts/validate-sample-buffer-renderer-recovery.sh",
     "scripts/validate-strict-frame-step.sh",
     "scripts/validate-vmem-picture-pts.sh",
 )
@@ -1112,6 +1910,7 @@ required_executable_validator_assets = (
     "scripts/validate-native-extension-contract.sh",
     "scripts/validate-native-patch-series-source.sh",
     "scripts/validate-pip-playback-snapshot.sh",
+    "scripts/validate-sample-buffer-renderer-recovery.sh",
     "scripts/validate-strict-frame-step.sh",
     "scripts/validate-vmem-picture-pts.sh",
 )
@@ -1435,6 +2234,7 @@ expected_extension_patch_versions = {
     "0030-vmem-picture-pts.patch": 6,
     "0031-effective-playback-rate-event.patch": 7,
     "0032-audio-media-services-reset.patch": 8,
+    "0041-native-pip-output-identity.patch": 9,
 }
 for patch_name, version in expected_extension_patch_versions.items():
     marker = (
@@ -1452,6 +2252,94 @@ lease_marker = (
 )
 if build.count(lease_marker) != 1:
     sys.exit("build does not track the 0033 same-version lease refinement")
+inherited_lease_guard = (
+    'if [ -n "$swiftvlc_manifest_extension_version" ] &&\n'
+    '   [ "$swiftvlc_manifest_extension_version" -ge 9 ] &&\n'
+    '   [ "$swiftvlc_apple_audio_session_leases_listed" != yes ]; then'
+)
+if build.count(inherited_lease_guard) != 1:
+    sys.exit("build lets extension v9 erase the inherited 0033 lease refinement")
+
+for marker in (
+    '"native-pip-playback-identity",\n        9,',
+    '"PiP playback identity typedef"',
+    '"PiP playback identity setter declaration"',
+    '"PiP playback identity setter implementation"',
+    '"PiP playback identity setter export"',
+    '"exact preserved PiP controller take declaration"',
+    '"exact preserved PiP controller publication declaration"',
+    '"exact PiP controller readiness declaration"',
+    '"exact PiP controller claim declaration"',
+    '"unclaimed PiP controller rollback declaration"',
+    '"exact PiP controller handoff cancellation declaration"',
+    '"exact PiP controller handoff timeout declaration"',
+    '"fail-closed exact PiP lifecycle preflight"',
+    'def validate_v9_native_pip_identity_semantics(',
+    'def validate_v9_native_pip_claim_semantics(',
+    'def validate_weak_compatibility_shim(shim_source: str) -> None:',
+    'effective_required_groups.add("apple-audio-session-leases")',
+    'expected version must be an integer from 4 through 9',
+):
+    if extension_resolver.count(marker) != 1:
+        sys.exit(f"v9 source resolver contract is incomplete: {marker}")
+for marker in (
+    'Usage: $0 --expected-version <1..9>',
+    'VERSION_9_SYMBOLS=(\n'
+    '        swiftvlc_libvlc_media_player_set_pip_playback_identity\n'
+    '    )',
+    'if (( EXPECTED_VERSION >= 9 )); then\n'
+    '    # v9 succeeds the final v8+0033 profile. Do not let omission of an optional\n'
+    '    # command-line flag turn an inherited safety contract back into an option.\n'
+    '    REQUIRE_LEASES=yes\n'
+    'fi',
+    'if (( EXPECTED_VERSION < 9 )); then',
+    'resolver.validate_weak_compatibility_shim(',
+):
+    if native_extension_validator.count(marker) != 1:
+        sys.exit(f"v9 archive/compatibility validator is incomplete: {marker}")
+for marker in (
+    'SWIFTVLC_EXPECTED_PIP_EXTENSIONS_VERSION > 9',
+    'sizeof(swiftvlc_pip_playback_identity_t) == 16',
+    'offsetof(swiftvlc_pip_playback_identity_t,',
+    'swiftvlc_libvlc_media_player_set_pip_playback_identity,',
+    'native PiP identity setter accepted a null player',
+    '#if SWIFTVLC_EXPECTED_PIP_EXTENSIONS_VERSION >= 9 \\\n'
+    ' && !SWIFTVLC_REQUIRE_APPLE_AUDIO_SESSION_LEASES',
+):
+    if marker not in native_extension_probe:
+        sys.exit(f"v9 linked type/runtime probe is incomplete: {marker}")
+for marker in (
+    '__attribute__((weak))\n'
+    'bool swiftvlc_libvlc_media_player_set_pip_playback_identity(',
+    'swiftvlc_libvlc_pip_extensions_version() < 9',
+    'swiftvlc_libvlc_pip_extensions_version() >= 9',
+):
+    if clibvlc_shim.count(marker) != 1:
+        sys.exit(f"v9 weak compatibility source is incomplete: {marker}")
+adaptive_source_gate = native_patch_series_validator.index(
+    'section "Validating adaptive ES codec-configuration recycling"'
+)
+v9_source_gate = native_patch_series_validator.index(
+    'section "Validating exact integrated extension version 9"'
+)
+pip_identity_gate = native_patch_series_validator.index(
+    'section "Validating native PiP output identity and race semantics"'
+)
+strict_source_gate = native_patch_series_validator.index(
+    'section "Validating strict frame-step source semantics"'
+)
+if not adaptive_source_gate < v9_source_gate < pip_identity_gate < strict_source_gate:
+    sys.exit("0042/v9/0041/legacy native source gates are out of fail-closed order")
+for marker in (
+    '"$SCRIPT_DIR/patches/validation/adaptive-es-recycling-source-check.py"',
+    '"$SCRIPT_DIR/patches/0042-adaptive-es-recycling-extradata-identity.patch"',
+    '"$SCRIPT_DIR/patches/validation/native-pip-output-identity-source-check.py"',
+    '"$SCRIPT_DIR/patches/0041-native-pip-output-identity.patch"',
+    '"$SCRIPT_DIR/patches/validation/native-pip-output-identity-race.c"',
+    '-std=c11 -O2 -Wall -Wextra -Werror -pthread',
+):
+    if native_patch_series_validator.count(marker) != 1:
+        sys.exit(f"native source replay is missing one exact 0041/0042 proof: {marker}")
 for export_marker in (
     'export SWIFTVLC_EXPECTED_EXTENSION_VERSION="$swiftvlc_manifest_extension_version"',
     'export SWIFTVLC_REQUIRE_APPLE_AUDIO_SESSION_LEASES="$swiftvlc_apple_audio_session_leases_listed"',
@@ -1531,6 +2419,19 @@ for stale_include in (
         sys.exit(
             "strict-frame validator bypasses its normalized VLC build root: "
             f"{stale_include}"
+        )
+for marker in (
+    'if [[ "$EXPECTED_EXTENSION_VERSION" == 9 ]]; then\n'
+    '  REQUIRE_APPLE_AUDIO_SESSION_LEASES=yes\n'
+    'fi',
+    'if [[ "$EXPECTED_EXTENSION_VERSION" -ge 9 &&\n'
+    '        "$REQUIRE_APPLE_AUDIO_SESSION_LEASES" != yes ]]; then',
+    'LEASE_DEFINE="-DSWIFTVLC_REQUIRE_APPLE_AUDIO_SESSION_LEASES=',
+):
+    if strict_frame_validator.count(marker) != 1:
+        sys.exit(
+            "strict-frame validator does not inherit the v9 Apple audio lease "
+            f"contract exactly once: {marker}"
         )
 for marker in (
     'STRICT_MACOS_BUILD_CONTAINER="${VLC_SRC}/build-macosx-${HOST_MACOS_ARCH}"',
@@ -1766,7 +2667,7 @@ release_native_extension_command = release[
 for marker in (
     '"$SCRIPT_DIR/validate-native-extension-contract.sh"',
     '--xcframework "$XCFW_PATH"',
-    '--expected-version 8',
+    '--expected-version 9',
     '--require-apple-audio-session-leases',
 ):
     if release_native_extension_command.count(marker) != 1:
@@ -1817,6 +2718,66 @@ for marker in (
 ):
     if marker not in release:
         sys.exit(f"release candidate is not bound to qualification input: {marker}")
+
+for marker in (
+    'if [[ "$DRY_RUN" == false && -z "$CANDIDATE_DIR" ]]; then',
+    'verify_github_release() {',
+    'verify_required_release_workflows() {',
+    'native-source-contracts.yml',
+    'sanitize.yml',
+    '--commit "$required_commit"',
+    '--event "$required_event"',
+    'if run.get("conclusion") != "success":',
+    'candidate_tag_for_commit() {',
+    'canonical_release_commit_matches() {',
+    'reconcile_candidate_assets() {',
+    "printf 'swiftvlc-candidate-%s-%s\\n'",
+    'repos/$REPO/immutable-releases',
+    'gh release verify "$TAG"',
+    'gh release verify-asset "$TAG"',
+    'verify_anonymous_public_artifact',
+    'verify_external_swiftpm_consumer',
+    'verify_main_governance() {',
+    "required_approving_review_count\": 0",
+    "required_review_thread_resolution\": True",
+    '"repos/$REPO/pulls/$RELEASE_PR_NUMBER/merge"',
+    '-f "sha=$STAGED_COMMIT"',
+    "-f 'merge_method=merge'",
+    'git merge-base --is-ancestor "$STAGED_COMMIT" "$RELEASE_PR_MERGE_COMMIT"',
+    '--force-with-lease="refs/tags/$CANDIDATE_TAG:"',
+    '--force-with-lease="refs/heads/$RELEASE_BRANCH:"',
+    '--force-with-lease="refs/tags/$TAG:"',
+    'rollback_reserved_final_tag() {',
+    '--force-with-lease="refs/heads/$RELEASE_BRANCH:$STAGED_COMMIT"',
+):
+    if marker not in release:
+        sys.exit(f"two-phase release gate is incomplete: {marker}")
+stage_pause = release.index('echo "No final SemVer tag exists.')
+workflow_gate = release.index(
+    'verify_required_release_workflows', stage_pause
+)
+publish = release.index(
+    'if ! gh release edit "$CANDIDATE_TAG"', workflow_gate
+)
+if not stage_pause < workflow_gate < publish:
+    sys.exit("release publication is not ordered after its explicit CI pause/gate")
+publish_command = release[publish : release.index('then', publish)]
+for marker in (
+    '--tag "$TAG"',
+    '--target "$STAGED_COMMIT"',
+    '--draft=false',
+):
+    if publish_command.count(marker) != 1:
+        sys.exit(f"atomic release publication is missing {marker}")
+if 'git push origin "refs/tags/$TAG' in release:
+    sys.exit("release stages the final SemVer tag before atomic publication")
+for direct_main_push in (
+    ':refs/heads/main',
+    'refs/heads/main:$',
+    '$STAGED_COMMIT:refs/heads/main',
+):
+    if direct_main_push in release:
+        sys.exit("release retains a direct main push path")
 PY
 
 source_repo="$temp_dir/release-source-repo"
@@ -2033,6 +2994,7 @@ python3 - "$temp_dir/record.json" "$temp_dir/evidence.json" \
   "$qualification_profiles_checksum" "$SCRIPT_DIR/qualification" "$temp_dir" <<'PY'
 import json
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 (
@@ -2266,10 +3228,15 @@ row = {
 }
 (retained_root / "evidence.json").write_text(json.dumps(evidence, sort_keys=True))
 report_path = retained_root / "report.json"
+completed_at = datetime.now(timezone.utc).replace(microsecond=0)
+started_at = completed_at - timedelta(seconds=120)
 report_path.write_text(
     json.dumps(
         {
             **identity,
+            "startedAtUTC": started_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "completedAtUTC": completed_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "wallDurationSeconds": 120,
             "mode": "qualification",
             "qualificationEligibleEnvironment": True,
             "device": {"udid": "fixture-device"},
@@ -2725,6 +3692,8 @@ mkdir -p \
 cp "$SCRIPT_DIR/release.sh" "$release_flow_repo/scripts/release.sh"
 cp "$SCRIPT_DIR/artifact-tree-digest.py" \
   "$release_flow_repo/scripts/artifact-tree-digest.py"
+cp "$SCRIPT_DIR/release-artifact-info.py" \
+  "$release_flow_repo/scripts/release-artifact-info.py"
 cp "$ROOT_DIR/Package.swift" "$release_flow_repo/Package.swift"
 cp "$ROOT_DIR/Showcase/SwiftVLCShowcase.xcodeproj/project.pbxproj" \
   "$release_flow_repo/Showcase/SwiftVLCShowcase.xcodeproj/project.pbxproj"
@@ -2910,7 +3879,38 @@ if [ "$#" -eq 3 ] && [ "$1" = package ] && \
   shasum -a 256 "$3" | cut -d' ' -f1
   exit 0
 fi
+if [ "${1:-}" = build ]; then
+  package_path=""
+  while [ "$#" -gt 0 ]; do
+    if [ "$1" = --package-path ]; then
+      package_path=$2
+      break
+    fi
+    shift
+  done
+  [ -n "$package_path" ]
+  grep -Fq '.package(url: "https://github.com/harflabs/SwiftVLC.git", exact: "1.1.0")' \
+    "$package_path/Package.swift"
+  grep -Fq 'import SwiftVLC' "$package_path/Sources/SwiftVLCSmoke/main.swift"
+  exit 0
+fi
 exit 2
+SH
+cat > "$release_flow_fake_bin/curl" <<'SH'
+#!/bin/sh
+set -eu
+
+output=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = --output ]; then
+    output=$2
+    shift 2
+  else
+    shift
+  fi
+done
+[ -n "$output" ]
+cp "$SWIFTVLC_RELEASE_TEST_CAPTURE/uploaded/libvlc.xcframework.zip" "$output"
 SH
 cat > "$release_flow_fake_bin/git" <<'SH'
 #!/bin/sh
@@ -2918,7 +3918,25 @@ set -eu
 
 if [ "${1:-}" = push ]; then
   printf '%s\n' "$*" >> "$SWIFTVLC_RELEASE_TEST_GIT_LOG"
-  exit 0
+  if [ "${SWIFTVLC_RELEASE_TEST_CLEANUP_RACE:-}" = branch ]; then
+    case "$*" in
+      *:refs/heads/release-candidates/v1.1.0*)
+        /usr/bin/git --git-dir="$SWIFTVLC_RELEASE_TEST_ORIGIN" update-ref \
+          refs/heads/release-candidates/v1.1.0 \
+          "$SWIFTVLC_RELEASE_TEST_RACE_COMMIT"
+        ;;
+    esac
+  elif [ "${SWIFTVLC_RELEASE_TEST_CLEANUP_RACE:-}" = tag ]; then
+    case "$*" in
+      *:refs/tags/swiftvlc-candidate-v1.1.0-*)
+        candidate_ref=$(printf '%s\n' "$*" | sed -n \
+          's/.*:\(refs\/tags\/swiftvlc-candidate-v1\.1\.0-[0-9a-f]*\).*/\1/p')
+        [ -n "$candidate_ref" ]
+        /usr/bin/git --git-dir="$SWIFTVLC_RELEASE_TEST_ORIGIN" update-ref \
+          "$candidate_ref" "$SWIFTVLC_RELEASE_TEST_RACE_COMMIT"
+        ;;
+    esac
+  fi
 fi
 exec /usr/bin/git "$@"
 SH
@@ -2929,26 +3947,515 @@ set -eu
 if [ "${1:-}" = auth ] && [ "${2:-}" = status ]; then
   exit 0
 fi
-if [ "${1:-}" = release ] && [ "${2:-}" = view ]; then
-  exit 1
+if [ "${1:-}" = release ] && [ "${3:-}" = --help ]; then
+  case "${2:-}" in
+    edit|verify|verify-asset) exit 0 ;;
+  esac
 fi
-if [ "${1:-}" = release ] && [ "${2:-}" = edit ]; then
+
+state_file=$SWIFTVLC_RELEASE_TEST_GH_STATE
+capture=$SWIFTVLC_RELEASE_TEST_CAPTURE
+origin=$SWIFTVLC_RELEASE_TEST_ORIGIN
+pr_state="$capture/pr.state"
+pr_base="$capture/pr.base"
+pr_head="$capture/pr.head"
+pr_merge="$capture/pr.merge"
+
+current_tag() {
+  [ -f "$state_file" ] || return 1
+  state=$(cat "$state_file")
+  if [ "$state" = draft ]; then
+    cat "$capture/release.tag"
+  else
+    printf 'v1.1.0\n'
+  fi
+}
+
+perform_merge() {
+  expected=$1
+  [ "$(cat "$pr_state")" = open ]
+  head=$(cat "$pr_head")
+  base=$(cat "$pr_base")
+  [ "$expected" = "$head" ]
+  [ "${SWIFTVLC_RELEASE_TEST_MERGE_MODE:-}" != fail-before ] || return 42
+  tree=$(/usr/bin/git --git-dir="$origin" rev-parse "${head}^{tree}")
+  merge_commit=$(printf 'Merge release PR #17\n' | \
+    GIT_AUTHOR_NAME='SwiftVLC Release Test' \
+    GIT_AUTHOR_EMAIL='swiftvlc-release-test@example.invalid' \
+    GIT_COMMITTER_NAME='SwiftVLC Release Test' \
+    GIT_COMMITTER_EMAIL='swiftvlc-release-test@example.invalid' \
+    /usr/bin/git --git-dir="$origin" commit-tree "$tree" -p "$base" -p "$head")
+  /usr/bin/git --git-dir="$origin" update-ref refs/heads/main "$merge_commit" "$base"
+  printf '%s\n' "$merge_commit" > "$pr_merge"
+  printf 'merged\n' > "$pr_state"
+  [ "${SWIFTVLC_RELEASE_TEST_MERGE_MODE:-}" != fail-after ] || return 42
+  printf '{"sha":"%s","merged":true,"message":"Pull Request successfully merged"}\n' \
+    "$merge_commit"
+}
+
+if [ "${1:-}" = api ]; then
+  case " $* " in
+    *" repos/harflabs/SwiftVLC "*)
+      if [ "${SWIFTVLC_RELEASE_TEST_RULESET_DRIFT:-}" = repository-merge ]; then
+        allow_merge=false
+      else
+        allow_merge=true
+      fi
+      printf '{"full_name":"harflabs/SwiftVLC","default_branch":"main","archived":false,"disabled":false,"allow_merge_commit":%s}\n' \
+        "$allow_merge"
+      exit 0
+      ;;
+    *" repos/harflabs/SwiftVLC/pulls/17/merge "*)
+      expected=""
+      merge_method=""
+      method=""
+      previous=""
+      for argument in "$@"; do
+        case "$argument" in
+          sha=*) expected=${argument#sha=} ;;
+          merge_method=*) merge_method=${argument#merge_method=} ;;
+        esac
+        if [ "$previous" = --method ]; then
+          method=$argument
+        fi
+        previous=$argument
+      done
+      [ "$method" = PUT ] && [ "$merge_method" = merge ]
+      perform_merge "$expected"
+      exit $?
+      ;;
+    *" repos/harflabs/SwiftVLC/rulesets?includes_parents=true&per_page=100 "*)
+      printf '%s\n' '[{"id":15683730,"name":"Protect main","target":"branch","source_type":"Repository","source":"harflabs/SwiftVLC","enforcement":"active"}]'
+      exit 0
+      ;;
+    *" repos/harflabs/SwiftVLC/rulesets/15683730 "*)
+      python3 - "${SWIFTVLC_RELEASE_TEST_RULESET_DRIFT:-}" <<'PY'
+import json
+import sys
+
+drift = sys.argv[1]
+policy = {
+    "id": 15683730,
+    "name": "Protect main",
+    "target": "branch",
+    "source_type": "Repository",
+    "source": "harflabs/SwiftVLC",
+    "enforcement": "active",
+    "bypass_actors": [],
+    "conditions": {
+        "ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}
+    },
+    "rules": [
+        {"type": "deletion"},
+        {"type": "non_fast_forward"},
+        {
+            "type": "pull_request",
+            "parameters": {
+                "required_approving_review_count": 0,
+                "dismiss_stale_reviews_on_push": False,
+                "require_code_owner_review": False,
+                "require_last_push_approval": False,
+                "required_review_thread_resolution": True,
+                "allowed_merge_methods": ["merge"],
+            },
+        },
+        {
+            "type": "required_status_checks",
+            "parameters": {
+                "strict_required_status_checks_policy": True,
+                "do_not_enforce_on_create": False,
+                "required_status_checks": [
+                    {"context": name, "integration_id": 15368}
+                    for name in ("lint", "ios-build", "test")
+                ],
+            },
+        },
+    ],
+}
+rules = {rule["type"]: rule for rule in policy["rules"]}
+if drift == "disabled":
+    policy["enforcement"] = "disabled"
+elif drift == "bypass":
+    policy["bypass_actors"] = [
+        {"actor_id": 5, "actor_type": "RepositoryRole", "bypass_mode": "always"}
+    ]
+elif drift == "approvals":
+    rules["pull_request"]["parameters"]["required_approving_review_count"] = 1
+elif drift == "conversations":
+    rules["pull_request"]["parameters"]["required_review_thread_resolution"] = False
+elif drift == "merge-method":
+    rules["pull_request"]["parameters"]["allowed_merge_methods"] = ["squash"]
+elif drift == "deletion":
+    policy["rules"] = [rule for rule in policy["rules"] if rule["type"] != "deletion"]
+elif drift == "force-push":
+    policy["rules"] = [
+        rule for rule in policy["rules"] if rule["type"] != "non_fast_forward"
+    ]
+elif drift == "checks":
+    rules["required_status_checks"]["parameters"]["required_status_checks"] = [
+        {"context": "lint", "integration_id": 15368}
+    ]
+elif drift == "integration":
+    rules["required_status_checks"]["parameters"]["required_status_checks"][0][
+        "integration_id"
+    ] = None
+elif drift:
+    raise SystemExit(f"unknown ruleset drift fixture: {drift}")
+print(json.dumps(policy))
+PY
+      exit 0
+      ;;
+    *" repos/harflabs/SwiftVLC/immutable-releases "*)
+      [ "${SWIFTVLC_RELEASE_TEST_IMMUTABLE_DISABLED:-}" != 1 ] || exit 1
+      printf 'true\n'
+      exit 0
+      ;;
+    *" --method DELETE https://api.github.com/repos/harflabs/SwiftVLC/releases/assets/"*)
+      asset_url=${!#}
+      asset_name=${asset_url##*/}
+      rm -f "$capture/starters/$asset_name"
+      exit 0
+      ;;
+  esac
+fi
+
+if [ "${1:-}" = release ] && [ "${2:-}" = view ]; then
+  requested_tag=$3
+  actual_tag=$(current_tag) || exit 1
+  [ "$requested_tag" = "$actual_tag" ] || exit 1
+  case " $* " in
+    *" --json "*)
+      python3 - \
+        "$state_file" \
+        "$capture" \
+        "$actual_tag" \
+        "${SWIFTVLC_RELEASE_TEST_ASSET_DRIFT:-}" \
+        "${SWIFTVLC_RELEASE_TEST_IMMUTABLE_DRIFT:-}" \
+        "${SWIFTVLC_RELEASE_TEST_METADATA_DRIFT:-}" <<'PY'
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+state_path, capture_path, tag, drift, immutable_drift, metadata_drift = sys.argv[1:]
+state = Path(state_path).read_text().strip()
+capture = Path(capture_path)
+assets = []
+for path in sorted((capture / "uploaded").iterdir()):
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    if drift and path.name == "libvlc.xcframework.zip":
+        digest = "0" * 64
+    assets.append(
+        {
+            "name": path.name,
+            "digest": f"sha256:{digest}",
+            "url": (
+                "https://github.com/harflabs/SwiftVLC/releases/download/"
+                f"{tag}/{path.name}"
+            ),
+            "apiUrl": (
+                "https://api.github.com/repos/harflabs/SwiftVLC/"
+                f"releases/assets/{path.name}"
+            ),
+            "state": "uploaded",
+            "size": path.stat().st_size,
+        }
+    )
+for path in sorted((capture / "starters").iterdir()):
+    assets.append(
+        {
+            "name": path.name,
+            "digest": None,
+            "url": (
+                "https://github.com/harflabs/SwiftVLC/releases/download/"
+                f"{tag}/{path.name}"
+            ),
+            "apiUrl": (
+                "https://api.github.com/repos/harflabs/SwiftVLC/"
+                f"releases/assets/{path.name}"
+            ),
+            "state": "starter",
+            "size": 0,
+        }
+    )
+print(
+    json.dumps(
+        {
+            "tagName": tag,
+            "targetCommitish": (capture / "release.commit").read_text().strip(),
+            "isDraft": state == "draft",
+            "isImmutable": state == "published" and not immutable_drift,
+            "isPrerelease": False,
+            "name": (
+                "drifted title"
+                if metadata_drift == "title"
+                else (capture / "release.title").read_text()
+            ),
+            "body": (
+                "drifted notes"
+                if metadata_drift == "body"
+                else (capture / "release.notes").read_text()
+            ),
+            "assets": assets,
+        }
+    )
+)
+PY
+      ;;
+  esac
   exit 0
 fi
+
 if [ "${1:-}" = release ] && [ "${2:-}" = create ]; then
+  tag=$3
   shift 3
-  : > "$SWIFTVLC_RELEASE_TEST_CAPTURE/assets.paths"
-  while [ "$#" -gt 0 ] && [ "${1#--}" = "$1" ]; do
-    source_path=$1
-    output_path="$SWIFTVLC_RELEASE_TEST_CAPTURE/$(basename "$source_path")"
-    [ ! -e "$output_path" ] || exit 3
-    cp "$source_path" "$output_path"
-    printf '%s\n' "$source_path" >> \
-      "$SWIFTVLC_RELEASE_TEST_CAPTURE/assets.paths"
+  commit=""
+  title=""
+  notes=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --target) commit=$2; shift 2 ;;
+      --title) title=$2; shift 2 ;;
+      --notes) notes=$2; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  [ -n "$commit" ] && [ -n "$title" ] && [ -n "$notes" ]
+  mkdir -p "$capture/uploaded" "$capture/starters"
+  : > "$capture/assets.paths"
+  printf '%s\n' "$tag" > "$capture/release.tag"
+  printf '%s\n' "$commit" > "$capture/release.commit"
+  printf '%s' "$title" > "$capture/release.title"
+  printf '%s' "$notes" > "$capture/release.notes"
+  printf 'draft\n' > "$state_file"
+  exit 0
+fi
+
+if [ "${1:-}" = release ] && [ "${2:-}" = upload ]; then
+  tag=$3
+  source_path=$4
+  [ "$tag" = "$(current_tag)" ]
+  asset_name=$(basename "$source_path")
+  if [ "${SWIFTVLC_RELEASE_TEST_FAIL_UPLOAD_NAME:-}" = "$asset_name" ] && \
+      [ ! -e "$capture/upload-failed-$asset_name" ]; then
+    : > "$capture/upload-failed-$asset_name"
+    : > "$capture/starters/$asset_name"
+    exit 42
+  fi
+  [ ! -e "$capture/uploaded/$asset_name" ] || exit 3
+  cp "$source_path" "$capture/uploaded/$asset_name"
+  printf '%s\n' "$source_path" >> "$capture/assets.paths"
+  exit 0
+fi
+
+if [ "${1:-}" = release ] && [ "${2:-}" = edit ]; then
+  candidate_tag=$3
+  [ "$candidate_tag" = "$(current_tag)" ]
+  [ "${SWIFTVLC_RELEASE_TEST_EDIT_MODE:-}" != fail-before ] || exit 42
+  shift 3
+  commit=""
+  tag=""
+  title=""
+  notes=""
+  draft=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --target) commit=$2; shift 2 ;;
+      --tag) tag=$2; shift 2 ;;
+      --title) title=$2; shift 2 ;;
+      --notes) notes=$2; shift 2 ;;
+      --draft=false) draft=false; shift ;;
+      *) shift ;;
+    esac
+  done
+  [ "$tag" = v1.1.0 ] && [ "$draft" = false ]
+  [ "$commit" = "$(cat "$capture/release.commit")" ]
+  [ -n "$title" ] && [ -n "$notes" ]
+  /usr/bin/git --git-dir="$origin" update-ref refs/tags/v1.1.0 "$commit"
+  printf '%s' "$title" > "$capture/release.title"
+  printf '%s' "$notes" > "$capture/release.notes"
+  printf 'published\n' > "$state_file"
+  if [ "${SWIFTVLC_RELEASE_TEST_EDIT_MODE:-}" = fail-after ]; then
+    exit 42
+  fi
+  exit 0
+fi
+
+if [ "${1:-}" = pr ] && [ "${2:-}" = create ]; then
+  [ ! -e "$pr_state" ]
+  /usr/bin/git --git-dir="$origin" rev-parse refs/heads/main > "$pr_base"
+  /usr/bin/git --git-dir="$origin" \
+    rev-parse refs/heads/release-candidates/v1.1.0 > "$pr_head"
+  printf 'open\n' > "$pr_state"
+  printf 'https://github.com/harflabs/SwiftVLC/pull/17\n'
+  exit 0
+fi
+
+if [ "${1:-}" = pr ] && [ "${2:-}" = list ]; then
+  if [ ! -e "$pr_state" ]; then
+    case " $* " in
+      *" --jq length "*) printf '0\n' ;;
+      *) printf '[]\n' ;;
+    esac
+    exit 0
+  fi
+  case " $* " in
+    *" --jq length "*)
+      printf '1\n'
+      ;;
+    *)
+      python3 - "$pr_state" "$pr_base" "$pr_head" "$pr_merge" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+state_path, base_path, head_path, merge_path = map(Path, sys.argv[1:])
+state = state_path.read_text().strip()
+merge = merge_path.read_text().strip() if merge_path.exists() else ""
+print(
+    json.dumps(
+        [
+            {
+                "number": 17,
+                "state": state.upper(),
+                "isDraft": False,
+                "isCrossRepository": False,
+                "headRefName": "release-candidates/v1.1.0",
+                "headRefOid": head_path.read_text().strip(),
+                "baseRefName": "main",
+                "baseRefOid": base_path.read_text().strip(),
+                "mergedAt": "2026-09-02T00:00:00Z" if state == "merged" else None,
+                "mergeCommit": {"oid": merge} if merge else None,
+                "url": "https://github.com/harflabs/SwiftVLC/pull/17",
+            }
+        ]
+    )
+)
+PY
+      ;;
+  esac
+  exit 0
+fi
+
+if [ "${1:-}" = pr ] && [ "${2:-}" = view ]; then
+  [ -e "$pr_state" ]
+  python3 - \
+    "$pr_state" "$pr_base" "$pr_head" \
+    "${SWIFTVLC_RELEASE_TEST_PR_CHECK_STATE:-success}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+state_path, base_path, head_path, check_state = sys.argv[1:]
+names = ("lint", "ios-build", "test", "dynamic-host", "check", "replay")
+checks = [
+    {"name": name, "status": "COMPLETED", "conclusion": "SUCCESS"}
+    for name in names
+]
+if check_state == "missing":
+    checks.pop()
+elif check_state == "pending":
+    checks[0].update(status="IN_PROGRESS", conclusion=None)
+elif check_state == "failed":
+    checks[0]["conclusion"] = "FAILURE"
+elif check_state == "skipped-required":
+    checks[0]["conclusion"] = "SKIPPED"
+elif check_state == "duplicate":
+    checks.append(dict(checks[0]))
+elif check_state != "success":
+    raise SystemExit(f"unknown PR check state: {check_state}")
+print(
+    json.dumps(
+        {
+            "number": 17,
+            "state": Path(state_path).read_text().strip().upper(),
+            "isDraft": False,
+            "isCrossRepository": False,
+            "headRefName": "release-candidates/v1.1.0",
+            "headRefOid": Path(head_path).read_text().strip(),
+            "baseRefName": "main",
+            "baseRefOid": Path(base_path).read_text().strip(),
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "CLEAN",
+            "statusCheckRollup": checks,
+        }
+    )
+)
+PY
+  exit 0
+fi
+
+if [ "${1:-}" = pr ] && [ "${2:-}" = merge ]; then
+  [ "$(cat "$pr_state")" = open ]
+  expected=""
+  while [ "$#" -gt 0 ]; do
+    if [ "$1" = --match-head-commit ]; then
+      expected=$2
+      break
+    fi
     shift
   done
+  perform_merge "$expected"
+  exit $?
+fi
+
+if [ "${1:-}" = release ] && [ "$2" = verify ]; then
+  [ "$(cat "$state_file")" = published ]
+  printf '{"verified":true}\n'
   exit 0
 fi
+
+if [ "${1:-}" = release ] && [ "$2" = verify-asset ]; then
+  [ "$(cat "$state_file")" = published ]
+  asset_path=$4
+  cmp -s "$asset_path" "$capture/uploaded/$(basename "$asset_path")"
+  printf '{"verified":true}\n'
+  exit 0
+fi
+
+if [ "${1:-}" = run ] && [ "${2:-}" = list ]; then
+  commit=""
+  event=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --commit) commit=$2; shift 2 ;;
+      --event) event=$2; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  branch="release-candidates/v1.1.0"
+  expected_event=pull_request
+  run_state=${SWIFTVLC_RELEASE_TEST_RUN_STATE:-success}
+  if [ -s "$pr_merge" ] && [ "$commit" = "$(cat "$pr_merge")" ]; then
+    branch=main
+    expected_event=push
+    run_state=${SWIFTVLC_RELEASE_TEST_MAIN_RUN_STATE:-$run_state}
+  fi
+  [ "$event" = "$expected_event" ] || exit 4
+  case "$run_state" in
+    missing)
+      printf '[]\n'
+      ;;
+    pending)
+      printf '[{"databaseId":1,"attempt":1,"createdAt":"2026-09-02T00:00:01Z","status":"in_progress","conclusion":"","headSha":"%s","headBranch":"%s","event":"%s"}]\n' "$commit" "$branch" "$event"
+      ;;
+    failed)
+      printf '[{"databaseId":1,"attempt":1,"createdAt":"2026-09-02T00:00:01Z","status":"completed","conclusion":"failure","headSha":"%s","headBranch":"%s","event":"%s"}]\n' "$commit" "$branch" "$event"
+      ;;
+    stale-failure-recovered)
+      printf '[{"databaseId":1,"attempt":1,"createdAt":"2026-09-02T00:00:01Z","status":"completed","conclusion":"failure","headSha":"%s","headBranch":"%s","event":"%s"},{"databaseId":2,"attempt":1,"createdAt":"2026-09-02T00:00:02Z","status":"completed","conclusion":"success","headSha":"%s","headBranch":"%s","event":"%s"}]\n' "$commit" "$branch" "$event" "$commit" "$branch" "$event"
+      ;;
+    stale-success-pending)
+      printf '[{"databaseId":1,"attempt":1,"createdAt":"2026-09-02T00:00:01Z","status":"completed","conclusion":"success","headSha":"%s","headBranch":"%s","event":"%s"},{"databaseId":2,"attempt":1,"createdAt":"2026-09-02T00:00:02Z","status":"in_progress","conclusion":"","headSha":"%s","headBranch":"%s","event":"%s"}]\n' "$commit" "$branch" "$event" "$commit" "$branch" "$event"
+      ;;
+    success)
+      printf '[{"databaseId":1,"attempt":1,"createdAt":"2026-09-02T00:00:01Z","status":"completed","conclusion":"success","headSha":"%s","headBranch":"%s","event":"%s"}]\n' "$commit" "$branch" "$event"
+      ;;
+    *) exit 4 ;;
+  esac
+  exit 0
+fi
+
 echo "unexpected gh invocation: $*" >&2
 exit 2
 SH
@@ -2957,6 +4464,7 @@ chmod +x \
   "$release_flow_repo/scripts/"*.py \
   "$release_flow_fake_bin/git" \
   "$release_flow_fake_bin/gh" \
+  "$release_flow_fake_bin/curl" \
   "$release_flow_fake_bin/swift"
 
 for slice in \
@@ -3004,6 +4512,7 @@ for release_flow_sidecar in \
 done
 
 release_flow_git_log="$release_flow_root/git-pushes.log"
+release_flow_gh_state="$release_flow_root/github-release.state"
 : > "$release_flow_git_log"
 (
   cd "$release_flow_repo"
@@ -3114,18 +4623,66 @@ release_flow_origin_before_release=$(
 [[ "$release_flow_origin_before_release" != "$release_flow_source_commit" ]] || \
   fail "release revision fixture did not advance main after preparation"
 
-(
-  cd "$release_flow_repo"
-  PATH="$release_flow_fake_bin:$PATH" \
-    TMPDIR="$release_flow_tmp" \
-    SWIFTVLC_RELEASE_TEST_EXPECTED_REVISION="$release_flow_source_commit" \
-    SWIFTVLC_RELEASE_TEST_CAPTURE="$release_flow_capture" \
-    SWIFTVLC_RELEASE_TEST_GIT_LOG="$release_flow_git_log" \
-    SWIFTVLC_RELEASE_TEST_MUTATE_CANDIDATE="$release_flow_candidate" \
-    ./scripts/release.sh 1.1.0 --candidate "$release_flow_candidate" \
-    > "$release_flow_root/release.log"
+release_flow_common_env=(
+  "PATH=$release_flow_fake_bin:$PATH"
+  "TMPDIR=$release_flow_tmp"
+  "SWIFTVLC_RELEASE_TEST_EXPECTED_REVISION=$release_flow_source_commit"
+  "SWIFTVLC_RELEASE_TEST_CAPTURE=$release_flow_capture"
+  "SWIFTVLC_RELEASE_TEST_GH_STATE=$release_flow_gh_state"
+  "SWIFTVLC_RELEASE_TEST_GIT_LOG=$release_flow_git_log"
+  "SWIFTVLC_RELEASE_TEST_ORIGIN=$release_flow_origin"
 )
 
+# Staging fails before any ref/release mutation unless repository-level
+# immutable releases are enabled. The script only reads the setting.
+if (
+  cd "$release_flow_repo"
+  env "${release_flow_common_env[@]}" \
+    SWIFTVLC_RELEASE_TEST_IMMUTABLE_DISABLED=1 \
+    ./scripts/release.sh 1.1.0 --candidate "$release_flow_candidate" \
+      > "$release_flow_root/immutable-disabled.log" 2>&1
+); then
+  fail "release staging accepted disabled repository immutability"
+fi
+[[ ! -e "$release_flow_gh_state" ]] || \
+  fail "immutable-release preflight mutated GitHub release state"
+[[ -z $(git --git-dir="$release_flow_origin" tag -l 'v1.1.0') ]] || \
+  fail "immutable-release preflight exposed the final SemVer tag"
+
+for release_flow_ruleset_drift in \
+  disabled \
+  bypass \
+  approvals \
+  conversations \
+  merge-method \
+  deletion \
+  force-push \
+  checks \
+  integration \
+  repository-merge; do
+  # Keep repository-level merge-method compatibility in the same fail-closed
+  # governance matrix as the ruleset itself.
+  if (
+    cd "$release_flow_repo"
+    env "${release_flow_common_env[@]}" \
+      SWIFTVLC_RELEASE_TEST_RULESET_DRIFT="$release_flow_ruleset_drift" \
+      ./scripts/release.sh 1.1.0 --candidate "$release_flow_candidate" \
+        > "$release_flow_root/ruleset-$release_flow_ruleset_drift.log" 2>&1
+  ); then
+    fail "release staging accepted weakened main ruleset: $release_flow_ruleset_drift"
+  fi
+  [[ ! -e "$release_flow_gh_state" ]] || \
+    fail "ruleset preflight mutated GitHub release state: $release_flow_ruleset_drift"
+  [[ -z $(git --git-dir="$release_flow_origin" \
+    branch --list 'release-candidates/v1.1.0') ]] || \
+    fail "ruleset preflight pushed a release branch: $release_flow_ruleset_drift"
+  [[ -z $(git --git-dir="$release_flow_origin" tag -l 'v1.1.0') ]] || \
+    fail "ruleset preflight exposed a final tag: $release_flow_ruleset_drift"
+done
+
+# Fail each asset upload once. Every rerun must retain exact completed assets,
+# remove only an incomplete starter, and continue with the missing asset. This
+# is the recovery shape produced by gh's separate asset upload API calls.
 expected_release_assets=(
   libvlc.xcframework.zip
   libvlc-provenance-a.json
@@ -3133,13 +4690,42 @@ expected_release_assets=(
   libvlc-reproducibility.json
   release-candidate.json
 )
+for release_flow_failed_asset in "${expected_release_assets[@]}"; do
+  if (
+    cd "$release_flow_repo"
+    env "${release_flow_common_env[@]}" \
+      SWIFTVLC_RELEASE_TEST_FAIL_UPLOAD_NAME="$release_flow_failed_asset" \
+      ./scripts/release.sh 1.1.0 --candidate "$release_flow_candidate" \
+        > "$release_flow_root/upload-$release_flow_failed_asset.log" 2>&1
+  ); then
+    fail "release hid a failed $release_flow_failed_asset upload"
+  fi
+  [[ $(tr -d '\n' < "$release_flow_gh_state") == draft ]] || \
+    fail "asset upload failure changed draft visibility"
+  [[ -z $(git --git-dir="$release_flow_origin" \
+    branch --list 'release-candidates/v1.1.0') ]] || \
+    fail "candidate CI started before every asset upload completed"
+  [[ -z $(git --git-dir="$release_flow_origin" tag -l 'v1.1.0') ]] || \
+    fail "asset upload failure exposed the final SemVer tag"
+done
+
+# Complete staging with an original-directory TOCTOU mutation after the private
+# snapshot. Already-uploaded exact bytes must not be replaced or duplicated.
+(
+  cd "$release_flow_repo"
+  env "${release_flow_common_env[@]}" \
+    SWIFTVLC_RELEASE_TEST_MUTATE_CANDIDATE="$release_flow_candidate" \
+    ./scripts/release.sh 1.1.0 --candidate "$release_flow_candidate" \
+      > "$release_flow_root/release.log"
+)
+
 captured_release_count=0
 while IFS= read -r captured_release_path; do
   captured_release_paths[$captured_release_count]="$captured_release_path"
   captured_release_count=$((captured_release_count + 1))
 done < "$release_flow_capture/assets.paths"
 [[ $captured_release_count -eq ${#expected_release_assets[@]} ]] || \
-  fail "release uploaded the wrong number of assets"
+  fail "resumed release uploaded or replaced an asset more than once"
 for ((release_flow_index = 0;
       release_flow_index < ${#expected_release_assets[@]};
       release_flow_index++)); do
@@ -3152,23 +4738,439 @@ for ((release_flow_index = 0;
     *) fail "release uploaded an asset outside its private snapshot: $release_flow_path" ;;
   esac
   cmp -s "$release_flow_expected/$release_flow_asset" \
-    "$release_flow_capture/$release_flow_asset" || \
+    "$release_flow_capture/uploaded/$release_flow_asset" || \
     fail "release uploaded changed bytes for $release_flow_asset"
   if cmp -s "$release_flow_expected/$release_flow_asset" \
     "$release_flow_candidate/$release_flow_asset"; then
     fail "release TOCTOU fixture did not mutate original $release_flow_asset"
   fi
 done
-[[ $(wc -l < "$release_flow_git_log" | tr -d ' ') == 2 ]] || \
-  fail "mock release did not reach both production push boundaries"
+[[ -z $(find "$release_flow_capture/starters" -type f -print -quit) ]] || \
+  fail "release left an incomplete starter asset after recovery"
+
+release_flow_release_commit=$(git -C "$release_flow_repo" rev-parse HEAD)
+release_flow_candidate_tag="swiftvlc-candidate-v1.1.0-$release_flow_release_commit"
 [[ $(git --git-dir="$release_flow_origin" rev-parse refs/heads/main) == \
   "$release_flow_origin_before_release" ]] || \
-  fail "mock release changed its local origin/main"
+  fail "staging exposed a draft-only artifact through origin/main"
 if git --git-dir="$release_flow_origin" rev-parse refs/tags/v1.1.0 \
-  >/dev/null 2>&1; then
-  fail "mock release pushed a tag to its local origin"
+    >/dev/null 2>&1; then
+  fail "staging exposed the final SemVer tag before CI"
+fi
+[[ $(git --git-dir="$release_flow_origin" \
+  rev-parse "refs/tags/$release_flow_candidate_tag") == \
+  "$release_flow_release_commit" ]] || \
+  fail "staging did not bind the non-SemVer candidate tag to the release commit"
+[[ $(git --git-dir="$release_flow_origin" \
+  rev-parse refs/heads/release-candidates/v1.1.0) == \
+  "$release_flow_release_commit" ]] || \
+  fail "staging did not push the exact release-candidate branch"
+[[ $(tr -d '\n' < "$release_flow_gh_state") == draft ]] || \
+  fail "the first release phase published instead of retaining a draft"
+grep -q 'No final SemVer tag exists' "$release_flow_root/release.log" || \
+  fail "the first release phase did not report its safe CI pause"
+[[ $(wc -l < "$release_flow_git_log" | tr -d ' ') == 2 ]] || \
+  fail "staging did not use exactly candidate-tag and candidate-branch pushes"
+
+# Restore the deliberately mutated source candidate. Every finalize retry
+# independently verifies the operator-supplied immutable candidate directory.
+rm -rf "$release_flow_candidate/libvlc.xcframework"
+ditto -x -k \
+  "$release_flow_expected/libvlc.xcframework.zip" \
+  "$release_flow_candidate"
+for release_flow_asset in "${expected_release_assets[@]}"; do
+  cp "$release_flow_expected/$release_flow_asset" \
+    "$release_flow_candidate/$release_flow_asset"
+done
+
+# A checksum-looking staged Package.swift is not sufficient. Move the mutable
+# candidate anchors to a one-parent commit containing the canonical release
+# files plus an unrelated Package.swift edit; fresh finalize must reconstruct
+# and reject it byte-for-byte before querying CI.
+release_flow_malicious_repo="$release_flow_root/malicious-repository"
+git clone -q "$release_flow_origin" "$release_flow_malicious_repo"
+git -C "$release_flow_malicious_repo" config user.name "SwiftVLC Release Test"
+git -C "$release_flow_malicious_repo" config user.email \
+  "swiftvlc-release-test@example.invalid"
+git -C "$release_flow_malicious_repo" checkout -q \
+  "$release_flow_release_commit" -- Package.swift \
+  Showcase/SwiftVLCShowcase.xcodeproj/project.pbxproj
+printf '\n// unrelated staged dependency mutation\n' >> \
+  "$release_flow_malicious_repo/Package.swift"
+git -C "$release_flow_malicious_repo" add Package.swift \
+  Showcase/SwiftVLCShowcase.xcodeproj/project.pbxproj
+git -C "$release_flow_malicious_repo" commit -qm "Malicious release rewrite"
+release_flow_malicious_commit=$(git -C "$release_flow_malicious_repo" rev-parse HEAD)
+release_flow_malicious_tag="swiftvlc-candidate-v1.1.0-$release_flow_malicious_commit"
+git --git-dir="$release_flow_origin" update-ref -d \
+  "refs/tags/$release_flow_candidate_tag"
+/usr/bin/git -C "$release_flow_malicious_repo" push -q origin \
+  "$release_flow_malicious_commit:refs/tags/$release_flow_malicious_tag"
+git --git-dir="$release_flow_origin" update-ref \
+  refs/heads/release-candidates/v1.1.0 "$release_flow_malicious_commit"
+printf '%s\n' "$release_flow_malicious_tag" > "$release_flow_capture/release.tag"
+printf '%s\n' "$release_flow_malicious_commit" > \
+  "$release_flow_capture/release.commit"
+release_flow_malicious_finalize="$release_flow_root/malicious-finalize"
+git clone -q "$release_flow_origin" "$release_flow_malicious_finalize"
+git -C "$release_flow_malicious_finalize" config user.name \
+  "SwiftVLC Release Test"
+git -C "$release_flow_malicious_finalize" config user.email \
+  "swiftvlc-release-test@example.invalid"
+if (
+  cd "$release_flow_malicious_finalize"
+  env "${release_flow_common_env[@]}" SWIFTVLC_RELEASE_TEST_RUN_STATE=success \
+    ./scripts/release.sh 1.1.0 \
+      --candidate "$release_flow_candidate" --finalize \
+      > "$release_flow_root/malicious-finalize.log" 2>&1
+); then
+  fail "finalize accepted an unrelated Package.swift mutation"
+fi
+git --git-dir="$release_flow_origin" update-ref -d \
+  "refs/tags/$release_flow_malicious_tag"
+git --git-dir="$release_flow_origin" update-ref \
+  "refs/tags/$release_flow_candidate_tag" "$release_flow_release_commit"
+git --git-dir="$release_flow_origin" update-ref \
+  refs/heads/release-candidates/v1.1.0 "$release_flow_release_commit"
+printf '%s\n' "$release_flow_candidate_tag" > "$release_flow_capture/release.tag"
+printf '%s\n' "$release_flow_release_commit" > \
+  "$release_flow_capture/release.commit"
+
+# Finalize from a fresh clone whose main still points at the last public
+# commit. Candidate push evidence and protected-PR evidence fail independently.
+release_flow_finalize_repo="$release_flow_root/finalize-repository"
+git clone -q "$release_flow_origin" "$release_flow_finalize_repo"
+git -C "$release_flow_finalize_repo" config user.name \
+  "SwiftVLC Release Test"
+git -C "$release_flow_finalize_repo" config user.email \
+  "swiftvlc-release-test@example.invalid"
+
+for release_flow_run_state in missing pending failed stale-success-pending; do
+  if (
+    cd "$release_flow_finalize_repo"
+    env "${release_flow_common_env[@]}" \
+      SWIFTVLC_RELEASE_TEST_RUN_STATE="$release_flow_run_state" \
+      ./scripts/release.sh 1.1.0 \
+        --candidate "$release_flow_candidate" --finalize \
+        > "$release_flow_root/finalize-$release_flow_run_state.log" 2>&1
+  ); then
+    fail "finalize accepted $release_flow_run_state exact-commit CI"
+  fi
+  [[ $(tr -d '\n' < "$release_flow_gh_state") == draft ]] || \
+    fail "finalize published after $release_flow_run_state CI"
+done
+
+for release_flow_pr_state in \
+  missing pending failed skipped-required duplicate; do
+  if (
+    cd "$release_flow_finalize_repo"
+    env "${release_flow_common_env[@]}" \
+      SWIFTVLC_RELEASE_TEST_RUN_STATE=success \
+      SWIFTVLC_RELEASE_TEST_PR_CHECK_STATE="$release_flow_pr_state" \
+      ./scripts/release.sh 1.1.0 \
+        --candidate "$release_flow_candidate" --finalize \
+        > "$release_flow_root/finalize-pr-$release_flow_pr_state.log" 2>&1
+  ); then
+    fail "finalize accepted $release_flow_pr_state protected-PR checks"
+  fi
+  [[ $(tr -d '\n' < "$release_flow_gh_state") == draft ]] || \
+    fail "finalize published after $release_flow_pr_state protected-PR checks"
+done
+
+if (
+  cd "$release_flow_finalize_repo"
+  env "${release_flow_common_env[@]}" \
+    SWIFTVLC_RELEASE_TEST_RUN_STATE=success \
+    SWIFTVLC_RELEASE_TEST_ASSET_DRIFT=1 \
+    ./scripts/release.sh 1.1.0 \
+      --candidate "$release_flow_candidate" --finalize \
+      > "$release_flow_root/finalize-asset-drift.log" 2>&1
+); then
+  fail "finalize accepted GitHub asset digest drift"
+fi
+[[ $(tr -d '\n' < "$release_flow_gh_state") == draft ]] || \
+  fail "finalize published after GitHub asset digest drift"
+
+for release_flow_metadata_drift in title body; do
+  if (
+    cd "$release_flow_finalize_repo"
+    env "${release_flow_common_env[@]}" \
+      SWIFTVLC_RELEASE_TEST_RUN_STATE=success \
+      SWIFTVLC_RELEASE_TEST_METADATA_DRIFT="$release_flow_metadata_drift" \
+      ./scripts/release.sh 1.1.0 \
+        --candidate "$release_flow_candidate" --finalize \
+        > "$release_flow_root/finalize-metadata-$release_flow_metadata_drift.log" 2>&1
+  ); then
+    fail "finalize accepted candidate release $release_flow_metadata_drift drift"
+  fi
+  [[ $(tr -d '\n' < "$release_flow_gh_state") == draft ]] || \
+    fail "candidate metadata drift reached publication"
+done
+
+# Candidate branch, candidate tag, and main are all mutable before publish.
+# Move each boundary independently and prove finalize refuses it, then restore
+# the isolated bare fixture for the next case.
+git --git-dir="$release_flow_origin" update-ref \
+  refs/heads/release-candidates/v1.1.0 "$release_flow_origin_before_release"
+if (
+  cd "$release_flow_finalize_repo"
+  env "${release_flow_common_env[@]}" SWIFTVLC_RELEASE_TEST_RUN_STATE=success \
+    ./scripts/release.sh 1.1.0 --candidate "$release_flow_candidate" --finalize \
+      > "$release_flow_root/finalize-branch-drift.log" 2>&1
+); then
+  fail "finalize accepted a moved candidate branch"
+fi
+git --git-dir="$release_flow_origin" update-ref \
+  refs/heads/release-candidates/v1.1.0 "$release_flow_release_commit"
+
+git --git-dir="$release_flow_origin" update-ref \
+  "refs/tags/$release_flow_candidate_tag" "$release_flow_origin_before_release"
+if (
+  cd "$release_flow_finalize_repo"
+  env "${release_flow_common_env[@]}" SWIFTVLC_RELEASE_TEST_RUN_STATE=success \
+    ./scripts/release.sh 1.1.0 --candidate "$release_flow_candidate" --finalize \
+      > "$release_flow_root/finalize-tag-drift.log" 2>&1
+); then
+  fail "finalize accepted a moved candidate tag"
+fi
+git --git-dir="$release_flow_origin" update-ref \
+  "refs/tags/$release_flow_candidate_tag" "$release_flow_release_commit"
+
+git --git-dir="$release_flow_origin" update-ref refs/heads/main \
+  "$release_flow_malicious_commit"
+if (
+  cd "$release_flow_finalize_repo"
+  env "${release_flow_common_env[@]}" SWIFTVLC_RELEASE_TEST_RUN_STATE=success \
+    ./scripts/release.sh 1.1.0 --candidate "$release_flow_candidate" --finalize \
+      > "$release_flow_root/finalize-main-drift.log" 2>&1
+); then
+  fail "finalize accepted an advanced origin/main"
+fi
+git --git-dir="$release_flow_origin" update-ref refs/heads/main \
+  "$release_flow_origin_before_release"
+
+# A concurrently/preemptively created final tag cannot be frozen into the
+# immutable release. The final identity must either be absent or equal H.
+git --git-dir="$release_flow_origin" update-ref refs/tags/v1.1.0 \
+  "$release_flow_origin_before_release"
+if (
+  cd "$release_flow_finalize_repo"
+  env "${release_flow_common_env[@]}" SWIFTVLC_RELEASE_TEST_RUN_STATE=success \
+    ./scripts/release.sh 1.1.0 --candidate "$release_flow_candidate" --finalize \
+      > "$release_flow_root/finalize-final-tag-race.log" 2>&1
+); then
+  fail "finalize accepted a wrong preexisting final tag"
+fi
+[[ $(tr -d '\n' < "$release_flow_gh_state") == draft ]] || \
+  fail "wrong final-tag race reached publication"
+git --git-dir="$release_flow_origin" update-ref -d refs/tags/v1.1.0
+
+# A failed atomic update that did not commit must remain an exact draft and
+# leave final tag/main absent. A later invocation, not an in-process blind
+# retry, is the only allowed recovery.
+if (
+  cd "$release_flow_finalize_repo"
+  env "${release_flow_common_env[@]}" \
+    SWIFTVLC_RELEASE_TEST_RUN_STATE=stale-failure-recovered \
+    SWIFTVLC_RELEASE_TEST_EDIT_MODE=fail-before \
+    ./scripts/release.sh 1.1.0 --candidate "$release_flow_candidate" --finalize \
+      > "$release_flow_root/finalize-publish-failed-before.log" 2>&1
+); then
+  fail "finalize hid a publication update that failed before commit"
+fi
+[[ $(tr -d '\n' < "$release_flow_gh_state") == draft ]] || \
+  fail "failed publication update did not remain a draft"
+if git --git-dir="$release_flow_origin" rev-parse refs/tags/v1.1.0 \
+    >/dev/null 2>&1; then
+  fail "failed publication update created the final SemVer tag"
 fi
 
+# An uncertain publication response that did commit is recovered by inspecting
+# the final identity, not by blindly repeating the PATCH. Inject a PR merge
+# failure before commit: the public immutable release remains usable, main is
+# still intact, and the already-green protected PR remains the recovery path.
+if (
+  cd "$release_flow_finalize_repo"
+  env "${release_flow_common_env[@]}" \
+    SWIFTVLC_RELEASE_TEST_RUN_STATE=success \
+    SWIFTVLC_RELEASE_TEST_EDIT_MODE=fail-after \
+    SWIFTVLC_RELEASE_TEST_MERGE_MODE=fail-before \
+    ./scripts/release.sh 1.1.0 \
+      --candidate "$release_flow_candidate" --finalize \
+      > "$release_flow_root/finalize-pr-merge-failed-before.log" 2>&1
+); then
+  fail "finalize hid a failed protected-PR merge after publication"
+fi
+[[ $(tr -d '\n' < "$release_flow_gh_state") == published ]] || \
+  fail "uncertain successful publication was not recovered"
+[[ $(git --git-dir="$release_flow_origin" rev-parse refs/tags/v1.1.0) == \
+  "$release_flow_release_commit" ]] || \
+  fail "atomic publication did not create the exact final SemVer tag"
+[[ $(git --git-dir="$release_flow_origin" rev-parse refs/heads/main) == \
+  "$release_flow_origin_before_release" ]] || \
+  fail "failed PR merge unexpectedly changed origin/main"
+[[ $(git --git-dir="$release_flow_origin" \
+  rev-parse refs/heads/release-candidates/v1.1.0) == \
+  "$release_flow_release_commit" ]] || \
+  fail "failed PR merge removed the recovery branch"
+[[ $(tr -d '\n' < "$release_flow_capture/pr.state") == open ]] || \
+  fail "failed PR merge did not retain the open recovery PR"
+
+# A public release whose immutable state can no longer be proven must not merge
+# or clean any authorization ref, even if all prior checks were green.
+if (
+  cd "$release_flow_finalize_repo"
+  env "${release_flow_common_env[@]}" \
+    SWIFTVLC_RELEASE_TEST_RUN_STATE=success \
+    SWIFTVLC_RELEASE_TEST_IMMUTABLE_DRIFT=1 \
+    ./scripts/release.sh 1.1.0 \
+      --candidate "$release_flow_candidate" --finalize \
+      > "$release_flow_root/finalize-public-immutability-drift.log" 2>&1
+); then
+  fail "finalize merged a release whose immutable state drifted"
+fi
+[[ $(tr -d '\n' < "$release_flow_capture/pr.state") == open ]] || \
+  fail "immutable-state drift changed the release PR"
+
+# A merge response may fail after GitHub committed it. Re-read PR and main,
+# prove the exact two-parent tree relationship, and pause for fresh main CI.
+(
+  cd "$release_flow_finalize_repo"
+  env "${release_flow_common_env[@]}" \
+    SWIFTVLC_RELEASE_TEST_RUN_STATE=success \
+    SWIFTVLC_RELEASE_TEST_MERGE_MODE=fail-after \
+    ./scripts/release.sh 1.1.0 \
+      --candidate "$release_flow_candidate" --finalize \
+      > "$release_flow_root/finalize-pr-merge-uncertain.log"
+)
+release_flow_merge_commit=$(cat "$release_flow_capture/pr.merge")
+[[ $(tr -d '\n' < "$release_flow_capture/pr.state") == merged ]] || \
+  fail "uncertain successful PR merge was not recovered"
+[[ $(git --git-dir="$release_flow_origin" rev-parse refs/heads/main) == \
+  "$release_flow_merge_commit" ]] || \
+  fail "protected PR merge did not become origin/main"
+[[ "$release_flow_merge_commit" != "$release_flow_release_commit" ]] || \
+  fail "protected-main flow did not create a merge commit"
+git --git-dir="$release_flow_origin" merge-base --is-ancestor \
+  "$release_flow_release_commit" "$release_flow_merge_commit" || \
+  fail "tagged release head is not an ancestor of the main merge"
+[[ $(git --git-dir="$release_flow_origin" rev-parse \
+  "${release_flow_release_commit}^{tree}") == \
+  $(git --git-dir="$release_flow_origin" rev-parse \
+  "${release_flow_merge_commit}^{tree}") ]] || \
+  fail "protected PR merge changed the qualified release tree"
+grep -q 'exact-main CI is running' \
+  "$release_flow_root/finalize-pr-merge-uncertain.log" || \
+  fail "first protected-main merge did not pause for fresh main CI"
+[[ $(git --git-dir="$release_flow_origin" rev-parse refs/tags/v1.1.0) == \
+  "$release_flow_release_commit" ]] || \
+  fail "protected-main merge moved the immutable release tag"
+
+# Post-merge authorization is a fresh push run for the exact main merge SHA,
+# never a reuse of either the candidate push or PR checks.
+for release_flow_main_run_state in missing pending failed; do
+  if (
+    cd "$release_flow_finalize_repo"
+    env "${release_flow_common_env[@]}" \
+      SWIFTVLC_RELEASE_TEST_RUN_STATE=success \
+      SWIFTVLC_RELEASE_TEST_MAIN_RUN_STATE="$release_flow_main_run_state" \
+      ./scripts/release.sh 1.1.0 \
+        --candidate "$release_flow_candidate" --finalize \
+        > "$release_flow_root/finalize-main-$release_flow_main_run_state.log" 2>&1
+  ); then
+    fail "finalize accepted $release_flow_main_run_state exact-main CI"
+  fi
+  [[ $(git --git-dir="$release_flow_origin" \
+    rev-parse refs/heads/release-candidates/v1.1.0) == \
+    "$release_flow_release_commit" ]] || \
+    fail "$release_flow_main_run_state main CI removed the recovery branch"
+done
+
+# Compare-and-delete cleanup must fail closed if either temporary ref moves
+# after verification. The force-with-lease rejection preserves the moved ref.
+if (
+  cd "$release_flow_finalize_repo"
+  env "${release_flow_common_env[@]}" \
+    SWIFTVLC_RELEASE_TEST_RUN_STATE=success \
+    SWIFTVLC_RELEASE_TEST_MAIN_RUN_STATE=success \
+    SWIFTVLC_RELEASE_TEST_CLEANUP_RACE=branch \
+    SWIFTVLC_RELEASE_TEST_RACE_COMMIT="$release_flow_origin_before_release" \
+    ./scripts/release.sh 1.1.0 \
+      --candidate "$release_flow_candidate" --finalize \
+      > "$release_flow_root/finalize-cleanup-branch-race.log" 2>&1
+); then
+  fail "cleanup hid a candidate-branch compare-and-delete race"
+fi
+[[ $(git --git-dir="$release_flow_origin" \
+  rev-parse refs/heads/release-candidates/v1.1.0) == \
+  "$release_flow_origin_before_release" ]] || \
+  fail "branch cleanup race deleted or overwrote the moved ref"
+git --git-dir="$release_flow_origin" update-ref \
+  refs/heads/release-candidates/v1.1.0 "$release_flow_release_commit"
+
+if (
+  cd "$release_flow_finalize_repo"
+  env "${release_flow_common_env[@]}" \
+    SWIFTVLC_RELEASE_TEST_RUN_STATE=success \
+    SWIFTVLC_RELEASE_TEST_MAIN_RUN_STATE=success \
+    SWIFTVLC_RELEASE_TEST_CLEANUP_RACE=tag \
+    SWIFTVLC_RELEASE_TEST_RACE_COMMIT="$release_flow_origin_before_release" \
+    ./scripts/release.sh 1.1.0 \
+      --candidate "$release_flow_candidate" --finalize \
+      > "$release_flow_root/finalize-cleanup-tag-race.log" 2>&1
+); then
+  fail "cleanup hid a candidate-tag compare-and-delete race"
+fi
+[[ $(git --git-dir="$release_flow_origin" \
+  rev-parse "refs/tags/$release_flow_candidate_tag") == \
+  "$release_flow_origin_before_release" ]] || \
+  fail "tag cleanup race deleted or overwrote the moved ref"
+git --git-dir="$release_flow_origin" update-ref \
+  "refs/tags/$release_flow_candidate_tag" "$release_flow_release_commit"
+
+# A clean retry verifies the immutable public artifact, exact PR merge, and
+# fresh main CI before removing only the remaining temporary ref.
+(
+  cd "$release_flow_finalize_repo"
+  env "${release_flow_common_env[@]}" \
+    SWIFTVLC_RELEASE_TEST_RUN_STATE=success \
+    SWIFTVLC_RELEASE_TEST_MAIN_RUN_STATE=success \
+    ./scripts/release.sh 1.1.0 \
+      --candidate "$release_flow_candidate" --finalize \
+      > "$release_flow_root/finalize-recovery.log"
+)
+[[ $(git --git-dir="$release_flow_origin" rev-parse refs/heads/main) == \
+  "$release_flow_merge_commit" ]] || \
+  fail "finalize recovery moved protected main"
+if git --git-dir="$release_flow_origin" rev-parse \
+    refs/heads/release-candidates/v1.1.0 >/dev/null 2>&1; then
+  fail "completed release retained its candidate branch"
+fi
+if git --git-dir="$release_flow_origin" rev-parse \
+    "refs/tags/$release_flow_candidate_tag" >/dev/null 2>&1; then
+  fail "completed release retained its non-SemVer candidate tag"
+fi
+grep -q '^SwiftVLC v1.1.0$' "$release_flow_capture/release.title" || \
+  fail "immutable final release retained candidate title"
+grep -q '^## libVLC xcframework$' "$release_flow_capture/release.notes" || \
+  fail "immutable final release retained candidate notes"
+
+# A fully completed rerun performs the same verification with no ref writes.
+release_flow_pushes_before=$(wc -l < "$release_flow_git_log" | tr -d ' ')
+(
+  cd "$release_flow_finalize_repo"
+  env "${release_flow_common_env[@]}" \
+    SWIFTVLC_RELEASE_TEST_RUN_STATE=success \
+    SWIFTVLC_RELEASE_TEST_MAIN_RUN_STATE=success \
+    ./scripts/release.sh 1.1.0 \
+      --candidate "$release_flow_candidate" --finalize \
+      > "$release_flow_root/finalize-idempotent.log"
+)
+[[ $(wc -l < "$release_flow_git_log" | tr -d ' ') == 9 ]] || \
+  fail "release flow did not use the expected leased temporary-ref writes"
+[[ $(wc -l < "$release_flow_git_log" | tr -d ' ') == \
+  "$release_flow_pushes_before" ]] || \
+  fail "completed finalize repeated a candidate or cleanup ref write"
 cd "$ROOT_DIR"
 bash -n \
   scripts/canonical-libvlc-artifact.sh \
