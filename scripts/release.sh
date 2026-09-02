@@ -3,7 +3,8 @@
 # release.sh — Strip, zip, checksum, and publish the libVLC xcframework.
 #
 # Prerequisites:
-#   - Two ./scripts/build-libvlc.sh --clean-build --all invocations, compared
+#   - Two canonical-root ./scripts/build-libvlc.sh --clean-build --all
+#     invocations, compared byte-for-byte
 #     with both provenance records retained beside Vendor/libvlc.xcframework
 #   - gh authed (gh auth login)
 #   - A completely clean, up-to-date main checkout
@@ -384,7 +385,7 @@ snapshot_release_inputs() {
 
   if [[ ! -d "$source_xcframework" ]]; then
     echo "Error: $source_xcframework not found." >&2
-    echo "  Build it first: ./scripts/build-libvlc.sh --clean-build --all" >&2
+    echo "  Build it first: ./scripts/build-libvlc.sh --build-root=/absolute/path/to/shared-native-root --clean-build --all" >&2
     exit 1
   fi
   if [[ -n "$CANDIDATE_DIR" ]]; then
@@ -729,7 +730,7 @@ assert_hits=$(strings -a "$XCFW_PATH"/*/libvlc.a 2>/dev/null \
 if [[ "${assert_hits:-0}" -gt 0 ]]; then
   echo "Error: libVLC slices were built with run-time assertions enabled." >&2
   echo "  Shipping them would re-introduce the issue #30 abort() crash." >&2
-  echo "  Rebuild without --with-asserts: ./scripts/build-libvlc.sh --clean-build --all" >&2
+  echo "  Rebuild without --with-asserts: ./scripts/build-libvlc.sh --build-root=/absolute/path/to/shared-native-root --clean-build --all" >&2
   exit 1
 fi
 
@@ -884,7 +885,7 @@ verify_artifact_provenance() {
     echo "  Required: $reproducibility" >&2
     echo "  $XCFW_PATH was built before provenance was recorded, so its inputs" >&2
     echo "  cannot be established. Rebuild with:" >&2
-    echo "    ./scripts/build-libvlc.sh --clean-build --all" >&2
+    echo "    ./scripts/build-libvlc.sh --build-root=/absolute/path/to/shared-native-root --clean-build --all" >&2
     return 1
   fi
 
@@ -901,6 +902,7 @@ verify_artifact_provenance() {
     --build-configuration-file "build-libvlc.sh=$SCRIPT_DIR/build-libvlc.sh" \
     --build-configuration-file "fix-duplicate-symbols.sh=$SCRIPT_DIR/fix-duplicate-symbols.sh" \
     --build-configuration-file "validate-libvlc-macho-metadata.py=$SCRIPT_DIR/validate-libvlc-macho-metadata.py" \
+    --build-configuration-file "verify-libvlc-build-paths.py=$SCRIPT_DIR/verify-libvlc-build-paths.py" \
     --build-configuration-file "validate-apple-assembly-metadata-patch.sh=$SCRIPT_DIR/validate-apple-assembly-metadata-patch.sh" \
     --build-configuration-file "validate-aom-nasm3-detection.sh=$SCRIPT_DIR/validate-aom-nasm3-detection.sh" \
     --build-configuration-file "validate-headless-vout-teardown.sh=$SCRIPT_DIR/validate-headless-vout-teardown.sh" \
@@ -912,7 +914,7 @@ verify_artifact_provenance() {
     --build-configuration-file "native-validator-assets.sha256=$SCRIPT_DIR/native-validator-assets.sha256" \
     --build-configuration-file "verify-native-validator-assets.py=$SCRIPT_DIR/verify-native-validator-assets.py"; then
     echo "  Rebuild so every shipped slice and input has current provenance:" >&2
-    echo "    ./scripts/build-libvlc.sh --clean-build --all" >&2
+    echo "    ./scripts/build-libvlc.sh --build-root=/absolute/path/to/shared-native-root --clean-build --all" >&2
     return 1
   fi
   if ! python3 "$SCRIPT_DIR/libvlc-provenance.py" verify-proof \

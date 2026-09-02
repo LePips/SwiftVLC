@@ -2504,6 +2504,10 @@ headless_runtime_gate = build.index(
 final_archive_mutation = build.index(
     'find "${OUTPUT_DIR}/libvlc.xcframework" -name \'*.a\' -exec xcrun ranlib -D {} \\;'
 )
+checkout_path_gate = build.index(
+    'if [ "${EXTERNAL_BUILD_ROOT}" = yes ]; then\n'
+    '    info "Verifying that the release artifact contains no checkout-local paths..."'
+)
 native_archive_contract_setup = build.index(
     'native_archive_contract_args=('
 )
@@ -2518,6 +2522,7 @@ if not (
     < headless_runtime_selection
     < headless_runtime_gate
     < final_archive_mutation
+    < checkout_path_gate
     < native_archive_contract_setup
     < native_archive_contract
     < archive_metadata_gate
@@ -2526,6 +2531,36 @@ if not (
         "exact linked native extension validation is not after the final "
         "archive mutation and before artifact metadata/provenance gates"
     )
+checkout_path_gate_region = build[
+    checkout_path_gate:native_archive_contract_setup
+]
+checkout_path_function_start = build.index(
+    'verify_checkout_path_not_embedded() {'
+)
+checkout_path_function = build[
+    checkout_path_function_start:build.index(
+        '\n}\n\ntrap release_build_locks EXIT', checkout_path_function_start
+    )
+]
+for marker in (
+    '"${SCRIPT_DIR}/verify-libvlc-build-paths.py"',
+    '--xcframework "${OUTPUT_DIR}/libvlc.xcframework"',
+    '--forbidden-path "${REPO_ROOT}"',
+):
+    if checkout_path_function.count(marker) != 1:
+        sys.exit(f"checkout-path verifier invocation is incomplete: {marker}")
+for marker in (
+    'if [ "${EXTERNAL_BUILD_ROOT}" = yes ]; then',
+    'verify_checkout_path_not_embedded',
+):
+    if checkout_path_gate_region.count(marker) != 1:
+        sys.exit(f"checkout-path gate is not ordered after archive normalization: {marker}")
+if (
+    'if [ "${CLEAN_BUILD}" = yes ] && [ "${EXTERNAL_BUILD_ROOT}" != yes ]; then'
+    not in build
+    or '--clean-build requires a canonical external --build-root' not in build
+):
+    sys.exit("clean provenance builds do not require the canonical external root")
 headless_runtime_region = build[headless_runtime_selection:final_archive_mutation]
 for marker in (
     'if [ "$headless_vout_teardown_patch_listed" = yes ] && [ "$BUILD_MACOS" = "yes" ]; then',
@@ -2567,6 +2602,7 @@ expected_configurations = {
     "native-extension-version-probe.c",
     "pip_extension_version.py",
     "validate-libvlc-macho-metadata.py",
+    "verify-libvlc-build-paths.py",
     "validate-apple-assembly-metadata-patch.sh",
     "validate-aom-nasm3-detection.sh",
     "validate-headless-vout-teardown.sh",
@@ -5173,6 +5209,7 @@ release_flow_pushes_before=$(wc -l < "$release_flow_git_log" | tr -d ' ')
   fail "completed finalize repeated a candidate or cleanup ref write"
 cd "$ROOT_DIR"
 bash -n \
+  scripts/build-libvlc.sh \
   scripts/canonical-libvlc-artifact.sh \
   scripts/check-engine-coverage.sh \
   scripts/check-qualification.sh \

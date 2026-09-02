@@ -15,14 +15,26 @@
 #   ./build-libvlc.sh --macos-only # macOS only (fastest for dev)
 #   ./build-libvlc.sh --catalyst   # Add Mac Catalyst (arm64 + x86_64)
 #   ./build-libvlc.sh --clean      # Remove build directory
-#   ./build-libvlc.sh --clean-build --all # Required when patch 0038 is selected
+#   ./build-libvlc.sh --build-root=/absolute/path --clean-build --all
+#   ./build-libvlc.sh --build-root=/absolute/path # Canonical external work root
 #   ./build-libvlc.sh --hash=abc   # Pin to a specific VLC commit
 
 set -e
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-BUILD_DIR="${SCRIPT_DIR}/.build-libvlc"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd -P)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd -P)"
+DEFAULT_BUILD_DIR="${SCRIPT_DIR}/.build-libvlc"
+BUILD_ROOT="${SCRIPT_DIR}"
+BUILD_DIR="${DEFAULT_BUILD_DIR}"
+EXTERNAL_BUILD_ROOT=no
+BUILD_ROOT_OVERRIDE=""
+BUILD_ROOT_OVERRIDE_SET=no
+BUILD_LOCK_DIR=""
+BUILD_LOCK_HELD=no
+OUTPUT_LOCK_DIR=""
+OUTPUT_LOCK_HELD=no
+BUILD_DIRECTORY_MARKER=".swiftvlc-managed-libvlc-build-v1"
+BUILD_DIRECTORY_MARKER_CONTENT="SwiftVLC managed libVLC build directory v1"
 OUTPUT_DIR="${REPO_ROOT}/Vendor"
 VLC_REPO="https://code.videolan.org/videolan/vlc.git"
 VLC_BRANCH="master"
@@ -57,6 +69,7 @@ BUILD_CATALYST=no
 # restore the asserts with --with-asserts.
 WITH_ASSERTS=no
 CLEAN_BUILD=no
+CLEAN_ONLY=no
 
 # Keep these deployment targets in sync with Package.swift.
 SWIFTVLC_MIN_IOS="18.0"
@@ -113,6 +126,178 @@ error() {
     echo "[${COLOR_RED}error${COLOR_RESET}] [$(elapsed)] $1" >&2
     exit 1
 }
+
+# A release reproducibility proof uses two different SwiftVLC checkouts, but
+# VLC and several contribs retain their absolute source/configure paths in live
+# string data. Giving both sequential builds the same external working root
+# makes that otherwise-hidden input explicit and stable. BUILD_DIR is always a
+# fixed child of the user-selected root so cleanup never targets the root
+# itself. Existing children must carry our ownership marker before deletion.
+configure_external_build_root() {
+    local requested_root="$1"
+    local canonical_root
+
+    if [ -z "${requested_root}" ]; then
+        error "--build-root requires an absolute directory path."
+    fi
+    case "${requested_root}" in
+        /*) ;;
+        *) error "--build-root must be an absolute directory path: ${requested_root}" ;;
+    esac
+    while [ "${requested_root}" != "/" ] &&
+          [ "${requested_root%/}" != "${requested_root}" ]; do
+        requested_root="${requested_root%/}"
+    done
+    if [ ! -d "${requested_root}" ]; then
+        error "External build root does not exist: ${requested_root}"
+    fi
+    canonical_root=$(cd "${requested_root}" && pwd -P)
+    if [ "${canonical_root}" != "${requested_root}" ]; then
+        error "--build-root must use its canonical physical path: ${canonical_root}"
+    fi
+    if [ "${canonical_root}" = "/" ]; then
+        error "Refusing to use the filesystem root as --build-root."
+    fi
+    case "${canonical_root}/" in
+        "${REPO_ROOT}/"*)
+            error "--build-root must be outside the SwiftVLC checkout so separate checkouts share one path."
+            ;;
+    esac
+    case "${REPO_ROOT}/" in
+        "${canonical_root}/swiftvlc-libvlc-build/"*)
+            error "Refusing an external build directory that contains the SwiftVLC checkout."
+            ;;
+    esac
+
+    BUILD_ROOT="${canonical_root}"
+    BUILD_DIR="${BUILD_ROOT}/swiftvlc-libvlc-build"
+    BUILD_LOCK_DIR="${BUILD_ROOT}/.swiftvlc-libvlc-build.lock"
+    EXTERNAL_BUILD_ROOT=yes
+}
+
+verify_managed_build_directory() {
+    if [ "${EXTERNAL_BUILD_ROOT}" != yes ]; then
+        return
+    fi
+    if [ -L "${BUILD_DIR}" ]; then
+        error "Refusing symlinked managed build directory: ${BUILD_DIR}"
+    fi
+    if [ ! -e "${BUILD_DIR}" ]; then
+        return
+    fi
+    if [ ! -d "${BUILD_DIR}" ]; then
+        error "Managed build path is not a directory: ${BUILD_DIR}"
+    fi
+    if [ -L "${BUILD_DIR}/${BUILD_DIRECTORY_MARKER}" ] ||
+       [ ! -f "${BUILD_DIR}/${BUILD_DIRECTORY_MARKER}" ]; then
+        error "Refusing unowned external build directory: ${BUILD_DIR}"
+    fi
+    if ! printf '%s\n' "${BUILD_DIRECTORY_MARKER_CONTENT}" | \
+         cmp -s - "${BUILD_DIR}/${BUILD_DIRECTORY_MARKER}"; then
+        error "Refusing unowned external build directory: ${BUILD_DIR}"
+    fi
+}
+
+release_build_root_lock() {
+    if [ "${BUILD_LOCK_HELD}" != yes ]; then
+        return
+    fi
+    if [ ! -f "${BUILD_LOCK_DIR}/owner" ] ||
+       ! grep -Fqx "invocationId=${BUILD_INVOCATION_ID}" "${BUILD_LOCK_DIR}/owner"; then
+        warn "External build-root lock ownership changed; leaving it untouched: ${BUILD_LOCK_DIR}"
+        BUILD_LOCK_HELD=no
+        return
+    fi
+    rm -f "${BUILD_LOCK_DIR}/owner"
+    if ! rmdir "${BUILD_LOCK_DIR}" 2>/dev/null; then
+        warn "Could not remove external build-root lock: ${BUILD_LOCK_DIR}"
+    fi
+    BUILD_LOCK_HELD=no
+}
+
+acquire_build_root_lock() {
+    local lock_owner=""
+    if [ "${EXTERNAL_BUILD_ROOT}" != yes ]; then
+        return
+    fi
+    if ! mkdir "${BUILD_LOCK_DIR}" 2>/dev/null; then
+        if [ -f "${BUILD_LOCK_DIR}/owner" ]; then
+            lock_owner=$(tr '\n' ' ' < "${BUILD_LOCK_DIR}/owner")
+        fi
+        error "External build root is locked; verify the owner before removing the lock: ${BUILD_LOCK_DIR}${lock_owner:+ (${lock_owner})}"
+    fi
+    BUILD_LOCK_HELD=yes
+    printf 'invocationId=%s\npid=%s\nhost=%s\nrevision=%s\nstartedAt=%s\n' \
+        "${BUILD_INVOCATION_ID}" "$$" "$(hostname)" \
+        "$(git -C "${REPO_ROOT}" rev-parse HEAD 2>/dev/null || echo unknown)" \
+        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "${BUILD_LOCK_DIR}/owner"
+}
+
+release_output_lock() {
+    if [ "${OUTPUT_LOCK_HELD}" != yes ]; then
+        return
+    fi
+    if [ ! -f "${OUTPUT_LOCK_DIR}/owner" ] ||
+       ! grep -Fqx "invocationId=${BUILD_INVOCATION_ID}" "${OUTPUT_LOCK_DIR}/owner"; then
+        warn "Checkout artifact lock ownership changed; leaving it untouched: ${OUTPUT_LOCK_DIR}"
+        OUTPUT_LOCK_HELD=no
+        return
+    fi
+    rm -f "${OUTPUT_LOCK_DIR}/owner"
+    if ! rmdir "${OUTPUT_LOCK_DIR}" 2>/dev/null; then
+        warn "Could not remove checkout artifact lock: ${OUTPUT_LOCK_DIR}"
+    fi
+    OUTPUT_LOCK_HELD=no
+}
+
+release_build_locks() {
+    release_output_lock
+    release_build_root_lock
+}
+
+acquire_output_lock() {
+    local raw_lock_path
+    local lock_parent
+    local lock_owner=""
+    raw_lock_path=$(git -C "${REPO_ROOT}" rev-parse --git-path swiftvlc-libvlc-output.lock)
+    case "${raw_lock_path}" in
+        /*) ;;
+        *) raw_lock_path="${REPO_ROOT}/${raw_lock_path}" ;;
+    esac
+    lock_parent=$(cd "$(dirname "${raw_lock_path}")" && pwd -P)
+    OUTPUT_LOCK_DIR="${lock_parent}/$(basename "${raw_lock_path}")"
+    if ! mkdir "${OUTPUT_LOCK_DIR}" 2>/dev/null; then
+        if [ -f "${OUTPUT_LOCK_DIR}/owner" ]; then
+            lock_owner=$(tr '\n' ' ' < "${OUTPUT_LOCK_DIR}/owner")
+        fi
+        error "This checkout already has a native build or cleanup in progress: ${OUTPUT_LOCK_DIR}${lock_owner:+ (${lock_owner})}"
+    fi
+    OUTPUT_LOCK_HELD=yes
+    printf 'invocationId=%s\npid=%s\nhost=%s\nrevision=%s\nstartedAt=%s\n' \
+        "${BUILD_INVOCATION_ID}" "$$" "$(hostname)" \
+        "$(git -C "${REPO_ROOT}" rev-parse HEAD 2>/dev/null || echo unknown)" \
+        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "${OUTPUT_LOCK_DIR}/owner"
+}
+
+initialize_managed_build_directory() {
+    mkdir -p "${BUILD_DIR}"
+    if [ "${EXTERNAL_BUILD_ROOT}" = yes ]; then
+        printf '%s\n' "${BUILD_DIRECTORY_MARKER_CONTENT}" > \
+            "${BUILD_DIR}/${BUILD_DIRECTORY_MARKER}"
+    fi
+}
+
+verify_checkout_path_not_embedded() {
+    if [ "${EXTERNAL_BUILD_ROOT}" != yes ]; then
+        return
+    fi
+    PYTHONDONTWRITEBYTECODE=1 python3 \
+        "${SCRIPT_DIR}/verify-libvlc-build-paths.py" \
+        --xcframework "${OUTPUT_DIR}/libvlc.xcframework" \
+        --forbidden-path "${REPO_ROOT}"
+}
+
+trap release_build_locks EXIT
 
 # --- Error trap for better failure reporting ---
 # Install only after `error` and its formatting dependencies are defined so a
@@ -204,7 +389,7 @@ check_disk_space() {
         required_gb=40
     fi
     local available_kb
-    available_kb=$(df -k "$SCRIPT_DIR" | awk 'NR==2 {print $4}')
+    available_kb=$(df -k "$BUILD_ROOT" | awk 'NR==2 {print $4}')
     local available_gb=$((available_kb / 1024 / 1024))
 
     if [ "$available_gb" -lt "$required_gb" ]; then
@@ -219,7 +404,12 @@ check_disk_space() {
 # fail closed if any writer keeps repopulating it.
 remove_build_directory() {
     local attempt
+    verify_managed_build_directory
     for attempt in 1 2 3 4 5; do
+        # An external directory is deletion-authorized only while the exact
+        # marker remains present. If another process recreates or swaps the
+        # child between attempts, fail closed instead of deleting new data.
+        verify_managed_build_directory
         if rm -rf "${BUILD_DIR}" && [ ! -e "${BUILD_DIR}" ]; then
             return
         fi
@@ -228,6 +418,28 @@ remove_build_directory() {
     done
     error "Could not completely remove build directory after 5 attempts: ${BUILD_DIR}"
 }
+
+# Resolve this before processing --clean/--clean-build: cleanup must never
+# depend on option order. Reject duplicates rather than silently selecting one
+# root and deleting another caller's managed directory.
+for arg in "$@"; do
+    case $arg in
+        --build-root=*)
+            if [ "${BUILD_ROOT_OVERRIDE_SET}" = yes ]; then
+                error "--build-root may be specified only once."
+            fi
+            BUILD_ROOT_OVERRIDE="${arg#--build-root=}"
+            BUILD_ROOT_OVERRIDE_SET=yes
+            ;;
+    esac
+done
+if [ "${BUILD_ROOT_OVERRIDE_SET}" = yes ]; then
+    configure_external_build_root "${BUILD_ROOT_OVERRIDE}"
+    acquire_build_root_lock
+    verify_managed_build_directory
+    info "Canonical external build root: ${BUILD_ROOT}"
+    info "Managed native build directory: ${BUILD_DIR}"
+fi
 
 # --- Parse arguments ---
 for arg in "$@"; do
@@ -287,16 +499,10 @@ for arg in "$@"; do
             BUILD_CATALYST=yes
             ;;
         --clean)
-            echo "Removing build directory: ${BUILD_DIR}"
-            remove_build_directory
-            echo "Done."
-            exit 0
+            CLEAN_ONLY=yes
             ;;
         --clean-build)
-            echo "Removing build directory: ${BUILD_DIR}"
-            remove_build_directory
             CLEAN_BUILD=yes
-            echo "Continuing with fresh build..."
             ;;
         --with-asserts)
             WITH_ASSERTS=yes
@@ -314,6 +520,10 @@ for arg in "$@"; do
                 echo "Error: Patches directory not found: ${PATCHES_DIR}" >&2
                 exit 1
             fi
+            ;;
+        --build-root=*)
+            # Resolved before this loop so --clean is safe regardless of
+            # argument order.
             ;;
         --help)
             cat <<HELPEOF
@@ -334,6 +544,9 @@ Platform selection:
 Build options:
   --clean            Remove the build directory and exit
   --clean-build      Remove the build directory, then build
+  --build-root=DIR   Use DIR/swiftvlc-libvlc-build as the canonical external
+                     working directory. DIR must already exist, be outside
+                     this checkout, and be identical for both release builds.
   --hash=COMMIT      Pin to a specific VLC commit (default: ${VLC_HASH})
   --patches-dir=DIR  Directory containing .patch files to apply
   --with-asserts     Enable libVLC run-time assertions (debugging only; these
@@ -348,7 +561,7 @@ Examples:
   $0 --macos-only             # Quick macOS build for development
   $0 --all                    # Full build for all platforms
   $0 --hash=abc123 --all      # Build all platforms from a specific commit
-  $0 --clean-build --all      # Fresh build for all platforms
+  $0 --build-root=/Volumes/Builds --clean-build --all
 HELPEOF
             exit 0
             ;;
@@ -359,6 +572,24 @@ HELPEOF
             ;;
     esac
 done
+
+if [ "${CLEAN_ONLY}" = yes ] && [ "${CLEAN_BUILD}" = yes ]; then
+    error "--clean and --clean-build cannot be used together."
+fi
+if [ "${CLEAN_BUILD}" = yes ] && [ "${EXTERNAL_BUILD_ROOT}" != yes ]; then
+    error "--clean-build requires a canonical external --build-root so release builds cannot depend on a checkout-local path."
+fi
+
+# Every native invocation that can delete its work tree or replace Vendor must
+# own this checkout's artifact lock. Git keeps the lock outside the tracked
+# tree and gives linked worktrees independent paths.
+acquire_output_lock
+if [ "${CLEAN_ONLY}" = yes ]; then
+    echo "Removing build directory: ${BUILD_DIR}"
+    remove_build_directory
+    echo "Done."
+    exit 0
+fi
 
 # Record the exact SwiftVLC commit whose build logic and vendored headers are
 # producing this artifact. A short or symbolic revision would allow a stale
@@ -389,6 +620,9 @@ verify_clean_swiftvlc_checkout() {
 # appear in this check.
 if [ "${CLEAN_BUILD}" = yes ]; then
     verify_clean_swiftvlc_checkout
+    echo "Removing build directory: ${BUILD_DIR}"
+    remove_build_directory
+    echo "Continuing with fresh build..."
 fi
 
 # --- Run startup checks ---
@@ -701,7 +935,7 @@ PYEOF
 
 # --- Step 1: Clone VLC source ---
 info "Setting up VLC source..."
-mkdir -p "${BUILD_DIR}"
+initialize_managed_build_directory
 cd "${BUILD_DIR}"
 
 if [ ! -d "vlc" ]; then
@@ -1971,6 +2205,15 @@ find "${OUTPUT_DIR}/libvlc.xcframework" -name '*.a' -exec strip -S {} \;
 info "Normalizing archive indexes after stripping..."
 find "${OUTPUT_DIR}/libvlc.xcframework" -name '*.a' -exec xcrun ranlib -D {} \;
 
+# The external working root is intentionally stable across clean builds, but
+# the two SwiftVLC checkout paths must remain independent. Reject any future
+# build-system change that copies a checkout-local absolute path into a shipped
+# library or header; such a leak would make the proof location-dependent again.
+if [ "${EXTERNAL_BUILD_ROOT}" = yes ]; then
+    info "Verifying that the release artifact contains no checkout-local paths..."
+    verify_checkout_path_not_embedded
+fi
+
 # Re-evaluate the manifest-owned identity across every exact archive after the
 # final archive mutation. The central gate inspects every declared architecture
 # and additionally executes its probe when a host-runnable macOS slice exists.
@@ -2034,6 +2277,7 @@ provenance_args=(
     --build-configuration-file "build-libvlc.sh=${SCRIPT_DIR}/build-libvlc.sh"
     --build-configuration-file "fix-duplicate-symbols.sh=${SCRIPT_DIR}/fix-duplicate-symbols.sh"
     --build-configuration-file "validate-libvlc-macho-metadata.py=${SCRIPT_DIR}/validate-libvlc-macho-metadata.py"
+    --build-configuration-file "verify-libvlc-build-paths.py=${SCRIPT_DIR}/verify-libvlc-build-paths.py"
     --build-configuration-file "validate-apple-assembly-metadata-patch.sh=${SCRIPT_DIR}/validate-apple-assembly-metadata-patch.sh"
     --build-configuration-file "validate-aom-nasm3-detection.sh=${SCRIPT_DIR}/validate-aom-nasm3-detection.sh"
     --build-configuration-file "validate-headless-vout-teardown.sh=${SCRIPT_DIR}/validate-headless-vout-teardown.sh"

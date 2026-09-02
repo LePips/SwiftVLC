@@ -102,6 +102,13 @@ class LibVLCFeatureContractTests(unittest.TestCase):
             build_script.write_bytes(
                 (REPO_ROOT / "scripts" / "build-libvlc.sh").read_bytes()
             )
+            subprocess.run(
+                ["git", "init", "-q"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
             build_directory = scripts / ".build-libvlc"
             (build_directory / "vlc").mkdir(parents=True)
             (build_directory / "vlc" / "stale").write_text("stale")
