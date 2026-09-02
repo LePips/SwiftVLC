@@ -16,7 +16,7 @@ index 42dacba037..b5fd8a3c2c 100644
  @required
  
  /// Called by picture in picture to get the current media duration
-@@ -126,8 +133,31 @@
+@@ -126,8 +133,38 @@
  /// controller is passed
  - (void (^)(id<VLCPictureInPictureWindowControlling>)) pictureInPictureReady;
  
@@ -42,6 +42,13 @@ index 42dacba037..b5fd8a3c2c 100644
 +/// nil when there is no pending handoff.
 +- (id<VLCPictureInPictureWindowControlling>)
 +    takePreservedPictureInPictureWindowController;
++
++/// Returns the retained controller and reports whether this output was
++/// displaced by a newer handoff. A superseded output must not create a fresh
++/// controller when the returned value is nil.
++- (id<VLCPictureInPictureWindowControlling>)
++    takePreservedPictureInPictureWindowControllerWasSuperseded:
++        (BOOL *)wasSuperseded;
 +
 +/// Reports that the native handoff bound expired and the retained controller
 +/// is about to close. Implementations must discard any matching handoff.
@@ -278,7 +285,7 @@ index 68dd7cc369..ab23e0a149 100644
      }
      
      return VLC_SUCCESS;
-@@ -375,9 +474,26 @@ static int OpenController( pip_controller_t *pipcontroller )
+@@ -375,9 +474,39 @@ static int OpenController( pip_controller_t *pipcontroller )
      pipcontroller->ops = &ops;
  
      if (@available(macOS 12.0, iOS 15.0, tvos 15.0, *)) {
@@ -289,18 +296,31 @@ index 68dd7cc369..ab23e0a149 100644
 +            (__bridge id)var_InheritAddress(pipcontroller,
 +                                             "drawable-nsobject");
 +        VLCPictureInPictureController *sys = nil;
++        BOOL handoffWasSuperseded = NO;
++        id preserved = nil;
 +        if ([drawable conformsToProtocol:
-+                @protocol(VLCPictureInPictureDrawable)] &&
-+            [drawable respondsToSelector:
-+                @selector(takePreservedPictureInPictureWindowController)]) {
-+            id preserved =
-+                [drawable takePreservedPictureInPictureWindowController];
++                @protocol(VLCPictureInPictureDrawable)]) {
++            if ([drawable respondsToSelector:@selector(
++                    takePreservedPictureInPictureWindowControllerWasSuperseded:)]) {
++                preserved = [drawable
++                    takePreservedPictureInPictureWindowControllerWasSuperseded:
++                        &handoffWasSuperseded];
++            } else if ([drawable respondsToSelector:
++                    @selector(takePreservedPictureInPictureWindowController)]) {
++                // Compatibility with SwiftVLC builds carrying the original
++                // continuity hook without the superseded outcome.
++                preserved =
++                    [drawable takePreservedPictureInPictureWindowController];
++            }
 +            if ([preserved isKindOfClass:
 +                    [VLCPictureInPictureController class]]) {
 +                sys = preserved;
 +                [sys rebindToPipController:pipcontroller];
 +            }
 +        }
++
++        if (handoffWasSuperseded)
++            return VLC_EGENERIC;
 +
 +        if (sys == nil)
 +            sys = [[VLCPictureInPictureController alloc]

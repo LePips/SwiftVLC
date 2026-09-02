@@ -503,6 +503,34 @@ extension Integration {
     }
 
     @Test
+    func `skip interval conversion honors exact pinned VLC millisecond boundaries`() {
+      #expect(
+        PiPController.skipOffsetMilliseconds(CMTime(
+          value: LibVLCTimeMilliseconds.minimum,
+          timescale: 1000
+        )) == LibVLCTimeMilliseconds.minimum
+      )
+      #expect(
+        PiPController.skipOffsetMilliseconds(CMTime(
+          value: LibVLCTimeMilliseconds.maximum,
+          timescale: 1000
+        )) == LibVLCTimeMilliseconds.maximum
+      )
+      #expect(
+        PiPController.skipOffsetMilliseconds(CMTime(
+          value: LibVLCTimeMilliseconds.minimum - 1,
+          timescale: 1000
+        )) == nil
+      )
+      #expect(
+        PiPController.skipOffsetMilliseconds(CMTime(
+          value: LibVLCTimeMilliseconds.maximum + 1,
+          timescale: 1000
+        )) == nil
+      )
+    }
+
+    @Test
     func `skip target arithmetic saturates before timeline clamp`() {
       #expect(
         PiPController.clampedSkipTargetMilliseconds(

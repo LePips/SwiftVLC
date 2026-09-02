@@ -18,6 +18,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from report_validation import atomic_write_json  # noqa: E402
+
 
 class RangeNotSatisfiable(ValueError):
     pass
@@ -25,6 +28,8 @@ class RangeNotSatisfiable(ValueError):
 
 TIMEBASE_VOD_SECONDS = 14_400
 ADAPTIVE_SEGMENT_SECONDS = 2
+PROGRESSIVE_COMMAND_ORIGIN_HEADER = "X-SwiftVLC-Progressive-Command-Origin"
+PROGRESSIVE_COMMAND_ORIGIN = "candidate-app-before-strict-request-seek-v1"
 
 
 class FixtureHandler(BaseHTTPRequestHandler):
@@ -37,6 +42,9 @@ class FixtureHandler(BaseHTTPRequestHandler):
         self.response_status = HTTPStatus.OK
         self.response_content_range: str | None = None
         transferred = 0
+        progressive_request: dict | None = None
+        self.progressive_transferred = 0
+        self.progressive_completed = False
         try:
             route = unquote(urlsplit(self.path).path)
             if route == "/healthz":
@@ -73,9 +81,7 @@ class FixtureHandler(BaseHTTPRequestHandler):
                 transferred = len(payload)
                 return
 
-            match = re.fullmatch(
-                r"/fault/gated-close/([A-Za-z0-9._-]+)/(.+)", route
-            )
+            match = re.fullmatch(r"/fault/gated-close/([A-Za-z0-9._-]+)/(.+)", route)
             if match:
                 token = match.group(1)
                 if self.server.close_generation(token) > 0:
@@ -114,6 +120,50 @@ class FixtureHandler(BaseHTTPRequestHandler):
                     self.server.complete_adaptive_run(match.group(1)), sort_keys=True
                 ).encode()
                 transferred = self._serve_bytes(payload, "application/json")
+                return
+
+            match = re.fullmatch(
+                r"/progressive/([A-Za-z0-9._-]+)/(range|no-range)/command", route
+            )
+            if match:
+                payload = json.dumps(
+                    self.server.mark_progressive_command(
+                        *match.groups(),
+                        origin=self.headers.get(PROGRESSIVE_COMMAND_ORIGIN_HEADER),
+                    ),
+                    sort_keys=True,
+                ).encode()
+                transferred = self._serve_bytes(payload, "application/json")
+                return
+
+            match = re.fullmatch(r"/progressive/([A-Za-z0-9._-]+)/transcript", route)
+            if match:
+                payload = json.dumps(
+                    self.server.progressive_transcript(match.group(1)),
+                    sort_keys=True,
+                ).encode()
+                transferred = self._serve_bytes(payload, "application/json")
+                return
+
+            match = re.fullmatch(
+                r"/progressive/([A-Za-z0-9._-]+)/(range|no-range)/media\.mp4",
+                route,
+            )
+            if match:
+                token, mode = match.groups()
+                path = self._safe_path("oracles/progressive-range.mp4")
+                progressive_request = self.server.begin_progressive_request(
+                    token,
+                    mode,
+                    route,
+                    self.headers.get("Range"),
+                )
+                transferred = self._serve_progressive_file(
+                    path,
+                    range_capable=mode == "range",
+                    event=progressive_request,
+                )
+                self.progressive_completed = True
                 return
 
             match = re.fullmatch(
@@ -156,9 +206,7 @@ class FixtureHandler(BaseHTTPRequestHandler):
                     self.response_status = status
                     self.send_error(status, "deterministic adaptive retry")
                     return
-                path = self._safe_path(
-                    f"hls/soak/{container}/{variant}/{filename}"
-                )
+                path = self._safe_path(f"hls/soak/{container}/{variant}/{filename}")
                 transferred = self._serve_file(path)
                 self.server.record_adaptive_asset(
                     token, mode, variant, filename, recovered=True
@@ -200,8 +248,11 @@ class FixtureHandler(BaseHTTPRequestHandler):
             self.response_status = status
             self.send_error(status)
         except (BrokenPipeError, ConnectionResetError):
-            status = HTTPStatus.PARTIAL_CONTENT
-            self.response_status = status
+            if progressive_request is not None:
+                transferred = self.progressive_transferred
+            else:
+                status = HTTPStatus.PARTIAL_CONTENT
+                self.response_status = status
         except (FileNotFoundError, IsADirectoryError):
             status = HTTPStatus.NOT_FOUND
             self.response_status = status
@@ -212,6 +263,20 @@ class FixtureHandler(BaseHTTPRequestHandler):
             self.send_error(status, str(error))
         finally:
             status = self.response_status
+            if progressive_request is not None:
+                self.server.finish_progressive_request(
+                    progressive_request,
+                    response_status=int(status),
+                    response_content_range=self.response_content_range,
+                    accept_ranges=(
+                        "bytes" if progressive_request["mode"] == "range" else None
+                    ),
+                    response_content_length=getattr(
+                        self, "progressive_response_content_length", None
+                    ),
+                    transferred_bytes=self.progressive_transferred,
+                    completed=self.progressive_completed,
+                )
             self.server.record(
                 {
                     "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -257,18 +322,31 @@ class FixtureHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", content_type)
         self.send_header("Cache-Control", "no-store")
         self.send_header("Connection", "close")
+        if close_token:
+            # A close-delimited HTTP body ends successfully when the socket
+            # closes, so it cannot model source loss. Chunked framing makes a
+            # close without the terminal zero-length chunk unambiguously
+            # incomplete to the media client.
+            self.send_header("Transfer-Encoding", "chunked")
         self.end_headers()
         transferred = 0
         observed_stall_generation = 0
         if stall_token:
-            observed_stall_generation, triggered_at = self.server.stall_state(stall_token)
+            observed_stall_generation, triggered_at = self.server.stall_state(
+                stall_token
+            )
             remaining = triggered_at + stall_seconds - time.monotonic()
             if observed_stall_generation > 0 and remaining > 0:
                 time.sleep(remaining)
         while True:
             with path.open("rb") as source:
                 while chunk := source.read(self.server.chunk_size):
-                    self.wfile.write(chunk)
+                    if close_token:
+                        self.wfile.write(f"{len(chunk):X}\r\n".encode())
+                        self.wfile.write(chunk)
+                        self.wfile.write(b"\r\n")
+                    else:
+                        self.wfile.write(chunk)
                     self.wfile.flush()
                     transferred += len(chunk)
                     if stall_token:
@@ -299,10 +377,15 @@ class FixtureHandler(BaseHTTPRequestHandler):
             self.end_headers()
             return 0
         length = end - start + 1
-        advertised_length = length if close_after is None else min(length, close_after + 1)
+        advertised_length = (
+            length if close_after is None else min(length, close_after + 1)
+        )
         self.response_status = HTTPStatus.PARTIAL_CONTENT if partial else HTTPStatus.OK
         self.send_response(self.response_status)
-        self.send_header("Content-Type", mimetypes.guess_type(path.name)[0] or "application/octet-stream")
+        self.send_header(
+            "Content-Type",
+            mimetypes.guess_type(path.name)[0] or "application/octet-stream",
+        )
         self.send_header("Accept-Ranges", "bytes")
         self.send_header("Content-Length", str(length))
         if partial:
@@ -333,6 +416,65 @@ class FixtureHandler(BaseHTTPRequestHandler):
                     stalled = True
                     time.sleep(stall_seconds)
         return transferred
+
+    def _serve_progressive_file(
+        self, path: Path, *, range_capable: bool, event: dict
+    ) -> int:
+        """Serve the large seek oracle with deterministic bounded throughput.
+
+        Range mode implements RFC byte ranges. No-Range mode deliberately
+        ignores a Range request, returns a complete 200 response, and omits
+        Accept-Ranges so VLC's HTTP access reports the source as non-seekable.
+        """
+
+        size = path.stat().st_size
+        if range_capable:
+            try:
+                start, end, partial = self._range(size)
+            except RangeNotSatisfiable:
+                self.response_status = HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE
+                self.response_content_range = f"bytes */{size}"
+                self.progressive_response_content_length = 0
+                self.send_response(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
+                self.send_header("Accept-Ranges", "bytes")
+                self.send_header("Content-Range", self.response_content_range)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return 0
+        else:
+            start, end, partial = 0, size - 1, False
+
+        length = end - start + 1
+        self.response_status = HTTPStatus.PARTIAL_CONTENT if partial else HTTPStatus.OK
+        self.progressive_response_content_length = length
+        self.send_response(self.response_status)
+        self.send_header("Content-Type", "video/mp4")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(length))
+        if range_capable:
+            self.send_header("Accept-Ranges", "bytes")
+        if partial:
+            self.response_content_range = f"bytes {start}-{end}/{size}"
+            self.send_header("Content-Range", self.response_content_range)
+        self.end_headers()
+
+        with path.open("rb") as source:
+            source.seek(start)
+            remaining = length
+            while remaining:
+                chunk = source.read(min(self.server.chunk_size, remaining))
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+                self.wfile.flush()
+                self.progressive_transferred += len(chunk)
+                self.server.update_progressive_request_transfer(
+                    event, self.progressive_transferred
+                )
+                remaining -= len(chunk)
+                if self.server.chunk_delay:
+                    time.sleep(self.server.chunk_delay)
+        return self.progressive_transferred
 
     def _range(self, size: int) -> tuple[int, int, bool]:
         header = self.headers.get("Range")
@@ -369,11 +511,17 @@ class FixtureHTTPServer(ThreadingHTTPServer):
         chunk_delay: float,
         verbose: bool,
     ) -> None:
+        # TCPServer.__init__ invokes the overridden server_close() when bind or
+        # activation fails. Establish the close state first so the original
+        # socket error survives that cleanup path instead of being masked by a
+        # partially initialized FixtureHTTPServer.
+        self.request_log = request_log
+        self._request_log_lock = threading.Lock()
+        self._accepts_request_log_writes = True
         if ":" in address[0]:
             self.address_family = socket.AF_INET6
         super().__init__(address, FixtureHandler)
         self.root = root.resolve()
-        self.request_log = request_log
         self.chunk_size = chunk_size
         self.chunk_delay = chunk_delay
         self.verbose = verbose
@@ -386,6 +534,137 @@ class FixtureHTTPServer(ThreadingHTTPServer):
         self._adaptive_runs: dict[str, dict] = {}
         self._adaptive_started_at: dict[tuple[str, str, str], float] = {}
         self._adaptive_retry_failures: set[tuple[str, str, str, str]] = set()
+        self._progressive_lock = threading.Lock()
+        self._progressive_runs: dict[str, dict] = {}
+
+    def _progressive_state(self, token: str) -> dict:
+        return self._progressive_runs.setdefault(
+            token,
+            {
+                "nextSequence": 1,
+                "commandedModes": set(),
+                "events": [],
+            },
+        )
+
+    def begin_progressive_request(
+        self,
+        token: str,
+        mode: str,
+        path: str,
+        request_range: str | None,
+    ) -> dict:
+        with self._progressive_lock:
+            state = self._progressive_state(token)
+            sequence = state["nextSequence"]
+            state["nextSequence"] += 1
+            event = {
+                "kind": "media-request",
+                "sequence": sequence,
+                "token": token,
+                "mode": mode,
+                "phase": (
+                    "post-command" if mode in state["commandedModes"] else "pre-command"
+                ),
+                "method": "GET",
+                "path": path,
+                "fixtureRelativePath": "oracles/progressive-range.mp4",
+                "requestRange": request_range,
+                "responseStatus": None,
+                "responseContentRange": None,
+                "acceptRanges": None,
+                "responseContentLength": None,
+                "transferredBytes": 0,
+                "transferredBytesAtCommand": None,
+                "completed": False,
+                "startedAtUTC": datetime.now(timezone.utc).isoformat(),
+                "completedAtUTC": None,
+            }
+            state["events"].append(event)
+            return event
+
+    def finish_progressive_request(
+        self,
+        event: dict,
+        *,
+        response_status: int,
+        response_content_range: str | None,
+        accept_ranges: str | None,
+        response_content_length: int | None,
+        transferred_bytes: int,
+        completed: bool,
+    ) -> None:
+        with self._progressive_lock:
+            event.update(
+                {
+                    "responseStatus": response_status,
+                    "responseContentRange": response_content_range,
+                    "acceptRanges": accept_ranges,
+                    "responseContentLength": response_content_length,
+                    "transferredBytes": transferred_bytes,
+                    "completed": completed,
+                    "completedAtUTC": datetime.now(timezone.utc).isoformat(),
+                }
+            )
+
+    def mark_progressive_command(
+        self, token: str, mode: str, *, origin: str | None
+    ) -> dict:
+        with self._progressive_lock:
+            if origin != PROGRESSIVE_COMMAND_ORIGIN:
+                raise ValueError("progressive command marker has an invalid origin")
+            state = self._progressive_state(token)
+            if mode in state["commandedModes"]:
+                raise ValueError(
+                    f"progressive command marker already exists for {mode}"
+                )
+            sequence = state["nextSequence"]
+            state["nextSequence"] += 1
+            state["commandedModes"].add(mode)
+            precommand = [
+                event
+                for event in state["events"]
+                if event.get("kind") == "media-request"
+                and event.get("mode") == mode
+                and event.get("phase") == "pre-command"
+            ]
+            for event in precommand:
+                event["transferredBytesAtCommand"] = event["transferredBytes"]
+            event = {
+                "kind": "command-marker",
+                "sequence": sequence,
+                "token": token,
+                "mode": mode,
+                "phase": "post-command",
+                "origin": origin,
+                "precommandRequestCount": len(precommand),
+                "precommandTransferredBytes": sum(
+                    item["transferredBytesAtCommand"] for item in precommand
+                ),
+                "markedAtUTC": datetime.now(timezone.utc).isoformat(),
+            }
+            state["events"].append(event)
+            return event
+
+    def update_progressive_request_transfer(
+        self, event: dict, transferred_bytes: int
+    ) -> None:
+        with self._progressive_lock:
+            event["transferredBytes"] = transferred_bytes
+
+    def progressive_transcript(self, token: str) -> dict:
+        path = self.root / "oracles" / "progressive-range.mp4"
+        if not path.is_file():
+            raise FileNotFoundError(path)
+        with self._progressive_lock:
+            state = self._progressive_state(token)
+            return {
+                "formatVersion": 1,
+                "token": token,
+                "fixtureRelativePath": "oracles/progressive-range.mp4",
+                "fixtureBytes": path.stat().st_size,
+                "events": json.loads(json.dumps(state["events"])),
+            }
 
     @staticmethod
     def adaptive_container(mode: str) -> str:
@@ -507,10 +786,7 @@ class FixtureHTTPServer(ThreadingHTTPServer):
             indices = range(len(segments))
 
         discontinuity = (
-            playlist_type == "event"
-            or is_live
-            or is_subtitle_vod
-            or is_timebase_vod
+            playlist_type == "event" or is_live or is_subtitle_vod or is_timebase_vod
         )
         lines = [
             "#EXTM3U",
@@ -529,19 +805,21 @@ class FixtureHTTPServer(ThreadingHTTPServer):
         if is_live:
             discontinuities_before_window = 0
             if media_sequence > midpoint:
-                discontinuities_before_window = (
-                    1 + (media_sequence - 1 - midpoint) // len(segments)
-                )
+                discontinuities_before_window = 1 + (
+                    media_sequence - 1 - midpoint
+                ) // len(segments)
             lines.append(
                 f"#EXT-X-DISCONTINUITY-SEQUENCE:{discontinuities_before_window}"
             )
         for offset, sequence in enumerate(indices):
             should_discontinue = (
-                playlist_type == "event" and offset == midpoint
-            ) or (is_live and sequence % len(segments) == midpoint) or (
-                (is_subtitle_vod or is_timebase_vod)
-                and offset > 0
-                and sequence % len(segments) == 0
+                (playlist_type == "event" and offset == midpoint)
+                or (is_live and sequence % len(segments) == midpoint)
+                or (
+                    (is_subtitle_vod or is_timebase_vod)
+                    and offset > 0
+                    and sequence % len(segments) == 0
+                )
             )
             if should_discontinue:
                 lines.append("#EXT-X-DISCONTINUITY")
@@ -586,22 +864,32 @@ class FixtureHTTPServer(ThreadingHTTPServer):
     ) -> None:
         with self._adaptive_lock:
             state = self._adaptive_state(token)
-            if mode != "retry-ts" or (token, mode, variant, filename) not in self._adaptive_retry_failures:
+            if (
+                mode != "retry-ts"
+                or (token, mode, variant, filename) not in self._adaptive_retry_failures
+            ):
                 state["segmentRequests"] += 1
             state["successfulSegments"] += 1
             state["successfulSegmentsByVariant"][variant] += 1
             state["variants"].add(variant)
             self._record_adaptive_variant(state, mode, variant)
-            if recovered and (token, mode, variant, filename) in self._adaptive_retry_failures:
+            if (
+                recovered
+                and (token, mode, variant, filename) in self._adaptive_retry_failures
+            ):
                 state["retryRecoveries"] += 1
 
     def adaptive_metrics(self, token: str) -> dict:
         with self._adaptive_lock:
             state = self._adaptive_state(token)
             return {
-                key: sorted(value) if isinstance(value, set) else value
-                for key, value in state.items()
-                if key != "lastVariantByMode"
+                "formatVersion": 1,
+                "token": token,
+                **{
+                    key: sorted(value) if isinstance(value, set) else value
+                    for key, value in state.items()
+                    if key != "lastVariantByMode"
+                },
             }
 
     @staticmethod
@@ -656,11 +944,22 @@ class FixtureHTTPServer(ThreadingHTTPServer):
             return
         super().handle_error(request, client_address)
 
+    def server_close(self) -> None:
+        super().server_close()
+        # Request handlers are intentionally daemon threads, so the standard
+        # ThreadingHTTPServer close does not join them. Serialize this boundary
+        # with record(): any write already in progress finishes before close
+        # returns, while a handler that finishes later observes the closed log
+        # and cannot recreate it after its owner removes the fixture directory.
+        with self._request_log_lock:
+            self._accepts_request_log_writes = False
+
     def record(self, value: dict) -> None:
-        if self.request_log is None:
-            return
-        with self.request_log.open("a") as output:
-            output.write(json.dumps(value, sort_keys=True) + "\n")
+        with self._request_log_lock:
+            if self.request_log is None or not self._accepts_request_log_writes:
+                return
+            with self.request_log.open("a") as output:
+                output.write(json.dumps(value, sort_keys=True) + "\n")
 
 
 def lan_address() -> str:
@@ -704,7 +1003,7 @@ def main() -> None:
         "baseURL": advertised_url(advertised, server.server_port),
     }
     if args.ready_file:
-        args.ready_file.write_text(json.dumps(ready, indent=2, sort_keys=True) + "\n")
+        atomic_write_json(args.ready_file, ready)
     print(json.dumps(ready, sort_keys=True), flush=True)
     server.serve_forever()
 

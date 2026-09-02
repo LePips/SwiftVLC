@@ -9,9 +9,8 @@ public enum PiPStopReason: Sendable, Equatable {
   /// The user dismissed the PiP window with its close (X) affordance.
   ///
   /// Reported when SwiftVLC owns or successfully bridges the full
-  /// `AVPictureInPictureController` delegate: a stop with no restore request,
-  /// failure, programmatic ``PiPController/stop()``, controller replacement,
-  /// or end-of-media is attributed to the close button.
+  /// `AVPictureInPictureController` delegate and no restore request, failure,
+  /// end-of-media, or compatibility fallback explains the stop.
   case userClosed
 
   /// The user tapped the PiP window's restore ("return to app")
@@ -25,18 +24,71 @@ public enum PiPStopReason: Sendable, Equatable {
   /// Playback reached the end of the media while PiP was up.
   case mediaEnded
 
-  /// The application explicitly called ``PiPController/stop()``.
-  case programmatic
-
-  /// libVLC replaced the native AVKit controller while PiP was active. This
-  /// includes native-handle replacement during a renderer recast or player
-  /// rebuild.
-  case controllerReplaced
-
-  /// No discriminating signal was available. This is retained as the explicit
-  /// fallback for unsupported native libVLC delegate revisions; supported
-  /// native and direct AVKit paths report an authoritative reason.
+  /// No version-1-compatible reason describes the stop. This includes an
+  /// explicit ``PiPController/stop()`` call, native-controller replacement,
+  /// and unsupported native libVLC delegate revisions. The attributed
+  /// ``PiPController/pipEventEnvelopes`` stream exposes the more precise
+  /// ``PiPEventEnvelope/stopCause`` when it is known.
   case unknown
+}
+
+/// An extensible cause for a Picture-in-Picture stop.
+///
+/// ``PiPStopReason`` is a version-1 compatibility enum: adding cases would
+/// break exhaustive client switches. The attributed event stream therefore
+/// carries this raw-representable value alongside its compatibility event.
+/// Applications should compare against the known static values and retain a
+/// fallback for values introduced by a future SwiftVLC release.
+public struct PiPStopCause: RawRepresentable, Hashable, Sendable, CustomStringConvertible {
+  /// Stable textual identity for the cause.
+  public let rawValue: String
+
+  /// Creates a stop cause from its textual identity.
+  public init(rawValue: String) {
+    self.rawValue = rawValue
+  }
+
+  /// The user dismissed the PiP window with its close affordance.
+  public static let userClosed = Self(rawValue: "userClosed")
+  /// The user requested restoration of the application's playback UI.
+  public static let restoreRequested = Self(rawValue: "restoreRequested")
+  /// PiP start, playback, or rendering failed.
+  public static let failure = Self(rawValue: "failure")
+  /// Playback reached the natural end of the media.
+  public static let mediaEnded = Self(rawValue: "mediaEnded")
+  /// The application explicitly called ``PiPController/stop()``.
+  public static let programmatic = Self(rawValue: "programmatic")
+  /// libVLC replaced the native AVKit controller while PiP was active.
+  public static let controllerReplaced = Self(rawValue: "controllerReplaced")
+  /// No discriminating signal was available.
+  public static let unknown = Self(rawValue: "unknown")
+
+  public var description: String {
+    rawValue
+  }
+}
+
+extension PiPStopCause {
+  var compatibilityReason: PiPStopReason {
+    switch self {
+    case .userClosed: .userClosed
+    case .restoreRequested: .restoreRequested
+    case .failure: .failure
+    case .mediaEnded: .mediaEnded
+    case .programmatic, .controllerReplaced, .unknown: .unknown
+    default: .unknown
+    }
+  }
+
+  init(compatibilityReason: PiPStopReason) {
+    self = switch compatibilityReason {
+    case .userClosed: .userClosed
+    case .restoreRequested: .restoreRequested
+    case .failure: .failure
+    case .mediaEnded: .mediaEnded
+    case .unknown: .unknown
+    }
+  }
 }
 
 /// A Picture-in-Picture lifecycle transition, delivered on
@@ -62,6 +114,17 @@ public enum PiPEvent: Sendable {
   case failedToStart(any Error)
 }
 
+extension PiPEvent {
+  var compatibilityStopCause: PiPStopCause? {
+    switch self {
+    case .willStop(let reason), .didStop(let reason):
+      PiPStopCause(compatibilityReason: reason)
+    case .willStart, .didStart, .failedToStart:
+      nil
+    }
+  }
+}
+
 /// A Picture-in-Picture lifecycle transition paired with the controller and
 /// media generations that own it.
 ///
@@ -76,6 +139,14 @@ public enum PiPEvent: Sendable {
 public struct PiPEventEnvelope: Sendable {
   /// The lifecycle transition reported by AVKit or the native backend.
   public let event: PiPEvent
+  /// The precise stop cause for a `willStop` or `didStop` event.
+  ///
+  /// This is `nil` for start and start-failure events. It can be more specific
+  /// than the version-1-compatible reason carried by ``event``; for example,
+  /// programmatic and controller-replacement stops use `.unknown` there while
+  /// this property reports ``PiPStopCause/programmatic`` or
+  /// ``PiPStopCause/controllerReplaced``.
+  public let stopCause: PiPStopCause?
   /// Media session active when the PiP lifecycle began.
   public let mediaGeneration: PlaybackGeneration
   /// AVKit controller or native-backend generation that emitted the event.
@@ -94,7 +165,7 @@ extension PiPController {
 
   struct FailedPiPLifecycle {
     let attribution: PiPLifecycleAttribution
-    let stopReason: PiPStopReason
+    let stopReason: PiPStopCause
     var willStopObserved = false
   }
 
@@ -123,34 +194,35 @@ extension PiPController {
   /// forwarding bridge in front of libVLC's AVKit delegate. The original
   /// delegate still receives every callback, while this stream receives the
   /// complete ordered lifecycle, underlying start failure, restore request,
-  /// and authoritative stop reason. If a future libVLC revision exposes no
+  /// and authoritative stop cause. If a future libVLC revision exposes no
   /// delegate to bridge, SwiftVLC logs the incompatibility and retains the
-  /// active-state fallback with ``PiPStopReason/unknown``.
+  /// active-state fallback with ``PiPStopCause/unknown``.
   ///
   /// ## Stop-reason resolution
   ///
-  /// The reason attached to ``PiPEvent/didStop(reason:)`` is resolved
-  /// in this order:
+  /// ``PiPEventEnvelope/stopCause`` is resolved in this order:
   ///
   /// 1. The **first discriminating signal** observed for the in-flight
   ///    stop wins and is never overwritten: the restore callback
-  ///    records ``PiPStopReason/restoreRequested``, a start or playback failure
-  ///    records ``PiPStopReason/failure``, a programmatic ``stop()`` records
-  ///    ``PiPStopReason/programmatic``, and native replacement records
-  ///    ``PiPStopReason/controllerReplaced``. In practice these
+  ///    records ``PiPStopCause/restoreRequested``, a start or playback failure
+  ///    records ``PiPStopCause/failure``, a programmatic ``stop()`` records
+  ///    ``PiPStopCause/programmatic``, and native replacement records
+  ///    ``PiPStopCause/controllerReplaced``. In practice these
   ///    signals are mutually exclusive, which yields the effective
   ///    precedence `restoreRequested` > `failure` over the fallbacks
   ///    below.
   /// 2. Otherwise, if the player reported a natural end of media
-  ///    (``Player/didReachEnd``), the stop is ``PiPStopReason/mediaEnded``.
-  /// 3. Otherwise ``PiPStopReason/userClosed`` — on the sample-buffer
+  ///    (``Player/didReachEnd``), the stop is ``PiPStopCause/mediaEnded``.
+  /// 3. Otherwise ``PiPStopCause/userClosed`` — on the sample-buffer
   ///    path the close (X) button is the only remaining cause.
   ///
-  /// ``PiPEvent/willStop(reason:)`` carries the best-known reason at
+  /// ``PiPEventEnvelope/stopCause`` carries the best-known cause at
   /// emission time. AVKit guarantees the restore callback completes
   /// before the stop finishes (so `didStop` always sees it) but does
-  /// not document its order relative to `willStop`; treat `didStop`'s
-  /// reason as authoritative.
+  /// not document its order relative to `willStop`; treat the `didStop`
+  /// envelope's cause as authoritative. The compatibility ``PiPEvent`` maps
+  /// programmatic, controller-replacement, and future causes to
+  /// ``PiPStopReason/unknown``.
   public var pipEvents: AsyncStream<PiPEvent> {
     pipEventBroadcaster.subscribe(policy: .unbounded)
   }
@@ -158,7 +230,8 @@ extension PiPController {
   /// Lossless PiP lifecycle events carrying controller and media identity.
   ///
   /// Prefer this stream when work can remain queued across a player media
-  /// change or an AVKit backend-controller replacement. Each access returns an
+  /// change or an AVKit backend-controller replacement, or when the precise
+  /// extensible ``PiPEventEnvelope/stopCause`` matters. Each access returns an
   /// independent unbounded stream, and streams finish when this controller
   /// deinits, matching ``pipEvents``.
   public var pipEventEnvelopes: AsyncStream<PiPEventEnvelope> {
@@ -170,6 +243,7 @@ extension PiPController {
   /// start, or by the first callback for a system-initiated start.
   func publishPiPEvent(
     _ event: PiPEvent,
+    stopCause: PiPStopCause? = nil,
     mediaGeneration mediaGenerationOverride: PlaybackGeneration? = nil
   ) {
     let attribution: PiPLifecycleAttribution
@@ -260,6 +334,7 @@ extension PiPController {
 
     let envelope = PiPEventEnvelope(
       event: event,
+      stopCause: stopCause ?? event.compatibilityStopCause,
       mediaGeneration: attribution.mediaGeneration,
       controllerGeneration: attribution.controllerGeneration
     )
@@ -287,12 +362,14 @@ extension PiPController {
   /// controller generation.
   func publishTransferredNativePiPEvent(
     _ event: PiPEvent,
+    stopCause: PiPStopCause? = nil,
     mediaGeneration: PlaybackGeneration?
   ) {
     let attribution = makePiPLifecycleAttribution(mediaGeneration: mediaGeneration)
     pipEventBroadcaster.broadcast(event)
     pipEventEnvelopeBroadcaster.broadcast(PiPEventEnvelope(
       event: event,
+      stopCause: stopCause ?? event.compatibilityStopCause,
       mediaGeneration: attribution.mediaGeneration,
       controllerGeneration: attribution.controllerGeneration
     ))
@@ -406,7 +483,7 @@ extension PiPController {
   /// `willStop` remains queued until its matching `didStop` arrives.
   private func recordFailedPiPLifecycle(
     attribution: PiPLifecycleAttribution,
-    stopReason: PiPStopReason
+    stopReason: PiPStopCause
   ) {
     failedPiPLifecycles.removeAll {
       $0.attribution.sequence < attribution.sequence && !$0.willStopObserved
@@ -496,7 +573,7 @@ extension PiPController {
   /// Records the best-known reason for the in-flight stop. First
   /// discriminating signal wins; later signals never overwrite it (see
   /// ``pipEvents`` for the resulting precedence).
-  func notePendingStopReason(_ reason: PiPStopReason) {
+  func notePendingStopReason(_ reason: PiPStopCause) {
     guard pendingStopReason == nil else { return }
     pendingStopReason = reason
   }
@@ -507,7 +584,7 @@ extension PiPController {
   /// reason, natural end of media, or the user's close affordance.
   func resolveStopReason(
     mediaGeneration: PlaybackGeneration? = nil
-  ) -> PiPStopReason {
+  ) -> PiPStopCause {
     if failedLifecycleOwnsNextStop, let failedPiPLifecycle = failedPiPLifecycles.first {
       return failedPiPLifecycle.stopReason
     }
@@ -526,7 +603,7 @@ extension PiPController {
   /// an active retry during that delay.
   func resolveWillStopReason(
     mediaGeneration: PlaybackGeneration? = nil
-  ) -> PiPStopReason {
+  ) -> PiPStopCause {
     if let failedIndex = failedLifecycleIndexOwningNextWillStop {
       return failedPiPLifecycles[failedIndex].stopReason
     }
@@ -545,7 +622,7 @@ extension PiPController {
   /// can remain `.error` until libVLC publishes its next transition.
   private func terminalStopReason(
     for mediaGeneration: PlaybackGeneration?
-  ) -> PiPStopReason? {
+  ) -> PiPStopCause? {
     let generation = mediaGeneration
       ?? pipLifecycleAttribution?.mediaGeneration
       ?? player.generation

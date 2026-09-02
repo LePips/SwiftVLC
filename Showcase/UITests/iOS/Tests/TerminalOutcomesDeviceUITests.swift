@@ -128,8 +128,17 @@ final class TerminalOutcomesDeviceUITests: ShowcaseIOSTestCase {
     reveal(run)
     XCTAssertTrue(run.isEnabled)
     run.tap()
-    waitForPrefix(result, prefix: "pass:", timeout: 120)
-    XCTAssertFalse(error.exists, "Terminal action \(action) failed: \(error.label)")
+    guard waitForCompletion(result, timeout: 120) else {
+      throw TerminalOutcomeDeviceFailure(
+        "Terminal action \(action) did not complete; result was \(result.label)"
+      )
+    }
+    guard result.label.hasPrefix("pass:") else {
+      reveal(error)
+      throw TerminalOutcomeDeviceFailure(
+        "Terminal action \(action) failed: \(error.label)"
+      )
+    }
     let evidence = try decodeEvidence(result.label)
     XCTAssertEqual(evidence["action"] as? String, action)
     return evidence
@@ -170,20 +179,22 @@ final class TerminalOutcomesDeviceUITests: ShowcaseIOSTestCase {
     return app.launchArguments[index + 1]
   }
 
-  private func waitForPrefix(
+  private func waitForCompletion(
     _ element: XCUIElement,
-    prefix: String,
     timeout: TimeInterval
-  ) {
+  ) -> Bool {
     let predicate = NSPredicate { _, _ in
-      element.exists && element.label.hasPrefix(prefix)
+      element.exists
+        && (element.label.hasPrefix("pass:") || element.label == "failed")
     }
     let expectation = expectation(for: predicate, evaluatedWith: NSObject())
+    let result = XCTWaiter.wait(for: [expectation], timeout: timeout)
     XCTAssertEqual(
-      XCTWaiter.wait(for: [expectation], timeout: timeout),
+      result,
       .completed,
-      "Expected prefix \(prefix), got: \(element.label)"
+      "Expected a terminal validation result, got: \(element.label)"
     )
+    return result == .completed
   }
 
   private func reveal(_ element: XCUIElement) {
@@ -191,5 +202,13 @@ final class TerminalOutcomesDeviceUITests: ShowcaseIOSTestCase {
       app.swipeUp()
     }
     XCTAssertTrue(element.isHittable)
+  }
+}
+
+private struct TerminalOutcomeDeviceFailure: Error, CustomStringConvertible {
+  let description: String
+
+  init(_ description: String) {
+    self.description = description
   }
 }

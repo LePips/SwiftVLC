@@ -1,6 +1,78 @@
 @testable import SwiftVLC
 import CLibVLC
+import CustomDump
+import Dispatch
 import Testing
+
+private enum CachedTerminalTimelineEmission: CaseIterable, Equatable, Sendable {
+  case externalLanding
+  case exactFrame
+}
+
+private enum TerminalTimelineResetBoundary: CaseIterable, Sendable {
+  case media
+  case playback
+  case nativeHandle
+}
+
+private struct CachedTerminalTimelineResetCase: Sendable {
+  let emission: CachedTerminalTimelineEmission
+  let boundary: TerminalTimelineResetBoundary
+
+  static let allCases = CachedTerminalTimelineEmission.allCases.flatMap { emission in
+    TerminalTimelineResetBoundary.allCases.map { boundary in
+      Self(emission: emission, boundary: boundary)
+    }
+  }
+}
+
+private enum TimelineCallbackTerminal: CaseIterable, Sendable {
+  case mediaStopping
+  case encounteredError
+  case stopped
+
+  func event(mediaAddress: UInt?) -> libvlc_event_t {
+    var event = libvlc_event_t()
+    switch self {
+    case .mediaStopping:
+      event.type = Int32(libvlc_MediaPlayerMediaStopping.rawValue)
+      event.u.media_player_media_stopping.media = mediaAddress.flatMap {
+        OpaquePointer(bitPattern: $0)
+      }
+      event.u.media_player_media_stopping.reason = libvlc_stopping_reason_eos
+
+    case .encounteredError:
+      event.type = Int32(libvlc_MediaPlayerEncounteredError.rawValue)
+      event.u.media_player_encountered_error.failure = libvlc_playback_failure_decoder
+
+    case .stopped:
+      event.type = Int32(libvlc_MediaPlayerStopped.rawValue)
+    }
+    return event
+  }
+
+  func matches(_ event: PlayerEvent) -> Bool {
+    switch (self, event) {
+    case (.mediaStopping, .mediaStopping),
+         (.encounteredError, .encounteredError),
+         (.stopped, .stateChanged(.stopped)):
+      true
+    default:
+      false
+    }
+  }
+}
+
+private struct TerminalCallbackTimelineCase: Sendable {
+  let terminal: TimelineCallbackTerminal
+  let emission: CachedTerminalTimelineEmission
+
+  static let allCases = TimelineCallbackTerminal.allCases.flatMap { terminal in
+    CachedTerminalTimelineEmission.allCases.map { emission in
+      Self(terminal: terminal, emission: emission)
+    }
+  }
+}
 
 extension Integration {
   @Suite(.tags(.mainActor, .async), .serialized)
@@ -46,6 +118,13 @@ extension Integration {
       let generation = player.sessionGeneration
       let nativeGeneration = player.eventBridge.currentNativeHandleGeneration
       let staleRevision = player.acceptedTimelineRevision
+      let staleStamp = NativeSeekEmissionStamp(
+        timelineGeneration: player.nativeSeekMonitor.timelineGeneration,
+        externalEpoch: player.nativeSeekMonitor.externalSeekEpoch,
+        externalDrainPending: false,
+        externalOverlapAmbiguous: false,
+        timelineEmissionSequence: 0
+      )
       let authoritativeRevision = player.eventBridge.advanceTimelineRevision()
       player.eventBridge.updateAuthoritativeTimeline(
         time: .seconds(40),
@@ -58,13 +137,15 @@ extension Integration {
         .timeChanged(.seconds(11)),
         nativeHandleGeneration: nativeGeneration,
         playbackGeneration: generation,
-        emittedTimelineRevision: staleRevision
+        emittedTimelineRevision: staleRevision,
+        nativeSeekEmissionStamp: staleStamp
       )
       player.eventBridge._broadcastForTesting(
         .positionChanged(0.11),
         nativeHandleGeneration: nativeGeneration,
         playbackGeneration: generation,
-        emittedTimelineRevision: staleRevision
+        emittedTimelineRevision: staleRevision,
+        nativeSeekEmissionStamp: staleStamp
       )
 
       let outcome = firstOutcome(from: player.terminalOutcomes)
@@ -79,6 +160,13 @@ extension Integration {
       let player = Player(instance: TestInstance.makeAudioOnly())
       try player.load(Media(url: TestMedia.twosecURL))
       let staleRevision = player.acceptedTimelineRevision
+      let staleStamp = NativeSeekEmissionStamp(
+        timelineGeneration: player.nativeSeekMonitor.timelineGeneration,
+        externalEpoch: player.nativeSeekMonitor.externalSeekEpoch,
+        externalDrainPending: false,
+        externalOverlapAmbiguous: false,
+        timelineEmissionSequence: 0
+      )
       try player.load(Media(url: TestMedia.silenceURL))
       let successorGeneration = player.sessionGeneration
       let nativeGeneration = player.eventBridge.currentNativeHandleGeneration
@@ -87,13 +175,15 @@ extension Integration {
         .timeChanged(.seconds(11)),
         nativeHandleGeneration: nativeGeneration,
         playbackGeneration: successorGeneration,
-        emittedTimelineRevision: staleRevision
+        emittedTimelineRevision: staleRevision,
+        nativeSeekEmissionStamp: staleStamp
       )
       player.eventBridge._broadcastForTesting(
         .positionChanged(0.11),
         nativeHandleGeneration: nativeGeneration,
         playbackGeneration: successorGeneration,
-        emittedTimelineRevision: staleRevision
+        emittedTimelineRevision: staleRevision,
+        nativeSeekEmissionStamp: staleStamp
       )
 
       let outcome = firstOutcome(from: player.terminalOutcomes)
@@ -145,6 +235,167 @@ extension Integration {
       #expect(value.generation == expectedGeneration)
       #expect(value.cause == .naturalEnd)
       #expect(value.finalTimeline.time == .seconds(2))
+    }
+
+    @Test
+    func `Stopped freezes an already emitted external time and position landing`() async throws {
+      let player = try makeCallbackTimelinePlayer()
+      let outcome = firstOutcome(from: player.terminalOutcomes)
+
+      player.nativeSeekMonitor._noteExternalSeekStartedForTesting()
+      player.nativeSeekMonitor._noteSeekEndedForTesting()
+      player.nativeSeekMonitor._noteTimeUpdatedForTesting(
+        timeMilliseconds: 33000,
+        position: 0.33
+      )
+      emitStopped(on: player)
+
+      let value = try #require(await outcome.value)
+      #expect(value.finalTimeline.time == .seconds(33))
+      #expect(value.finalTimeline.position == 0.33)
+    }
+
+    @Test
+    func `Stopped freezes an already emitted external position only landing`() async throws {
+      let player = try makeCallbackTimelinePlayer()
+      let outcome = firstOutcome(from: player.terminalOutcomes)
+
+      player.nativeSeekMonitor._noteExternalSeekStartedForTesting()
+      player.nativeSeekMonitor._noteSeekEndedForTesting()
+      player.nativeSeekMonitor._noteTimeUpdatedForTesting(
+        timeMilliseconds: -1,
+        position: 0.33
+      )
+      emitStopped(on: player)
+
+      let value = try #require(await outcome.value)
+      #expect(value.finalTimeline.time == .zero)
+      #expect(value.finalTimeline.position == 0.33)
+    }
+
+    @Test
+    func `Stopped freezes an already emitted exact frame before MainActor delivery`() async throws {
+      let player = try makeCallbackTimelinePlayer()
+      let outcome = firstOutcome(from: player.terminalOutcomes)
+      let frameGeneration = player.nativeSeekMonitor.frameGeneration
+
+      #expect(player.nativeSeekMonitor._requestFrameStepForTesting(
+        requestID: 34,
+        frameGeneration: frameGeneration
+      ) { .accepted } == .accepted)
+      player.nativeSeekMonitor._noteFrameStepCompletedForTesting(
+        requestID: 34,
+        status: NativeFrameStepTerminalStatus.success.rawValue,
+        timeMicroseconds: 34_000_000,
+        position: 0.34
+      )
+      emitStopped(on: player)
+
+      let value = try #require(await outcome.value)
+      #expect(value.finalTimeline.time == .seconds(34))
+      #expect(value.finalTimeline.position == 0.34)
+    }
+
+    @Test
+    func `Stopped freezes the exact frame after an external landing`() async throws {
+      let player = try makeCallbackTimelinePlayer()
+      let outcome = firstOutcome(from: player.terminalOutcomes)
+
+      player.nativeSeekMonitor._noteExternalSeekStartedForTesting()
+      player.nativeSeekMonitor._noteSeekEndedForTesting()
+      player.nativeSeekMonitor._noteTimeUpdatedForTesting(
+        timeMilliseconds: 33000,
+        position: 0.33
+      )
+      let frameGeneration = player.nativeSeekMonitor.frameGeneration
+      #expect(player.nativeSeekMonitor._requestFrameStepForTesting(
+        requestID: 34,
+        frameGeneration: frameGeneration
+      ) { .accepted } == .accepted)
+      player.nativeSeekMonitor._noteFrameStepCompletedForTesting(
+        requestID: 34,
+        status: NativeFrameStepTerminalStatus.success.rawValue,
+        timeMicroseconds: 34_000_000,
+        position: 0.34
+      )
+      emitStopped(on: player)
+
+      let value = try #require(await outcome.value)
+      #expect(value.finalTimeline.time == .seconds(34))
+      #expect(value.finalTimeline.position == 0.34)
+    }
+
+    @Test(arguments: CachedTerminalTimelineResetCase.allCases)
+    fileprivate func `Cached landing and frame evidence cannot cross a reset boundary`(
+      testCase: CachedTerminalTimelineResetCase
+    )
+      async throws {
+      let player = try makeCallbackTimelinePlayer()
+      cacheTimelineEmission(testCase.emission, on: player)
+      try crossTimelineResetBoundary(testCase.boundary, on: player)
+
+      let outcome = firstOutcome(from: player.terminalOutcomes)
+      emitStopped(on: player)
+
+      let value = try #require(await outcome.value)
+      expectNoDifference(value.finalTimeline, emptyFinalTimeline)
+    }
+
+    @Test(arguments: CachedTerminalTimelineEmission.allCases)
+    fileprivate func `Pre-entry timeline evidence stays with an entered terminal across playback replacement`(
+      emission: CachedTerminalTimelineEmission
+    )
+      async throws {
+      let player = try makeCallbackTimelinePlayer()
+      cacheTimelineEmission(emission, on: player)
+      let bridge = player.eventBridge
+      let outgoingGeneration = player.sessionGeneration
+      let outcome = firstOutcome(from: player.terminalOutcomes)
+      let entered = DispatchSemaphore(value: 0)
+      let release = DispatchSemaphore(value: 0)
+      bridge._setNativeEventCallbackBeforePlaybackClaimHookForTesting {
+        entered.signal()
+        _ = release.wait(timeout: .now() + 5)
+      }
+      defer {
+        release.signal()
+        bridge._setNativeEventCallbackBeforePlaybackClaimHookForTesting(nil)
+      }
+
+      let callback = Task.detached {
+        bridge._emitNativeEventForTesting(
+          TimelineCallbackTerminal.stopped.event(mediaAddress: nil)
+        )
+      }
+      try #require(await wait(entered))
+
+      let successorGeneration = bridge.beginPlaybackGeneration(
+        player.sessionGeneration + 1,
+        media: player.currentMedia?.pointer
+      )
+      player.sessionGeneration = successorGeneration
+      release.signal()
+      await callback.value
+      bridge._setNativeEventCallbackBeforePlaybackClaimHookForTesting(nil)
+
+      let value = try #require(await outcome.value)
+      #expect(value.generation == PlaybackGeneration(outgoingGeneration))
+      #expect(value.cause == .unknownNativeStop)
+      let expectedTime: Duration = emission == .externalLanding
+        ? .seconds(33)
+        : .seconds(34)
+      let expectedPosition = emission == .externalLanding ? 0.33 : 0.34
+      expectNoDifference(
+        value.finalTimeline,
+        PlaybackFinalTimeline(
+          time: expectedTime,
+          duration: nil,
+          position: expectedPosition,
+          bufferFill: 0,
+          activeVideoOutputs: 0
+        )
+      )
+      #expect(bridge.terminalCause(for: successorGeneration) == nil)
     }
 
     @Test
@@ -261,6 +512,89 @@ extension Integration {
       }
     }
 
+    private func makeCallbackTimelinePlayer() throws -> Player {
+      let player = Player(instance: TestInstance.makeAudioOnly())
+      try player.load(Media(url: TestMedia.twosecURL))
+      // Remove any incidental load-time watcher activity. The three tests then
+      // control every callback entry without yielding the main actor.
+      player.resetNativeSeekMonitorForCausalBoundary()
+      return player
+    }
+
+    private var emptyFinalTimeline: PlaybackFinalTimeline {
+      PlaybackFinalTimeline(
+        time: .zero,
+        duration: nil,
+        position: 0,
+        bufferFill: 0,
+        activeVideoOutputs: 0
+      )
+    }
+
+    private func cacheTimelineEmission(
+      _ emission: CachedTerminalTimelineEmission,
+      on player: Player
+    ) {
+      switch emission {
+      case .externalLanding:
+        player.nativeSeekMonitor._noteExternalSeekStartedForTesting()
+        player.nativeSeekMonitor._noteSeekEndedForTesting()
+        player.nativeSeekMonitor._noteTimeUpdatedForTesting(
+          timeMilliseconds: 33000,
+          position: 0.33
+        )
+
+      case .exactFrame:
+        let frameGeneration = player.nativeSeekMonitor.frameGeneration
+        #expect(player.nativeSeekMonitor._requestFrameStepForTesting(
+          requestID: 34,
+          frameGeneration: frameGeneration
+        ) { .accepted } == .accepted)
+        player.nativeSeekMonitor._noteFrameStepCompletedForTesting(
+          requestID: 34,
+          status: NativeFrameStepTerminalStatus.success.rawValue,
+          timeMicroseconds: 34_000_000,
+          position: 0.34
+        )
+      }
+    }
+
+    private func crossTimelineResetBoundary(
+      _ boundary: TerminalTimelineResetBoundary,
+      on player: Player
+    )
+      throws {
+      switch boundary {
+      case .media:
+        player.resetMediaDerivedState()
+
+      case .playback:
+        player.sessionGeneration = player.eventBridge.beginPlaybackGeneration(
+          player.sessionGeneration + 1,
+          media: player.currentMedia?.pointer
+        )
+
+      case .nativeHandle:
+        try player.replaceNativePlayerForDrawablePlayback(target: nil)
+      }
+    }
+
+    private func emitStopped(on player: Player) {
+      var stopped = libvlc_event_t()
+      stopped.type = Int32(libvlc_MediaPlayerStopped.rawValue)
+      player.eventBridge._emitNativeEventForTesting(stopped)
+    }
+
+    private func wait(_ semaphore: DispatchSemaphore) async -> Bool {
+      await withCheckedContinuation { continuation in
+        DispatchQueue.global(qos: .userInitiated).async {
+          continuation.resume(
+            returning: semaphore.wait(timeout: .now() + 5) == .success
+          )
+        }
+      }
+    }
+
     private func collect(
       _ stream: AsyncStream<PlaybackTerminalOutcome>,
       for duration: Duration
@@ -276,6 +610,153 @@ extension Integration {
         try? await Task.sleep(for: duration)
         collector.cancel()
         return await collector.value
+      }
+    }
+  }
+}
+
+extension Integration {
+  @Suite(.serialized)
+  struct TerminalEntryLinearizationTests {
+    @Test(arguments: TerminalCallbackTimelineCase.allCases)
+    fileprivate func `A terminal reservation excludes later evidence after lifecycle contention`(
+      testCase: TerminalCallbackTimelineCase
+    )
+      async throws {
+      let setup = try await MainActor.run {
+        let player = Player(instance: TestInstance.makeAudioOnly())
+        try player.load(Media(url: TestMedia.twosecURL))
+        player.resetNativeSeekMonitorForCausalBoundary()
+        return (
+          player: player,
+          bridge: player.eventBridge,
+          monitor: player.nativeSeekMonitor,
+          generation: player.sessionGeneration,
+          mediaAddress: player.currentMedia.map { UInt(bitPattern: $0.pointer) },
+          outcomes: player.terminalOutcomes
+        )
+      }
+      let retainedPlayer = setup.player
+      let entryRevision = setup.bridge.advanceTimelineRevision()
+      let sourcedStream = setup.bridge.makeSourcedStream(policy: .unbounded)
+      let sourcedTerminal = Task.detached { () -> SourcedPlayerEvent? in
+        for await sourced in sourcedStream where testCase.terminal.matches(sourced.event) {
+          return sourced
+        }
+        return nil
+      }
+      let outcome = Task.detached {
+        await setup.outcomes.first(where: { _ in true })
+      }
+
+      let lifecycleLocked = DispatchSemaphore(value: 0)
+      let releaseLifecycle = DispatchSemaphore(value: 0)
+      let lifecycleReleased = DispatchSemaphore(value: 0)
+      let releaseMainActor = DispatchSemaphore(value: 0)
+      let callbackReservedNativeOrder = DispatchSemaphore(value: 0)
+      let callbackReservedEntry = DispatchSemaphore(value: 0)
+      let releaseCallback = DispatchSemaphore(value: 0)
+      defer {
+        releaseLifecycle.signal()
+        releaseMainActor.signal()
+        releaseCallback.signal()
+        setup.bridge._setNativeEventCallbackBeforePlaybackClaimHookForTesting(nil)
+        setup.bridge._setNativeEventCallbackAfterNativeReservationHookForTesting(nil)
+      }
+
+      let holder = Task.detached {
+        await MainActor.run {
+          _ = setup.bridge.performIfCurrentPlaybackGeneration(setup.generation) {
+            lifecycleLocked.signal()
+            _ = releaseLifecycle.wait(timeout: .now() + 5)
+          }
+          lifecycleReleased.signal()
+          _ = releaseMainActor.wait(timeout: .now() + 5)
+        }
+      }
+      try #require(await wait(lifecycleLocked))
+
+      setup.bridge._setNativeEventCallbackAfterNativeReservationHookForTesting {
+        callbackReservedNativeOrder.signal()
+      }
+      setup.bridge._setNativeEventCallbackBeforePlaybackClaimHookForTesting {
+        callbackReservedEntry.signal()
+        _ = releaseCallback.wait(timeout: .now() + 5)
+      }
+      let callback = Task.detached {
+        setup.bridge._emitNativeEventForTesting(
+          testCase.terminal.event(mediaAddress: setup.mediaAddress)
+        )
+      }
+      try #require(await wait(callbackReservedNativeOrder))
+      releaseLifecycle.signal()
+      try #require(await wait(lifecycleReleased))
+      try #require(await wait(callbackReservedEntry))
+
+      cacheTimelineEmission(testCase.emission, monitor: setup.monitor)
+      let laterRevision = setup.bridge.advanceTimelineRevision()
+
+      releaseCallback.signal()
+      await callback.value
+      setup.bridge._setNativeEventCallbackBeforePlaybackClaimHookForTesting(nil)
+      setup.bridge._setNativeEventCallbackAfterNativeReservationHookForTesting(nil)
+      let value = try #require(await outcome.value)
+      let sourced = try #require(await sourcedTerminal.value)
+
+      releaseMainActor.signal()
+      await holder.value
+
+      expectNoDifference(value.finalTimeline, emptyFinalTimeline)
+      #expect(sourced.timelineRevision == entryRevision)
+      #expect(sourced.timelineRevision < laterRevision)
+      _ = retainedPlayer
+    }
+
+    private func cacheTimelineEmission(
+      _ emission: CachedTerminalTimelineEmission,
+      monitor: NativeSeekMonitor
+    ) {
+      switch emission {
+      case .externalLanding:
+        monitor._noteExternalSeekStartedForTesting()
+        monitor._noteSeekEndedForTesting()
+        monitor._noteTimeUpdatedForTesting(
+          timeMilliseconds: 33000,
+          position: 0.33
+        )
+
+      case .exactFrame:
+        let frameGeneration = monitor.frameGeneration
+        #expect(monitor._requestFrameStepForTesting(
+          requestID: 34,
+          frameGeneration: frameGeneration
+        ) { .accepted } == .accepted)
+        monitor._noteFrameStepCompletedForTesting(
+          requestID: 34,
+          status: NativeFrameStepTerminalStatus.success.rawValue,
+          timeMicroseconds: 34_000_000,
+          position: 0.34
+        )
+      }
+    }
+
+    private var emptyFinalTimeline: PlaybackFinalTimeline {
+      PlaybackFinalTimeline(
+        time: .zero,
+        duration: nil,
+        position: 0,
+        bufferFill: 0,
+        activeVideoOutputs: 0
+      )
+    }
+
+    private func wait(_ semaphore: DispatchSemaphore) async -> Bool {
+      await withCheckedContinuation { continuation in
+        DispatchQueue.global(qos: .userInitiated).async {
+          continuation.resume(
+            returning: semaphore.wait(timeout: .now() + 5) == .success
+          )
+        }
       }
     }
   }

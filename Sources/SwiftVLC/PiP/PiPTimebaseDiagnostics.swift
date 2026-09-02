@@ -41,16 +41,65 @@ public struct PiPTimebaseCorrection: Codable, Sendable, Equatable {
 @_spi(Qualification)
 public struct PiPTimebaseDiagnosticSnapshot: Codable, Sendable, Equatable {
   public let capturedAt: TimeInterval
+  /// Exact `Double` monotonic-clock boundary. Callers must not floor this when
+  /// delimiting a retained measurement window or binding external frames.
   public let systemUptime: TimeInterval
   public let playbackGeneration: UInt64
   public let isPlaybackActive: Bool
   public let isPictureInPictureActive: Bool
+  /// Compatibility mirror of the rate read back from `Player` at this sample.
+  /// It does not retain the caller's requested control input and must not be
+  /// used as request evidence. New producers carry their requested rate in
+  /// the scenario/window record and use `effectivePlayerRate` for readback.
   public let requestedRate: Float
+  /// Rate read back from libVLC at this exact sample boundary.
+  ///
+  /// `requestedRate` is retained for schema compatibility; new evidence must
+  /// use this name and compare it with the requested control input.
+  public let effectivePlayerRate: Float
   public let mediaTimeSeconds: Double
   public let controlTimebaseSeconds: Double?
   public let controlTimebaseRate: Double?
   public let driftSeconds: Double?
   public let decodedFrameCount: UInt64
+  /// Compatibility view of single-delta buckets for the current vout.
+  /// Despite the historic name, these are post-filter, vout-selected vmem
+  /// output-attempt PTS intervals, not lossless decoded-source cadence.
+  public let sourceIntervalCounts: PiPSourceIntervalCounts?
+  /// Compatibility provenance for `sourceIntervalCounts`. New evidence must
+  /// use `vmemOutputTimestampProvenance` and the lossless histogram below.
+  public let sourceTimestampProvenance: String?
+  /// Truthful post-filter, vout-selected vmem output-attempt PTS evidence.
+  /// Every field is `nil` when the linked libVLC lacks the native v6 callback;
+  /// an empty histogram is distinct from unavailable telemetry.
+  public let vmemOutputTimestampProvenance: String?
+  public let vmemOutputPlaybackGeneration: UInt64?
+  public let vmemOutputVoutGeneration: UInt64?
+  public let vmemOutputCallbackCount: UInt64?
+  public let vmemOutputValidPTSCount: UInt64?
+  public let vmemOutputInvalidPTSCount: UInt64?
+  public let vmemOutputDuplicatePTSCount: UInt64?
+  public let vmemOutputBackwardPTSCount: UInt64?
+  public let vmemOutputDeltaOverflowCount: UInt64?
+  /// Exact first/last callback arguments, including the invalid sentinel.
+  public let vmemOutputFirstPTSUS: Int64?
+  public let vmemOutputLastPTSUS: Int64?
+  /// Exact valid PTS endpoints for native-span calculations.
+  public let vmemOutputFirstValidPTSUS: Int64?
+  public let vmemOutputLastValidPTSUS: Int64?
+  public let vmemOutputDeltaHistogram: [PiPVmemOutputPTSDeltaCount]?
+  public let vmemOutputIntervalCounts: PiPVmemOutputIntervalCounts?
+  /// Synchronous callback results returned by Swift to VLC.
+  /// `callback == submitted + swiftRejected + inFlight` for every snapshot.
+  public let vmemOutputSubmittedCount: UInt64?
+  public let vmemOutputSwiftRejectedCount: UInt64?
+  public let vmemOutputInFlightCount: UInt64?
+  /// Independent libVLC runtime counters. These describe different pipeline
+  /// stages and are diagnostics, not substitutes for callback conservation.
+  public let libVLCDecodedVideoCount: UInt64?
+  public let libVLCDisplayedPictureCount: UInt64?
+  public let libVLCLostPictureCount: UInt64?
+  public let libVLCLatePictureCount: UInt64?
   /// libVLC media clock sampled at the decoded frame's vmem display callback.
   /// This is distinct from the control-timebase presentation timestamp.
   public let lastDecodedFrameMediaTimeSeconds: Double?
@@ -104,17 +153,22 @@ extension PiPController {
   /// Captures one clock-series row without changing playback or the timebase.
   public func timebaseDiagnosticSnapshot() -> PiPTimebaseDiagnosticSnapshot {
     let mediaTime = player.currentTime
-    let mediaTimeSeconds = Double(mediaTime.components.seconds)
-      + Double(mediaTime.components.attoseconds) / 1e18
+    let mediaTimeSeconds =
+      Double(mediaTime.components.seconds)
+        + Double(mediaTime.components.attoseconds) / 1e18
     let timebaseSeconds = controlTimebase.map { CMTimebaseGetTime($0).seconds }
     let telemetry = renderer.telemetrySnapshot
+    let sourceTimestamps = callbackRegistration?.sourceTimestampTelemetrySnapshot
+    let hasVmemOutputTimestamps = sourceTimestamps?.isAvailable == true
+    let mediaStatistics = player.statistics
     let displayLayer = layer
-    let displayLayerStatus = switch displayLayer.sampleBufferRenderer.status {
-    case .unknown: "unknown"
-    case .rendering: "rendering"
-    case .failed: "failed"
-    @unknown default: "future"
-    }
+    let displayLayerStatus =
+      switch displayLayer.sampleBufferRenderer.status {
+      case .unknown: "unknown"
+      case .rendering: "rendering"
+      case .failed: "failed"
+      @unknown default: "future"
+      }
 
     return PiPTimebaseDiagnosticSnapshot(
       capturedAt: Date().timeIntervalSince1970,
@@ -123,11 +177,69 @@ extension PiPController {
       isPlaybackActive: player.isActive,
       isPictureInPictureActive: isActive,
       requestedRate: player.rate,
+      effectivePlayerRate: player.rate,
       mediaTimeSeconds: mediaTimeSeconds,
       controlTimebaseSeconds: timebaseSeconds,
       controlTimebaseRate: controlTimebase.map { CMTimebaseGetRate($0) },
       driftSeconds: timebaseSeconds.map { mediaTimeSeconds - $0 },
       decodedFrameCount: telemetry.decodedFrameCount,
+      sourceIntervalCounts: sourceTimestamps?.sourceIntervalCounts,
+      sourceTimestampProvenance: sourceTimestamps?.sourceTimestampProvenance,
+      vmemOutputTimestampProvenance: sourceTimestamps?
+        .vmemOutputTimestampProvenance,
+      vmemOutputPlaybackGeneration: hasVmemOutputTimestamps
+        ? sourceTimestamps?.playbackGeneration
+        : nil,
+      vmemOutputVoutGeneration: hasVmemOutputTimestamps
+        ? sourceTimestamps?.voutGeneration
+        : nil,
+      vmemOutputCallbackCount: hasVmemOutputTimestamps
+        ? sourceTimestamps?.callbackCount
+        : nil,
+      vmemOutputValidPTSCount: hasVmemOutputTimestamps
+        ? sourceTimestamps?.validTimestampCount
+        : nil,
+      vmemOutputInvalidPTSCount: hasVmemOutputTimestamps
+        ? sourceTimestamps?.invalidTimestampCount
+        : nil,
+      vmemOutputDuplicatePTSCount: hasVmemOutputTimestamps
+        ? sourceTimestamps?.duplicateTimestampCount
+        : nil,
+      vmemOutputBackwardPTSCount: hasVmemOutputTimestamps
+        ? sourceTimestamps?.backwardTimestampCount
+        : nil,
+      vmemOutputDeltaOverflowCount: hasVmemOutputTimestamps
+        ? sourceTimestamps?.deltaOverflowCount
+        : nil,
+      vmemOutputFirstPTSUS: hasVmemOutputTimestamps
+        ? sourceTimestamps?.firstPicturePTSUS
+        : nil,
+      vmemOutputLastPTSUS: hasVmemOutputTimestamps
+        ? sourceTimestamps?.lastPicturePTSUS
+        : nil,
+      vmemOutputFirstValidPTSUS: hasVmemOutputTimestamps
+        ? sourceTimestamps?.firstValidPicturePTSUS
+        : nil,
+      vmemOutputLastValidPTSUS: hasVmemOutputTimestamps
+        ? sourceTimestamps?.lastValidPicturePTSUS
+        : nil,
+      vmemOutputDeltaHistogram: hasVmemOutputTimestamps
+        ? sourceTimestamps?.deltaHistogram
+        : nil,
+      vmemOutputIntervalCounts: sourceTimestamps?.vmemOutputIntervalCounts,
+      vmemOutputSubmittedCount: hasVmemOutputTimestamps
+        ? sourceTimestamps?.submittedCount
+        : nil,
+      vmemOutputSwiftRejectedCount: hasVmemOutputTimestamps
+        ? sourceTimestamps?.swiftRejectedCount
+        : nil,
+      vmemOutputInFlightCount: hasVmemOutputTimestamps
+        ? sourceTimestamps?.inFlightCount
+        : nil,
+      libVLCDecodedVideoCount: mediaStatistics?.decodedVideo,
+      libVLCDisplayedPictureCount: mediaStatistics?.displayedPictures,
+      libVLCLostPictureCount: mediaStatistics?.lostPictures,
+      libVLCLatePictureCount: mediaStatistics?.latePictures,
       lastDecodedFrameMediaTimeSeconds: telemetry.lastDecodedFrameMediaTimeSeconds,
       decodedContentChangeCount: telemetry.decodedContentChangeCount,
       lastDecodedContentFingerprint: telemetry.lastDecodedContentFingerprint,
@@ -172,19 +284,21 @@ extension PiPController {
     correctedTimebaseRate: Double? = nil
   ) {
     timebaseCorrectionSequence &+= 1
-    timebaseCorrectionBroadcaster.broadcast(PiPTimebaseCorrection(
-      sequence: timebaseCorrectionSequence,
-      capturedAt: Date().timeIntervalSince1970,
-      systemUptime: ProcessInfo.processInfo.systemUptime,
-      playbackGeneration: player.sessionGeneration,
-      reason: reason,
-      mediaTimeSeconds: mediaTimeSeconds,
-      previousTimebaseSeconds: previousTimebaseSeconds,
-      correctedTimebaseSeconds: correctedTimebaseSeconds,
-      driftSeconds: mediaTimeSeconds - previousTimebaseSeconds,
-      previousTimebaseRate: previousTimebaseRate,
-      correctedTimebaseRate: correctedTimebaseRate
-    ))
+    timebaseCorrectionBroadcaster.broadcast(
+      PiPTimebaseCorrection(
+        sequence: timebaseCorrectionSequence,
+        capturedAt: Date().timeIntervalSince1970,
+        systemUptime: ProcessInfo.processInfo.systemUptime,
+        playbackGeneration: player.sessionGeneration,
+        reason: reason,
+        mediaTimeSeconds: mediaTimeSeconds,
+        previousTimebaseSeconds: previousTimebaseSeconds,
+        correctedTimebaseSeconds: correctedTimebaseSeconds,
+        driftSeconds: mediaTimeSeconds - previousTimebaseSeconds,
+        previousTimebaseRate: previousTimebaseRate,
+        correctedTimebaseRate: correctedTimebaseRate
+      )
+    )
   }
 
   /// Writes and records a control-timebase rate change without fabricating a
@@ -213,8 +327,9 @@ extension PiPController {
   func syncTimebaseTime(reason: PiPTimebaseCorrectionReason) {
     guard let timebase = controlTimebase else { return }
     let time = player.currentTime
-    let seconds = Double(time.components.seconds)
-      + Double(time.components.attoseconds) / 1e18
+    let seconds =
+      Double(time.components.seconds)
+        + Double(time.components.attoseconds) / 1e18
     let previousSeconds = CMTimebaseGetTime(timebase).seconds
     CMTimebaseSetTime(
       timebase,
@@ -235,8 +350,9 @@ extension PiPController {
   ) {
     guard controlTimebase != nil else { return }
     let mediaTime = player.currentTime
-    let mediaTimeSeconds = Double(mediaTime.components.seconds)
-      + Double(mediaTime.components.attoseconds) / 1e18
+    let mediaTimeSeconds =
+      Double(mediaTime.components.seconds)
+        + Double(mediaTime.components.attoseconds) / 1e18
     syncTimebaseTime(reason: reason)
     setTimebaseRate(
       playing ? Float64(player.rate) : 0.0,

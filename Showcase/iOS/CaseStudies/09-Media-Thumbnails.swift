@@ -20,7 +20,7 @@ struct ThumbnailsCase: View {
         if let thumbnail {
           Image(platformImage: thumbnail)
             .resizable()
-            .aspectRatio(contentMode: .fit)
+            .scaledToFit()
             .listRowInsets(EdgeInsets())
             .accessibilityIdentifier(AccessibilityID.Thumbnails.thumbnailImage)
         } else if isGenerating {

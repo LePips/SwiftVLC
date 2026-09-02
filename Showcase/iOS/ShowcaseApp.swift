@@ -1,4 +1,3 @@
-import AVFoundation
 import SwiftUI
 import SwiftVLC
 
@@ -8,10 +7,11 @@ struct ShowcaseApp: App {
 
   init() {
     TestStreamURL.startSession()
-    VLCInstance.prewarmShared()
-    try? AVAudioSession.sharedInstance().setCategory(.playback)
-    try? AVAudioSession.sharedInstance().setActive(true)
+    // Qualification must install its native log callback before any player
+    // setup can emit diagnostics. Outside UI-test mode this returns without
+    // touching VLCInstance, so normal launch retains background prewarming.
     UITestSupport.startLogMirrorIfRequested()
+    VLCInstance.prewarmShared()
     CastTrustResponder.shared.start()
   }
 

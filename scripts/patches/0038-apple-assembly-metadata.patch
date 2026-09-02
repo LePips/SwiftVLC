@@ -1,0 +1,356 @@
+diff --git a/contrib/src/gcrypt/rijndael-aesni-apple-alignment.patch b/contrib/src/gcrypt/rijndael-aesni-apple-alignment.patch
+new file mode 100644
+index 0000000000..5bbcdbc67f
+--- /dev/null
++++ b/contrib/src/gcrypt/rijndael-aesni-apple-alignment.patch
+@@ -0,0 +1,14 @@
++--- a/cipher/rijndael-aesni.c
+++++ b/cipher/rijndael-aesni.c
++@@ -1530,7 +1530,10 @@ do_aesni_ctr_8 (const RIJNDAEL_context *ctx,
++                 "pshufb %%xmm6, %%xmm5\n\t"     /* xmm5 := be(xmm5) */
++                 "movdqa %%xmm5, (%[ctr])\n\t"   /* Update CTR (mem).  */
++-
+++#ifdef __APPLE__
+++                ".p2align 4\n\t"
+++#else
++                 ".align 16\n\t"
+++#endif
++                 ".Ldone_ctr%=:\n\t"
++                 :
++                 : [ctr] "r" (ctr),
+diff --git a/contrib/src/gcrypt/rules.mak b/contrib/src/gcrypt/rules.mak
+index dabb62e05e..b91d78d903 100644
+--- a/contrib/src/gcrypt/rules.mak
++++ b/contrib/src/gcrypt/rules.mak
+@@ -25,6 +25,7 @@ gcrypt: libgcrypt-$(GCRYPT_VERSION).tar.bz2 .sum-gcrypt
+ 	$(APPLY) $(SRC)/gcrypt/0001-compat-provide-a-getpid-replacement-that-works-on-Wi.patch
+ 	$(APPLY) $(SRC)/gcrypt/0007-random-don-t-use-API-s-that-are-forbidden-in-UWP-app.patch
+ 	$(APPLY) $(SRC)/gcrypt/0008-random-only-use-wincrypt-in-UWP-builds-if-WINSTORECO.patch
++	$(APPLY) $(SRC)/gcrypt/rijndael-aesni-apple-alignment.patch
+ 
+ 	# don't use getpid in UWP as it's not actually available
+ 	$(APPLY) $(SRC)/gcrypt/gcrypt-uwp-getpid.patch
+diff --git a/contrib/src/main.mak b/contrib/src/main.mak
+index a4f6b6f573..ec59f033b6 100644
+--- a/contrib/src/main.mak
++++ b/contrib/src/main.mak
+@@ -553,13 +553,17 @@ ifdef HAVE_CROSS_COMPILE
+ # build machine compiler and not like most other
+ # buildsystems for the host compilation. Therefore
+ # we clear the enviornment variables using the env
+-# command, except PATH, which is needed.
++# command, except PATH and the fail-closed Apple NASM wrapper inputs.
+ # The values of the mentioned relevant env variables
+ # are passed for the host compilation using the
+ # generated crossfile, so everything should work as
+ # expected.
+ MESONFLAGS += --cross-file $(abspath crossfile.meson)
+ MESON = env -i PATH="$(PATH)" \
++	VLC_APPLE_NASM_REAL="$(VLC_APPLE_NASM_REAL)" \
++	VLC_APPLE_NASM_PLATFORM="$(VLC_APPLE_NASM_PLATFORM)" \
++	VLC_APPLE_NASM_MIN_OS_VERSION="$(VLC_APPLE_NASM_MIN_OS_VERSION)" \
++	VLC_APPLE_NASM_SDK_VERSION="$(VLC_APPLE_NASM_SDK_VERSION)" \
+ 	meson setup -Dpkg_config_path="$(PKG_CONFIG_PATH)" \
+ 	$(MESONFLAGS)
+ 
+diff --git a/extras/package/apple/build.sh b/extras/package/apple/build.sh
+index 7a9b311ce7..5c73e27067 100755
+--- a/extras/package/apple/build.sh
++++ b/extras/package/apple/build.sh
+@@ -168,6 +168,86 @@ check_tool()
+     }
+ }
+ 
++# Export the values consumed by the NASM wrapper for Apple Mach-O objects.
++# Unsupported Apple targets intentionally receive no metadata: a macho64
++# invocation then fails closed instead of being stamped as the wrong platform.
++configure_apple_nasm_metadata()
++{
++    unset VLC_APPLE_NASM_PLATFORM
++    unset VLC_APPLE_NASM_MIN_OS_VERSION
++    unset VLC_APPLE_NASM_SDK_VERSION
++
++    case "$VLC_HOST_PLATFORM" in
++        macOS) VLC_APPLE_NASM_PLATFORM=macos ;;
++        iOS) VLC_APPLE_NASM_PLATFORM=ios ;;
++        iOS-Simulator) VLC_APPLE_NASM_PLATFORM=iossimulator ;;
++        tvOS) VLC_APPLE_NASM_PLATFORM=tvos ;;
++        tvOS-Simulator) VLC_APPLE_NASM_PLATFORM=tvossimulator ;;
++        xrOS) VLC_APPLE_NASM_PLATFORM=xros ;;
++        xr-Simulator) VLC_APPLE_NASM_PLATFORM=xrsimulator ;;
++        macCatalyst) VLC_APPLE_NASM_PLATFORM=macCatalyst ;;
++        *) return 0 ;;
++    esac
++
++    VLC_APPLE_NASM_MIN_OS_VERSION=$VLC_DEPLOYMENT_TARGET
++    VLC_APPLE_NASM_SDK_VERSION=$VLC_APPLE_SDK_VERSION
++    export VLC_APPLE_NASM_PLATFORM
++    export VLC_APPLE_NASM_MIN_OS_VERSION
++    export VLC_APPLE_NASM_SDK_VERSION
++}
++
++# Install the wrapper in a per-build directory after the pinned extras/tools
++# NASM target has finished. contrib/src/main.mak puts extras/tools/build/bin
++# first again, so move its NASM binary aside before restoring the wrapper
++# directory to the front of PATH.
++install_apple_nasm_wrapper()
++{
++    local wrapper_source="$VLC_SCRIPT_DIR/nasm-wrapper.sh"
++    local wrapper_dir="$VLC_BUILD_DIR/apple-nasm-wrapper"
++    local wrapper_path="$wrapper_dir/nasm"
++    local tools_nasm="$VLC_SRC_DIR/extras/tools/build/bin/nasm"
++    local saved_tools_nasm="$VLC_SRC_DIR/extras/tools/build/bin/nasm.swiftvlc-real"
++    local real_nasm=
++    local real_nasm_dir=
++    local nasm_version=
++
++    [ -x "$wrapper_source" ] || abort_err "Apple NASM wrapper is not executable"
++    mkdir -p "$wrapper_dir" || abort_err "Failed creating Apple NASM wrapper directory"
++
++    if [ -e "$tools_nasm" ]; then
++        [ -x "$tools_nasm" ] || abort_err "Bundled NASM is not executable"
++        mv -f "$tools_nasm" "$saved_tools_nasm" \
++            || abort_err "Failed preserving bundled NASM"
++    fi
++
++    [ -e "$saved_tools_nasm" ] \
++        || abort_err "Pinned bundled NASM is missing after .buildnasm"
++    [ -x "$saved_tools_nasm" ] \
++        || abort_err "Preserved bundled NASM is not executable"
++    real_nasm=$saved_tools_nasm
++
++    real_nasm_dir=$(CDPATH= cd -- "$(dirname -- "$real_nasm")" && pwd -P) \
++        || abort_err "Failed resolving real NASM directory"
++    real_nasm="$real_nasm_dir/$(basename -- "$real_nasm")"
++    [ -x "$real_nasm" ] || abort_err "Real NASM is not executable"
++    nasm_version=$("$real_nasm" -v 2>/dev/null) \
++        || abort_err "Pinned bundled NASM failed its version probe"
++    case "$nasm_version" in
++        "NASM version 3.02"|"NASM version 3.02 "*) ;;
++        *) abort_err "Pinned bundled NASM must report exactly version 3.02 (got: $nasm_version)" ;;
++    esac
++
++    cp "$wrapper_source" "$wrapper_path" \
++        || abort_err "Failed installing Apple NASM wrapper"
++    chmod 755 "$wrapper_path" \
++        || abort_err "Failed making Apple NASM wrapper executable"
++
++    export VLC_APPLE_NASM_REAL="$real_nasm"
++    export PATH="$wrapper_dir:$PATH"
++    [ "$(command -v nasm)" = "$wrapper_path" ] \
++        || abort_err "Apple NASM wrapper did not take PATH precedence"
++}
++
+ # Set the VLC_DEPLOYMENT_TARGET* flag options correctly
+ # Globals:
+ #   VLC_DEPLOYMENT_TARGET
+@@ -548,6 +628,8 @@ readonly VLC_CONTRIB_INSTALL_DIR="$VLC_SRC_DIR/contrib/${VLC_HOST_ARCH}-${VLC_AP
+ # VLC install dir
+ readonly VLC_INSTALL_DIR="$VLC_BUILD_DIR/vlc-${VLC_APPLE_SDK_NAME}-${VLC_HOST_ARCH}"
+ 
++configure_apple_nasm_metadata
++
+ echo "Build configuration"
+ echo "  Platform:         $VLC_HOST_PLATFORM"
+ echo "  Architecture:     $VLC_HOST_ARCH"
+@@ -628,6 +710,8 @@ fi
+ cd "$VLC_SRC_DIR/extras/tools" || abort_err "Failed cd to tools dir"
+ ./bootstrap $TOOLS_BOOTSTRAP || abort_err "Bootstrapping tools failed"
+ $MAKE || abort_err "Building tools failed"
++$MAKE .buildnasm || abort_err "Building pinned NASM 3.02 failed"
++install_apple_nasm_wrapper
+ echo ""
+ 
+ ##########################################################
+diff --git a/extras/package/apple/nasm-wrapper.sh b/extras/package/apple/nasm-wrapper.sh
+new file mode 100755
+index 0000000000..7e2667fad3
+--- /dev/null
++++ b/extras/package/apple/nasm-wrapper.sh
+@@ -0,0 +1,147 @@
++#!/bin/sh
++# Add deterministic Apple LC_BUILD_VERSION metadata to NASM Mach-O objects.
++
++set -eu
++
++fail()
++{
++    echo "apple-nasm-wrapper: $*" >&2
++    exit 2
++}
++
++normalize_component()
++{
++    component="$1"
++    maximum="$2"
++    description="$3"
++
++    case "$component" in
++        ""|*[!0-9]*)
++            fail "$description is not an unsigned decimal integer"
++            ;;
++    esac
++
++    while [ "${component#0}" != "$component" ]; do
++        component="${component#0}"
++    done
++    component="${component:-0}"
++
++    component_length=${#component}
++    maximum_length=${#maximum}
++    if [ "$component_length" -gt "$maximum_length" ] ||
++       { [ "$component_length" -eq "$maximum_length" ] &&
++         [ "$component" -gt "$maximum" ]; }; then
++        fail "$description exceeds $maximum"
++    fi
++    printf '%s' "$component"
++}
++
++normalize_version()
++{
++    version="$1"
++    description="$2"
++
++    case "$version" in
++        ""|*[!0-9.]*|.*|*.|*..*)
++            fail "$description must use MAJOR.MINOR[.PATCH]"
++            ;;
++    esac
++
++    saved_ifs=$IFS
++    IFS=.
++    set -- $version
++    IFS=$saved_ifs
++    if [ "$#" -ne 2 ] && [ "$#" -ne 3 ]; then
++        fail "$description must use MAJOR.MINOR[.PATCH]"
++    fi
++
++    major=$(normalize_component "$1" 65535 "$description major version")
++    minor=$(normalize_component "$2" 255 "$description minor version")
++    patch=0
++    if [ "$#" -eq 3 ]; then
++        patch=$(normalize_component "$3" 255 "$description patch version")
++    fi
++    printf '%s,%s,%s' "$major" "$minor" "$patch"
++}
++
++real_nasm=${VLC_APPLE_NASM_REAL-}
++case "$real_nasm" in
++    /*) ;;
++    "") fail "VLC_APPLE_NASM_REAL is required" ;;
++    *) fail "VLC_APPLE_NASM_REAL must be an absolute path" ;;
++esac
++[ -x "$real_nasm" ] || fail "real NASM is not executable: $real_nasm"
++
++wrapper_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
++wrapper_path="$wrapper_dir/$(basename -- "$0")"
++real_dir=$(CDPATH= cd -- "$(dirname -- "$real_nasm")" && pwd -P)
++real_path="$real_dir/$(basename -- "$real_nasm")"
++[ "$real_path" != "$wrapper_path" ] || fail "real NASM resolves to the wrapper"
++
++[ -z "${NASMENV-}" ] ||
++    fail "NASMENV must be empty for deterministic output metadata"
++
++output_format=
++format_argument_pending=0
++parse_options=1
++caller_build_version=0
++for argument in "$@"; do
++    case "$argument" in
++        *build_version*) caller_build_version=1 ;;
++    esac
++
++    if [ "$format_argument_pending" -eq 1 ]; then
++        output_format=$argument
++        format_argument_pending=0
++        continue
++    fi
++    if [ "$parse_options" -eq 0 ]; then
++        continue
++    fi
++
++    case "$argument" in
++        -@|-@?*)
++            fail "NASM response files are unsupported because they can hide output metadata"
++            ;;
++        --)
++            parse_options=0
++            ;;
++        -f|--format)
++            format_argument_pending=1
++            ;;
++        --format=*)
++            output_format=${argument#--format=}
++            ;;
++        -f=*)
++            output_format=${argument#-f=}
++            ;;
++        -f?*)
++            output_format=${argument#-f}
++            ;;
++    esac
++done
++
++if [ "$output_format" != macho64 ]; then
++    exec "$real_path" "$@"
++fi
++
++[ "$caller_build_version" -eq 0 ] ||
++    fail "caller supplied build_version metadata; refusing a duplicate pragma"
++
++platform=${VLC_APPLE_NASM_PLATFORM-}
++case "$platform" in
++    macos|ios|iossimulator|tvos|tvossimulator|xros|xrsimulator|macCatalyst)
++        ;;
++    "") fail "VLC_APPLE_NASM_PLATFORM is required for macho64" ;;
++    *) fail "unsupported VLC_APPLE_NASM_PLATFORM: $platform" ;;
++esac
++
++minimum_os=$(normalize_version \
++    "${VLC_APPLE_NASM_MIN_OS_VERSION-}" \
++    VLC_APPLE_NASM_MIN_OS_VERSION)
++sdk=$(normalize_version \
++    "${VLC_APPLE_NASM_SDK_VERSION-}" \
++    VLC_APPLE_NASM_SDK_VERSION)
++pragma="macho build_version $platform,$minimum_os sdk_version $sdk"
++
++exec "$real_path" --pragma "$pragma" "$@"
+diff --git a/extras/tools/SHA512SUMS b/extras/tools/SHA512SUMS
+index 18c10443a5..b897a25531 100644
+--- a/extras/tools/SHA512SUMS
++++ b/extras/tools/SHA512SUMS
+@@ -12,7 +12,7 @@ e9785f3d620a204b7d20222888917dc065c2036cae28667065bf7862dfa1b25235095a12fd04efdb
+ 611e573756e3e936ce16b456df9583eb9acae51a0fbd28212444ddc0c1c5ec21e893d7a666bd77ef53423024939291a31dcf86d129126fa707b729d80b24184d  nasm-2.13.03.tar.gz
+ 6c2afb0737843028e1cd27f1cd7dd5b81372ccff8cd8e01e17cfdc517afdd9a849c232f1ff5adca5eb4b03f2cc64f4a3f689ae8b84e523ceeae85384f3844083  gettext-0.26.tar.gz
+ d24849b93de58b20f518c071687e7bfa653a96600382f36c4cf7fc1047656458f75f093b911b786b18b6931b2453cb60868ecbe07cc7d2984e5981a874b34942  help2man-1.47.6.tar.xz
+-8d23dde18525dccaa648ca01df40151e7f00cec4846bd611c8970dbcfc1fb57a453facfe4d41462e7c3c8bb548d44b961a04e4fc3073ab6b65063e53f42bf6fd  nasm-2.14.tar.gz
++2971e17bad24127149c53fec5b7f28b32811d19c3f4b3fe9fff7f44df9e6c78f0a7dc3b30cb2257317ce8faa96c6063dad785250104c670ed7bb14651c1c8437  nasm-3.02.tar.gz
+ 37b3a421419b16930e53181c431fe3b4afd55ac54733a5df08376641fd2fb88eeb73ee7abe3788f3e491e7c1b215c7f35aefa66f44b09008ad22b76ab2998830  ninja-1.11.1.tar.gz
+ e5a167ff035f1494d6b1df7d3bf6feb37aa6421222fd27bfbebb36de4c7c3083e327679b82b7d9d3d4a2cc4dc2a3babb7cbf03358e4a2784d47eb34502014a1c  meson-1.9.1.tar.gz
+ 27acef46d9eb67203d708b57d80b853f76fa4b9c2720ff36ec161e6cdf702249e7982214ddf60bae75511aa79bc7d92aa27e3eab7ef9c0f5c040e8e42e76a385  libtool-2.4.7.tar.gz
+diff --git a/extras/tools/bootstrap b/extras/tools/bootstrap
+index da8c6f7d20..687d7e4241 100755
+--- a/extras/tools/bootstrap
++++ b/extras/tools/bootstrap
+@@ -23,7 +23,7 @@ MIN_CONFIGGUESS=2025.07.10
+ MIN_LIBTOOL=2.4
+ MIN_M4=1.4.16
+ MIN_MESON=1.2.3
+-MIN_NASM=2.14
++MIN_NASM=3.02
+ 
+ export LC_ALL=
+ FOUND=
+diff --git a/extras/tools/packages.mak b/extras/tools/packages.mak
+index e48be5d5f5..a7aa758f9d 100644
+--- a/extras/tools/packages.mak
++++ b/extras/tools/packages.mak
+@@ -3,7 +3,7 @@ APACHE=https://downloads.apache.org/
+ SF=https://downloads.sourceforge.net/project
+ VIDEOLAN=https://downloads.videolan.org/pub/contrib
+ 
+-NASM_VERSION=2.14
++NASM_VERSION=3.02
+ NASM_URL=https://www.nasm.us/pub/nasm/releasebuilds/$(NASM_VERSION)/nasm-$(NASM_VERSION).tar.gz
+ 
+ CMAKE_VERSION_MAJ=4.1

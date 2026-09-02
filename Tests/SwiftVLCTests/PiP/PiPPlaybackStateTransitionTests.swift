@@ -1,6 +1,7 @@
 #if os(iOS) || os(macOS)
 @testable import SwiftVLC
 import CoreMedia
+import Synchronization
 import Testing
 
 @Suite(.tags(.logic, .mainActor))
@@ -380,30 +381,32 @@ import Testing
 
   @Test
   func `Capability fault injection excludes raw callbacks from the PiP observer`() {
-    #expect(
-      !PiPController.shouldObservePlaybackStateEvent(
-        .lengthChanged(.seconds(30)),
-        suppressingRawCapabilityEvents: true
-      )
+    var suppression = PiPController.PlaybackStateEventSuppression()
+
+    let observesLength = suppression.shouldObserve(
+      .lengthChanged(.seconds(30)),
+      suppressingRawCapabilityEvents: true
     )
-    #expect(
-      !PiPController.shouldObservePlaybackStateEvent(
-        .seekableChanged(true),
-        suppressingRawCapabilityEvents: true
-      )
+    let observesSeekable = suppression.shouldObserve(
+      .seekableChanged(true),
+      suppressingRawCapabilityEvents: true
     )
-    #expect(
-      PiPController.shouldObservePlaybackStateEvent(
-        .timeChanged(.seconds(1)),
-        suppressingRawCapabilityEvents: true
-      )
+    #expect(!observesLength)
+    #expect(!observesSeekable)
+    #expect(suppression.suppressedLengthEventCount == 1)
+    #expect(suppression.suppressedSeekableEventCount == 1)
+    let observesTime = suppression.shouldObserve(
+      .timeChanged(.seconds(1)),
+      suppressingRawCapabilityEvents: true
     )
-    #expect(
-      PiPController.shouldObservePlaybackStateEvent(
-        .lengthChanged(.seconds(30)),
-        suppressingRawCapabilityEvents: false
-      )
+    let observesUnsuppressedLength = suppression.shouldObserve(
+      .lengthChanged(.seconds(30)),
+      suppressingRawCapabilityEvents: false
     )
+    #expect(observesTime)
+    #expect(observesUnsuppressedLength)
+    #expect(suppression.suppressedLengthEventCount == 1)
+    #expect(suppression.suppressedSeekableEventCount == 1)
   }
 
   @Test
@@ -418,13 +421,13 @@ import Testing
       !PiPController.shouldObservePlaybackStateEnvelope(
         envelope,
         nativeGeneration: NativePlayerGeneration(2),
-        playbackGeneration: PlaybackGeneration(2)
+        authoritativePlaybackGeneration: PlaybackGeneration(2)
       )
     )
   }
 
   @Test
-  func `Successor media change can precede Player generation publication`() {
+  func `Successor media change follows bridge authority before Player publication`() {
     let envelope = PlayerEventEnvelope(
       event: .mediaChanged,
       nativeGeneration: NativePlayerGeneration(2),
@@ -435,7 +438,7 @@ import Testing
       PiPController.shouldObservePlaybackStateEnvelope(
         envelope,
         nativeGeneration: NativePlayerGeneration(2),
-        playbackGeneration: PlaybackGeneration(1)
+        authoritativePlaybackGeneration: PlaybackGeneration(2)
       )
     )
   }
@@ -452,7 +455,7 @@ import Testing
       !PiPController.shouldObservePlaybackStateEnvelope(
         envelope,
         nativeGeneration: NativePlayerGeneration(2),
-        playbackGeneration: PlaybackGeneration(2)
+        authoritativePlaybackGeneration: PlaybackGeneration(2)
       )
     )
   }
@@ -485,6 +488,169 @@ import Testing
       ) == nil,
       "the same generation published a duplicate reset"
     )
+  }
+
+  /// A successor can finish its synchronous load and capability poll before
+  /// PiP receives the first sourced envelope for it. The populated snapshot
+  /// is already B's truth; waiting for another capability-generation bump
+  /// would wait until C and leave B permanently linear.
+  @Test
+  func `Successor adopts an already populated capability snapshot for its exact generation`() throws {
+    var state = PiPController.PlaybackStateObservationState(
+      duration: .seconds(120),
+      isSeekable: true,
+      playbackGeneration: PlaybackGeneration(1)
+    )
+    let successor = PlaybackGeneration(2)
+    let successorCapability = PlayerCapabilitySnapshot(
+      generation: 2,
+      playbackGeneration: successor,
+      durationMilliseconds: 90000,
+      isSeekable: true
+    )
+
+    let boundaryCandidate = state.adoptPlaybackGeneration(
+      successor,
+      capability: successorCapability
+    )
+    let boundary = try #require(boundaryCandidate)
+    #expect(boundary.invalidatesPlaybackState)
+    #expect(boundary.requiresLinearPlayback == false)
+    #expect(state.durationMilliseconds == 90000)
+    #expect(state.isSeekable)
+  }
+
+  /// A cold replay creates a new playback generation for the same loaded
+  /// media. No media reset or capability setter runs, so the generation
+  /// boundary itself must carry the unchanged finite/seekable snapshot into
+  /// the successor episode. Otherwise a persistent PiP observer resets on B,
+  /// rejects A's snapshot forever, and exposes linear playback with no skips.
+  @Test
+  func `Cold replay retags unchanged same media capability for persistent PiP`() throws {
+    let player = Player(instance: TestInstance.makeAudioOnly())
+    player._setStateForTesting(
+      state: .stopped,
+      nativeState: .stopped,
+      duration: .seconds(90),
+      isSeekable: true
+    )
+    player.nativePlayerHasStartedPlayback = true
+    player._nativePlayOverrideForTesting = { 0 }
+
+    let retiringGeneration = player.generation
+    let retiringCapability = player.capabilitySnapshot.withLock { $0 }
+    var state = PiPController.PlaybackStateObservationState(
+      duration: .seconds(90),
+      isSeekable: true,
+      playbackGeneration: retiringGeneration
+    )
+
+    try player.play()
+
+    let successorGeneration = player.generation
+    let successorCapability = player.capabilitySnapshot.withLock { $0 }
+    #expect(successorGeneration > retiringGeneration)
+    #expect(retiringCapability.playbackGeneration == retiringGeneration)
+    #expect(successorCapability.playbackGeneration == successorGeneration)
+    #expect(successorCapability.generation == retiringCapability.generation)
+    #expect(successorCapability.durationMilliseconds == 90000)
+    #expect(successorCapability.isSeekable)
+
+    let boundaryCandidate = state.adoptPlaybackGeneration(
+      successorGeneration,
+      capability: successorCapability
+    )
+    let boundary = try #require(boundaryCandidate)
+    #expect(boundary.invalidatesPlaybackState)
+    #expect(boundary.requiresLinearPlayback == false)
+
+    let tick = state.consume(
+      .timeChanged(.seconds(1)),
+      capability: successorCapability
+    )
+    #expect(tick.requiresLinearPlayback == nil)
+    #expect(state.durationMilliseconds == 90000)
+    #expect(state.isSeekable)
+  }
+
+  @Test
+  func `Observer never adopts capability tagged for a future generation`() throws {
+    var state = PiPController.PlaybackStateObservationState(
+      duration: .seconds(120),
+      isSeekable: true,
+      playbackGeneration: PlaybackGeneration(1)
+    )
+    let successor = PlaybackGeneration(2)
+
+    let boundaryCandidate = state.adoptPlaybackGeneration(
+      successor,
+      capability: PlayerCapabilitySnapshot(
+        generation: 3,
+        playbackGeneration: PlaybackGeneration(3),
+        durationMilliseconds: 180_000,
+        isSeekable: true
+      )
+    )
+    _ = try #require(boundaryCandidate)
+    let update = state.consume(
+      .stateChanged(.opening),
+      capability: PlayerCapabilitySnapshot(
+        generation: 3,
+        playbackGeneration: PlaybackGeneration(3),
+        durationMilliseconds: 180_000,
+        isSeekable: true
+      )
+    )
+
+    #expect(update.requiresLinearPlayback == nil)
+    #expect(state.durationMilliseconds == nil)
+    #expect(!state.isSeekable)
+  }
+
+  /// Rate, timing, and control envelopes use separate main-actor tasks. If a
+  /// rate envelope adopts B first and a timing tick then learns B's finite
+  /// capability, the delayed control-lane MediaChanged(B) is only an echo of
+  /// the reset already performed at adoption. Resetting again would strand a
+  /// paused or quiet input in linear playback with no skip controls.
+  @Test
+  func `Delayed media changed echo cannot erase capability learned after cross lane adoption`() throws {
+    var state = PiPController.PlaybackStateObservationState(
+      duration: .seconds(120),
+      isSeekable: true,
+      playbackGeneration: PlaybackGeneration(1)
+    )
+    let successor = PlaybackGeneration(2)
+
+    let boundaryCandidate = state.adoptPlaybackGeneration(
+      successor,
+      capability: PlayerCapabilitySnapshot(generation: 2)
+    )
+    _ = try #require(boundaryCandidate)
+    let learned = state.consume(
+      .timeChanged(.seconds(1)),
+      capability: PlayerCapabilitySnapshot(
+        generation: 2,
+        durationMilliseconds: 90000,
+        isSeekable: true
+      )
+    )
+    #expect(learned.invalidatesPlaybackState)
+    #expect(learned.requiresLinearPlayback == false)
+    #expect(state.durationMilliseconds == 90000)
+    #expect(state.isSeekable)
+
+    let delayedEcho = state.consume(
+      .mediaChanged,
+      capability: PlayerCapabilitySnapshot(
+        generation: 2,
+        durationMilliseconds: 90000,
+        isSeekable: true
+      )
+    )
+
+    #expect(delayedEcho == PiPController.PlaybackStateUpdate())
+    #expect(state.durationMilliseconds == 90000)
+    #expect(state.isSeekable)
   }
 
   /// A poll that has not learned the length must not undo a length event that

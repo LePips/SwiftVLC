@@ -16,11 +16,18 @@ extension Player {
   ///   - height: Desired height in pixels, or `0` to derive from `width`
   ///     and the aspect ratio.
   /// - Throws: ``VLCError/invalidInput(_:)`` if `width` or `height` is negative
-  ///   or too large, or ``VLCError/operationFailed(_:)`` if no frame is available
-  ///   (e.g. audio-only media) or the file cannot be written.
+  ///   or too large, ``VLCError/invalidState(_:)`` if the current media is still
+  ///   awaiting its native handle, or ``VLCError/operationFailed(_:)`` if no
+  ///   frame is available (e.g. audio-only media) or the file cannot be written.
   public func takeSnapshot(to path: String, width: Int = 0, height: Int = 0) throws(VLCError) {
     let width = try checkedUInt32(width, parameter: "width")
     let height = try checkedUInt32(height, parameter: "height")
+    guard nativeHandleRepresentsCurrentMedia else {
+      throw .invalidState("takeSnapshot requires a native handle for the current media")
+    }
+    #if DEBUG
+    _mediaSpecificNativeDispatchHookForTesting?(.takeSnapshot)
+    #endif
     guard libvlc_video_take_snapshot(pointer, 0, path, width, height) == 0 else {
       throw .operationFailed("Take snapshot")
     }
@@ -32,13 +39,19 @@ extension Player {
   /// Listen to ``PlayerEvent/recordingChanged(isRecording:filePath:)`` for state updates.
   /// - Parameter directory: Path to save recording (`nil` for default).
   public func startRecording(to directory: String? = nil) {
-    guard currentMedia != nil else { return }
+    guard currentMedia != nil, nativeHandleRepresentsCurrentMedia else { return }
+    #if DEBUG
+    _mediaSpecificNativeDispatchHookForTesting?(.startRecording)
+    #endif
     libvlc_media_player_record(pointer, true, directory)
   }
 
   /// Stops recording the current stream. No-op when no media is loaded.
   public func stopRecording() {
-    guard currentMedia != nil else { return }
+    guard currentMedia != nil, nativeHandleRepresentsCurrentMedia else { return }
+    #if DEBUG
+    _mediaSpecificNativeDispatchHookForTesting?(.stopRecording)
+    #endif
     libvlc_media_player_record(pointer, false, nil)
   }
 }

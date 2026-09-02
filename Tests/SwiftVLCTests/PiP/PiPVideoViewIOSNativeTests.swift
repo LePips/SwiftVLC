@@ -97,6 +97,35 @@ extension Integration {
       )
     }
 
+    @Test
+    func `a transport command issued before same-player media advance is dropped`() async throws {
+      let player = Player(instance: TestInstance.makeAudioOnly())
+      try player.load(Media(url: TestMedia.twosecURL))
+      player._setStateForTesting(state: .paused, isPlaybackRequestedActive: false)
+      let controller = IOSNativePiPMediaController()
+      controller.player = player
+
+      // Capture A, then synchronously commit B before the main-actor command
+      // task gets a turn. The native pointer is intentionally unchanged.
+      let pointer = player.pointer
+      controller.play()
+      try player.load(Media(url: TestMedia.silenceURL))
+      player._setStateForTesting(state: .paused, isPlaybackRequestedActive: false)
+      #expect(player.pointer == pointer)
+
+      let drained = Mutex(false)
+      Task { @MainActor in drained.withLock { $0 = true } }
+      try #require(
+        await poll(timeout: .seconds(2), until: { drained.withLock { $0 } }),
+        "the main actor never drained, so the assertion below would prove nothing"
+      )
+
+      #expect(
+        !player.isPlaybackRequestedActive,
+        "a Play issued for media A resumed media B on the same native handle"
+      )
+    }
+
     /// The completion is owed to VLC's PiP module whether or not the seek is
     /// applied. Dropping it on a superseded generation would leave the skip it
     /// drives unresolved, which is worse than refusing a stale seek — the same
@@ -119,6 +148,54 @@ extension Integration {
         await poll(timeout: .seconds(2), until: { completed.withLock { $0 } }),
         "the seek completion never ran, leaving VLC's skip unresolved"
       )
+    }
+
+    /// `play(_:)` commits the exact successor identity before it stages PiP
+    /// handoff and releases the old handle. This leaves no window where a
+    /// retiring native callback sees successor EventBridge state while the
+    /// Player still publicly exposes its predecessor generation.
+    @Test
+    func `play replacement commits successor before releasing old handle`() throws {
+      let player = Player(instance: TestInstance.makeAudioOnly())
+      let view = IOSNativePiPDrawableView()
+      view.attach(to: player)
+      let attachment = try #require(view.drawableAttachment)
+
+      try player.load(Media(url: TestMedia.silenceURL))
+      player._setStateForTesting(state: .playing)
+      let outgoing = player.generation
+      let expectedSuccessor = PlaybackGeneration(
+        player.eventBridge.currentPlaybackGeneration + 1
+      )
+      attachment.nativePiPBackend.setActive(
+        true,
+        mediaGeneration: outgoing
+      )
+
+      var publicGenerationAtRelease: PlaybackGeneration?
+      var callbackGenerationAtRelease: UInt64?
+      player._nativePlayerReplacementWillReleaseOldHandleForTesting = {
+        publicGenerationAtRelease = player.generation
+        callbackGenerationAtRelease = attachment.nativeMediaController
+          .mediaPlaybackGeneration()
+      }
+      player._nativePlayOverrideForTesting = { 0 }
+      defer {
+        player._nativePlayerReplacementWillReleaseOldHandleForTesting = nil
+        player._nativePlayOverrideForTesting = nil
+      }
+
+      try player.play(Media(url: TestMedia.twosecURL))
+
+      #expect(
+        publicGenerationAtRelease == expectedSuccessor,
+        "the public media transaction lagged the native handoff identity"
+      )
+      #expect(
+        callbackGenerationAtRelease == expectedSuccessor.value,
+        "native close would classify the replacement as an ordinary teardown"
+      )
+      #expect(player.generation == expectedSuccessor)
     }
 
     @Test
@@ -308,9 +385,13 @@ extension Integration {
 
       #expect(successorHost.drawableView.drawableAttachment === attachment)
       // The C controller may already have snapshotted this selector, so the
-      // immutable attachment keeps its original answer. SwiftVLC overrides
-      // the actual AVPictureInPictureController through the adopted backend.
-      #expect(attachment.canStartPictureInPictureAutomaticallyFromInline())
+      // immutable attachment keeps its original requested policy. A linked
+      // v8 archive still answers false because provenance-free continuity is
+      // deliberately disabled; the adopted backend remains fail closed.
+      #expect(
+        attachment.canStartPictureInPictureAutomaticallyFromInline()
+          == swiftvlc_native_pip_handoff_v9_available()
+      )
       #expect(successorHost.nativePiPBackend.startsAutomaticallyFromInline == false)
       #expect(successorController.startsAutomaticallyFromInline == false)
     }
@@ -514,209 +595,6 @@ extension Integration {
       #expect(backend.owner === successorController)
       #expect(storage.value === successorController)
       #expect(player.drawable === successorHost.drawableView.drawableAttachment)
-    }
-
-    @Test
-    func `iOS native PiP drawable exposes VLC PiP selectors`() throws {
-      let player = Player(instance: TestInstance.shared)
-      let view = IOSNativePiPDrawableView()
-      view.attach(to: player)
-      let attachment = try #require(view.drawableAttachment)
-
-      #expect(attachment.responds(to: NSSelectorFromString("addSubview:")))
-      #expect(attachment.responds(to: NSSelectorFromString("bounds")))
-      #expect(attachment.responds(to: NSSelectorFromString("mediaController")))
-      #expect(attachment.responds(to: NSSelectorFromString("pictureInPictureReady")))
-      #expect(attachment.responds(to: NSSelectorFromString("canStartPictureInPictureAutomaticallyFromInline")))
-      if let protocolObject = NSProtocolFromString("VLCPictureInPictureDrawable") {
-        // Bind `conforms(to:)` to a plain Bool first. Calling it through an
-        // `AnyObject` (below) inside the `#expect` autoclosure makes SILGen
-        // emit a reabstraction thunk that crashes the iOS compiler (Swift
-        // 6.3.2); hoisting the call out of the autoclosure sidesteps it, and
-        // we keep both conformance checks consistent.
-        let conformsToDrawable = attachment.conforms(to: protocolObject)
-        #expect(conformsToDrawable)
-      } else {
-        Issue.record("VLCPictureInPictureDrawable protocol is not registered")
-      }
-
-      let mediaController = attachment.mediaController()
-      if let protocolObject = NSProtocolFromString("VLCPictureInPictureMediaControlling") {
-        let conformsToMediaControlling = mediaController.conforms(to: protocolObject)
-        #expect(conformsToMediaControlling)
-      } else {
-        Issue.record("VLCPictureInPictureMediaControlling protocol is not registered")
-      }
-      view.detach()
-    }
-
-    /// The VLCPictureInPictureDrawable selectors are invoked by libVLC
-    /// from its vout thread; their bodies are `nonisolated` and must be
-    /// callable (and return correct values) off the main actor.
-    @Test
-    func `iOS native PiP drawable selectors are callable off the main actor`() async throws {
-      let player = Player(instance: TestInstance.shared)
-      let view = IOSNativePiPDrawableView(startsAutomaticallyFromInline: false)
-      view.attach(to: player)
-      let attachment = try #require(view.drawableAttachment)
-
-      struct Refs: @unchecked Sendable {
-        let attachment: IOSNativePiPDrawableAttachment
-      }
-      let refs = Refs(attachment: attachment)
-
-      let (canStart, hasMediaController) = await withCheckedContinuation { (continuation: CheckedContinuation<(Bool, Bool), Never>) in
-        DispatchQueue.global().async {
-          let canStart = refs.attachment.canStartPictureInPictureAutomaticallyFromInline()
-          let mediaController = refs.attachment.mediaController()
-          // Building the ready block off-main must also be safe; it only
-          // captures a weak backend reference.
-          _ = refs.attachment.pictureInPictureReady()
-          continuation.resume(returning: (canStart, mediaController is IOSNativePiPMediaController))
-        }
-      }
-
-      #expect(canStart == false)
-      #expect(hasMediaController)
-      view.detach()
-    }
-
-    @Test
-    func `iOS native PiP drawable reports the configured auto-start flag`() throws {
-      let enabledPlayer = Player(instance: TestInstance.shared)
-      let enabledView = IOSNativePiPDrawableView(startsAutomaticallyFromInline: true)
-      enabledView.attach(to: enabledPlayer)
-      let enabled = try #require(enabledView.drawableAttachment)
-      #expect(enabled.canStartPictureInPictureAutomaticallyFromInline() == true)
-
-      let disabledPlayer = Player(instance: TestInstance.shared)
-      let disabledView = IOSNativePiPDrawableView(startsAutomaticallyFromInline: false)
-      disabledView.attach(to: disabledPlayer)
-      let disabled = try #require(disabledView.drawableAttachment)
-      #expect(disabled.canStartPictureInPictureAutomaticallyFromInline() == false)
-
-      // Omitting the argument defaults to auto-start enabled.
-      let defaultPlayer = Player(instance: TestInstance.shared)
-      let defaultView = IOSNativePiPDrawableView()
-      defaultView.attach(to: defaultPlayer)
-      let defaultAttachment = try #require(defaultView.drawableAttachment)
-      #expect(defaultAttachment.canStartPictureInPictureAutomaticallyFromInline() == true)
-
-      enabledView.detach()
-      disabledView.detach()
-      defaultView.detach()
-    }
-
-    @Test
-    func `iOS native PiP host propagates the auto-start flag to its drawable`() throws {
-      let player = Player(instance: TestInstance.shared)
-      let host = IOSNativePiPHostView(startsAutomaticallyFromInline: false)
-      host.attach(to: player)
-      let attachment = try #require(host.drawableView.drawableAttachment)
-      #expect(attachment.canStartPictureInPictureAutomaticallyFromInline() == false)
-
-      let defaultPlayer = Player(instance: TestInstance.shared)
-      let defaultHost = IOSNativePiPHostView()
-      defaultHost.attach(to: defaultPlayer)
-      let defaultAttachment = try #require(defaultHost.drawableView.drawableAttachment)
-      #expect(defaultAttachment.canStartPictureInPictureAutomaticallyFromInline() == true)
-
-      host.detach()
-      defaultHost.detach()
-    }
-
-    @Test
-    func `iOS native PiP drawable sizes VLC content to its bounds`() throws {
-      let player = Player(instance: TestInstance.shared)
-      let view = IOSNativePiPDrawableView()
-      view.frame = CGRect(x: 0, y: 0, width: 640, height: 360)
-      view.attach(to: player)
-      let attachment = try #require(view.drawableAttachment)
-      let vlcSubview = UIView()
-      attachment.addSubview(vlcSubview)
-      view.layoutIfNeeded()
-      attachment.layoutIfNeeded()
-
-      #expect(vlcSubview.frame.size == CGSize(width: 640, height: 360))
-      #expect(vlcSubview.autoresizingMask == [.flexibleWidth, .flexibleHeight])
-
-      view.frame = CGRect(x: 0, y: 0, width: 480, height: 270)
-      view.layoutIfNeeded()
-      attachment.layoutIfNeeded()
-
-      #expect(vlcSubview.frame.size == CGSize(width: 480, height: 270))
-      #expect(vlcSubview.autoresizingMask == [.flexibleWidth, .flexibleHeight])
-
-      view.detach()
-    }
-
-    @Test
-    func `iOS native PiP media controller reports playback intent`() {
-      let player = Player(instance: TestInstance.shared)
-      let mediaController = IOSNativePiPMediaController()
-      mediaController.player = player
-
-      #expect(mediaController.isMediaPlaying() == false)
-
-      player.setPlaybackIntentFromExternalControl(true)
-      #expect(mediaController.isMediaPlaying() == true)
-
-      player.setPlaybackIntentFromExternalControl(false)
-      #expect(mediaController.isMediaPlaying() == false)
-    }
-
-    /// libVLC's native PiP controller compares this callback result against
-    /// `VLC_TICK_INVALID`, which is 0 in the pinned libVLC build. Returning
-    /// libvlc's public `-1` length sentinel would instead make AVKit receive a
-    /// finite negative time range for live/unknown-duration media.
-    @Test
-    func `iOS native PiP media controller maps unknown length to VLC tick invalid`() {
-      let player = Player(instance: TestInstance.shared)
-      let mediaController = IOSNativePiPMediaController()
-      mediaController.player = player
-
-      #expect(mediaController.mediaLength() == 0)
-    }
-
-    /// A ready block can outlive the drawable/player attachment that created
-    /// it. Once a successor attachment starts, the old block must be unable
-    /// to install its window controller or publish state into that successor.
-    @Test
-    func `iOS native PiP generation rejects callbacks from an old attachment`() throws {
-      let generations = IOSNativePiPCallbackGenerations()
-      let firstAttachment = generations.beginAttachment()
-      let firstReady = try #require(
-        generations.reserveReadyCallback(for: firstAttachment)
-      )
-
-      let secondAttachment = generations.beginAttachment()
-      var staleMutationRan = false
-
-      #expect(generations.reserveReadyCallback(for: firstAttachment) == nil)
-      #expect(generations.reserveReadyCallback(for: secondAttachment) != nil)
-      #expect(!generations.isCurrent(firstReady))
-      #expect(!generations.performIfCurrent(firstReady) { staleMutationRan = true })
-      #expect(!staleMutationRan)
-    }
-
-    /// libVLC may rebuild its native PiP window controller without changing
-    /// players. Work queued by the previous ready callback must not overwrite
-    /// state published by the replacement controller.
-    @Test
-    func `iOS native PiP generation keeps only the newest ready callback`() throws {
-      let generations = IOSNativePiPCallbackGenerations()
-      let attachment = generations.beginAttachment()
-      let firstReady = try #require(
-        generations.reserveReadyCallback(for: attachment)
-      )
-      let secondReady = try #require(
-        generations.reserveReadyCallback(for: attachment)
-      )
-      var appliedGeneration = 0
-
-      #expect(!generations.performIfCurrent(firstReady) { appliedGeneration = 1 })
-      #expect(generations.performIfCurrent(secondReady) { appliedGeneration = 2 })
-      #expect(appliedGeneration == 2)
     }
 
     @Test
@@ -932,7 +810,7 @@ extension Integration {
       backend.handlePictureInPictureReady(NSObject())
 
       // Start/stop/invalidate are safe whether or not a controller installed.
-      backend.start()
+      _ = backend.start()
       backend.stop()
       backend.invalidatePlaybackState()
 

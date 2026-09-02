@@ -158,7 +158,7 @@ struct MatrixScreenI: View {
   private func togglePiP() {
     guard let pip else { return }
     let wasActive = pip.isActive
-    let result = pip.toggle()
+    let result = pip.toggleReportingStartResult()
     if wasActive {
       appendTransition("PiP stop requested")
     } else {

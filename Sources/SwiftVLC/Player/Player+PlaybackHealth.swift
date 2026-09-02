@@ -71,6 +71,13 @@ struct PlaybackHealthMonitoringState {
   }
 }
 
+private struct PlaybackHealthMutationIdentity {
+  let playbackGeneration: UInt64
+  let nativeHandleGeneration: UInt64
+  let timelineRevision: UInt64
+  let lifecycleControlEpoch: UInt64
+}
+
 /// Playback-health publication and the low-rate classifier that drives it.
 extension Player {
   /// How often cumulative pipeline counters are sampled.
@@ -105,65 +112,138 @@ extension Player {
     playbackHealthEventBridge.subscribeReplayingLatest(policy: .unbounded)
   }
 
-  func resetPlaybackHealth() {
+  @discardableResult
+  func resetPlaybackHealth(
+    ifPlaybackGeneration expectedPlaybackGeneration: UInt64? = nil,
+    nativeHandleGeneration expectedNativeHandleGeneration: UInt64? = nil,
+    timelineRevision expectedTimelineRevision: UInt64? = nil,
+    lifecycleControlEpoch expectedLifecycleControlEpoch: UInt64? = nil
+  ) -> Bool {
+    guard
+      let identity = playbackHealthMutationIdentity(
+        ifPlaybackGeneration: expectedPlaybackGeneration,
+        nativeHandleGeneration: expectedNativeHandleGeneration,
+        timelineRevision: expectedTimelineRevision,
+        lifecycleControlEpoch: expectedLifecycleControlEpoch
+      )
+    else { return false }
     playbackHealthEventBridge.clearReplay()
     #if os(iOS) || os(macOS)
-    directPiPVideoCallbackRegistration?.beginPlaybackGeneration(sessionGeneration)
+    directPiPVideoCallbackRegistration?.beginPlaybackGeneration(identity.playbackGeneration)
     #endif
     let renderer = capturePlaybackRendererHealth()
-    playbackHealthMonitoringState.reset(
-      generation: sessionGeneration,
+    var monitoringState = playbackHealthMonitoringState
+    monitoringState.reset(
+      generation: identity.playbackGeneration,
       rendererBaseline: renderer
     )
-    publishPlaybackHealth(
+    return publishPlaybackHealth(
       state: .idle,
       counters: PlaybackHealthCounters(),
       renderer: renderer,
-      now: ContinuousClock.now
+      now: ContinuousClock.now,
+      monitoringState: monitoringState,
+      identity: identity
     )
   }
 
-  func markPlaybackHealthSeek() {
-    markPlaybackHealthWaiting(.seeking)
+  @discardableResult
+  func markPlaybackHealthSeek(
+    ifPlaybackGeneration expectedPlaybackGeneration: UInt64? = nil,
+    nativeHandleGeneration expectedNativeHandleGeneration: UInt64? = nil,
+    timelineRevision expectedTimelineRevision: UInt64? = nil,
+    lifecycleControlEpoch expectedLifecycleControlEpoch: UInt64? = nil
+  ) -> Bool {
+    markPlaybackHealthWaiting(
+      .seeking,
+      ifPlaybackGeneration: expectedPlaybackGeneration,
+      nativeHandleGeneration: expectedNativeHandleGeneration,
+      timelineRevision: expectedTimelineRevision,
+      lifecycleControlEpoch: expectedLifecycleControlEpoch
+    )
   }
 
-  func markPlaybackHealthAdaptiveSwitch() {
+  @discardableResult
+  func markPlaybackHealthAdaptiveSwitch(
+    ifPlaybackGeneration expectedPlaybackGeneration: UInt64? = nil,
+    nativeHandleGeneration expectedNativeHandleGeneration: UInt64? = nil,
+    timelineRevision expectedTimelineRevision: UInt64? = nil,
+    lifecycleControlEpoch expectedLifecycleControlEpoch: UInt64? = nil
+  ) -> Bool {
     guard state == .playing, playbackHealthMonitoringState.firstPresentedEmitted else {
-      return
+      return true
     }
-    markPlaybackHealthWaiting(.adaptiveSwitch)
+    return markPlaybackHealthWaiting(
+      .adaptiveSwitch,
+      ifPlaybackGeneration: expectedPlaybackGeneration,
+      nativeHandleGeneration: expectedNativeHandleGeneration,
+      timelineRevision: expectedTimelineRevision,
+      lifecycleControlEpoch: expectedLifecycleControlEpoch
+    )
   }
 
-  private func markPlaybackHealthWaiting(_ reason: PlaybackWaitingReason) {
+  @discardableResult
+  private func markPlaybackHealthWaiting(
+    _ reason: PlaybackWaitingReason,
+    ifPlaybackGeneration expectedPlaybackGeneration: UInt64? = nil,
+    nativeHandleGeneration expectedNativeHandleGeneration: UInt64? = nil,
+    timelineRevision expectedTimelineRevision: UInt64? = nil,
+    lifecycleControlEpoch expectedLifecycleControlEpoch: UInt64? = nil
+  ) -> Bool {
+    guard
+      let identity = playbackHealthMutationIdentity(
+        ifPlaybackGeneration: expectedPlaybackGeneration,
+        nativeHandleGeneration: expectedNativeHandleGeneration,
+        timelineRevision: expectedTimelineRevision,
+        lifecycleControlEpoch: expectedLifecycleControlEpoch
+      )
+    else { return false }
     let now = ContinuousClock.now
     let renderer = capturePlaybackRendererHealth()
-    let counters = makePlaybackHealthCounters(renderer: renderer)
-    updatePlaybackHealthProgress(counters: counters, renderer: renderer, now: now)
+    var monitoringState = playbackHealthMonitoringState
+    let counters = makePlaybackHealthCounters(
+      renderer: renderer,
+      monitoringState: monitoringState
+    )
+    updatePlaybackHealthProgress(
+      counters: counters,
+      renderer: renderer,
+      now: now,
+      monitoringState: &monitoringState
+    )
     guard counters.rendererRecoveryFailures == 0 else {
-      clearPlaybackHealthWaiting()
-      publishPlaybackHealth(
+      clearPlaybackHealthWaiting(monitoringState: &monitoringState)
+      let didPublish = publishPlaybackHealth(
         state: .failed(.renderer),
         counters: counters,
         renderer: renderer,
-        now: now
+        now: now,
+        monitoringState: monitoringState,
+        identity: identity
       )
+      guard didPublish else { return false }
       reconcilePlaybackHealthSamplingTask()
-      return
+      return true
     }
-    playbackHealthMonitoringState.pendingWaitingReason = reason
-    playbackHealthMonitoringState.pendingWaitingBeganAt = now
-    playbackHealthMonitoringState.pendingPresentedBaseline = counters.presentedVideoFrames
-    playbackHealthMonitoringState.pendingAudioBaseline = counters.playedAudioBuffers
+    monitoringState.pendingWaitingReason = reason
+    monitoringState.pendingWaitingBeganAt = now
+    monitoringState.pendingPresentedBaseline = counters.presentedVideoFrames
+    monitoringState.pendingAudioBaseline = counters.playedAudioBuffers
     // Publish from the exact counters used as the baseline. Sampling again
     // here would let progress that predates the command clear the wait before
     // any subscriber can observe it.
-    publishPlaybackHealth(
-      state: .waiting(reason),
-      counters: counters,
-      renderer: renderer,
-      now: now
-    )
+    guard
+      publishPlaybackHealth(
+        state: .waiting(reason),
+        counters: counters,
+        renderer: renderer,
+        now: now,
+        monitoringState: monitoringState,
+        identity: identity
+      )
+    else { return false }
     reconcilePlaybackHealthSamplingTask()
+    return true
   }
 
   /// Grants a fresh progress window when intentional inactivity ends.
@@ -207,43 +287,88 @@ extension Player {
     }
   }
 
-  func samplePlaybackHealth() {
-    if playbackHealthMonitoringState.generation != sessionGeneration {
+  @discardableResult
+  func samplePlaybackHealth(
+    ifPlaybackGeneration expectedPlaybackGeneration: UInt64? = nil,
+    nativeHandleGeneration expectedNativeHandleGeneration: UInt64? = nil,
+    timelineRevision expectedTimelineRevision: UInt64? = nil,
+    lifecycleControlEpoch expectedLifecycleControlEpoch: UInt64? = nil
+  ) -> Bool {
+    // Sampling is timer-driven as well as event-driven. Resolve every optional
+    // source identity before touching native counters so a timer sample from A
+    // cannot publish after synchronous Observation replaces it with B.
+    guard
+      let identity = playbackHealthMutationIdentity(
+        ifPlaybackGeneration: expectedPlaybackGeneration,
+        nativeHandleGeneration: expectedNativeHandleGeneration,
+        timelineRevision: expectedTimelineRevision,
+        lifecycleControlEpoch: expectedLifecycleControlEpoch
+      )
+    else { return false }
+    if playbackHealthMonitoringState.generation != identity.playbackGeneration {
       // Recast and externally adopted generations can advance without a media
       // reset. Use the full boundary operation so replay and direct-renderer
       // telemetry cannot remain stamped with the predecessor generation.
-      resetPlaybackHealth()
+      guard
+        resetPlaybackHealth(
+          ifPlaybackGeneration: identity.playbackGeneration,
+          nativeHandleGeneration: identity.nativeHandleGeneration,
+          timelineRevision: identity.timelineRevision,
+          lifecycleControlEpoch: identity.lifecycleControlEpoch
+        ) else { return false }
     }
 
     let now = ContinuousClock.now
     let renderer = capturePlaybackRendererHealth()
-    let counters = makePlaybackHealthCounters(renderer: renderer)
-    updatePlaybackHealthProgress(counters: counters, renderer: renderer, now: now)
-    let classified = classifyPlaybackHealth(counters: counters, renderer: renderer, now: now)
-    publishPlaybackHealth(state: classified, counters: counters, renderer: renderer, now: now)
+    var monitoringState = playbackHealthMonitoringState
+    let counters = makePlaybackHealthCounters(
+      renderer: renderer,
+      monitoringState: monitoringState
+    )
+    updatePlaybackHealthProgress(
+      counters: counters,
+      renderer: renderer,
+      now: now,
+      monitoringState: &monitoringState
+    )
+    let classified = classifyPlaybackHealth(
+      counters: counters,
+      renderer: renderer,
+      now: now,
+      monitoringState: &monitoringState
+    )
+    return publishPlaybackHealth(
+      state: classified,
+      counters: counters,
+      renderer: renderer,
+      now: now,
+      monitoringState: monitoringState,
+      identity: identity
+    )
   }
 
   private func classifyPlaybackHealth(
     counters: PlaybackHealthCounters,
     renderer: PlaybackRendererHealthSample?,
-    now: ContinuousClock.Instant
+    now: ContinuousClock.Instant,
+    monitoringState: inout PlaybackHealthMonitoringState
   ) -> PlaybackHealthState {
     switch state {
     case .idle, .stopped, .stopping:
-      clearPlaybackHealthWaiting()
+      clearPlaybackHealthWaiting(monitoringState: &monitoringState)
       return .idle
     case .paused:
       if counters.rendererRecoveryFailures > 0 {
-        clearPlaybackHealthWaiting()
+        clearPlaybackHealthWaiting(monitoringState: &monitoringState)
         return .failed(.renderer)
       }
       if renderer?.status == .recovering {
         return .stalled(.rendererRecovery)
       }
-      clearPlaybackHealthWaiting()
+      clearPlaybackHealthWaiting(monitoringState: &monitoringState)
       return .paused
     case .error:
-      clearPlaybackHealthWaiting()
+      clearPlaybackHealthWaiting(monitoringState: &monitoringState)
       return .failed(.player)
     case .opening:
       return .waiting(.opening)
@@ -268,17 +393,17 @@ extension Player {
       || counters.decodedAudioFrames > 0
       || counters.playedAudioBuffers > 0
 
-    if let waiting = playbackHealthMonitoringState.pendingWaitingReason {
+    if let waiting = monitoringState.pendingWaitingReason {
       let progressed = if hasVideo {
         counters.presentedVideoFrames
-          > playbackHealthMonitoringState.pendingPresentedBaseline
+          > monitoringState.pendingPresentedBaseline
       } else {
-        counters.playedAudioBuffers > playbackHealthMonitoringState.pendingAudioBaseline
+        counters.playedAudioBuffers > monitoringState.pendingAudioBaseline
       }
       if progressed {
-        clearPlaybackHealthWaiting()
+        clearPlaybackHealthWaiting(monitoringState: &monitoringState)
       } else if
-        let began = playbackHealthMonitoringState.pendingWaitingBeganAt,
+        let began = monitoringState.pendingWaitingBeganAt,
         began.duration(to: now) < Self.playbackHealthStallThreshold {
         return .waiting(waiting)
       }
@@ -287,18 +412,18 @@ extension Player {
     if hasVideo {
       if
         counters.presentedVideoFrames == 0,
-        playbackHealthMonitoringState.activePlaybackBeganAt.duration(to: now)
+        monitoringState.activePlaybackBeganAt.duration(to: now)
         < Self.playbackHealthStallThreshold {
         return .waiting(.firstFrame)
       }
-      let videoIsProgressing = playbackHealthMonitoringState.lastPresentedProgressAt
+      let videoIsProgressing = monitoringState.lastPresentedProgressAt
         .duration(to: now) < Self.playbackHealthStallThreshold
-      let audioIsProgressing = playbackHealthMonitoringState.lastAudioProgressAt
+      let audioIsProgressing = monitoringState.lastAudioProgressAt
         .duration(to: now) < Self.playbackHealthStallThreshold
       if
         hasAudio,
         counters.playedAudioBuffers == 0,
-        playbackHealthMonitoringState.activePlaybackBeganAt.duration(to: now)
+        monitoringState.activePlaybackBeganAt.duration(to: now)
         < Self.playbackHealthStallThreshold {
         return .waiting(.firstFrame)
       }
@@ -307,7 +432,7 @@ extension Player {
       }
       if videoIsProgressing, hasAudio {
         if
-          playbackHealthMonitoringState.lastAudioDecodedProgressAt.duration(to: now)
+          monitoringState.lastAudioDecodedProgressAt.duration(to: now)
           < Self.playbackHealthStallThreshold {
           return .stalled(.audioOutput)
         }
@@ -316,12 +441,12 @@ extension Player {
         return .stalled(.decoder)
       }
       if
-        playbackHealthMonitoringState.lastDecodedProgressAt.duration(to: now)
+        monitoringState.lastDecodedProgressAt.duration(to: now)
         < Self.playbackHealthStallThreshold {
         return .stalled(.display)
       }
       if
-        playbackHealthMonitoringState.lastSourceProgressAt.duration(to: now)
+        monitoringState.lastSourceProgressAt.duration(to: now)
         < Self.playbackHealthStallThreshold {
         return .stalled(.decoder)
       }
@@ -331,22 +456,22 @@ extension Player {
     if hasAudio {
       if
         counters.playedAudioBuffers == 0,
-        playbackHealthMonitoringState.activePlaybackBeganAt.duration(to: now)
+        monitoringState.activePlaybackBeganAt.duration(to: now)
         < Self.playbackHealthStallThreshold {
         return .waiting(.firstFrame)
       }
       if
-        playbackHealthMonitoringState.lastAudioProgressAt.duration(to: now)
+        monitoringState.lastAudioProgressAt.duration(to: now)
         < Self.playbackHealthStallThreshold {
         return .healthy(.audioOnly)
       }
       if
-        playbackHealthMonitoringState.lastAudioDecodedProgressAt.duration(to: now)
+        monitoringState.lastAudioDecodedProgressAt.duration(to: now)
         < Self.playbackHealthStallThreshold {
         return .stalled(.audioOutput)
       }
       if
-        playbackHealthMonitoringState.lastSourceProgressAt.duration(to: now)
+        monitoringState.lastSourceProgressAt.duration(to: now)
         < Self.playbackHealthStallThreshold {
         return .stalled(.decoder)
       }
@@ -354,18 +479,20 @@ extension Player {
     }
 
     if
-      playbackHealthMonitoringState.activePlaybackBeganAt.duration(to: now)
+      monitoringState.activePlaybackBeganAt.duration(to: now)
       < Self.playbackHealthStallThreshold {
       return .waiting(.firstFrame)
     }
     return .stalled(.source)
   }
 
-  private func clearPlaybackHealthWaiting() {
-    playbackHealthMonitoringState.pendingWaitingReason = nil
-    playbackHealthMonitoringState.pendingWaitingBeganAt = nil
-    playbackHealthMonitoringState.pendingPresentedBaseline = 0
-    playbackHealthMonitoringState.pendingAudioBaseline = 0
+  private func clearPlaybackHealthWaiting(
+    monitoringState: inout PlaybackHealthMonitoringState
+  ) {
+    monitoringState.pendingWaitingReason = nil
+    monitoringState.pendingWaitingBeganAt = nil
+    monitoringState.pendingPresentedBaseline = 0
+    monitoringState.pendingAudioBaseline = 0
   }
 
   private func contentKind(hasVideo: Bool, hasAudio: Bool) -> PlaybackContentKind {
@@ -379,34 +506,38 @@ extension Player {
   private func updatePlaybackHealthProgress(
     counters: PlaybackHealthCounters,
     renderer: PlaybackRendererHealthSample?,
-    now: ContinuousClock.Instant
+    now: ContinuousClock.Instant,
+    monitoringState: inout PlaybackHealthMonitoringState
   ) {
-    let previous = playbackHealthMonitoringState.previousCounters
+    let previous = monitoringState.previousCounters
     if
       counters.sourceReadBytes > previous.sourceReadBytes
       || counters.demuxReadBytes > previous.demuxReadBytes {
-      playbackHealthMonitoringState.lastSourceProgressAt = now
+      monitoringState.lastSourceProgressAt = now
     }
     if counters.decodedVideoFrames > previous.decodedVideoFrames {
-      playbackHealthMonitoringState.lastDecodedProgressAt = renderer?.lastDecodedAt ?? now
+      monitoringState.lastDecodedProgressAt = renderer?.lastDecodedAt ?? now
     }
     if counters.decodedAudioFrames > previous.decodedAudioFrames {
-      playbackHealthMonitoringState.lastAudioDecodedProgressAt = now
+      monitoringState.lastAudioDecodedProgressAt = now
     }
     if counters.presentedVideoFrames > previous.presentedVideoFrames {
-      playbackHealthMonitoringState.lastPresentedProgressAt = renderer?.lastPresentedAt ?? now
+      monitoringState.lastPresentedProgressAt = renderer?.lastPresentedAt ?? now
     }
     if counters.playedAudioBuffers > previous.playedAudioBuffers {
-      playbackHealthMonitoringState.lastAudioProgressAt = now
+      monitoringState.lastAudioProgressAt = now
     }
-    playbackHealthMonitoringState.previousCounters = counters
+    monitoringState.previousCounters = counters
   }
 
   private func makePlaybackHealthCounters(
-    renderer: PlaybackRendererHealthSample?
+    renderer: PlaybackRendererHealthSample?,
+    monitoringState: PlaybackHealthMonitoringState
   ) -> PlaybackHealthCounters {
     let stats = statistics
-    let direct = renderer.map(rendererDelta) ?? PlaybackRendererHealthSample()
+    let direct = renderer.map {
+      rendererDelta($0, monitoringState: monitoringState)
+    } ?? PlaybackRendererHealthSample()
     return PlaybackHealthCounters(
       sourceReadBytes: stats?.readBytes ?? 0,
       demuxReadBytes: stats?.demuxReadBytes ?? 0,
@@ -427,9 +558,10 @@ extension Player {
   }
 
   private func rendererDelta(
-    _ current: PlaybackRendererHealthSample
+    _ current: PlaybackRendererHealthSample,
+    monitoringState: PlaybackHealthMonitoringState
   ) -> PlaybackRendererHealthSample {
-    guard let baseline = playbackHealthMonitoringState.rendererBaseline else {
+    guard let baseline = monitoringState.rendererBaseline else {
       return current
     }
     var delta = current
@@ -455,49 +587,63 @@ extension Player {
     return delta
   }
 
+  @discardableResult
   private func publishPlaybackHealth(
     state newState: PlaybackHealthState,
     counters: PlaybackHealthCounters,
     renderer: PlaybackRendererHealthSample?,
-    now: ContinuousClock.Instant
-  ) {
+    now: ContinuousClock.Instant,
+    monitoringState initialMonitoringState: PlaybackHealthMonitoringState,
+    identity: PlaybackHealthMutationIdentity
+  ) -> Bool {
+    guard playbackHealthPublicationRevision < UInt64.max else {
+      assertionFailure("Playback-health publication revision exhausted")
+      return false
+    }
+    playbackHealthPublicationRevision += 1
+    let publicationRevision = playbackHealthPublicationRevision
+    var monitoringState = initialMonitoringState
     let previousState = playbackHealth.state
     var eventKinds: [PlaybackHealthEventKind] = []
 
     let completedUnobservedRendererRecovery = counters.rendererFlushes
-      > playbackHealthMonitoringState.observedRendererFlushes
+      > monitoringState.observedRendererFlushes
       && renderer?.status == .rendering
       && counters.rendererRecoveryFailures == 0
     if completedUnobservedRendererRecovery {
-      playbackHealthMonitoringState.lastStallReason = .rendererRecovery
-      playbackHealthMonitoringState.lastStalledAt = elapsed(to: renderer?.lastEnqueuedAt)
-        ?? elapsed(to: now)
-      playbackHealthMonitoringState.lastRecoveredAt = elapsed(to: renderer?.lastPresentedAt)
-        ?? elapsed(to: now)
+      monitoringState.lastStallReason = .rendererRecovery
+      monitoringState.lastStalledAt = elapsed(
+        to: renderer?.lastEnqueuedAt,
+        monitoringState: monitoringState
+      ) ?? elapsed(to: now, monitoringState: monitoringState)
+      monitoringState.lastRecoveredAt = elapsed(
+        to: renderer?.lastPresentedAt,
+        monitoringState: monitoringState
+      ) ?? elapsed(to: now, monitoringState: monitoringState)
       eventKinds.append(.stalled(.rendererRecovery))
       eventKinds.append(.recovered(from: .rendererRecovery))
     }
-    playbackHealthMonitoringState.observedRendererFlushes = counters.rendererFlushes
+    monitoringState.observedRendererFlushes = counters.rendererFlushes
 
     if
-      !playbackHealthMonitoringState.firstDecodedEmitted,
+      !monitoringState.firstDecodedEmitted,
       counters.decodedVideoFrames > 0 {
-      playbackHealthMonitoringState.firstDecodedEmitted = true
+      monitoringState.firstDecodedEmitted = true
       eventKinds.append(.firstDecodedFrame)
     }
     if
-      !playbackHealthMonitoringState.firstPresentedEmitted,
+      !monitoringState.firstPresentedEmitted,
       counters.presentedVideoFrames > 0 {
-      playbackHealthMonitoringState.firstPresentedEmitted = true
+      monitoringState.firstPresentedEmitted = true
       eventKinds.append(.firstPresentedFrame)
     }
 
     if
       case .stalled(let reason) = newState,
       previousState != newState {
-      playbackHealthMonitoringState.lastStallReason = reason
-      playbackHealthMonitoringState.activeStallReason = reason
-      playbackHealthMonitoringState.lastStalledAt = elapsed(to: now)
+      monitoringState.lastStallReason = reason
+      monitoringState.activeStallReason = reason
+      monitoringState.lastStalledAt = elapsed(to: now, monitoringState: monitoringState)
       eventKinds.append(.stalled(reason))
     } else if
       case .waiting(let reason) = newState,
@@ -506,18 +652,20 @@ extension Player {
     }
 
     if
-      let reason = playbackHealthMonitoringState.activeStallReason,
+      let reason = monitoringState.activeStallReason,
       case .healthy = newState {
-      playbackHealthMonitoringState.lastRecoveredAt = elapsed(to: now)
-      playbackHealthMonitoringState.activeStallReason = nil
+      monitoringState.lastRecoveredAt = elapsed(to: now, monitoringState: monitoringState)
+      monitoringState.activeStallReason = nil
       eventKinds.append(.recovered(from: reason))
     } else if
       !completedUnobservedRendererRecovery,
       previousState == .stalled(.rendererRecovery),
       renderer?.status == .rendering {
-      playbackHealthMonitoringState.lastRecoveredAt = elapsed(to: renderer?.lastPresentedAt)
-        ?? elapsed(to: now)
-      playbackHealthMonitoringState.activeStallReason = nil
+      monitoringState.lastRecoveredAt = elapsed(
+        to: renderer?.lastPresentedAt,
+        monitoringState: monitoringState
+      ) ?? elapsed(to: now, monitoringState: monitoringState)
+      monitoringState.activeStallReason = nil
       eventKinds.append(.recovered(from: .rendererRecovery))
     }
     if
@@ -527,31 +675,91 @@ extension Player {
     }
 
     let snapshot = PlaybackHealthSnapshot(
-      generation: PlaybackGeneration(sessionGeneration),
+      generation: PlaybackGeneration(identity.playbackGeneration),
       state: newState,
       revision: playbackHealth.revision &+ 1,
-      lastDecodedAt: elapsed(to: renderer?.lastDecodedAt)
-        ?? (counters.decodedVideoFrames > 0 ? elapsed(to: playbackHealthMonitoringState.lastDecodedProgressAt) : nil),
-      lastEnqueuedAt: elapsed(to: renderer?.lastEnqueuedAt),
-      lastPresentedAt: elapsed(to: renderer?.lastPresentedAt)
-        ?? (counters.presentedVideoFrames > 0 ? elapsed(to: playbackHealthMonitoringState.lastPresentedProgressAt) : nil),
+      lastDecodedAt: elapsed(to: renderer?.lastDecodedAt, monitoringState: monitoringState)
+        ?? (counters.decodedVideoFrames > 0
+          ? elapsed(to: monitoringState.lastDecodedProgressAt, monitoringState: monitoringState)
+          : nil),
+      lastEnqueuedAt: elapsed(
+        to: renderer?.lastEnqueuedAt,
+        monitoringState: monitoringState
+      ),
+      lastPresentedAt: elapsed(
+        to: renderer?.lastPresentedAt,
+        monitoringState: monitoringState
+      ) ?? (counters.presentedVideoFrames > 0
+        ? elapsed(to: monitoringState.lastPresentedProgressAt, monitoringState: monitoringState)
+        : nil),
       rendererStatus: renderer?.status ?? .unavailable,
       voutGeneration: renderer?.voutGeneration,
       counters: counters,
-      lastStallReason: playbackHealthMonitoringState.lastStallReason,
-      lastStalledAt: playbackHealthMonitoringState.lastStalledAt,
-      lastRecoveredAt: playbackHealthMonitoringState.lastRecoveredAt
+      lastStallReason: monitoringState.lastStallReason,
+      lastStalledAt: monitoringState.lastStalledAt,
+      lastRecoveredAt: monitoringState.lastRecoveredAt
     )
-    playbackHealth = snapshot
+    var didCommit = false
+    let mutationIdentityRemainedCurrent = performObservableMutation(
+      keyPath: \.playbackHealth,
+      ifPlaybackGeneration: identity.playbackGeneration,
+      nativeHandleGeneration: identity.nativeHandleGeneration,
+      timelineRevision: identity.timelineRevision,
+      lifecycleControlEpoch: identity.lifecycleControlEpoch,
+      mutation: {
+        guard playbackHealthPublicationRevision == publicationRevision else { return }
+        playbackHealthMonitoringState = monitoringState
+        storePlaybackHealthWithoutNestedObservation(snapshot)
+        didCommit = true
+      }
+    )
+    guard
+      mutationIdentityRemainedCurrent,
+      didCommit,
+      playbackHealthPublicationRevision == publicationRevision
+    else { return false }
     playbackHealthSnapshotBridge.broadcast(snapshot)
     for kind in eventKinds {
       playbackHealthEventBridge.broadcast(PlaybackHealthEvent(kind: kind, snapshot: snapshot))
     }
+    return true
   }
 
-  private func elapsed(to instant: ContinuousClock.Instant?) -> Duration? {
-    guard let instant, instant >= playbackHealthMonitoringState.startedAt else { return nil }
-    return playbackHealthMonitoringState.startedAt.duration(to: instant)
+  /// Resolves timer/test convenience calls onto the same exact identity used
+  /// by sourced native events. Optional expectations must never mean
+  /// "generation agnostic": Observation can synchronously run a newer load,
+  /// seek, stop, or handle replacement before the mutation body executes.
+  private func playbackHealthMutationIdentity(
+    ifPlaybackGeneration expectedPlaybackGeneration: UInt64?,
+    nativeHandleGeneration expectedNativeHandleGeneration: UInt64?,
+    timelineRevision expectedTimelineRevision: UInt64?,
+    lifecycleControlEpoch expectedLifecycleControlEpoch: UInt64?
+  ) -> PlaybackHealthMutationIdentity? {
+    let identity = PlaybackHealthMutationIdentity(
+      playbackGeneration: expectedPlaybackGeneration ?? sessionGeneration,
+      nativeHandleGeneration: expectedNativeHandleGeneration
+        ?? eventBridge.currentNativeHandleGeneration,
+      timelineRevision: expectedTimelineRevision ?? acceptedTimelineRevision,
+      lifecycleControlEpoch: expectedLifecycleControlEpoch
+        ?? eventBridge.currentLifecycleControlEpoch
+    )
+    guard
+      identity.timelineRevision == acceptedTimelineRevision,
+      identity.lifecycleControlEpoch == eventBridge.currentLifecycleControlEpoch,
+      ownsPlaybackMutation(
+        identity.playbackGeneration,
+        nativeHandleGeneration: identity.nativeHandleGeneration
+      )
+    else { return nil }
+    return identity
+  }
+
+  private func elapsed(
+    to instant: ContinuousClock.Instant?,
+    monitoringState: PlaybackHealthMonitoringState
+  ) -> Duration? {
+    guard let instant, instant >= monitoringState.startedAt else { return nil }
+    return monitoringState.startedAt.duration(to: instant)
   }
 
   private func addingWithoutOverflow(_ lhs: UInt64, _ rhs: UInt64) -> UInt64 {
@@ -623,14 +831,41 @@ extension Player {
   }
 
   #if DEBUG
+  @discardableResult
   func _applyPlaybackHealthSampleForTesting(
     counters: PlaybackHealthCounters,
     renderer: PlaybackRendererHealthSample? = nil,
     now: ContinuousClock.Instant = .now
-  ) {
-    updatePlaybackHealthProgress(counters: counters, renderer: renderer, now: now)
-    let classified = classifyPlaybackHealth(counters: counters, renderer: renderer, now: now)
-    publishPlaybackHealth(state: classified, counters: counters, renderer: renderer, now: now)
+  ) -> Bool {
+    guard
+      let identity = playbackHealthMutationIdentity(
+        ifPlaybackGeneration: nil,
+        nativeHandleGeneration: nil,
+        timelineRevision: nil,
+        lifecycleControlEpoch: nil
+      )
+    else { return false }
+    var monitoringState = playbackHealthMonitoringState
+    updatePlaybackHealthProgress(
+      counters: counters,
+      renderer: renderer,
+      now: now,
+      monitoringState: &monitoringState
+    )
+    let classified = classifyPlaybackHealth(
+      counters: counters,
+      renderer: renderer,
+      now: now,
+      monitoringState: &monitoringState
+    )
+    return publishPlaybackHealth(
+      state: classified,
+      counters: counters,
+      renderer: renderer,
+      now: now,
+      monitoringState: monitoringState,
+      identity: identity
+    )
   }
   #endif
 }

@@ -37,8 +37,10 @@ def git_output(root: Path, *arguments: str) -> bytes:
 
 
 def excluded(path: str, version: str) -> bool:
-    return path == f"scripts/qualification/{version}.json" or path.startswith(
-        f"scripts/qualification/evidence/{version}/"
+    return (
+        path == f"scripts/qualification/{version}.json"
+        or path.startswith(f"scripts/qualification/evidence/{version}/")
+        or path.startswith("scripts/qualification/reports/")
     )
 
 

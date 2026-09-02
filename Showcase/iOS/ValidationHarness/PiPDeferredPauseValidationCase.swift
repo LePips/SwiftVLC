@@ -11,6 +11,7 @@ struct PiPDeferredPauseValidationCase: View {
   @State private var result = "not-run"
   @State private var playbackError: String?
   @State private var isRunning = false
+  @State private var qualificationTask: Task<Void, Never>?
 
   private let streams = HarnessStreams.load()?.streams
 
@@ -62,7 +63,10 @@ struct PiPDeferredPauseValidationCase: View {
         .disabled(controller?.isPossible != true || isRunning)
 
         Button("Run deferred-pause qualification") {
-          Task { await runQualification() }
+          qualificationTask?.cancel()
+          qualificationTask = Task { @MainActor in
+            await runQualification()
+          }
         }
         .accessibilityIdentifier(AccessibilityID.PiPDeferredPauseValidation.runButton)
         .disabled(
@@ -83,6 +87,8 @@ struct PiPDeferredPauseValidationCase: View {
     .navigationTitle("Deferred PiP pause")
     .task { startPlayback() }
     .onDisappear {
+      qualificationTask?.cancel()
+      qualificationTask = nil
       player.configureDeferredPauseQualificationFault(.disabled)
       player.stop()
     }
@@ -108,11 +114,15 @@ struct PiPDeferredPauseValidationCase: View {
     defer {
       player.configureDeferredPauseQualificationFault(.disabled)
       isRunning = false
+      qualificationTask = nil
     }
 
     do {
+      try Task.checkCancellation()
       let permanent = try await runPermanentCase(controller: controller)
+      try Task.checkCancellation()
       let transient = try await runTransientCase(controller: controller)
+      try Task.checkCancellation()
       let cancellations = try await runCancellationCases(
         controller: controller,
         url: url
@@ -125,37 +135,82 @@ struct PiPDeferredPauseValidationCase: View {
         transientCase: transient,
         cancellationCases: cancellations.allPassed ? "pass" : "failed",
         cancellationResults: cancellations.results,
-        endlessTaskCount: permanent.taskStayedSettled ? 0 : 1,
+        endlessTaskCount: [permanent, transient].count(where: {
+          !$0.taskStayedSettled
+        }),
         duplicatePauseCount: transient.nativePauseCommandCount > 1
           ? transient.nativePauseCommandCount - 1 : 0,
         truthfulControls: truthfulControls
       )
-      guard
-        evidence.permanentCase.outcome == "rejected",
-        evidence.permanentCase.forcedRejectionCount > 0,
-        evidence.permanentCase.nativePauseCommandCount == 0,
-        evidence.transientCase.outcome == "issued",
-        evidence.transientCase.forcedRejectionCount == 3,
-        evidence.transientCase.nativePauseCommandCount == 1,
-        evidence.cancellationCases == "pass",
-        evidence.endlessTaskCount == 0,
-        evidence.duplicatePauseCount == 0,
-        evidence.truthfulControls
-      else {
-        throw ValidationFailure("One or more acceptance conditions failed")
-      }
       let data = try JSONEncoder().encode(evidence)
-      result = "pass:\(data.base64EncodedString())"
+      let failures = acceptanceFailures(in: evidence)
+      if failures.isEmpty {
+        result = "pass:\(data.base64EncodedString())"
+      } else {
+        playbackError = failures.joined(separator: "; ")
+        result = "failed:\(data.base64EncodedString())"
+      }
+    } catch is CancellationError {
+      return
     } catch {
       playbackError = String(describing: error)
       result = "failed"
     }
   }
 
+  private func acceptanceFailures(in evidence: QualificationEvidence) -> [String] {
+    var failures: [String] = []
+    func require<T: Equatable>(_ actual: T, _ expected: T, _ field: String) {
+      if actual != expected {
+        failures.append("\(field) expected \(expected), got \(actual)")
+      }
+    }
+
+    require(evidence.permanentCase.outcome, "rejected", "permanentCase.outcome")
+    if evidence.permanentCase.forcedRejectionCount <= 0 {
+      failures.append(
+        "permanentCase.forcedRejectionCount expected > 0, got "
+          + "\(evidence.permanentCase.forcedRejectionCount)"
+      )
+    }
+    require(
+      evidence.permanentCase.nativePauseCommandCount,
+      0,
+      "permanentCase.nativePauseCommandCount"
+    )
+    require(
+      evidence.permanentCase.taskStayedSettled,
+      true,
+      "permanentCase.taskStayedSettled"
+    )
+    require(evidence.transientCase.outcome, "issued", "transientCase.outcome")
+    require(
+      evidence.transientCase.forcedRejectionCount,
+      3,
+      "transientCase.forcedRejectionCount"
+    )
+    require(
+      evidence.transientCase.nativePauseCommandCount,
+      1,
+      "transientCase.nativePauseCommandCount"
+    )
+    require(
+      evidence.transientCase.taskStayedSettled,
+      true,
+      "transientCase.taskStayedSettled"
+    )
+    require(evidence.cancellationCases, "pass", "cancellationCases")
+    require(evidence.endlessTaskCount, 0, "endlessTaskCount")
+    require(evidence.duplicatePauseCount, 0, "duplicatePauseCount")
+    require(evidence.truthfulControls, true, "truthfulControls")
+    return failures
+  }
+
   private func runPermanentCase(
     controller: PiPController
   )
     async throws -> PauseCaseEvidence {
+    try Task.checkCancellation()
     player.configureDeferredPauseQualificationFault(.permanentRejection)
     controller.performDeferredPauseQualificationCommand(playing: false)
     let outcome = try await awaitOutcome(controller, timeout: .seconds(12))
@@ -164,6 +219,7 @@ struct PiPDeferredPauseValidationCase: View {
     let laterSnapshot = player.deferredPauseQualificationSnapshot
     let taskStayedSettled = !controller.isDeferredPauseQualificationInFlight
       && settledSnapshot == laterSnapshot
+      && controller.deferredPauseOutcome == .rejected
     return PauseCaseEvidence(
       outcome: outcome.name,
       forcedRejectionCount: settledSnapshot.forcedRejectionCount,
@@ -178,6 +234,7 @@ struct PiPDeferredPauseValidationCase: View {
     controller: PiPController
   )
     async throws -> PauseCaseEvidence {
+    try Task.checkCancellation()
     player.configureDeferredPauseQualificationFault(
       .transientRejection(attempts: 3)
     )
@@ -185,17 +242,25 @@ struct PiPDeferredPauseValidationCase: View {
     let outcome = try await awaitOutcome(controller, timeout: .seconds(8))
     try await awaitPlayerState(.paused, timeout: .seconds(3))
     let snapshot = player.deferredPauseQualificationSnapshot
-    let truthful = !controller.deferredPauseQualificationControlsArePlaying
-      && !player.isPlaybackRequestedActive
-      && player.state == .paused
+    try await Task.sleep(for: .milliseconds(750))
+    try Task.checkCancellation()
+    let laterSnapshot = player.deferredPauseQualificationSnapshot
+    let settlement = DeferredPauseSettlementObservation(
+      taskIsInFlight: controller.isDeferredPauseQualificationInFlight,
+      countersStayedUnchanged: snapshot == laterSnapshot,
+      terminalOutcomeStayedExpected: controller.deferredPauseOutcome == .issued,
+      playerIsPaused: player.state == .paused,
+      playbackIntentIsActive: player.isPlaybackRequestedActive,
+      controlsArePlaying: controller.deferredPauseQualificationControlsArePlaying
+    )
     controller.performDeferredPauseQualificationCommand(playing: true)
     try await awaitPlayerState(.playing, timeout: .seconds(3))
     return PauseCaseEvidence(
       outcome: outcome.name,
       forcedRejectionCount: snapshot.forcedRejectionCount,
       nativePauseCommandCount: snapshot.nativePauseCommandCount,
-      taskStayedSettled: !controller.isDeferredPauseQualificationInFlight,
-      truthfulControls: truthful
+      taskStayedSettled: settlement.taskStayedSettled,
+      truthfulControls: settlement.pausedTruthStayedSettled
     )
   }
 
@@ -207,6 +272,7 @@ struct PiPDeferredPauseValidationCase: View {
     var cases: [String: String] = [:]
     var truthfulControls = true
 
+    try Task.checkCancellation()
     player.configureDeferredPauseQualificationFault(.permanentRejection)
     controller.performDeferredPauseQualificationCommand(playing: false)
     try await Task.sleep(for: .milliseconds(50))
@@ -215,6 +281,7 @@ struct PiPDeferredPauseValidationCase: View {
     truthfulControls = truthfulControls
       && controller.deferredPauseQualificationControlsArePlaying
 
+    try Task.checkCancellation()
     player.configureDeferredPauseQualificationFault(.permanentRejection)
     controller.performDeferredPauseQualificationCommand(playing: false)
     try await Task.sleep(for: .milliseconds(50))
@@ -224,6 +291,7 @@ struct PiPDeferredPauseValidationCase: View {
     truthfulControls = truthfulControls
       && controller.deferredPauseQualificationControlsArePlaying
 
+    try Task.checkCancellation()
     player.configureDeferredPauseQualificationFault(.permanentRejection)
     controller.performDeferredPauseQualificationCommand(playing: false)
     try await Task.sleep(for: .milliseconds(50))
@@ -283,8 +351,8 @@ struct PiPDeferredPauseValidationCase: View {
       Spacer()
       Text(value)
         .foregroundStyle(.secondary)
+        .accessibilityIdentifier(identifier)
     }
-    .qualificationAccessibilityValue(value, title: title, identifier: identifier)
   }
 }
 

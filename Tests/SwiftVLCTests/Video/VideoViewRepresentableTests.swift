@@ -64,7 +64,7 @@ extension Integration {
 
     @Test
     func `SwiftUI host creates and updates AppKit video surface`() async throws {
-      #if canImport(AppKit)
+      #if os(macOS)
       let firstPlayer = Player(instance: TestInstance.shared)
       let secondPlayer = Player(instance: TestInstance.shared)
       let host = NSHostingView(rootView: VideoView(firstPlayer))

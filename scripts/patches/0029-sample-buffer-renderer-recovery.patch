@@ -1,0 +1,1476 @@
+diff --git a/include/vlc/libvlc_media_player.h b/include/vlc/libvlc_media_player.h
+index 6816bca6ce70de7f204a82aba685a209d9559f81..a0978dcaf0cf4ab0993af0bc15274ba639979341 100644
+--- a/include/vlc/libvlc_media_player.h
++++ b/include/vlc/libvlc_media_player.h
+@@ -293,6 +293,68 @@ typedef struct swiftvlc_media_player_playback_snapshot_t
+     bool seekable;
+ } swiftvlc_media_player_playback_snapshot_t;
+ 
++/** Flags describing SwiftVLC's native Apple sample-buffer renderer. */
++typedef enum swiftvlc_sample_buffer_renderer_flags_t
++{
++    /** The snapshot names the display's currently installed renderer. */
++    swiftvlc_sample_buffer_renderer_current = 1u << 0,
++    /** AVFoundation currently requires a flush before decoding can resume. */
++    swiftvlc_sample_buffer_renderer_requires_flush = 1u << 1,
++    /** AVFoundation reports a failed renderer status. */
++    swiftvlc_sample_buffer_renderer_failed = 1u << 2,
++    /** A recovery episode has not produced a postflight-validated submission. */
++    swiftvlc_sample_buffer_renderer_recovery_in_progress = 1u << 3,
++    /** One frame from a postflight-validated enqueue is available for replay. */
++    swiftvlc_sample_buffer_renderer_recovery_sample_available = 1u << 4,
++} swiftvlc_sample_buffer_renderer_flags_t;
++
++/**
++ * Coherent native Apple sample-buffer renderer recovery evidence.
++ *
++ * All counters are cumulative for @a display_generation and saturate rather
++ * than wrapping. A new generation identifies a replaced display renderer, so
++ * callers must not subtract counters across generation changes.
++ *
++ * @warning @a successful_submission_count counts postflight-validated
++ * sample-buffer enqueue calls. It is not evidence of AVFoundation-visible
++ * output. Release qualification must use an independent visible-frame oracle.
++ */
++typedef struct swiftvlc_sample_buffer_renderer_snapshot_t
++{
++    /** Snapshot layout version. This definition has version 1. */
++    uint32_t abi_version;
++    /** Bitwise combination of swiftvlc_sample_buffer_renderer_flags_t. */
++    uint32_t flags;
++    /** Process-unique identity of the currently installed display renderer. */
++    uint64_t display_generation;
++    /** Bounded recovery episodes started by a revoke or failed status. */
++    uint64_t recovery_episode_count;
++    /** Episodes followed by a postflight-validated submission or reset. */
++    uint64_t recovered_episode_count;
++    uint64_t requirement_notification_count;
++    /** Requirement notifications observed while requires-flush was true. */
++    uint64_t revocation_notification_count;
++    uint64_t decode_failure_notification_count;
++    uint64_t foreground_check_count;
++    /** Total bounded recovery flushes, excluding discontinuity flushes. */
++    uint64_t recovery_flush_count;
++    /** Recovery flushes initiated by requiresFlushToResumeDecoding. */
++    uint64_t revocation_flush_count;
++    /** Recovery flushes initiated by an ordinary Failed renderer status. */
++    uint64_t failure_flush_count;
++    uint64_t discontinuity_flush_count;
++    /** Postflight-validated enqueue calls; not framework-visible output. */
++    uint64_t successful_submission_count;
++    /** Postflight-validated submissions closing outstanding episodes. */
++    uint64_t recovery_submission_count;
++    /** Samples rejected retryably before a validated enqueue commit. */
++    uint64_t retryable_submission_count;
++    /** Immediate recovery samples that could not be constructed. */
++    uint64_t recovery_sample_failure_count;
++    /** Failed statuses that remained failed after their bounded flush. */
++    uint64_t permanent_failure_count;
++} swiftvlc_sample_buffer_renderer_snapshot_t;
++
+ /** Result of submitting a strict, request-correlated frame step. */
+ typedef enum swiftvlc_next_frame_request_result_t
+ {
+@@ -324,7 +386,8 @@ typedef enum swiftvlc_frame_step_status_t
+  * media/length snapshot. Version 2 adds a separate playback snapshot carrying
+  * time and seekability without changing the version-1 layout. Version 3 adds
+  * native PiP overlay composition. Version 4 adds strict request-correlated
+- * frame stepping and result-bearing vmem output submission.
++ * frame stepping and result-bearing vmem output submission. Version 5 adds a
++ * coherent native Apple sample-buffer renderer recovery snapshot.
+  */
+ LIBVLC_API unsigned swiftvlc_libvlc_pip_extensions_version( void );
+ 
+@@ -336,6 +399,23 @@ LIBVLC_API bool swiftvlc_libvlc_media_player_get_playback_snapshot(
+     libvlc_media_player_t *p_mi,
+     swiftvlc_media_player_playback_snapshot_t *snapshot );
+ 
++/**
++ * Copy native Apple sample-buffer renderer recovery evidence.
++ *
++ * When a media player owns more than one supported display, this selects the
++ * current display with the newest generation. The destination is initialized,
++ * including @a abi_version, even when no supported current display exists.
++ *
++ * \param p_mi the media player
++ * \param[out] snapshot destination for the coherent evidence
++ * \retval true a current native Apple renderer was captured
++ * \retval false no current supported renderer exists, or snapshot is NULL
++ */
++LIBVLC_API bool
++swiftvlc_libvlc_media_player_get_sample_buffer_renderer_snapshot(
++    libvlc_media_player_t *p_mi,
++    swiftvlc_sample_buffer_renderer_snapshot_t *snapshot );
++
+ /**
+  * Submit one strict frame-step request.
+  *
+diff --git a/include/vlc_vout.h b/include/vlc_vout.h
+index cda8995825a0cd84e6033cba51c22b65071b5cbf..b7c577e53b9c3002eeebafc132fdcd68203fce2f 100644
+--- a/include/vlc_vout.h
++++ b/include/vlc_vout.h
+@@ -130,6 +130,13 @@ VLC_API int vout_GetSnapshot( vout_thread_t *p_vout,
+                               video_format_t *p_fmt,
+                               const char *psz_format, vlc_tick_t i_timeout );
+ 
++struct vout_display_renderer_recovery_snapshot;
++
++/** Copies display-owned renderer recovery evidence when supported. */
++VLC_API bool vout_GetRendererRecoverySnapshot(
++    vout_thread_t *vout,
++    struct vout_display_renderer_recovery_snapshot *snapshot);
++
+ /* */
+ VLC_API void vout_PutPicture( vout_thread_t *, picture_t * );
+ 
+diff --git a/include/vlc_vout_display.h b/include/vlc_vout_display.h
+index 0536864971438f7d0b2692aba7b73e5b4ac091c2..2aa8ca4afba7f7842fbeceff1fe2a4c8e92fa363 100644
+--- a/include/vlc_vout_display.h
++++ b/include/vlc_vout_display.h
+@@ -220,6 +220,38 @@ typedef int (*vout_display_open_cb)(vout_display_t *vd,
+  * request-correlated stepping must fail closed for the target picture. */
+ #define VOUT_DISPLAY_PICTURE_SUBMISSION_UNPROVEN 1
+ 
++enum vout_display_renderer_recovery_flags
++{
++    VOUT_DISPLAY_RENDERER_CURRENT = 1u << 0,
++    VOUT_DISPLAY_RENDERER_REQUIRES_FLUSH = 1u << 1,
++    VOUT_DISPLAY_RENDERER_FAILED = 1u << 2,
++    VOUT_DISPLAY_RENDERER_RECOVERY_IN_PROGRESS = 1u << 3,
++    VOUT_DISPLAY_RENDERER_RECOVERY_SAMPLE_AVAILABLE = 1u << 4,
++};
++
++/* Coherent, cumulative evidence from a display backend that owns a recoverable
++ * queued renderer. Unsupported displays omit the corresponding operation. */
++typedef struct vout_display_renderer_recovery_snapshot
++{
++    uint64_t display_generation;
++    uint64_t recovery_episode_count;
++    uint64_t recovered_episode_count;
++    uint64_t requirement_notification_count;
++    uint64_t revocation_notification_count;
++    uint64_t decode_failure_notification_count;
++    uint64_t foreground_check_count;
++    uint64_t recovery_flush_count;
++    uint64_t revocation_flush_count;
++    uint64_t failure_flush_count;
++    uint64_t discontinuity_flush_count;
++    uint64_t successful_submission_count;
++    uint64_t recovery_submission_count;
++    uint64_t retryable_submission_count;
++    uint64_t recovery_sample_failure_count;
++    uint64_t permanent_failure_count;
++    uint32_t flags;
++} vout_display_renderer_recovery_snapshot;
++
+ struct vlc_display_operations
+ {
+     /**
+@@ -381,6 +413,16 @@ struct vlc_display_operations
+      * discarded before this callback returns.
+      */
+     void (*purge_picture_submissions)(vout_display_t *, bool discontinuity);
++
++    /**
++     * Copies a coherent renderer-recovery snapshot (optional).
++     *
++     * The vout owner serializes this call against prepare, display, purge and
++     * close. The module must additionally synchronize any notification-driven
++     * mutations before returning.
++     */
++    bool (*get_renderer_recovery_snapshot)(
++        vout_display_t *, vout_display_renderer_recovery_snapshot *);
+ };
+ 
+ /**
+@@ -529,6 +571,14 @@ vout_display_PurgePictureSubmissions(vout_display_t *vd, bool discontinuity)
+         vd->ops->purge_picture_submissions(vd, discontinuity);
+ }
+ 
++static inline bool
++vout_display_GetRendererRecoverySnapshot(
++    vout_display_t *vd, vout_display_renderer_recovery_snapshot *snapshot)
++{
++    return vd->ops->get_renderer_recovery_snapshot != NULL &&
++        vd->ops->get_renderer_recovery_snapshot(vd, snapshot);
++}
++
+ VLC_API
+ void vout_display_SetSize(vout_display_t *vd, unsigned width, unsigned height);
+ 
+diff --git a/lib/libvlc.sym b/lib/libvlc.sym
+index aed278f8d15e60ffa8607c8ca2705b945c1de7f3..ab285ca860bd99ff363bc2d49285842db3413f32 100644
+--- a/lib/libvlc.sym
++++ b/lib/libvlc.sym
+@@ -139,6 +139,7 @@ libvlc_media_player_get_length
+ libvlc_media_player_get_media
+ swiftvlc_libvlc_media_player_get_media_length_snapshot
+ swiftvlc_libvlc_media_player_get_playback_snapshot
++swiftvlc_libvlc_media_player_get_sample_buffer_renderer_snapshot
+ swiftvlc_libvlc_media_player_request_next_frame
+ swiftvlc_libvlc_media_player_cancel_next_frame_request
+ swiftvlc_libvlc_pip_extensions_version
+diff --git a/lib/media_player.c b/lib/media_player.c
+index 7823d65bb62aec9defe32ab3eb0fc391d19c0b81..c9cf82e464198f07ad43ca23fd312819854fab09 100644
+--- a/lib/media_player.c
++++ b/lib/media_player.c
+@@ -37,6 +37,7 @@
+ 
+ #include <vlc_demux.h>
+ #include <vlc_vout.h>
++#include <vlc_vout_display.h>
+ #include <vlc_aout.h>
+ #include <vlc_subpicture.h>
+ #include <vlc_actions.h>
+@@ -1062,7 +1063,7 @@ libvlc_media_player_get_media( libvlc_media_player_t *p_mi )
+ 
+ unsigned swiftvlc_libvlc_pip_extensions_version( void )
+ {
+-    return 4;
++    return 5;
+ }
+ 
+ bool
+@@ -1121,6 +1122,83 @@ swiftvlc_libvlc_media_player_get_playback_snapshot(
+     return media != NULL;
+ }
+ 
++bool
++swiftvlc_libvlc_media_player_get_sample_buffer_renderer_snapshot(
++    libvlc_media_player_t *p_mi,
++    swiftvlc_sample_buffer_renderer_snapshot_t *snapshot )
++{
++    if (snapshot == NULL)
++        return false;
++
++    *snapshot = (swiftvlc_sample_buffer_renderer_snapshot_t) {
++        .abi_version = 1,
++    };
++
++    _Static_assert((unsigned)swiftvlc_sample_buffer_renderer_current ==
++                   (unsigned)VOUT_DISPLAY_RENDERER_CURRENT,
++                   "renderer current flag mismatch");
++    _Static_assert((unsigned)swiftvlc_sample_buffer_renderer_requires_flush ==
++                   (unsigned)VOUT_DISPLAY_RENDERER_REQUIRES_FLUSH,
++                   "renderer requires-flush flag mismatch");
++    _Static_assert((unsigned)swiftvlc_sample_buffer_renderer_failed ==
++                   (unsigned)VOUT_DISPLAY_RENDERER_FAILED,
++                   "renderer failed flag mismatch");
++    _Static_assert((unsigned)swiftvlc_sample_buffer_renderer_recovery_in_progress ==
++                   (unsigned)VOUT_DISPLAY_RENDERER_RECOVERY_IN_PROGRESS,
++                   "renderer recovery flag mismatch");
++    _Static_assert((unsigned)swiftvlc_sample_buffer_renderer_recovery_sample_available ==
++                   (unsigned)VOUT_DISPLAY_RENDERER_RECOVERY_SAMPLE_AVAILABLE,
++                   "renderer recovery-sample flag mismatch");
++
++    size_t count;
++    vout_thread_t **vouts = vlc_player_vout_HoldAll(p_mi->player, &count);
++    if (vouts == NULL)
++        return false;
++
++    bool found = false;
++    vout_display_renderer_recovery_snapshot newest = { 0 };
++    for (size_t i = 0; i < count; ++i)
++    {
++        vout_display_renderer_recovery_snapshot candidate;
++        if (vout_GetRendererRecoverySnapshot(vouts[i], &candidate) &&
++            (!found || candidate.display_generation >
++                       newest.display_generation))
++        {
++            newest = candidate;
++            found = true;
++        }
++        vout_Release(vouts[i]);
++    }
++    free(vouts);
++
++    if (!found)
++        return false;
++
++    *snapshot = (swiftvlc_sample_buffer_renderer_snapshot_t) {
++        .abi_version = 1,
++        .flags = newest.flags,
++        .display_generation = newest.display_generation,
++        .recovery_episode_count = newest.recovery_episode_count,
++        .recovered_episode_count = newest.recovered_episode_count,
++        .requirement_notification_count =
++            newest.requirement_notification_count,
++        .revocation_notification_count = newest.revocation_notification_count,
++        .decode_failure_notification_count =
++            newest.decode_failure_notification_count,
++        .foreground_check_count = newest.foreground_check_count,
++        .recovery_flush_count = newest.recovery_flush_count,
++        .revocation_flush_count = newest.revocation_flush_count,
++        .failure_flush_count = newest.failure_flush_count,
++        .discontinuity_flush_count = newest.discontinuity_flush_count,
++        .successful_submission_count = newest.successful_submission_count,
++        .recovery_submission_count = newest.recovery_submission_count,
++        .retryable_submission_count = newest.retryable_submission_count,
++        .recovery_sample_failure_count = newest.recovery_sample_failure_count,
++        .permanent_failure_count = newest.permanent_failure_count,
++    };
++    return true;
++}
++
+ swiftvlc_next_frame_request_result_t
+ swiftvlc_libvlc_media_player_request_next_frame(
+     libvlc_media_player_t *p_mi, uint64_t request_id )
+@@ -2745,8 +2823,6 @@ libvlc_media_player_time_point_get_next_date(const libvlc_media_player_time_poin
+     return US_FROM_VLC_TICK(date);
+ }
+ 
+-#include <vlc_vout_display.h>
+-
+ /* make sure surface structures from libvlc can be passed as such to vlc
+    otherwise we will need wrappers between what libvlc understands and what vlc uses */
+ #define cast_  libvlc_video_color_space_t
+diff --git a/modules/video_output/Makefile.am b/modules/video_output/Makefile.am
+index 5853c442658b84d9c30e98603d135e52d9ec5c73..5c09186a7454b7e608082375546de247afc38e38 100644
+--- a/modules/video_output/Makefile.am
++++ b/modules/video_output/Makefile.am
+@@ -85,6 +85,7 @@ libsamplebufferdisplay_plugin_la_SOURCES = \
+ 	video_output/apple/VLCSampleBufferDisplay.m \
+ 	video_output/apple/VLCSampleBufferGeometry.h \
+ 	video_output/apple/VLCSampleBufferOverlayGeometry.h \
++	video_output/apple/VLCSampleBufferRendererRecovery.h \
+ 	codec/vt_utils.c codec/vt_utils.h
+ libsamplebufferdisplay_plugin_la_OBJCFLAGS = $(AM_OBJCFLAGS) -fobjc-arc
+ if HAVE_OSX
+diff --git a/modules/video_output/apple/VLCSampleBufferDisplay.m b/modules/video_output/apple/VLCSampleBufferDisplay.m
+index 2a94b367a8d3364f4b8e63df7a72468faf2d92ea..5b30d8c5d21adbc5ce072b266ce8a39253702459 100644
+--- a/modules/video_output/apple/VLCSampleBufferDisplay.m
++++ b/modules/video_output/apple/VLCSampleBufferDisplay.m
+@@ -35,6 +35,7 @@
+ 
+ #include <limits.h>
+ #include <errno.h>
++#include <inttypes.h>
+ 
+ #import "VLCDrawable.h"
+ 
+@@ -47,6 +48,7 @@
+ #include "VLCSampleBufferFormatDescriptionCache.h"
+ #include "VLCSampleBufferGeometry.h"
+ #include "VLCSampleBufferOverlayGeometry.h"
++#include "VLCSampleBufferRendererRecovery.h"
+ 
+ #import <VideoToolbox/VideoToolbox.h>
+ 
+@@ -60,6 +62,15 @@
+ #define IS_VT_ROTATION_API_AVAILABLE __VISION_OS_VERSION_MAX_ALLOWED >= 10000
+ #endif
+ 
++typedef NS_ENUM(NSUInteger, VLCSampleBufferRendererGateResult) {
++    VLCSampleBufferRendererGateResultReady,
++    VLCSampleBufferRendererGateResultRetryable,
++    VLCSampleBufferRendererGateResultPermanentFailure,
++    VLCSampleBufferRendererGateResultStale,
++};
++
++static atomic_uint_fast64_t rendererGenerationSource = ATOMIC_VAR_INIT(1);
++
+ typedef NS_ENUM(NSUInteger, VLCSampleBufferPixelRotation) {
+     kVLCSampleBufferPixelRotation_0 = 0,
+     kVLCSampleBufferPixelRotation_90CW,
+@@ -847,12 +858,34 @@ shouldInheritContentsScale:(CGFloat)newScale
+     atomic_bool overlayCompositionEnabled;
+     atomic_uint_fast64_t overlayRefreshGeneration;
+     atomic_uint_fast64_t lastOverlayWarmupSignature;
++    /* The PiP controller's requested mode can get ahead of the sample that
++     * the renderer actually accepted.  Keep the sibling overlay tied to the
++     * last accepted composition mode so a rejected transition cannot create
++     * either duplicate or missing subtitles.  Protected by displayLayerLock. */
++    bool overlayUICompositionEnabled;
++    CMSampleBufferRef recoverySampleBuffer;
+     CVPixelBufferRef latestUncompositedPixelBuffer;
+     CMSampleTimingInfo latestSampleTiming;
+     uint64_t latestFrameSequence;
++    /* Orders every validated renderer enqueue, including paused overlay
++     * refreshes that intentionally reuse the same accepted base frame. */
++    uint64_t overlayAcceptedSubmissionSequence;
+     uint64_t overlayWarmupSignatures[16];
+     uint8_t overlayWarmupSignatureCount;
+     uint8_t overlayWarmupSignatureCursor;
++    uint64_t rendererGeneration;
++    uint64_t rendererRequirementNotificationCount;
++    uint64_t rendererRevocationNotificationCount;
++    uint64_t rendererDecodeFailureNotificationCount;
++    uint64_t rendererForegroundCheckCount;
++    uint64_t rendererSuccessfulSubmissionCount;
++    uint64_t rendererRetryableSubmissionCount;
++    uint64_t rendererRecoverySampleFailureCount;
++    uint64_t rendererDiscontinuityFlushCount;
++    vlc_samplebuffer_renderer_recovery_state rendererRecovery;
++    bool rendererFlushInProgress;
++    bool rendererEnqueueInProgress;
++    bool rendererRecoveryCheckDeferred;
+     int lastPictureSubmissionStatus;
+     vlc_samplebuffer_format_description_cache formatDescriptionCache;
+ }
+@@ -861,6 +894,10 @@ shouldInheritContentsScale:(CGFloat)newScale
+     @property (nonatomic) VLCView *displayClipView;
+     @property (nonatomic) VLCSampleBufferDisplayView *displayView;
+     @property (nonatomic) AVSampleBufferDisplayLayer *displayLayer;
++    @property (nonatomic, strong) AVSampleBufferVideoRenderer *observedRenderer;
++    @property (nonatomic, strong) id rendererRequirementObserver;
++    @property (nonatomic, strong) id rendererDecodeFailureObserver;
++    @property (nonatomic, strong) id applicationActiveObserver;
+     @property (nonatomic, readonly) NSObject *displayLayerLock;
+     @property (nonatomic, readonly) NSObject *subpictureLock;
+     @property (nonatomic, readonly) dispatch_queue_t overlayRefreshQueue;
+@@ -880,10 +917,30 @@ shouldInheritContentsScale:(CGFloat)newScale
+     - (instancetype)init NS_UNAVAILABLE;
+     + (instancetype)new NS_UNAVAILABLE;
+     - (instancetype)initWithVoutDisplay:(vout_display_t *)vd;
++    - (void)installObserversForRendererLocked:
++        (AVSampleBufferVideoRenderer *)renderer;
++    - (BOOL)isCurrentRendererLocked:(AVSampleBufferVideoRenderer *)renderer
++                         generation:(uint64_t)generation;
++    - (VLCSampleBufferRendererGateResult)prepareRendererLocked:
++        (AVSampleBufferVideoRenderer *)renderer
++        generation:(uint64_t)generation
++        context:(const char *)context
++        didFlush:(BOOL *)didFlush;
++    - (VLCSampleBufferRendererGateResult)enqueueSampleBufferLocked:
++        (CMSampleBufferRef)sampleBuffer
++        renderer:(AVSampleBufferVideoRenderer *)renderer
++        generation:(uint64_t)generation
++        requireReadiness:(BOOL)requireReadiness
++        rememberForRecovery:(BOOL)rememberForRecovery;
++    - (void)recoverRendererLocked:(AVSampleBufferVideoRenderer *)renderer
++                       generation:(uint64_t)generation
++                          context:(const char *)context;
+     - (void)placeVideo:(vout_display_place_t)newPlace;
+     - (void)refreshOverlayCompositionEnabled:(bool)enabled
+                                     snapshot:
+                                         (VLCSampleBufferSubpicture *)snapshot;
++    - (void)commitOverlayUICompositionEnabled:(bool)enabled
++                         submissionSequence:(uint64_t)submissionSequence;
+     - (void)prewarmOverlayForPixelBuffer:(CVPixelBufferRef)pixelBuffer
+                                 snapshot:
+                                     (VLCSampleBufferSubpicture *)snapshot
+@@ -897,6 +954,41 @@ shouldInheritContentsScale:(CGFloat)newScale
+  * aspect a second time in AVSampleBufferDisplayLayer. The host clips an
+  * oversized place rectangle for cover/width/height fitting modes. */
+ 
++static CMSampleBufferRef
++CopyImmediateRecoverySampleBuffer(CMSampleBufferRef source)
++{
++    CVImageBufferRef imageBuffer = CMSampleBufferGetImageBuffer(source);
++    CMFormatDescriptionRef formatDescription =
++        CMSampleBufferGetFormatDescription(source);
++    if (imageBuffer == NULL || formatDescription == NULL)
++        return NULL;
++
++    CMSampleTimingInfo timing = {
++        .duration = kCMTimeInvalid,
++        .presentationTimeStamp = kCMTimeInvalid,
++        .decodeTimeStamp = kCMTimeInvalid,
++    };
++    CMSampleBufferRef copy = NULL;
++    OSStatus status = CMSampleBufferCreateReadyWithImageBuffer(
++        kCFAllocatorDefault, imageBuffer,
++        (CMVideoFormatDescriptionRef)formatDescription, &timing, &copy);
++    if (status != noErr || copy == NULL)
++        return NULL;
++
++    CFArrayRef attachments =
++        CMSampleBufferGetSampleAttachmentsArray(copy, true);
++    if (attachments == NULL || CFArrayGetCount(attachments) == 0)
++    {
++        CFRelease(copy);
++        return NULL;
++    }
++    CFMutableDictionaryRef attachment =
++        (CFMutableDictionaryRef)CFArrayGetValueAtIndex(attachments, 0);
++    CFDictionarySetValue(attachment, kCMSampleAttachmentKey_DisplayImmediately,
++                         kCFBooleanTrue);
++    return copy;
++}
++
+ @implementation VLCSampleBufferDisplay
+ 
+ - (id<VLCPixelBufferRotationContext>)rotationContext
+@@ -917,6 +1009,316 @@ shouldInheritContentsScale:(CGFloat)newScale
+     return _cropContext;
+ }
+ 
++- (BOOL)isCurrentRendererLocked:(AVSampleBufferVideoRenderer *)renderer
++                     generation:(uint64_t)generation
++{
++    return !_displayClosed && renderer != nil &&
++        generation == rendererGeneration && _observedRenderer == renderer &&
++        _displayLayer != nil &&
++        _displayLayer.sampleBufferRenderer == renderer;
++}
++
++- (VLCSampleBufferRendererGateResult)prepareRendererLocked:
++        (AVSampleBufferVideoRenderer *)renderer
++        generation:(uint64_t)generation
++        context:(const char *)context
++        didFlush:(BOOL *)didFlush
++{
++    if (didFlush != NULL)
++        *didFlush = NO;
++    if (![self isCurrentRendererLocked:renderer generation:generation])
++        return VLCSampleBufferRendererGateResultStale;
++    if (rendererFlushInProgress || rendererEnqueueInProgress)
++    {
++        /* NSNotificationCenter may synchronously re-enter from inside flush
++         * or enqueue. The outer operation re-reads live state before it can
++         * treat the affected sample as accepted. */
++        rendererRecoveryCheckDeferred = true;
++        return VLCSampleBufferRendererGateResultRetryable;
++    }
++
++    const uint64_t priorPermanentFailures =
++        rendererRecovery.permanent_failure_count;
++    bool requiresFlushBeforeStatus =
++        renderer.requiresFlushToResumeDecoding;
++    bool rendererFailed =
++        renderer.status == AVQueuedSampleBufferRenderingStatusFailed;
++    bool requiresFlushAfterStatus =
++        renderer.requiresFlushToResumeDecoding;
++    vlc_samplebuffer_renderer_gate gate =
++        vlc_samplebuffer_renderer_evaluate(
++            &rendererRecovery,
++            requiresFlushBeforeStatus || requiresFlushAfterStatus,
++            rendererFailed);
++    if (gate == VLC_SAMPLEBUFFER_RENDERER_FLUSH_REQUIRED)
++    {
++        const char *reason =
++            requiresFlushBeforeStatus || requiresFlushAfterStatus
++            ? "revoked decoder resources" : "failed renderer status";
++        msg_Warn(_vd, "Recovering sample-buffer %s during %s "
++                 "(episode %" PRIu64 ")", reason, context,
++                 rendererRecovery.recovery_episode);
++        if (didFlush != NULL)
++            *didFlush = YES;
++        rendererFlushInProgress = true;
++        @try {
++            [renderer flush];
++        } @finally {
++            rendererFlushInProgress = false;
++        }
++        rendererRecoveryCheckDeferred = false;
++
++        /* A resource revoke can race the status read. Bracket it with two
++         * requires-flush reads before classifying a failure as permanent. */
++        requiresFlushBeforeStatus =
++            renderer.requiresFlushToResumeDecoding;
++        rendererFailed =
++            renderer.status == AVQueuedSampleBufferRenderingStatusFailed;
++        requiresFlushAfterStatus =
++            renderer.requiresFlushToResumeDecoding;
++        gate = vlc_samplebuffer_renderer_evaluate(
++            &rendererRecovery,
++            requiresFlushBeforeStatus || requiresFlushAfterStatus,
++            rendererFailed);
++    }
++
++    if (gate == VLC_SAMPLEBUFFER_RENDERER_RETRYABLE ||
++        gate == VLC_SAMPLEBUFFER_RENDERER_FLUSH_REQUIRED)
++        return VLCSampleBufferRendererGateResultRetryable;
++
++    if (gate == VLC_SAMPLEBUFFER_RENDERER_PERMANENT_FAILURE)
++    {
++        if (rendererRecovery.permanent_failure_count != priorPermanentFailures)
++        {
++            const char *description =
++                renderer.error.localizedDescription.UTF8String;
++            msg_Err(_vd,
++                    "Permanent sample-buffer renderer failure during %s%s%s",
++                    context, description != NULL ? ": " : "",
++                    description != NULL ? description : "");
++        }
++        return VLCSampleBufferRendererGateResultPermanentFailure;
++    }
++
++    return VLCSampleBufferRendererGateResultReady;
++}
++
++- (VLCSampleBufferRendererGateResult)enqueueSampleBufferLocked:
++        (CMSampleBufferRef)sampleBuffer
++        renderer:(AVSampleBufferVideoRenderer *)renderer
++        generation:(uint64_t)generation
++        requireReadiness:(BOOL)requireReadiness
++        rememberForRecovery:(BOOL)rememberForRecovery
++{
++    /* A notification posted synchronously from enqueue cannot be allowed to
++     * flush recursively underneath that enqueue. Defer it, inspect the live
++     * state after the call returns, and re-submit this exact sample once when
++     * that inspection had to flush it out of the renderer queue. */
++    for (unsigned attempt = 0; attempt < 2; ++attempt)
++    {
++        VLCSampleBufferRendererGateResult result =
++            [self prepareRendererLocked:renderer
++                             generation:generation
++                                context:"sample submission"
++                               didFlush:NULL];
++        if (result != VLCSampleBufferRendererGateResultReady)
++        {
++            if (result == VLCSampleBufferRendererGateResultRetryable)
++                vlc_samplebuffer_renderer_increment(
++                    &rendererRetryableSubmissionCount);
++            return result;
++        }
++        if (requireReadiness && !renderer.isReadyForMoreMediaData)
++        {
++            vlc_samplebuffer_renderer_increment(
++                &rendererRetryableSubmissionCount);
++            return VLCSampleBufferRendererGateResultRetryable;
++        }
++
++        rendererRecoveryCheckDeferred = false;
++        rendererEnqueueInProgress = true;
++        @try {
++            [renderer enqueueSampleBuffer:sampleBuffer];
++        } @finally {
++            rendererEnqueueInProgress = false;
++        }
++        /* Always bracket the enqueue with a second live-state evaluation.
++         * A notification delivered on another thread cannot set the deferred
++         * bit while it is blocked on displayLayerLock, but the renderer's
++         * state can already have changed. Strict success is therefore not
++         * committed from the preflight alone. */
++        rendererRecoveryCheckDeferred = false;
++        BOOL didFlush = NO;
++        result = [self prepareRendererLocked:renderer
++                                  generation:generation
++                                     context:"post-enqueue validation"
++                                    didFlush:&didFlush];
++        if (result != VLCSampleBufferRendererGateResultReady)
++        {
++            if (result == VLCSampleBufferRendererGateResultRetryable)
++                vlc_samplebuffer_renderer_increment(
++                    &rendererRetryableSubmissionCount);
++            return result;
++        }
++        if (didFlush)
++        {
++            if (attempt == 0)
++                continue;
++            vlc_samplebuffer_renderer_increment(
++                &rendererRetryableSubmissionCount);
++            return VLCSampleBufferRendererGateResultRetryable;
++        }
++
++        /* The void AVFoundation call is not counted on its own. Commit one
++         * successful submission only after the postflight proves that this
++         * exact attempt was not invalidated by a flush or failed status. */
++        vlc_samplebuffer_renderer_increment(
++            &rendererSuccessfulSubmissionCount);
++        if (rememberForRecovery)
++        {
++            CMSampleBufferRef retained =
++                (CMSampleBufferRef)CFRetain(sampleBuffer);
++            if (recoverySampleBuffer != NULL)
++                CFRelease(recoverySampleBuffer);
++            recoverySampleBuffer = retained;
++        }
++        vlc_samplebuffer_renderer_record_submission(&rendererRecovery);
++        return VLCSampleBufferRendererGateResultReady;
++    }
++
++    vlc_assert_unreachable();
++}
++
++- (void)recoverRendererLocked:(AVSampleBufferVideoRenderer *)renderer
++                   generation:(uint64_t)generation
++                      context:(const char *)context
++{
++    VLCSampleBufferRendererGateResult result =
++        [self prepareRendererLocked:renderer
++                         generation:generation
++                            context:context
++                           didFlush:NULL];
++    if (result != VLCSampleBufferRendererGateResultReady ||
++        rendererRecovery.recovery_episode ==
++            rendererRecovery.recovered_episode ||
++        recoverySampleBuffer == NULL)
++        return;
++
++    CMSampleBufferRef immediate =
++        CopyImmediateRecoverySampleBuffer(recoverySampleBuffer);
++    if (immediate == NULL)
++    {
++        vlc_samplebuffer_renderer_increment(
++            &rendererRecoverySampleFailureCount);
++        msg_Err(_vd, "Failed to create immediate renderer recovery sample");
++        return;
++    }
++
++    [self enqueueSampleBufferLocked:immediate
++                           renderer:renderer
++                         generation:generation
++                   requireReadiness:NO
++                rememberForRecovery:NO];
++    CFRelease(immediate);
++}
++
++- (void)installObserversForRendererLocked:
++        (AVSampleBufferVideoRenderer *)renderer
++{
++    NSAssert(_observedRenderer == nil && _rendererRequirementObserver == nil &&
++             _rendererDecodeFailureObserver == nil &&
++             _applicationActiveObserver == nil,
++             @"sample-buffer renderer observers installed twice");
++
++    rendererGeneration = atomic_fetch_add_explicit(
++        &rendererGenerationSource, 1, memory_order_relaxed);
++    if (rendererGeneration == 0)
++        rendererGeneration = atomic_fetch_add_explicit(
++            &rendererGenerationSource, 1, memory_order_relaxed);
++    if (renderer == nil)
++    {
++        msg_Err(_vd, "Installed sample-buffer display layer has no renderer");
++        return;
++    }
++
++    const uint64_t generation = rendererGeneration;
++    _observedRenderer = renderer;
++    __weak VLCSampleBufferDisplay *weakSelf = self;
++    NSNotificationCenter *center = NSNotificationCenter.defaultCenter;
++    _rendererRequirementObserver = [center
++        addObserverForName:
++            AVSampleBufferVideoRendererRequiresFlushToResumeDecodingDidChangeNotification
++        object:renderer
++        queue:nil
++        usingBlock:^(NSNotification *notification) {
++            VLCSampleBufferDisplay *sys = weakSelf;
++            AVSampleBufferVideoRenderer *notifyingRenderer =
++                (AVSampleBufferVideoRenderer *)notification.object;
++            if (sys == nil || notifyingRenderer == nil)
++                return;
++            @synchronized(sys.displayLayerLock) {
++                if (![sys isCurrentRendererLocked:notifyingRenderer
++                                              generation:generation])
++                    return;
++                vlc_samplebuffer_renderer_increment(
++                    &sys->rendererRequirementNotificationCount);
++                if (notifyingRenderer.requiresFlushToResumeDecoding)
++                    vlc_samplebuffer_renderer_increment(
++                        &sys->rendererRevocationNotificationCount);
++                [sys recoverRendererLocked:notifyingRenderer
++                                  generation:generation
++                                     context:"decoder-resource notification"];
++            }
++        }];
++
++    _rendererDecodeFailureObserver = [center
++        addObserverForName:
++            AVSampleBufferVideoRendererDidFailToDecodeNotification
++        object:renderer
++        queue:nil
++        usingBlock:^(NSNotification *notification) {
++            VLCSampleBufferDisplay *sys = weakSelf;
++            AVSampleBufferVideoRenderer *notifyingRenderer =
++                (AVSampleBufferVideoRenderer *)notification.object;
++            if (sys == nil || notifyingRenderer == nil)
++                return;
++            @synchronized(sys.displayLayerLock) {
++                if (![sys isCurrentRendererLocked:notifyingRenderer
++                                              generation:generation])
++                    return;
++                vlc_samplebuffer_renderer_increment(
++                    &sys->rendererDecodeFailureNotificationCount);
++                [sys recoverRendererLocked:notifyingRenderer
++                                  generation:generation
++                                     context:"decode-failure notification"];
++            }
++        }];
++
++#if !TARGET_OS_OSX
++    _applicationActiveObserver = [center
++        addObserverForName:UIApplicationDidBecomeActiveNotification
++        object:nil
++        queue:nil
++        usingBlock:^(NSNotification *notification) {
++            VLC_UNUSED(notification);
++            VLCSampleBufferDisplay *sys = weakSelf;
++            if (sys == nil)
++                return;
++            @synchronized(sys.displayLayerLock) {
++                AVSampleBufferVideoRenderer *current = sys.observedRenderer;
++                if (![sys isCurrentRendererLocked:current
++                                              generation:generation])
++                    return;
++                vlc_samplebuffer_renderer_increment(
++                    &sys->rendererForegroundCheckCount);
++                [sys recoverRendererLocked:current
++                                  generation:generation
++                                     context:"application activation"];
++            }
++        }];
++#endif
++}
++
+ 
+ - (instancetype)initWithVoutDisplay:(vout_display_t *)vd
+ {
+@@ -946,6 +1348,7 @@ shouldInheritContentsScale:(CGFloat)newScale
+     atomic_init(&overlayCompositionEnabled, false);
+     atomic_init(&overlayRefreshGeneration, 0);
+     atomic_init(&lastOverlayWarmupSignature, 0);
++    overlayUICompositionEnabled = false;
+     lastPictureSubmissionStatus = -EIO;
+ 
+     _pipcontroller = CreatePipController(vd, (__bridge void *)self);
+@@ -1036,6 +1439,8 @@ shouldInheritContentsScale:(CGFloat)newScale
+                 sys.displayView = displayView;
+                 sys.spuView = spuView;
+                 sys.displayLayer = displayLayer;
++                [sys installObserversForRendererLocked:
++                    displayLayer.sampleBufferRenderer];
+             }
+             if (presentationContext != NULL)
+                 preparePresentationContext(
+@@ -1068,22 +1473,24 @@ shouldInheritContentsScale:(CGFloat)newScale
+     [self refreshOverlayCompositionEnabled:enabled snapshot:snapshot];
+ }
+ 
+-- (void)refreshOverlayCompositionEnabled:(bool)enabled
+-                                    snapshot:
+-                                        (VLCSampleBufferSubpicture *)snapshot
++- (void)commitOverlayUICompositionEnabled:(bool)enabled
++                         submissionSequence:(uint64_t)submissionSequence
+ {
+     VLCSampleBufferDisplay *sys = self;
+-    uint64_t refreshGeneration = atomic_fetch_add_explicit(
+-        &overlayRefreshGeneration, 1, memory_order_acq_rel) + 1;
+-
+-    dispatch_block_t updateInlineOverlay = ^{
+-        if (atomic_load_explicit(&sys->overlayRefreshGeneration,
+-                                 memory_order_acquire) != refreshGeneration)
+-            return;
++    dispatch_block_t commit = ^{
++        bool changed = false;
+         @synchronized(sys.displayLayerLock) {
+-            if (sys.displayClosed)
++            if (sys.displayClosed ||
++                sys->overlayAcceptedSubmissionSequence != submissionSequence)
+                 return;
++            if (sys->overlayUICompositionEnabled != enabled) {
++                sys->overlayUICompositionEnabled = enabled;
++                changed = true;
++            }
+         }
++        if (!changed)
++            return;
++
+         VLCSampleBufferSubpicture *inlineSnapshot = nil;
+         if (!enabled) {
+             @synchronized(sys.subpictureLock) {
+@@ -1092,17 +1499,20 @@ shouldInheritContentsScale:(CGFloat)newScale
+         }
+         [sys.spuView drawSubpicture:inlineSnapshot];
+     };
+-    dispatch_block_t scheduleInlineOverlayUpdate = ^{
+-        if ([NSThread isMainThread])
+-            updateInlineOverlay();
+-        else
+-            dispatch_async(dispatch_get_main_queue(), updateInlineOverlay);
+-    };
+-    /* Hide the sibling before the first burned-in frame can arrive. During
+-     * restoration, keep it hidden until an uncomposited frame is enqueued so
+-     * the inline surface never displays the same subtitle twice. */
+-    if (enabled)
+-        scheduleInlineOverlayUpdate();
++
++    if ([NSThread isMainThread])
++        commit();
++    else
++        dispatch_async(dispatch_get_main_queue(), commit);
++}
++
++- (void)refreshOverlayCompositionEnabled:(bool)enabled
++                                    snapshot:
++                                        (VLCSampleBufferSubpicture *)snapshot
++{
++    VLCSampleBufferDisplay *sys = self;
++    uint64_t refreshGeneration = atomic_fetch_add_explicit(
++        &overlayRefreshGeneration, 1, memory_order_acq_rel) + 1;
+ 
+     CVPixelBufferRef basePixelBuffer = NULL;
+     CMSampleTimingInfo sampleTiming;
+@@ -1120,11 +1530,8 @@ shouldInheritContentsScale:(CGFloat)newScale
+             displayHeight = _vd->cfg->display.height;
+         }
+     }
+-    if (basePixelBuffer == NULL) {
+-        if (!enabled)
+-            scheduleInlineOverlayUpdate();
++    if (basePixelBuffer == NULL)
+         return;
+-    }
+ 
+     dispatch_async(_overlayRefreshQueue, ^{
+         if (atomic_load_explicit(&sys->overlayRefreshGeneration,
+@@ -1171,11 +1578,8 @@ shouldInheritContentsScale:(CGFloat)newScale
+         }
+         CVPixelBufferRelease(refreshPixelBuffer);
+         CVPixelBufferRelease(basePixelBuffer);
+-        if (status != noErr || sampleBuffer == NULL) {
+-            if (!enabled)
+-                scheduleInlineOverlayUpdate();
++        if (status != noErr || sampleBuffer == NULL)
+             return;
+-        }
+ 
+         CFArrayRef attachments =
+             CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, true);
+@@ -1191,24 +1595,41 @@ shouldInheritContentsScale:(CGFloat)newScale
+             if (atomic_load_explicit(&sys->overlayRefreshGeneration,
+                                      memory_order_acquire) ==
+                 refreshGeneration) {
++                VLCSampleBufferRendererGateResult gateResult =
++                    VLCSampleBufferRendererGateResultStale;
++                uint64_t acceptedSubmissionSequence = 0;
+                 @synchronized(sys.displayLayerLock) {
+                     if (!sys.displayClosed &&
++                        atomic_load_explicit(&sys->overlayRefreshGeneration,
++                                             memory_order_acquire) ==
++                            refreshGeneration &&
+                         sys->latestFrameSequence == frameSequence &&
+                         sys.displayLayer != nil) {
+                         AVSampleBufferVideoRenderer *renderer =
+                             sys.displayLayer.sampleBufferRenderer;
+-                        if (renderer.requiresFlushToResumeDecoding ||
+-                            renderer.status ==
+-                                AVQueuedSampleBufferRenderingStatusFailed)
+-                            [renderer flush];
+                         /* This one bounded transition sample makes paused PiP
+                          * entry and inline restoration reflect the new
+                          * composition mode without waiting for another frame. */
+-                        [renderer enqueueSampleBuffer:sampleBuffer];
++                        gateResult =
++                            [sys enqueueSampleBufferLocked:sampleBuffer
++                                                 renderer:renderer
++                                               generation:sys->rendererGeneration
++                                         requireReadiness:NO
++                                      rememberForRecovery:YES];
++                        if (gateResult ==
++                            VLCSampleBufferRendererGateResultReady)
++                            acceptedSubmissionSequence =
++                                ++sys->overlayAcceptedSubmissionSequence;
+                     }
+                 }
+-                if (!enabled)
+-                    updateInlineOverlay();
++                /* The sibling UI changes only after the corresponding sample
++                 * reached the current renderer and survived its postflight
++                 * gate.  A rejected transition leaves the prior mode intact;
++                 * the next accepted frame can complete the requested mode. */
++                if (gateResult == VLCSampleBufferRendererGateResultReady)
++                    [sys commitOverlayUICompositionEnabled:enabled
++                                         submissionSequence:
++                                             acceptedSubmissionSequence];
+             }
+             CFRelease(sampleBuffer);
+         });
+@@ -1289,11 +1710,28 @@ shouldInheritContentsScale:(CGFloat)newScale
+ 
+ - (void)close {
+     VLCSampleBufferDisplay *sys = self;
++    NSNotificationCenter *center = NSNotificationCenter.defaultCenter;
++    id rendererRequirementObserver;
++    id rendererDecodeFailureObserver;
++    id applicationActiveObserver;
+     @synchronized(_displayLayerLock) {
+         atomic_fetch_add_explicit(&overlayRefreshGeneration, 1,
+                                   memory_order_acq_rel);
+         _displayClosed = YES;
++        rendererGeneration = 0;
++        rendererRequirementObserver = _rendererRequirementObserver;
++        rendererDecodeFailureObserver = _rendererDecodeFailureObserver;
++        applicationActiveObserver = _applicationActiveObserver;
++        _rendererRequirementObserver = nil;
++        _rendererDecodeFailureObserver = nil;
++        _applicationActiveObserver = nil;
++        _observedRenderer = nil;
+         _displayLayer = nil;
++        if (recoverySampleBuffer != NULL)
++        {
++            CFRelease(recoverySampleBuffer);
++            recoverySampleBuffer = NULL;
++        }
+         if (latestUncompositedPixelBuffer != NULL)
+         {
+             CVPixelBufferRelease(latestUncompositedPixelBuffer);
+@@ -1302,6 +1740,12 @@ shouldInheritContentsScale:(CGFloat)newScale
+         vlc_samplebuffer_format_description_cache_Clear(
+             &formatDescriptionCache);
+     }
++    if (rendererRequirementObserver != nil)
++        [center removeObserver:rendererRequirementObserver];
++    if (rendererDecodeFailureObserver != nil)
++        [center removeObserver:rendererDecodeFailureObserver];
++    if (applicationActiveObserver != nil)
++        [center removeObserver:applicationActiveObserver];
+     dispatch_async(dispatch_get_main_queue(), ^{
+         [sys.displayClipView removeFromSuperview];
+         [sys.spuView removeFromSuperview];
+@@ -1417,15 +1861,17 @@ static int RenderPicture(vout_display_t *vd, picture_t *pic, vlc_tick_t date,
+         {
+             AVSampleBufferVideoRenderer *renderer =
+                 displayLayer.sampleBufferRenderer;
+-            if (renderer.requiresFlushToResumeDecoding ||
+-                renderer.status == AVQueuedSampleBufferRenderingStatusFailed)
+-            {
+-                NSError *error = renderer.error;
+-                msg_Warn(vd, "Flushing failed sample-buffer renderer%s%s",
+-                         error ? ": " : "",
+-                         error ? error.description.UTF8String : "");
+-                [renderer flush];
+-            }
++            VLCSampleBufferRendererGateResult gate =
++                [sys prepareRendererLocked:renderer
++                                 generation:sys->rendererGeneration
++                                    context:"render preflight"
++                                   didFlush:NULL];
++            if (gate == VLCSampleBufferRendererGateResultPermanentFailure)
++                return -EIO;
++            if (gate == VLCSampleBufferRendererGateResultStale)
++                return -ECANCELED;
++            if (gate != VLCSampleBufferRendererGateResultReady)
++                return -EAGAIN;
+             if (!renderer.isReadyForMoreMediaData)
+                 return -EAGAIN;
+         }
+@@ -1599,6 +2045,11 @@ static int RenderPicture(vout_display_t *vd, picture_t *pic, vlc_tick_t date,
+      * appear after generation B has started. */
+     CVPixelBufferRef uncompositedPixelBuffer =
+         CVPixelBufferRetain(pixelBuffer);
++    /* With no regions, an unmodified frame is a valid realization of either
++     * overlay mode. With visible regions, composition becomes accepted only
++     * when the compositor actually produced the submitted pixel buffer. */
++    bool submittedComposition =
++        compositeSubpicture && subpicture.regions.count == 0;
+ 
+     if (compositeSubpicture && subpicture.regions.count != 0) {
+         VLCSampleBufferOverlayCompositor *compositor;
+@@ -1619,6 +2070,7 @@ static int RenderPicture(vout_display_t *vd, picture_t *pic, vlc_tick_t date,
+         if (composited != NULL) {
+             CVPixelBufferRelease(pixelBuffer);
+             pixelBuffer = composited;
++            submittedComposition = true;
+         } else {
+             ReportOverlayFailure(vd, sys);
+         }
+@@ -1643,25 +2095,21 @@ static int RenderPicture(vout_display_t *vd, picture_t *pic, vlc_tick_t date,
+     }
+ 
+     int submissionStatus = -EAGAIN;
++    uint64_t acceptedSubmissionSequence = 0;
+     @synchronized(sys.displayLayerLock) {
+         AVSampleBufferDisplayLayer *displayLayer = sys.displayLayer;
+         if (displayLayer != nil && !sys.displayClosed)
+         {
+             AVSampleBufferVideoRenderer *renderer =
+                 displayLayer.sampleBufferRenderer;
+-            if (renderer.requiresFlushToResumeDecoding ||
+-                renderer.status == AVQueuedSampleBufferRenderingStatusFailed)
+-            {
+-                NSError *error = renderer.error;
+-                msg_Warn(vd, "Flushing failed sample-buffer renderer%s%s",
+-                         error ? ": " : "",
+-                         error ? error.description.UTF8String : "");
+-                [renderer flush];
+-            }
+-            if (renderer.isReadyForMoreMediaData)
++            VLCSampleBufferRendererGateResult result =
++                [sys enqueueSampleBufferLocked:sampleBuffer
++                                     renderer:renderer
++                                   generation:sys->rendererGeneration
++                             requireReadiness:YES
++                          rememberForRecovery:YES];
++            if (result == VLCSampleBufferRendererGateResultReady)
+             {
+-                [renderer enqueueSampleBuffer:sampleBuffer];
+-
+                 /* Enqueue and publication form one commit under the same lock
+                  * used by close, purge and layer installation.  Only a sample
+                  * that reached this exact renderer call can become the base
+@@ -1673,8 +2121,34 @@ static int RenderPicture(vout_display_t *vd, picture_t *pic, vlc_tick_t date,
+                     CVPixelBufferRetain(uncompositedPixelBuffer);
+                 sys->latestSampleTiming = sampleTimingInfo;
+                 ++sys->latestFrameSequence;
++                acceptedSubmissionSequence =
++                    ++sys->overlayAcceptedSubmissionSequence;
+                 submissionStatus = VLC_SUCCESS;
+             }
++            else if (result ==
++                     VLCSampleBufferRendererGateResultPermanentFailure)
++                submissionStatus = -EIO;
++            else if (result == VLCSampleBufferRendererGateResultStale)
++                submissionStatus = -ECANCELED;
++        }
++    }
++
++    if (submissionStatus == VLC_SUCCESS) {
++        /* First bind the sibling UI to the exact sample that was accepted,
++         * even when it is an uncomposited fallback for a still-enabled PiP
++         * request. The desired mode can then retry without leaving this
++         * already-visible sample incoherent. */
++        [sys commitOverlayUICompositionEnabled:submittedComposition
++                             submissionSequence:acceptedSubmissionSequence];
++        bool requestedComposition = atomic_load_explicit(
++            &sys->overlayCompositionEnabled, memory_order_acquire);
++        if (requestedComposition != submittedComposition) {
++            /* The PiP request changed while this frame was being prepared, or
++             * composition failed and the exact accepted sample fell back to
++             * its uncomposited base. Use that newly published accepted base
++             * for one bounded transition instead of hiding the sibling UI. */
++            [sys refreshOverlayCompositionEnabled:requestedComposition
++                                         snapshot:subpicture];
+         }
+     }
+ 
+@@ -1887,8 +2361,7 @@ static bool UpdateSubpictureSnapshot(
+ }
+ 
+ static void DrawSubpicture(VLCSampleBufferDisplay *sys,
+-                           VLCSampleBufferSubpicture *snapshot,
+-                           bool compositeSubpicture)
++                           VLCSampleBufferSubpicture *snapshot)
+ {
+     VLCSampleBufferSubpicture *const triggeringSnapshot = snapshot;
+     uint64_t overlayModeGeneration = atomic_load_explicit(
+@@ -1896,14 +2369,21 @@ static void DrawSubpicture(VLCSampleBufferDisplay *sys,
+ 
+     dispatch_async(dispatch_get_main_queue(), ^{
+         if (atomic_load_explicit(&sys->overlayRefreshGeneration,
+-                                 memory_order_acquire) !=
+-                overlayModeGeneration ||
+-            atomic_load_explicit(&sys->overlayCompositionEnabled,
+-                                 memory_order_acquire) != compositeSubpicture)
++                                 memory_order_acquire) != overlayModeGeneration)
+             return;
++        bool committedComposition;
++        @synchronized(sys.displayLayerLock) {
++            if (sys.displayClosed)
++                return;
++            committedComposition = sys->overlayUICompositionEnabled;
++        }
+         /* The block retains the exact snapshot that triggered this draw. It
+-         * never re-reads the producer's replaceable publication slot. */
+-        [sys.spuView drawSubpicture:triggeringSnapshot];
++         * never re-reads the producer's replaceable publication slot. The UI
++         * follows the last renderer-accepted composition mode, not a request
++         * whose transition sample may have been rejected. */
++        [sys.spuView drawSubpicture:committedComposition
++                                        ? nil
++                                        : triggeringSnapshot];
+     });
+ }
+ 
+@@ -1938,8 +2418,7 @@ static void Prepare (vout_display_t *vd, picture_t *pic,
+         [sys refreshOverlayCompositionEnabled:true
+                                      snapshot:currentSubpicture];
+     else if (subpictureChanged)
+-        DrawSubpicture(sys, compositeSubpicture ? nil : currentSubpicture,
+-                       compositeSubpicture);
++        DrawSubpicture(sys, currentSubpicture);
+ }
+ 
+ static void Display(vout_display_t *vd, picture_t *pic)
+@@ -1967,24 +2446,117 @@ static void PurgePictureSubmissions(vout_display_t *vd, bool discontinuity)
+          * makes that invariant fail closed if a future early-return path is
+          * introduced between prepare and status inspection. */
+         sys->lastPictureSubmissionStatus = -ECANCELED;
+-        atomic_fetch_add_explicit(&sys->overlayRefreshGeneration, 1,
+-                                  memory_order_acq_rel);
+-        ++sys->latestFrameSequence;
+-        if (sys->latestUncompositedPixelBuffer != NULL)
++        /* A routine strict-cancel/backpressure purge invalidates pending
++         * submissions, not the last renderer-accepted picture.  Preserve its
++         * uncomposited base so a paused PiP mode change can replace the still
++         * displayed frame coherently.  A true discontinuity is the boundary
++         * that makes both recovery representations stale. */
++        if (discontinuity && sys->latestUncompositedPixelBuffer != NULL)
+         {
+             CVPixelBufferRelease(sys->latestUncompositedPixelBuffer);
+             sys->latestUncompositedPixelBuffer = NULL;
+         }
++        if (discontinuity && sys->recoverySampleBuffer != NULL)
++        {
++            CFRelease(sys->recoverySampleBuffer);
++            sys->recoverySampleBuffer = NULL;
++        }
+         if (discontinuity)
+         {
++            atomic_fetch_add_explicit(&sys->overlayRefreshGeneration, 1,
++                                      memory_order_acq_rel);
++            ++sys->latestFrameSequence;
++            ++sys->overlayAcceptedSubmissionSequence;
+             AVSampleBufferVideoRenderer *renderer =
+                 sys.displayLayer.sampleBufferRenderer;
+             if (renderer != nil)
+-                [renderer flush];
++            {
++                vlc_samplebuffer_renderer_increment(
++                    &sys->rendererDiscontinuityFlushCount);
++                sys->rendererFlushInProgress = true;
++                @try {
++                    [renderer flush];
++                } @finally {
++                    sys->rendererFlushInProgress = false;
++                }
++            }
++            sys->rendererRecoveryCheckDeferred = false;
++            vlc_samplebuffer_renderer_reset_boundary(&sys->rendererRecovery);
+         }
+     }
+ }
+ 
++static bool GetRendererRecoverySnapshot(
++    vout_display_t *vd,
++    vout_display_renderer_recovery_snapshot *snapshot)
++{
++    if (snapshot == NULL)
++        return false;
++
++    VLCSampleBufferDisplay *sys =
++        (__bridge VLCSampleBufferDisplay *)vd->sys;
++    @synchronized(sys.displayLayerLock) {
++        AVSampleBufferVideoRenderer *renderer = sys.observedRenderer;
++        uint64_t generation = sys->rendererGeneration;
++        if (![sys isCurrentRendererLocked:renderer generation:generation])
++            return false;
++
++        bool requiresFlushBeforeStatus =
++            renderer.requiresFlushToResumeDecoding;
++        AVQueuedSampleBufferRenderingStatus status = renderer.status;
++        bool requiresFlushAfterStatus =
++            renderer.requiresFlushToResumeDecoding;
++        bool requiresFlush =
++            requiresFlushBeforeStatus || requiresFlushAfterStatus;
++        uint32_t flags = VOUT_DISPLAY_RENDERER_CURRENT;
++        if (requiresFlush)
++            flags |= VOUT_DISPLAY_RENDERER_REQUIRES_FLUSH;
++        if (status == AVQueuedSampleBufferRenderingStatusFailed)
++            flags |= VOUT_DISPLAY_RENDERER_FAILED;
++        if (sys->rendererFlushInProgress ||
++            sys->rendererRecovery.recovery_episode !=
++                sys->rendererRecovery.recovered_episode)
++            flags |= VOUT_DISPLAY_RENDERER_RECOVERY_IN_PROGRESS;
++        if (sys->recoverySampleBuffer != NULL)
++            flags |= VOUT_DISPLAY_RENDERER_RECOVERY_SAMPLE_AVAILABLE;
++
++        *snapshot = (vout_display_renderer_recovery_snapshot) {
++            .display_generation = generation,
++            .recovery_episode_count =
++                sys->rendererRecovery.recovery_episode,
++            .recovered_episode_count =
++                sys->rendererRecovery.recovered_episode,
++            .requirement_notification_count =
++                sys->rendererRequirementNotificationCount,
++            .revocation_notification_count =
++                sys->rendererRevocationNotificationCount,
++            .decode_failure_notification_count =
++                sys->rendererDecodeFailureNotificationCount,
++            .foreground_check_count = sys->rendererForegroundCheckCount,
++            .recovery_flush_count =
++                sys->rendererRecovery.recovery_flush_count,
++            .revocation_flush_count =
++                sys->rendererRecovery.revocation_flush_count,
++            .failure_flush_count =
++                sys->rendererRecovery.failure_flush_count,
++            .discontinuity_flush_count =
++                sys->rendererDiscontinuityFlushCount,
++            .successful_submission_count =
++                sys->rendererSuccessfulSubmissionCount,
++            .recovery_submission_count =
++                sys->rendererRecovery.recovery_submission_count,
++            .retryable_submission_count =
++                sys->rendererRetryableSubmissionCount,
++            .recovery_sample_failure_count =
++                sys->rendererRecoverySampleFailureCount,
++            .permanent_failure_count =
++                sys->rendererRecovery.permanent_failure_count,
++            .flags = flags,
++        };
++        return true;
++    }
++}
++
+ static int Control (vout_display_t *vd, int query)
+ {
+     VLCSampleBufferDisplay *sys;
+@@ -2107,6 +2679,8 @@ static int Open (vout_display_t *vd,
+             .update_format = UpdateFormat,
+             .get_picture_submission_status = GetPictureSubmissionStatus,
+             .purge_picture_submissions = PurgePictureSubmissions,
++            .get_renderer_recovery_snapshot =
++                GetRendererRecoverySnapshot,
+         };
+ 
+         vd->ops = &ops;
+diff --git a/modules/video_output/apple/VLCSampleBufferRendererRecovery.h b/modules/video_output/apple/VLCSampleBufferRendererRecovery.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..198d9d89309e35fe5837bb230c3fb017a9f0b242
+--- /dev/null
++++ b/modules/video_output/apple/VLCSampleBufferRendererRecovery.h
+@@ -0,0 +1,119 @@
++/*****************************************************************************
++ * VLCSampleBufferRendererRecovery.h: deterministic renderer recovery state
++ *****************************************************************************
++ * Copyright (C) 2026 VLC authors and VideoLAN
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU Lesser General Public License as published by
++ * the Free Software Foundation; either version 2.1 of the License, or
++ * (at your option) any later version.
++ *****************************************************************************
++ * This header intentionally depends only on the C standard library. The
++ * transition policy can therefore be stress-tested without AVFoundation;
++ * production remains responsible for performing a requested flush and then
++ * re-evaluating the renderer's live state before enqueueing.
++ *****************************************************************************/
++
++#ifndef VLC_SAMPLE_BUFFER_RENDERER_RECOVERY_H
++#define VLC_SAMPLE_BUFFER_RENDERER_RECOVERY_H
++
++#include <stdbool.h>
++#include <stdint.h>
++
++typedef enum
++{
++    VLC_SAMPLEBUFFER_RENDERER_READY,
++    VLC_SAMPLEBUFFER_RENDERER_FLUSH_REQUIRED,
++    VLC_SAMPLEBUFFER_RENDERER_RETRYABLE,
++    VLC_SAMPLEBUFFER_RENDERER_PERMANENT_FAILURE,
++} vlc_samplebuffer_renderer_gate;
++
++typedef struct
++{
++    uint64_t recovery_episode;
++    uint64_t recovered_episode;
++    uint64_t recovery_flush_count;
++    uint64_t revocation_flush_count;
++    uint64_t failure_flush_count;
++    uint64_t recovery_submission_count;
++    uint64_t permanent_failure_count;
++    bool recovery_flush_latched;
++    bool permanent_failure_latched;
++} vlc_samplebuffer_renderer_recovery_state;
++
++static inline void
++vlc_samplebuffer_renderer_increment(uint64_t *value)
++{
++    if (*value != UINT64_MAX)
++        (*value)++;
++}
++
++/* Both revoked resources and an ordinary failed status require one bounded
++ * flush attempt. requires_flush takes precedence when both are true. A failed
++ * status becomes permanent only if that flush did not reset it to Unknown.
++ * One flush action is emitted per contiguous non-ready interval. */
++static inline vlc_samplebuffer_renderer_gate
++vlc_samplebuffer_renderer_evaluate(
++    vlc_samplebuffer_renderer_recovery_state *state,
++    bool requires_flush, bool failed)
++{
++    if (requires_flush || failed)
++    {
++        if (!state->recovery_flush_latched)
++        {
++            state->recovery_flush_latched = true;
++            state->permanent_failure_latched = false;
++            vlc_samplebuffer_renderer_increment(&state->recovery_episode);
++            vlc_samplebuffer_renderer_increment(&state->recovery_flush_count);
++            if (requires_flush)
++                vlc_samplebuffer_renderer_increment(
++                    &state->revocation_flush_count);
++            else
++                vlc_samplebuffer_renderer_increment(
++                    &state->failure_flush_count);
++            return VLC_SAMPLEBUFFER_RENDERER_FLUSH_REQUIRED;
++        }
++        if (!requires_flush)
++        {
++            if (!state->permanent_failure_latched)
++            {
++                state->permanent_failure_latched = true;
++                vlc_samplebuffer_renderer_increment(
++                    &state->permanent_failure_count);
++            }
++            return VLC_SAMPLEBUFFER_RENDERER_PERMANENT_FAILURE;
++        }
++        return VLC_SAMPLEBUFFER_RENDERER_RETRYABLE;
++    }
++
++    state->recovery_flush_latched = false;
++    state->permanent_failure_latched = false;
++    return VLC_SAMPLEBUFFER_RENDERER_READY;
++}
++
++/* Returns true exactly once for the first successful submission following a
++ * recovery episode. */
++static inline bool
++vlc_samplebuffer_renderer_record_submission(
++    vlc_samplebuffer_renderer_recovery_state *state)
++{
++    if (state->recovery_episode == state->recovered_episode)
++        return false;
++
++    state->recovered_episode = state->recovery_episode;
++    vlc_samplebuffer_renderer_increment(&state->recovery_submission_count);
++    return true;
++}
++
++/* Seek/reset/replace has already discarded the old renderer queue. Retain
++ * cumulative evidence while making the prior episode ineligible for replay. */
++static inline void
++vlc_samplebuffer_renderer_reset_boundary(
++    vlc_samplebuffer_renderer_recovery_state *state)
++{
++    state->recovered_episode = state->recovery_episode;
++    state->recovery_flush_latched = false;
++    state->permanent_failure_latched = false;
++}
++
++#endif /* VLC_SAMPLE_BUFFER_RENDERER_RECOVERY_H */
+diff --git a/src/libvlccore.sym b/src/libvlccore.sym
+index 49783312d5d72a1eddcd1398af370ff48801b164..a028f182f4daed311e691ab72b00ac82290d91c8 100644
+--- a/src/libvlccore.sym
++++ b/src/libvlccore.sym
+@@ -776,6 +776,7 @@ vout_UnregisterSubpictureChannel
+ vout_FlushSubpictureChannel
+ vout_Flush
+ vout_GetSnapshot
++vout_GetRendererRecoverySnapshot
+ vout_OSDIcon
+ vout_OSDMessageVa
+ vout_OSDEpg
+diff --git a/src/video_output/video_output.c b/src/video_output/video_output.c
+index 4f58a2a45fd09f2e31c24e337980e0ace0af7273..d1061d7beb178d0ff4b2f0e0c84fab16ba071603 100644
+--- a/src/video_output/video_output.c
++++ b/src/video_output/video_output.c
+@@ -465,6 +465,26 @@ void vout_GetResetStatistic(vout_thread_t *vout, unsigned *restrict displayed,
+     vout_statistic_GetReset( &sys->statistic, displayed, lost, late );
+ }
+ 
++bool vout_GetRendererRecoverySnapshot(
++    vout_thread_t *vout,
++    vout_display_renderer_recovery_snapshot *snapshot)
++{
++    if (snapshot == NULL)
++        return false;
++
++    *snapshot = (vout_display_renderer_recovery_snapshot) { 0 };
++    vout_thread_sys_t *sys = VOUT_THREAD_TO_SYS(vout);
++    if (sys->dummy)
++        return false;
++
++    vlc_queuedmutex_lock(&sys->display_lock);
++    vout_display_t *display = sys->display;
++    bool supported = display != NULL &&
++        vout_display_GetRendererRecoverySnapshot(display, snapshot);
++    vlc_queuedmutex_unlock(&sys->display_lock);
++    return supported;
++}
++
+ bool vout_IsEmpty(vout_thread_t *vout)
+ {
+     vout_thread_sys_t *sys = VOUT_THREAD_TO_SYS(vout);

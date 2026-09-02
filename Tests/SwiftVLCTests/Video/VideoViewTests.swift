@@ -1,7 +1,7 @@
 @testable import SwiftVLC
 import Testing
 
-#if canImport(AppKit)
+#if os(macOS)
 import AppKit
 #elseif canImport(UIKit)
 import UIKit
@@ -67,7 +67,7 @@ extension Integration {
       let surface = VideoSurface()
       surface.attach(to: player)
 
-      #if canImport(AppKit)
+      #if os(macOS)
       surface.frame = NSRect(x: 0, y: 0, width: 320, height: 240)
       surface.layout()
       #elseif canImport(UIKit)

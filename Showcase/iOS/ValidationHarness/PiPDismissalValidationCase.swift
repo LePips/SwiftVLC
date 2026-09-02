@@ -116,7 +116,7 @@ struct PiPDismissalValidationCase: View {
   private func startPictureInPicture() {
     guard let controller else { return }
     playbackError = nil
-    guard controller.start() == .accepted else {
+    guard controller.requestStart() == .accepted else {
       playbackError = "PiP start was not accepted"
       return
     }
@@ -128,8 +128,8 @@ struct PiPDismissalValidationCase: View {
       Spacer()
       Text(value)
         .foregroundStyle(.secondary)
+        .accessibilityIdentifier(identifier)
     }
-    .qualificationAccessibilityValue(value, title: title, identifier: identifier)
   }
 }
 

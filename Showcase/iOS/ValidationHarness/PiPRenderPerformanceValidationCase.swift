@@ -96,7 +96,7 @@ struct PiPRenderPerformanceValidationCase: View {
       try await waitUntil("Performance fixture did not start", timeout: .seconds(30)) {
         player.state == .playing
       }
-      guard controller.start() == .accepted else {
+      guard controller.requestStart() == .accepted else {
         throw PiPPerformanceFailure("Direct PiP start was not accepted")
       }
       try await waitUntil("Direct PiP did not become active", timeout: .seconds(30)) {
@@ -391,8 +391,7 @@ struct PiPRenderPerformanceValidationCase: View {
   }
 
   private func valueRow(_ title: String, value: String, identifier: String) -> some View {
-    HStack { Text(title); Spacer(); Text(value).foregroundStyle(.secondary) }
-      .qualificationAccessibilityValue(value, title: title, identifier: identifier)
+    HStack { Text(title); Spacer(); Text(value).foregroundStyle(.secondary).accessibilityIdentifier(identifier) }
   }
 }
 

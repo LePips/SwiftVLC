@@ -35,6 +35,26 @@ private struct SystemPictureInPictureInspectionFailure: Error, CustomStringConve
   }
 }
 
+enum ShowcaseScrollDirection {
+  case up
+  case down
+
+  var opposite: Self {
+    switch self {
+    case .up: .down
+    case .down: .up
+    }
+  }
+
+  @MainActor
+  func perform(in app: XCUIApplication) {
+    switch self {
+    case .up: app.swipeUp()
+    case .down: app.swipeDown()
+    }
+  }
+}
+
 /// Base class for every iOS showcase UI test.
 ///
 /// Owns the `XCUIApplication` instance, configures the launch-arg contract
@@ -144,20 +164,56 @@ class ShowcaseIOSTestCase: XCTestCase {
 
   /// Reads the current log file and returns the parsed entries.
   func readLogEntries() -> [UITestLogEntry] {
+    // Physical-device logs live inside the application container and are
+    // pulled by the host after XCTest finishes. The runner cannot read that
+    // relative app-container path directly; host policy validates the same
+    // health record before accepting the attempt.
+    if ProcessInfo.processInfo.environment[Self.deviceLogPrefixEnvironment] != nil {
+      return []
+    }
+
     guard
       let logURL,
       let data = try? Data(contentsOf: logURL),
       let text = String(data: data, encoding: .utf8)
-    else { return [] }
+    else {
+      XCTFail("The library log mirror is missing or unreadable")
+      return []
+    }
 
     let decoder = JSONDecoder()
     decoder.dateDecodingStrategy = .iso8601
 
-    return text
-      .split(whereSeparator: \.isNewline)
-      .compactMap { line in
-        line.data(using: .utf8).flatMap { try? decoder.decode(UITestLogEntry.self, from: $0) }
+    let lines = text.split(whereSeparator: \.isNewline)
+    guard !lines.isEmpty else {
+      XCTFail("The library log mirror is empty")
+      return []
+    }
+
+    var entries: [UITestLogEntry] = []
+    for (offset, line) in lines.enumerated() {
+      guard let lineData = line.data(using: .utf8) else {
+        XCTFail("The library log mirror contains invalid UTF-8 at line \(offset + 1)")
+        return []
       }
+      do {
+        try entries.append(decoder.decode(UITestLogEntry.self, from: lineData))
+      } catch {
+        XCTFail("The library log mirror is malformed at line \(offset + 1): \(error)")
+        return []
+      }
+    }
+
+    guard
+      entries.contains(where: {
+        $0.level == "debug"
+          && $0.module == "swiftvlc.qualification.log-mirror"
+          && $0.message == "mirror-start/v1"
+      }) else {
+      XCTFail("The library log mirror has no startup health record")
+      return []
+    }
+    return entries
   }
 
   /// Fails the test if the library emitted any `error`-level entries during
@@ -289,6 +345,90 @@ class ShowcaseIOSTestCase: XCTestCase {
     return Int(element.label) ?? Int.min
   }
 
+  /// Returns the exact machine value published by a validation element.
+  /// Human-readable row titles intentionally remain in `label`.
+  func accessibilityValue(of element: XCUIElement) -> String {
+    element.value as? String ?? ""
+  }
+
+  /// Spins until an accessibility element publishes the expected machine
+  /// value. Requiring `exists` prevents an unmounted lazy Form row from
+  /// accidentally satisfying an empty or default comparison.
+  func waitForAccessibilityValue(
+    _ element: XCUIElement,
+    equals expected: String,
+    timeout: TimeInterval,
+    file: StaticString = #filePath,
+    line: UInt = #line
+  ) {
+    let predicate = NSPredicate { _, _ in
+      element.exists && self.accessibilityValue(of: element) == expected
+    }
+    let exp = expectation(for: predicate, evaluatedWith: NSObject())
+    if XCTWaiter.wait(for: [exp], timeout: timeout) != .completed {
+      XCTFail(
+        "Expected accessibility value '\(expected)' for '\(element.label)', "
+          + "but found '\(accessibilityValue(of: element))' after \(timeout)s",
+        file: file,
+        line: line
+      )
+    }
+  }
+
+  /// Spins until an accessibility value parses as an integer above the
+  /// supplied lower bound, then returns the observed value.
+  @discardableResult
+  func waitForIntegerAccessibilityValue(
+    _ element: XCUIElement,
+    greaterThan lowerBound: Int,
+    timeout: TimeInterval,
+    file: StaticString = #filePath,
+    line: UInt = #line
+  ) -> Int {
+    let predicate = NSPredicate { _, _ in
+      element.exists
+        && Int(self.accessibilityValue(of: element)).map { $0 > lowerBound } == true
+    }
+    let exp = expectation(for: predicate, evaluatedWith: NSObject())
+    if XCTWaiter.wait(for: [exp], timeout: timeout) != .completed {
+      XCTFail(
+        "Expected an integer accessibility value above \(lowerBound) for "
+          + "'\(element.label)', but found '\(accessibilityValue(of: element))' "
+          + "after \(timeout)s",
+        file: file,
+        line: line
+      )
+    }
+    return Int(accessibilityValue(of: element)) ?? Int.min
+  }
+
+  /// Mounts a lazily created SwiftUI Form row before a test reads its exact
+  /// accessibility value. The caller supplies the likely direction for a
+  /// short path; if the layout or device size differs, a bounded reverse scan
+  /// searches the full form instead of turning viewport placement into a
+  /// product failure.
+  func revealMeasurement(
+    _ element: XCUIElement,
+    swiping initialDirection: ShowcaseScrollDirection,
+    file: StaticString = #filePath,
+    line: UInt = #line
+  ) {
+    for _ in 0..<10 where !element.exists {
+      initialDirection.perform(in: app)
+    }
+    if !element.exists {
+      for _ in 0..<20 where !element.exists {
+        initialDirection.opposite.perform(in: app)
+      }
+    }
+    XCTAssertTrue(
+      element.exists,
+      "Could not mount validation measurement \(element)",
+      file: file,
+      line: line
+    )
+  }
+
   /// Waits until the element's visible screen region contains real video
   /// pixels instead of the all-black drawable placeholder.
   func assertRendersNonBlackFrame(
@@ -365,7 +505,11 @@ class ShowcaseIOSTestCase: XCTestCase {
     samples: Int = 6,
     interval: TimeInterval = 0.75
   ) -> String? {
-    inspectSystemPictureInPictureMotion(samples: samples, interval: interval).failure
+    inspectSystemPictureInPictureMotion(
+      samples: samples,
+      interval: interval,
+      retainDiagnostics: true
+    ).failure
   }
 
   /// Returns the stable system-PiP bounds proven by the same moving-pixel
@@ -374,10 +518,15 @@ class ShowcaseIOSTestCase: XCTestCase {
   /// without depending on localized SpringBoard accessibility labels.
   func locateSystemPictureInPictureWindow(
     samples: Int = 6,
-    interval: TimeInterval = 0.75
+    interval: TimeInterval = 0.75,
+    retainDiagnostics: Bool = true
   )
     throws -> SystemPictureInPictureWindowRegion {
-    let inspection = inspectSystemPictureInPictureMotion(samples: samples, interval: interval)
+    let inspection = inspectSystemPictureInPictureMotion(
+      samples: samples,
+      interval: interval,
+      retainDiagnostics: retainDiagnostics
+    )
     if let failure = inspection.failure {
       throw SystemPictureInPictureInspectionFailure(failure)
     }
@@ -410,48 +559,207 @@ class ShowcaseIOSTestCase: XCTestCase {
     return summary
   }
 
-  private func inspectSystemPictureInPictureMotion(
+  /// Captures one already-located system PiP surface repeatedly and emits the
+  /// canonical hashes plus every adjacent changed-pixel ratio. The detected
+  /// region is fixed for the whole window: moving UI outside PiP cannot count
+  /// as video motion, and a freeze after one transition drives the minimum
+  /// score to zero.
+  func captureSystemPictureInPictureVisualEvidence(
+    in region: SystemPictureInPictureWindowRegion,
+    samples: Int = 3,
+    interval: TimeInterval = 0.25,
+    attachmentName: String? = nil
+  )
+    throws -> VideoSurfaceMotionEvidence {
+    try captureVideoSurfaceVisualEvidence(
+      samples: samples,
+      interval: interval,
+      attachmentName: attachmentName
+    ) {
+      croppedSystemPictureInPictureRegion(
+        XCUIScreen.main.screenshot().image,
+        region: region
+      )
+    }
+  }
+
+  /// Captures one canonical frame from an already-located PiP surface. Cadence
+  /// qualification timestamps these frames against system uptime, then binds
+  /// only frames that fall strictly inside the app's retained sample windows.
+  func captureSystemPictureInPictureCanonicalFrame(
+    in region: SystemPictureInPictureWindowRegion
+  )
+    throws -> VideoSurfaceCanonicalFrame {
+    guard
+      let image = croppedSystemPictureInPictureRegion(
+        XCUIScreen.main.screenshot().image,
+        region: region
+      ),
+      let frame = makeCanonicalVideoSurfaceFrame(from: image)
+    else {
+      throw SystemPictureInPictureInspectionFailure(
+        "Could not crop or rasterize the cadence PiP frame"
+      )
+    }
+    return frame
+  }
+
+  /// Captures an inline app-owned video element using the same canonical
+  /// surface oracle as system PiP qualification.
+  func captureInlineVideoSurfaceVisualEvidence(
+    _ element: XCUIElement,
+    samples: Int = 3,
+    interval: TimeInterval = 0.25,
+    attachmentName: String? = nil
+  )
+    throws -> VideoSurfaceMotionEvidence {
+    guard element.exists else {
+      throw SystemPictureInPictureInspectionFailure("Inline video element does not exist")
+    }
+    return try captureVideoSurfaceVisualEvidence(
+      samples: samples,
+      interval: interval,
+      attachmentName: attachmentName
+    ) {
+      croppedImage(XCUIScreen.main.screenshot().image, to: element.frame)
+    }
+  }
+
+  /// Captures one raw canonical inline frame. Qualification lanes that retain
+  /// replayable RGB bytes use this instead of trusting precomputed hashes.
+  func captureInlineVideoSurfaceCanonicalFrame(
+    _ element: XCUIElement
+  )
+    throws -> VideoSurfaceCanonicalFrame {
+    guard
+      element.exists,
+      let image = croppedImage(XCUIScreen.main.screenshot().image, to: element.frame),
+      let frame = makeCanonicalVideoSurfaceFrame(from: image)
+    else {
+      throw SystemPictureInPictureInspectionFailure(
+        "Could not crop or rasterize the inline video frame"
+      )
+    }
+    return frame
+  }
+
+  private func captureVideoSurfaceVisualEvidence(
     samples: Int,
-    interval: TimeInterval
-  ) -> (region: SystemPictureInPictureWindowRegion?, failure: String?) {
-    precondition(samples >= 5)
-
-    var screenshots: [XCUIScreenshot] = []
-
+    interval: TimeInterval,
+    attachmentName: String?,
+    capture: () -> UIImage?
+  )
+    throws -> VideoSurfaceMotionEvidence {
+    guard samples >= 3 else {
+      throw SystemPictureInPictureInspectionFailure(
+        "Visual evidence requires at least three adjacent captures"
+      )
+    }
+    var frames: [VideoSurfaceCanonicalFrame] = []
+    var boundaryImages: [UIImage] = []
     for index in 0..<samples {
-      screenshots.append(XCUIScreen.main.screenshot())
-      if index + 1 < samples {
+      guard
+        let image = capture(),
+        let frame = makeCanonicalVideoSurfaceFrame(from: image)
+      else {
+        throw SystemPictureInPictureInspectionFailure(
+          "Could not crop or rasterize visual-evidence frame \(index)"
+        )
+      }
+      frames.append(frame)
+      if index == 0 || index == samples - 1 {
+        boundaryImages.append(image)
+      }
+      if index < samples - 1 {
         RunLoop.current.run(until: Date().addingTimeInterval(interval))
       }
     }
+    if let attachmentName {
+      for (suffix, image) in zip(["start", "end"], boundaryImages) {
+        let attachment = XCTAttachment(image: image)
+        attachment.name = "\(attachmentName)-\(suffix)"
+        attachment.lifetime = .keepAlways
+        add(attachment)
+      }
+    }
+    guard let evidence = VideoSurfaceMotionEvidenceAnalyzer.analyze(frames) else {
+      throw SystemPictureInPictureInspectionFailure(
+        "Could not analyze canonical visual-evidence frames"
+      )
+    }
+    return evidence
+  }
 
-    for (index, screenshot) in screenshots.enumerated()
-      where index == 0 || index == screenshots.count - 1 {
-      let attachment = XCTAttachment(screenshot: screenshot)
-      attachment.name = index == 0 ? "system-pip-motion-start" : "system-pip-motion-end"
-      attachment.lifetime = .keepAlways
-      add(attachment)
+  private func inspectSystemPictureInPictureMotion(
+    samples: Int,
+    interval: TimeInterval,
+    retainDiagnostics: Bool
+  ) -> (region: SystemPictureInPictureWindowRegion?, failure: String?) {
+    precondition(samples >= 5)
+
+    let settledSurface = waitForStableSystemPictureInPictureSurface()
+    let stabilityRatios = settledSurface.changedPixelRatios
+      .map { String(format: "%.4f", $0) }
+      .joined(separator: ",")
+    if retainDiagnostics {
+      let stabilityAttachment = XCTAttachment(
+        string: "wholeScreenChangedRatios=[\(stabilityRatios)]\n"
+          + "requiredConsecutiveStablePairs=2\nmaximumChangedRatio=0.1200"
+      )
+      stabilityAttachment.name = "system-pip-surface-stability"
+      stabilityAttachment.lifetime = .keepAlways
+      add(stabilityAttachment)
+    }
+
+    guard let settledScreenshot = settledSurface.screenshot else {
+      return (
+        nil,
+        "SpringBoard did not settle before PiP sampling. "
+          + "whole-screen changed ratios: [\(stabilityRatios)]"
+      )
+    }
+
+    var screenshots = [settledScreenshot]
+
+    for _ in 1..<samples {
+      RunLoop.current.run(until: Date().addingTimeInterval(interval))
+      screenshots.append(XCUIScreen.main.screenshot())
+    }
+
+    if retainDiagnostics {
+      for (index, screenshot) in screenshots.enumerated()
+        where index == 0 || index == screenshots.count - 1 {
+        let attachment = XCTAttachment(screenshot: screenshot)
+        attachment.name = index == 0 ? "system-pip-motion-start" : "system-pip-motion-end"
+        attachment.lifetime = .keepAlways
+        add(attachment)
+      }
     }
 
     let frames = screenshots.compactMap { makePiPMotionFrame(from: $0.image) }
     guard frames.count == screenshots.count else {
-      let attachment = XCTAttachment(
-        string: "Could rasterize only \(frames.count) of \(screenshots.count) screenshots."
-      )
-      attachment.name = "system-pip-motion-diagnostics"
-      attachment.lifetime = .keepAlways
-      add(attachment)
+      if retainDiagnostics {
+        let attachment = XCTAttachment(
+          string: "Could rasterize only \(frames.count) of \(screenshots.count) screenshots."
+        )
+        attachment.name = "system-pip-motion-diagnostics"
+        attachment.lifetime = .keepAlways
+        add(attachment)
+      }
       return (nil, "Could not rasterize system PiP screenshots")
     }
 
     let analysis = PiPMotionRegionAnalyzer().analyze(frames)
     let diagnostics = systemPiPMotionDiagnostics(analysis)
-    let diagnosticAttachment = XCTAttachment(string: diagnostics)
-    diagnosticAttachment.name = "system-pip-motion-diagnostics"
-    diagnosticAttachment.lifetime = .keepAlways
-    add(diagnosticAttachment)
+    if retainDiagnostics {
+      let diagnosticAttachment = XCTAttachment(string: diagnostics)
+      diagnosticAttachment.name = "system-pip-motion-diagnostics"
+      diagnosticAttachment.lifetime = .keepAlways
+      add(diagnosticAttachment)
+    }
 
     if
+      retainDiagnostics,
       let region = analysis.region,
       let first = screenshots.first,
       let last = screenshots.last {
@@ -484,6 +792,51 @@ class ShowcaseIOSTestCase: XCTestCase {
       normalizedRegion,
       "System PiP image oracle failed: \(failure.rawValue). \(diagnostics)"
     )
+  }
+
+  /// Waits for two consecutive low-delta screen transitions so sampling
+  /// cannot mistake the app-switcher/home animation for PiP motion. A moving
+  /// PiP occupies only a bounded part of the screen and remains below this
+  /// whole-screen threshold; an unsettled system surface fails closed.
+  private func waitForStableSystemPictureInPictureSurface(
+    timeout: TimeInterval = 3,
+    sampleInterval: TimeInterval = 0.2
+  ) -> (screenshot: XCUIScreenshot?, changedPixelRatios: [Double]) {
+    let detector = PiPSystemSurfaceStabilityDetector()
+    let deadline = Date().addingTimeInterval(timeout)
+    let initialScreenshot = XCUIScreen.main.screenshot()
+    guard var previousFrame = makePiPMotionFrame(from: initialScreenshot.image) else {
+      return (nil, [])
+    }
+    var changedPixelRatios: [Double] = []
+    var consecutiveStablePairs = 0
+
+    while Date() < deadline {
+      RunLoop.current.run(until: Date().addingTimeInterval(sampleInterval))
+      let currentScreenshot = XCUIScreen.main.screenshot()
+      guard let currentFrame = makePiPMotionFrame(from: currentScreenshot.image) else {
+        return (nil, changedPixelRatios)
+      }
+      guard
+        let changedRatio = detector.changedPixelRatio(
+          from: previousFrame,
+          to: currentFrame
+        ) else {
+        return (nil, changedPixelRatios)
+      }
+      changedPixelRatios.append(changedRatio)
+      if detector.isStableTransition(from: previousFrame, to: currentFrame) {
+        consecutiveStablePairs += 1
+        if consecutiveStablePairs >= 2 {
+          return (currentScreenshot, changedPixelRatios)
+        }
+      } else {
+        consecutiveStablePairs = 0
+      }
+      previousFrame = currentFrame
+    }
+
+    return (nil, changedPixelRatios)
   }
 
   // MARK: - Fixtures
@@ -575,188 +928,4 @@ private func croppedImage(_ image: UIImage, to frame: CGRect) -> UIImage? {
 
   guard let cropped = cgImage.cropping(to: pixelRect) else { return nil }
   return UIImage(cgImage: cropped, scale: image.scale, orientation: image.imageOrientation)
-}
-
-private func makePiPMotionFrame(
-  from image: UIImage,
-  maximumDimension: Int = 240
-) -> PiPMotionFrame? {
-  guard let cgImage = image.cgImage else { return nil }
-
-  let sourceWidth = cgImage.width
-  let sourceHeight = cgImage.height
-  guard sourceWidth > 0, sourceHeight > 0 else { return nil }
-
-  let scale = min(
-    1,
-    Double(maximumDimension) / Double(max(sourceWidth, sourceHeight))
-  )
-  let width = max(1, Int((Double(sourceWidth) * scale).rounded()))
-  let height = max(1, Int((Double(sourceHeight) * scale).rounded()))
-  let bytesPerPixel = 4
-  let bytesPerRow = width * bytesPerPixel
-  let colorSpace = CGColorSpaceCreateDeviceRGB()
-  let bitmapInfo = CGImageAlphaInfo.premultipliedLast.rawValue
-    | CGBitmapInfo.byteOrder32Big.rawValue
-  var bytes = [UInt8](repeating: 0, count: height * bytesPerRow)
-
-  guard
-    let context = CGContext(
-      data: &bytes,
-      width: width,
-      height: height,
-      bitsPerComponent: 8,
-      bytesPerRow: bytesPerRow,
-      space: colorSpace,
-      bitmapInfo: bitmapInfo
-    )
-  else { return nil }
-
-  context.interpolationQuality = .low
-  let bounds = CGRect(x: 0, y: 0, width: width, height: height)
-  context.draw(cgImage, in: bounds)
-
-  var pixels: [PiPMotionPixel] = []
-  pixels.reserveCapacity(width * height)
-  for y in 0..<height {
-    for x in 0..<width {
-      let offset = y * bytesPerRow + x * bytesPerPixel
-      pixels.append(
-        PiPMotionPixel(
-          red: bytes[offset],
-          green: bytes[offset + 1],
-          blue: bytes[offset + 2]
-        )
-      )
-    }
-  }
-
-  return PiPMotionFrame(width: width, height: height, pixels: pixels)
-}
-
-private func croppedPiPMotionRegion(
-  _ image: UIImage,
-  region: PiPMotionRegion,
-  frameWidth: Int,
-  frameHeight: Int
-) -> UIImage? {
-  guard
-    let cgImage = image.cgImage,
-    frameWidth > 0,
-    frameHeight > 0
-  else { return nil }
-
-  let scaleX = Double(cgImage.width) / Double(frameWidth)
-  let scaleY = Double(cgImage.height) / Double(frameHeight)
-  let imageBounds = CGRect(x: 0, y: 0, width: cgImage.width, height: cgImage.height)
-  let pixelRegion = CGRect(
-    x: Double(region.x) * scaleX,
-    y: Double(region.y) * scaleY,
-    width: Double(region.width) * scaleX,
-    height: Double(region.height) * scaleY
-  ).integral.intersection(imageBounds)
-  guard pixelRegion.width > 0, pixelRegion.height > 0 else { return nil }
-  guard let cropped = cgImage.cropping(to: pixelRegion) else { return nil }
-  return UIImage(cgImage: cropped, scale: image.scale, orientation: image.imageOrientation)
-}
-
-private func croppedSystemPictureInPictureRegion(
-  _ image: UIImage,
-  region: SystemPictureInPictureWindowRegion
-) -> UIImage? {
-  guard let cgImage = image.cgImage else { return nil }
-  let bounds = CGRect(x: 0, y: 0, width: cgImage.width, height: cgImage.height)
-  let crop = CGRect(
-    x: Double(cgImage.width) * region.normalizedX,
-    y: Double(cgImage.height) * region.normalizedY,
-    width: Double(cgImage.width) * region.normalizedWidth,
-    height: Double(cgImage.height) * region.normalizedHeight
-  ).integral.intersection(bounds)
-  guard crop.width > 0, crop.height > 0, let cropped = cgImage.cropping(to: crop) else {
-    return nil
-  }
-  return UIImage(cgImage: cropped, scale: image.scale, orientation: image.imageOrientation)
-}
-
-private func pictureInPicturePixelSummary(
-  _ image: UIImage
-) -> SystemPictureInPicturePixelSummary? {
-  guard let frame = makePiPMotionFrame(from: image) else { return nil }
-  let pixels = frame.pixels
-  guard !pixels.isEmpty else { return nil }
-  var bright = 0
-  var saturated = 0
-  var yellow = 0
-  var green = 0
-  var nonGray = 0
-  var redTotal: UInt64 = 0
-  var greenTotal: UInt64 = 0
-  var blueTotal: UInt64 = 0
-  for pixel in pixels {
-    let red = Int(pixel.red)
-    let greenValue = Int(pixel.green)
-    let blue = Int(pixel.blue)
-    let maximum = max(red, greenValue, blue)
-    let minimum = min(red, greenValue, blue)
-    if minimum >= 220 {
-      bright += 1
-    }
-    if maximum >= 150, maximum - minimum >= 80 {
-      saturated += 1
-    }
-    if red >= 180, greenValue >= 160, blue <= 140 {
-      yellow += 1
-    }
-    if greenValue >= 140, greenValue >= red + 35, greenValue >= blue + 20 {
-      green += 1
-    }
-    if maximum - minimum >= 30 {
-      nonGray += 1
-    }
-    redTotal += UInt64(pixel.red)
-    greenTotal += UInt64(pixel.green)
-    blueTotal += UInt64(pixel.blue)
-  }
-  let count = Double(pixels.count)
-  return SystemPictureInPicturePixelSummary(
-    sampledPixels: pixels.count,
-    brightPixelRatio: Double(bright) / count,
-    saturatedPixelRatio: Double(saturated) / count,
-    yellowPixelRatio: Double(yellow) / count,
-    greenPixelRatio: Double(green) / count,
-    nonGrayPixelRatio: Double(nonGray) / count,
-    meanRed: Double(redTotal) / count,
-    meanGreen: Double(greenTotal) / count,
-    meanBlue: Double(blueTotal) / count
-  )
-}
-
-private func systemPiPMotionDiagnostics(_ analysis: PiPMotionRegionAnalysis) -> String {
-  let regionDescription = analysis.region.map {
-    "x=\($0.x),y=\($0.y),w=\($0.width),h=\($0.height)"
-  } ?? "none"
-  let pairMotion = analysis.pairMotionRatios
-    .map { String(format: "%.4f", $0) }
-    .joined(separator: ",")
-  let nonBlack = analysis.frameNonBlackRatios
-    .map { String(format: "%.4f", $0) }
-    .joined(separator: ",")
-
-  return """
-  result=\(analysis.failure?.rawValue ?? "pass")
-  frame=\(analysis.frameWidth)x\(analysis.frameHeight)
-  region=\(regionDescription)
-  geometry.area=\(String(format: "%.4f", analysis.regionAreaRatio))
-  geometry.aspect=\(String(format: "%.4f", analysis.regionAspectRatio))
-  geometry.persistentFill=\(String(format: "%.4f", analysis.persistentFillRatio))
-  persistent.components=\(analysis.persistentComponentCount)
-  persistent.largestArea=\(String(format: "%.4f", analysis.largestPersistentComponentAreaRatio))
-  pairs.matching=\(analysis.matchingPairCount)/\(analysis.requiredPairCount)
-  pairs.sustainedMotion=\(analysis.sustainedMotionPairCount)/\(analysis.requiredPairCount)
-  pairs.motionRatios=[\(pairMotion)]
-  frames.nonBlack=\(analysis.nonBlackFrameCount)/\(analysis.requiredNonBlackFrameCount) required
-  frames.nonBlackRatios=[\(nonBlack)]
-  drift.horizontal=\(String(format: "%.4f", analysis.horizontalCenterDriftRatio))
-  drift.vertical=\(String(format: "%.4f", analysis.verticalCenterDriftRatio))
-  """
 }

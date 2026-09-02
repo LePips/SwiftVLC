@@ -1,0 +1,1480 @@
+diff --git a/include/vlc/libvlc_media_player.h b/include/vlc/libvlc_media_player.h
+index 80775ef..7844dce 100644
+--- a/include/vlc/libvlc_media_player.h
++++ b/include/vlc/libvlc_media_player.h
+@@ -428,6 +428,18 @@ typedef struct swiftvlc_apple_audio_recovery_snapshot_t
+     uint64_t broker_failed_deactivation_count;
+ } swiftvlc_apple_audio_recovery_snapshot_t;
+ 
++/** Immutable native-PiP identity copied into one Apple video output.
++ *
++ * The native handle value is write-once for a media-player lifetime. Playback
++ * generation may be republished only while the client can prove no output
++ * from an earlier generation can still be created. Apple PiP outputs copy both
++ * values before module mapping and never dereference this snapshot again. */
++typedef struct swiftvlc_pip_playback_identity_t
++{
++    uint64_t native_handle_identity;
++    uint64_t playback_generation;
++} swiftvlc_pip_playback_identity_t;
++
+ /**
+  * Version of SwiftVLC's additive pinned-libVLC extensions.
+  *
+@@ -442,10 +454,28 @@ typedef struct swiftvlc_apple_audio_recovery_snapshot_t
+  * the vmem output-attempt boundary. Version 7 adds the public
+  * libvlc_MediaPlayerRateChanged event for effective player control-rate
+  * resolution notifications. Version 8 adds Apple audio-session ownership,
+- * causal reset recovery, and read-only qualification telemetry.
++ * causal reset recovery, and read-only qualification telemetry. Version 9
++ * adds immutable native-handle/playback/output identity for race-free Apple
++ * PiP controller handoff.
+  */
+ LIBVLC_API unsigned swiftvlc_libvlc_pip_extensions_version( void );
+ 
++/** Publish the immutable pair future Apple PiP outputs copy at creation.
++ *
++ * @a native_handle_identity must be nonzero and cannot change for @a p_mi.
++ * Each successful publication remains alive until all outputs have joined at
++ * media-player destruction, so an output can safely copy it through VLC's
++ * inherited-variable mechanism. Both identity values must be nonzero.
++ *
++ * \retval true the pair was published, or was already current
++ * \retval false invalid input, a changed handle identity, a generation
++ * regression, or allocation failure
++ */
++LIBVLC_API bool swiftvlc_libvlc_media_player_set_pip_playback_identity(
++    libvlc_media_player_t *p_mi,
++    uint64_t native_handle_identity,
++    uint64_t playback_generation );
++
+ /** Copies a read-only causal Apple audio recovery snapshot. Before calling,
+  * initialize version to SWIFTVLC_APPLE_AUDIO_RECOVERY_SNAPSHOT_VERSION and
+  * size to sizeof(swiftvlc_apple_audio_recovery_snapshot_t). Unsupported
+diff --git a/lib/libvlc.sym b/lib/libvlc.sym
+index 0fc5b3e..88cdb53 100644
+--- a/lib/libvlc.sym
++++ b/lib/libvlc.sym
+@@ -278,6 +278,7 @@ swiftvlc_libvlc_video_set_format_callbacks_ex
+ swiftvlc_libvlc_video_set_display_status_callback
+ swiftvlc_libvlc_video_set_callbacks_atomic
+ swiftvlc_libvlc_video_set_callbacks_atomic_v2
++swiftvlc_libvlc_media_player_set_pip_playback_identity
+ libvlc_video_set_output_callbacks
+ libvlc_video_set_key_input
+ libvlc_video_set_logo_int
+diff --git a/lib/media_player.c b/lib/media_player.c
+index 69e5094..c24c253 100644
+--- a/lib/media_player.c
++++ b/lib/media_player.c
+@@ -111,6 +111,12 @@ snapshot_was_taken( vlc_object_t *p_this, char const *psz_cmd,
+ 
+ static void libvlc_media_player_destroy( libvlc_media_player_t *p_mi );
+ 
++struct swiftvlc_pip_playback_identity_node
++{
++    swiftvlc_pip_playback_identity_t identity;
++    struct swiftvlc_pip_playback_identity_node *next;
++};
++
+ // player callbacks
+ 
+ static void
+@@ -780,6 +786,8 @@ libvlc_media_player_new( libvlc_instance_t *instance )
+         vlc_object_delete(mp);
+         return NULL;
+     }
++    mp->pip_playback_identities = NULL;
++    mp->pip_native_handle_identity = 0;
+ 
+     /* Input */
+     var_Create (mp, "rate", VLC_VAR_FLOAT|VLC_VAR_DOINHERIT);
+@@ -826,6 +834,7 @@ libvlc_media_player_new( libvlc_instance_t *instance )
+ #endif
+ #ifdef __APPLE__
+     var_Create (mp, "drawable-nsobject", VLC_VAR_ADDRESS);
++    var_Create (mp, "swiftvlc-pip-playback-identity", VLC_VAR_ADDRESS);
+ #endif
+ #ifdef __ANDROID__
+     var_Create (mp, "drawable-androidwindow", VLC_VAR_ADDRESS);
+@@ -1027,6 +1036,15 @@ static void libvlc_media_player_destroy( libvlc_media_player_t *p_mi )
+      * snapshots would remain independently refcount-safe in any case. */
+     swiftvlc_vmem_configuration_registry_Delete(p_mi->vmem_configuration);
+ 
++    struct swiftvlc_pip_playback_identity_node *identity =
++        p_mi->pip_playback_identities;
++    while (identity != NULL)
++    {
++        struct swiftvlc_pip_playback_identity_node *next = identity->next;
++        free(identity);
++        identity = next;
++    }
++
+     libvlc_event_manager_destroy(&p_mi->event_manager);
+ 
+     libvlc_instance_t *instance = p_mi->p_libvlc_instance;
+@@ -1119,7 +1137,59 @@ libvlc_media_player_get_media( libvlc_media_player_t *p_mi )
+ 
+ unsigned swiftvlc_libvlc_pip_extensions_version( void )
+ {
+-    return 8;
++    return 9;
++}
++
++bool
++swiftvlc_libvlc_media_player_set_pip_playback_identity(
++    libvlc_media_player_t *p_mi,
++    uint64_t native_handle_identity,
++    uint64_t playback_generation)
++{
++    if (p_mi == NULL || native_handle_identity == 0 || playback_generation == 0)
++        return false;
++
++    vlc_player_Lock(p_mi->player);
++    if (p_mi->pip_native_handle_identity != 0 &&
++        p_mi->pip_native_handle_identity != native_handle_identity)
++    {
++        vlc_player_Unlock(p_mi->player);
++        return false;
++    }
++
++    struct swiftvlc_pip_playback_identity_node *current =
++        p_mi->pip_playback_identities;
++    if (current != NULL &&
++        current->identity.native_handle_identity == native_handle_identity &&
++        current->identity.playback_generation == playback_generation)
++    {
++        vlc_player_Unlock(p_mi->player);
++        return true;
++    }
++    if (current != NULL &&
++        playback_generation < current->identity.playback_generation)
++    {
++        vlc_player_Unlock(p_mi->player);
++        return false;
++    }
++
++    struct swiftvlc_pip_playback_identity_node *node = malloc(sizeof(*node));
++    if (node == NULL)
++    {
++        vlc_player_Unlock(p_mi->player);
++        return false;
++    }
++    node->identity = (swiftvlc_pip_playback_identity_t) {
++        .native_handle_identity = native_handle_identity,
++        .playback_generation = playback_generation,
++    };
++
++    p_mi->pip_native_handle_identity = native_handle_identity;
++    node->next = current;
++    p_mi->pip_playback_identities = node;
++    var_SetAddress(p_mi, "swiftvlc-pip-playback-identity", &node->identity);
++    vlc_player_Unlock(p_mi->player);
++    return true;
+ }
+ 
+ bool
+diff --git a/lib/media_player_internal.h b/lib/media_player_internal.h
+index a240760..2fc62c2 100644
+--- a/lib/media_player_internal.h
++++ b/lib/media_player_internal.h
+@@ -44,6 +44,8 @@ struct libvlc_media_player_t
+     vlc_player_aout_listener_id *aout_listener;
+     vlc_cond_t wait;
+     swiftvlc_vmem_configuration_registry *vmem_configuration;
++    struct swiftvlc_pip_playback_identity_node *pip_playback_identities;
++    uint64_t pip_native_handle_identity;
+ 
+     struct libvlc_instance_t * p_libvlc_instance; /* Parent instance */
+     libvlc_event_manager_t event_manager;
+diff --git a/modules/video_output/apple/VLCDrawable.h b/modules/video_output/apple/VLCDrawable.h
+index 7d150e1..968e908 100644
+--- a/modules/video_output/apple/VLCDrawable.h
++++ b/modules/video_output/apple/VLCDrawable.h
+@@ -58,8 +58,8 @@
+ /// Returns the current client media generation. Zero means no media.
+ - (uint64_t)mediaPlaybackGeneration;
+ 
+-/// Consumes one client-issued permit for a seek-driven video-output rebuild.
+-/// Returns NO for ordinary stop, teardown, and navigation closes.
++/// Version-8 source compatibility only. Version-9 modules never call this
++/// provenance-free Boolean permit; clients must return NO.
+ - (BOOL)consumePictureInPictureVideoOutputRebuildPermit;
+ 
+ @required
+@@ -145,8 +145,8 @@
+ - (BOOL)preservePictureInPictureWindowController:
+     (id<VLCPictureInPictureWindowControlling>)controller;
+ 
+-/// Retains an active controller for a replacement or an explicitly
+-/// authorized same-media seek rebuild.
++/// Version-8 source compatibility for the former same-generation rebuild
++/// path. Version-9 modules never call this provenance-free selector.
+ - (BOOL)preservePictureInPictureWindowController:
+     (id<VLCPictureInPictureWindowControlling>)controller
+     sameMediaGenerationRebuild:(BOOL)sameMediaGenerationRebuild;
+@@ -167,4 +167,55 @@
+ /// is about to close. Implementations must discard any matching handoff.
+ - (void)pictureInPictureWindowControllerHandoffDidTimeOut:
+     (id<VLCPictureInPictureWindowControlling>)controller;
++
++/// Version-9 handoff entry points. Every scalar is copied into the native
++/// output before PiP module mapping; implementations must match all of them.
++- (id<VLCPictureInPictureWindowControlling>)
++    takePreservedPictureInPictureWindowControllerForNativeHandle:
++        (uint64_t)nativeHandle
++    playbackGeneration:(uint64_t)playbackGeneration
++    outputIdentity:(uint64_t)outputIdentity
++    wasSuperseded:(BOOL *)wasSuperseded;
++
++- (BOOL)preservePictureInPictureWindowController:
++    (id<VLCPictureInPictureWindowControlling>)controller
++    fromNativeHandle:(uint64_t)nativeHandle
++    playbackGeneration:(uint64_t)playbackGeneration
++    outputIdentity:(uint64_t)outputIdentity
++    sameMediaGenerationRebuild:(BOOL)sameMediaGenerationRebuild;
++
++/// Synchronously accepts or rejects readiness before the native controller
++/// can expose this output to AVKit or the client.
++- (BOOL)pictureInPictureWindowController:
++    (id<VLCPictureInPictureWindowControlling>)controller
++    didBecomeReadyForNativeHandle:(uint64_t)nativeHandle
++    playbackGeneration:(uint64_t)playbackGeneration
++    outputIdentity:(uint64_t)outputIdentity;
++
++/// Rolls back an exact fresh-output reservation only when controller
++/// construction failed before the claim above could bind an object.
++- (void)pictureInPictureControllerCreationFailedForNativeHandle:
++    (uint64_t)nativeHandle
++    playbackGeneration:(uint64_t)playbackGeneration
++    outputIdentity:(uint64_t)outputIdentity;
++
++/// Claims the exact controller/output pair before native code publishes a
++/// fresh or rebound controller or starts asynchronous AVKit preparation.
++- (BOOL)pictureInPictureWindowController:
++    (id<VLCPictureInPictureWindowControlling>)controller
++    didClaimNativeHandle:(uint64_t)nativeHandle
++    playbackGeneration:(uint64_t)playbackGeneration
++    outputIdentity:(uint64_t)outputIdentity;
++
++- (void)pictureInPictureWindowController:
++    (id<VLCPictureInPictureWindowControlling>)controller
++    cancelHandoffForNativeHandle:(uint64_t)nativeHandle
++    playbackGeneration:(uint64_t)playbackGeneration
++    outputIdentity:(uint64_t)outputIdentity;
++
++- (void)pictureInPictureWindowController:
++    (id<VLCPictureInPictureWindowControlling>)controller
++    handoffDidTimeOutForNativeHandle:(uint64_t)nativeHandle
++    playbackGeneration:(uint64_t)playbackGeneration
++    outputIdentity:(uint64_t)outputIdentity;
+ @end
+diff --git a/modules/video_output/apple/VLCPictureInPictureController.m b/modules/video_output/apple/VLCPictureInPictureController.m
+index 17d64bf..258592e 100644
+--- a/modules/video_output/apple/VLCPictureInPictureController.m
++++ b/modules/video_output/apple/VLCPictureInPictureController.m
+@@ -36,43 +36,159 @@
+ #include <math.h>
+ #import <AVFoundation/AVFoundation.h>
+ #import <stdatomic.h>
++#import <os/lock.h>
+ #import "VLCDrawable.h"
+ 
+ #include "vlc_pip_controller.h"
+ 
++@class VLCPictureInPicturePresentationContext;
++@class VLCPictureInPictureBinding;
++
+ API_AVAILABLE(ios(15.0), tvos(15.0), macosx(12.0))
+ @interface VLCPictureInPictureController: NSObject
+     <AVPictureInPictureSampleBufferPlaybackDelegate, 
+      AVPictureInPictureControllerDelegate,
+      VLCPictureInPictureWindowControlling> {
+     atomic_bool _closed;
+-    atomic_bool _awaitingSuccessor;
+     atomic_bool _pictureInPictureActive;
+     atomic_bool _pictureInPicturePresenting;
+-    atomic_uint_fast64_t _handoffToken;
++    atomic_uint_fast64_t _boundOutputIdentity;
++    atomic_uint_fast64_t _pendingPreparationOutputIdentity;
++    atomic_uint_fast64_t _pendingHandoffOutputIdentity;
++    os_unfair_lock _bindingLock;
++    uint64_t _preparingOutputIdentity;
++    uint64_t _closeRequestedOutputIdentity;
+     BOOL _observingPictureInPicturePossible;
+-    __weak id<VLCPictureInPictureOverlayStateObserving> _overlayStateObserver;
+-    __weak id<VLCPictureInPictureDrawable> _drawable;
+-    id<VLCPictureInPictureMediaControlling> _mediaController;
+-    uint64_t _mediaPlaybackGeneration;
+-    void (^_pictureInPictureReady)(id<VLCPictureInPictureWindowControlling>);
+-    BOOL _canStartAutomaticallyFromInline;
+-    AVSampleBufferDisplayLayer *_displayLayer;
++    VLCPictureInPictureBinding *_binding;
+ }
+ 
+ @property (nonatomic, readonly) NSObject *avPipController;
+ @property (nonatomic) void(^stateChangeEventHandler)(BOOL isStarted);
+ 
+ - (instancetype)initWithPipController:(pip_controller_t *)pipcontroller;
+-- (void)rebindToPipController:(pip_controller_t *)pipcontroller;
++- (BOOL)rebindToPipController:(pip_controller_t *)pipcontroller;
++- (BOOL)prepare:(AVSampleBufferDisplayLayer *)layer
++    nativeHandle:(uint64_t)nativeHandle
++    playbackGeneration:(uint64_t)playbackGeneration
++    outputIdentity:(uint64_t)outputIdentity;
+ - (void)invalidatePlaybackState;
+ - (BOOL)shouldCompositeSubpictures;
+ - (void)setOverlayCompositionEnabled:(BOOL)enabled;
+ - (void)close;
+-- (void)closeForVideoOutput;
++- (void)closeForVideoOutput:(pip_controller_t *)pipcontroller;
++- (VLCPictureInPicturePresentationContext *)presentationContextForPipController:
++    (pip_controller_t *)pipcontroller;
++- (void)closeForNativeHandle:(uint64_t)nativeHandle
++    playbackGeneration:(uint64_t)playbackGeneration
++    outputIdentity:(uint64_t)outputIdentity;
++- (void)performCloseCleanup;
++- (void)timeOutHandoffForDrawable:(id<VLCPictureInPictureDrawable>)drawable
++    nativeHandle:(uint64_t)nativeHandle
++    playbackGeneration:(uint64_t)playbackGeneration
++    outputIdentity:(uint64_t)outputIdentity;
++- (void)timeOutPreparationForBinding:
++    (VLCPictureInPictureBinding *)binding;
++- (BOOL)startPreparationTimeoutForNativeHandle:(uint64_t)nativeHandle
++    playbackGeneration:(uint64_t)playbackGeneration
++    outputIdentity:(uint64_t)outputIdentity;
++- (void)cancelAndCloseBinding:(VLCPictureInPictureBinding *)binding;
++- (void)closeForBinding:(VLCPictureInPictureBinding *)binding;
++- (VLCPictureInPictureBinding *)bindingSnapshot;
++- (VLCPictureInPictureBinding *)activeBindingSnapshot;
++- (VLCPictureInPictureBinding *)bindingSnapshotForNativeHandle:
++    (uint64_t)nativeHandle
++    playbackGeneration:(uint64_t)playbackGeneration
++    outputIdentity:(uint64_t)outputIdentity;
++- (AVSampleBufferDisplayLayer *)displayLayerSnapshotForBinding:
++    (VLCPictureInPictureBinding *)binding;
++
++@end
+ 
++API_AVAILABLE(ios(15.0), tvos(15.0), macosx(12.0))
++@interface VLCPictureInPictureBinding: NSObject
++@property (nonatomic, readonly) id<VLCPictureInPictureDrawable> drawable;
++@property (nonatomic, readonly)
++    id<VLCPictureInPictureMediaControlling> mediaController;
++@property (nonatomic, weak, readonly)
++    id<VLCPictureInPictureOverlayStateObserving> overlayStateObserver;
++@property (nonatomic, readonly) uint64_t nativeHandleIdentity;
++@property (nonatomic, readonly) uint64_t playbackGeneration;
++@property (nonatomic, readonly) uint64_t outputIdentity;
++@property (nonatomic, readonly) BOOL canStartAutomaticallyFromInline;
++@property (nonatomic) AVSampleBufferDisplayLayer *displayLayer;
++- (instancetype)initWithPipController:(pip_controller_t *)pipcontroller;
+ @end
+ 
++@implementation VLCPictureInPictureBinding
++
++- (instancetype)initWithPipController:(pip_controller_t *)pipcontroller
++{
++    id<VLCPictureInPictureDrawable> drawable =
++        (__bridge id)pipcontroller->drawable;
++    if (![drawable conformsToProtocol:@protocol(VLCPictureInPictureDrawable)])
++        return nil;
++    id mediaController = drawable.mediaController;
++    if (![mediaController conformsToProtocol:
++            @protocol(VLCPictureInPictureMediaControlling)])
++        return nil;
++
++    self = [super init];
++    if (self != nil)
++    {
++        _drawable = drawable;
++        _mediaController = mediaController;
++        _overlayStateObserver =
++            (__bridge id<VLCPictureInPictureOverlayStateObserving>)
++                pipcontroller->overlay_state_observer;
++        _nativeHandleIdentity = pipcontroller->native_handle_identity;
++        _playbackGeneration = pipcontroller->playback_generation;
++        _outputIdentity = pipcontroller->output_identity;
++        if ([drawable respondsToSelector:@selector(
++                canStartPictureInPictureAutomaticallyFromInline)])
++            _canStartAutomaticallyFromInline =
++                [drawable canStartPictureInPictureAutomaticallyFromInline];
++        else
++            _canStartAutomaticallyFromInline = NO;
++    }
++    return self;
++}
++
++@end
++
++API_AVAILABLE(ios(15.0), tvos(15.0), macosx(12.0))
++@interface VLCPictureInPicturePresentationContext: NSObject
++@property (nonatomic, readonly) VLCPictureInPictureController *controller;
++@property (nonatomic, readonly) uint64_t nativeHandleIdentity;
++@property (nonatomic, readonly) uint64_t playbackGeneration;
++@property (nonatomic, readonly) uint64_t outputIdentity;
++- (instancetype)initWithController:(VLCPictureInPictureController *)controller
++    nativeHandle:(uint64_t)nativeHandle
++    playbackGeneration:(uint64_t)playbackGeneration
++    outputIdentity:(uint64_t)outputIdentity;
++@end
++
++@implementation VLCPictureInPicturePresentationContext
++
++- (instancetype)initWithController:(VLCPictureInPictureController *)controller
++    nativeHandle:(uint64_t)nativeHandle
++    playbackGeneration:(uint64_t)playbackGeneration
++    outputIdentity:(uint64_t)outputIdentity
++{
++    self = [super init];
++    if (self != nil)
++    {
++        _controller = controller;
++        _nativeHandleIdentity = nativeHandle;
++        _playbackGeneration = playbackGeneration;
++        _outputIdentity = outputIdentity;
++    }
++    return self;
++}
++
++@end
++
++#define VLC_PIP_HANDOFF_TOKEN_CLAIMED UINT64_MAX
++
+ @implementation VLCPictureInPictureController
+ 
+ - (instancetype)initWithPipController:(pip_controller_t *)pipcontroller {
+@@ -80,66 +196,213 @@ - (instancetype)initWithPipController:(pip_controller_t *)pipcontroller {
+     if (!self)
+         return nil;
+     atomic_init(&_closed, false);
+-    atomic_init(&_awaitingSuccessor, false);
+     atomic_init(&_pictureInPictureActive, false);
+     atomic_init(&_pictureInPicturePresenting, false);
+-    atomic_init(&_handoffToken, 0);
++    atomic_init(&_boundOutputIdentity, 0);
++    atomic_init(&_pendingPreparationOutputIdentity, 0);
++    atomic_init(&_pendingHandoffOutputIdentity, 0);
++    _bindingLock = OS_UNFAIR_LOCK_INIT;
+ 
+-    [self rebindToPipController:pipcontroller];
+-    if (_drawable == nil)
++    if (![self rebindToPipController:pipcontroller])
+         return nil;
+ 
+     return self;
+ }
+ 
+-- (void)rebindToPipController:(pip_controller_t *)pipcontroller {
+-    NSAssert(!atomic_load_explicit(&_closed, memory_order_acquire),
+-             @"A closed PiP controller cannot be rebound");
++- (BOOL)rebindToPipController:(pip_controller_t *)pipcontroller {
++    const uint_fast64_t newOutput = pipcontroller->output_identity;
++    if (newOutput == 0 || newOutput == VLC_PIP_HANDOFF_TOKEN_CLAIMED ||
++        pipcontroller->native_handle_identity == 0 ||
++        pipcontroller->playback_generation == 0)
++        return NO;
++    VLCPictureInPictureBinding *newBinding =
++        [[VLCPictureInPictureBinding alloc]
++            initWithPipController:pipcontroller];
++    if (newBinding == nil)
++        return NO;
++
++    os_unfair_lock_lock(&_bindingLock);
++    if (atomic_load_explicit(&_closed, memory_order_acquire) ||
++        _preparingOutputIdentity != 0 || _closeRequestedOutputIdentity != 0 ||
++        atomic_load_explicit(&_pendingPreparationOutputIdentity,
++                             memory_order_acquire) != 0)
++    {
++        os_unfair_lock_unlock(&_bindingLock);
++        return NO;
++    }
++
++    uint_fast64_t oldOutput = atomic_load_explicit(
++        &_boundOutputIdentity, memory_order_acquire);
++    if (oldOutput != 0)
++    {
++        if (atomic_load_explicit(&_pendingHandoffOutputIdentity,
++                                 memory_order_acquire) != oldOutput)
++        {
++            os_unfair_lock_unlock(&_bindingLock);
++            return NO;
++        }
++        atomic_store_explicit(&_pendingHandoffOutputIdentity, 0,
++                              memory_order_release);
++    }
++    else if (atomic_load_explicit(&_pendingHandoffOutputIdentity,
++                                  memory_order_acquire) != 0)
++    {
++        os_unfair_lock_unlock(&_bindingLock);
++        return NO;
++    }
++
++    VLCPictureInPictureBinding *oldBinding = _binding;
++    _binding = newBinding;
++    atomic_store_explicit(&_boundOutputIdentity, newOutput,
++                          memory_order_release);
++    atomic_store_explicit(&_pendingPreparationOutputIdentity, newOutput,
++                          memory_order_release);
++    BOOL shouldPublishOverlay = atomic_load_explicit(
++        &_pictureInPicturePresenting, memory_order_acquire);
++    os_unfair_lock_unlock(&_bindingLock);
++
++    /* Rebinding can occur while PiP is already presenting. Publish the mode
++     * to the exact successor observer after releasing the binding lock. */
++    if (shouldPublishOverlay)
++        [newBinding.overlayStateObserver
++            pictureInPictureOverlayCompositionDidChange:YES];
++    (void)oldBinding;
++
++    return YES;
++}
++
++- (VLCPictureInPictureBinding *)bindingSnapshot {
++    os_unfair_lock_lock(&_bindingLock);
++    VLCPictureInPictureBinding *binding = _binding;
++    os_unfair_lock_unlock(&_bindingLock);
++    return binding;
++}
+ 
+-    id<VLCPictureInPictureDrawable> drawable =
+-        (__bridge id)var_InheritAddress (pipcontroller, "drawable-nsobject");
+-    
+-    if (![drawable conformsToProtocol:@protocol(VLCPictureInPictureDrawable)])
+-        return;
+-    
+-    _drawable = drawable;
+-    id<VLCPictureInPictureOverlayStateObserving> overlayStateObserver =
+-        (__bridge id<VLCPictureInPictureOverlayStateObserving>)
+-            pipcontroller->overlay_state_observer;
+-    _overlayStateObserver = overlayStateObserver;
+-    /* A preserved controller can be rebound while PiP is already presenting.
+-     * Publish the current mode to the successor vout even though the
+-     * controller-wide boolean did not transition. */
+-    if (atomic_load_explicit(&_pictureInPicturePresenting,
+-                             memory_order_acquire))
+-        [overlayStateObserver pictureInPictureOverlayCompositionDidChange:YES];
+-    _mediaController = drawable.mediaController;
+-    if ([_mediaController respondsToSelector:@selector(mediaPlaybackGeneration)])
+-        _mediaPlaybackGeneration = [_mediaController mediaPlaybackGeneration];
+-    else
+-        _mediaPlaybackGeneration = 0;
+-    _pictureInPictureReady = [drawable.pictureInPictureReady copy];
+-    if ([drawable respondsToSelector:@selector(canStartPictureInPictureAutomaticallyFromInline)])
+-        _canStartAutomaticallyFromInline =
+-            [drawable canStartPictureInPictureAutomaticallyFromInline];
+-    else
+-        _canStartAutomaticallyFromInline = YES;
++- (VLCPictureInPictureBinding *)activeBindingSnapshot {
++    os_unfair_lock_lock(&_bindingLock);
++    VLCPictureInPictureBinding *binding =
++        atomic_load_explicit(&_closed, memory_order_acquire) ? nil : _binding;
++    os_unfair_lock_unlock(&_bindingLock);
++    return binding;
+ }
+ 
+-- (void)prepare:(AVSampleBufferDisplayLayer *)layer {
+-    NSAssert([NSThread isMainThread], @"PiP preparation must run on the main thread");
+-    if (atomic_load_explicit(&_closed, memory_order_acquire))
+-        return;
+-    if (![AVPictureInPictureController isPictureInPictureSupported])
+-        return;
+-    assert(layer);
+-    _displayLayer = layer;
+-    AVPictureInPictureControllerContentSource *avPipSource;
+-    avPipSource = [
+-        [AVPictureInPictureControllerContentSource alloc]
++- (VLCPictureInPictureBinding *)bindingSnapshotForNativeHandle:
++    (uint64_t)nativeHandle
++    playbackGeneration:(uint64_t)playbackGeneration
++    outputIdentity:(uint64_t)outputIdentity {
++    os_unfair_lock_lock(&_bindingLock);
++    VLCPictureInPictureBinding *binding = _binding;
++    BOOL isCurrent = !atomic_load_explicit(&_closed, memory_order_acquire) &&
++        atomic_load_explicit(&_boundOutputIdentity, memory_order_acquire) ==
++            outputIdentity &&
++        binding.nativeHandleIdentity == nativeHandle &&
++        binding.playbackGeneration == playbackGeneration &&
++        binding.outputIdentity == outputIdentity;
++    if (!isCurrent)
++        binding = nil;
++    os_unfair_lock_unlock(&_bindingLock);
++    return binding;
++}
++
++- (AVSampleBufferDisplayLayer *)displayLayerSnapshotForBinding:
++    (VLCPictureInPictureBinding *)binding {
++    os_unfair_lock_lock(&_bindingLock);
++    AVSampleBufferDisplayLayer *layer = _binding == binding
++        ? binding.displayLayer : nil;
++    os_unfair_lock_unlock(&_bindingLock);
++    return layer;
++}
++
++- (BOOL)startPreparationTimeoutForNativeHandle:(uint64_t)nativeHandle
++    playbackGeneration:(uint64_t)playbackGeneration
++    outputIdentity:(uint64_t)outputIdentity {
++    VLCPictureInPictureBinding *binding =
++        [self bindingSnapshotForNativeHandle:nativeHandle
++            playbackGeneration:playbackGeneration
++            outputIdentity:outputIdentity];
++    if (binding == nil)
++        return NO;
++    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
++                                 (int64_t)(3 * NSEC_PER_SEC)),
++                   dispatch_get_main_queue(), ^{
++        [self timeOutPreparationForBinding:binding];
++    });
++    return YES;
++}
++
++- (VLCPictureInPicturePresentationContext *)presentationContextForPipController:
++    (pip_controller_t *)pipcontroller {
++    VLCPictureInPictureBinding *binding =
++        [self bindingSnapshotForNativeHandle:
++            pipcontroller->native_handle_identity
++            playbackGeneration:pipcontroller->playback_generation
++            outputIdentity:pipcontroller->output_identity];
++    if (binding == nil)
++        return nil;
++    return [[VLCPictureInPicturePresentationContext alloc]
++        initWithController:self
++        nativeHandle:binding.nativeHandleIdentity
++        playbackGeneration:binding.playbackGeneration
++        outputIdentity:binding.outputIdentity];
++}
++
++- (BOOL)prepare:(AVSampleBufferDisplayLayer *)layer
++    nativeHandle:(uint64_t)nativeHandle
++    playbackGeneration:(uint64_t)playbackGeneration
++    outputIdentity:(uint64_t)outputIdentity {
++    VLCPictureInPictureBinding *binding =
++        [self bindingSnapshotForNativeHandle:nativeHandle
++            playbackGeneration:playbackGeneration
++            outputIdentity:outputIdentity];
++    if (binding == nil)
++        return NO;
++    if (![NSThread isMainThread] || layer == nil ||
++        ![AVPictureInPictureController isPictureInPictureSupported]) {
++        [self closeForBinding:binding];
++        return NO;
++    }
++
++    BOOL seekable = NO;
++    if ([binding.mediaController respondsToSelector:
++            @selector(mediaPlaybackSnapshotWithLength:time:seekable:)]) {
++        int64_t ignoredLength;
++        int64_t ignoredTime;
++        [binding.mediaController
++            mediaPlaybackSnapshotWithLength:&ignoredLength
++            time:&ignoredTime
++            seekable:&seekable];
++    } else {
++        seekable = [binding.mediaController isMediaSeekable];
++    }
++
++    os_unfair_lock_lock(&_bindingLock);
++    BOOL isCurrent = !atomic_load_explicit(&_closed, memory_order_acquire) &&
++        _binding == binding &&
++        atomic_load_explicit(&_boundOutputIdentity, memory_order_acquire) ==
++            outputIdentity &&
++        _preparingOutputIdentity == 0;
++    uint_fast64_t expectedPreparation = outputIdentity;
++    BOOL wonPreparation = isCurrent &&
++        atomic_compare_exchange_strong_explicit(
++            &_pendingPreparationOutputIdentity, &expectedPreparation, 0,
++            memory_order_acq_rel, memory_order_acquire);
++    if (wonPreparation)
++    {
++        _preparingOutputIdentity = outputIdentity;
++        binding.displayLayer = layer;
++    }
++    os_unfair_lock_unlock(&_bindingLock);
++    if (!wonPreparation)
++        return NO;
++
++    AVPictureInPictureControllerContentSource *avPipSource =
++        [[AVPictureInPictureControllerContentSource alloc]
+             initWithSampleBufferDisplayLayer:layer
+-                            playbackDelegate:self
+-    ];
++            playbackDelegate:self];
++    if (avPipSource == nil) {
++        [self closeForBinding:binding];
++        return NO;
++    }
+     AVPictureInPictureController *avPipController =
+         (AVPictureInPictureController *)_avPipController;
+     BOOL isHandoff = avPipController != nil;
+@@ -148,23 +411,16 @@ - (void)prepare:(AVSampleBufferDisplayLayer *)layer {
+     else
+         avPipController = [[AVPictureInPictureController alloc]
+             initWithContentSource:avPipSource];
+-    BOOL seekable = NO;
+-    if ([_mediaController respondsToSelector:
+-            @selector(mediaPlaybackSnapshotWithLength:time:seekable:)]) {
+-        int64_t ignoredLength;
+-        int64_t ignoredTime;
+-        [_mediaController mediaPlaybackSnapshotWithLength:&ignoredLength
+-                                                     time:&ignoredTime
+-                                                 seekable:&seekable];
+-    } else {
+-        seekable = [_mediaController isMediaSeekable];
++    if (avPipController == nil) {
++        [self closeForBinding:binding];
++        return NO;
+     }
+     avPipController.requiresLinearPlayback = !seekable;
+     if (!isHandoff)
+         avPipController.delegate = self;
+ #if TARGET_OS_IOS
+     avPipController.canStartPictureInPictureAutomaticallyFromInline =
+-        _canStartAutomaticallyFromInline;
++        binding.canStartAutomaticallyFromInline;
+ #endif
+     _avPipController = avPipController;
+ 
+@@ -176,84 +432,269 @@ - (void)prepare:(AVSampleBufferDisplayLayer *)layer {
+         _observingPictureInPicturePossible = YES;
+     }
+ 
+-    atomic_store_explicit(&_awaitingSuccessor, false, memory_order_release);
++    /* Keep _preparingOutputIdentity armed through synchronous Swift
++     * readiness. A concurrent close then records an exact close request
++     * instead of preserving the controller and allowing this stale callback
++     * to cancel the successor's pending handoff. */
++    os_unfair_lock_lock(&_bindingLock);
++    BOOL closeWasRequested = _closeRequestedOutputIdentity == outputIdentity;
++    isCurrent = !atomic_load_explicit(&_closed, memory_order_acquire) &&
++        _binding == binding &&
++        atomic_load_explicit(&_boundOutputIdentity, memory_order_acquire) ==
++            outputIdentity;
++    if (closeWasRequested || !isCurrent) {
++        if (closeWasRequested)
++            _closeRequestedOutputIdentity = 0;
++        if (_preparingOutputIdentity == outputIdentity)
++            _preparingOutputIdentity = 0;
++    }
++    os_unfair_lock_unlock(&_bindingLock);
+ 
+-    if (!atomic_load_explicit(&_closed, memory_order_acquire) && _pictureInPictureReady)
+-        _pictureInPictureReady(self);
++    if (closeWasRequested) {
++        [self closeForBinding:binding];
++        return NO;
++    }
++    if (!isCurrent)
++        return NO;
++
++    BOOL accepted = [binding.drawable respondsToSelector:@selector(
++            pictureInPictureWindowController:
++            didBecomeReadyForNativeHandle:
++            playbackGeneration:outputIdentity:)] &&
++            [binding.drawable pictureInPictureWindowController:self
++                didBecomeReadyForNativeHandle:nativeHandle
++                playbackGeneration:playbackGeneration
++                outputIdentity:outputIdentity];
++
++    os_unfair_lock_lock(&_bindingLock);
++    closeWasRequested =
++        _closeRequestedOutputIdentity == outputIdentity;
++    if (closeWasRequested)
++        _closeRequestedOutputIdentity = 0;
++    if (_preparingOutputIdentity == outputIdentity)
++        _preparingOutputIdentity = 0;
++    isCurrent = !atomic_load_explicit(&_closed, memory_order_acquire) &&
++        _binding == binding &&
++        atomic_load_explicit(&_boundOutputIdentity, memory_order_acquire) ==
++            outputIdentity;
++    os_unfair_lock_unlock(&_bindingLock);
++
++    if (!accepted || !isCurrent) {
++        /* A newer exact output may have superseded this one while Swift's
++         * readiness callback ran. Route through normal close so an active
++         * controller can be returned to that successor; all other failures
++         * fall through to exact cancel-and-close. */
++        [self closeForBinding:binding];
++        return NO;
++    }
++    if (closeWasRequested) {
++        [self closeForBinding:binding];
++        return NO;
++    }
++    return accepted;
+ }
+ 
+-- (void)closeForVideoOutput {
+-    id<VLCPictureInPictureDrawable> drawable = _drawable;
+-    uint64_t currentGeneration = 0;
+-    if ([_mediaController respondsToSelector:@selector(mediaPlaybackGeneration)])
+-        currentGeneration = [_mediaController mediaPlaybackGeneration];
++- (void)closeForVideoOutput:(pip_controller_t *)pipcontroller {
++    VLCPictureInPictureBinding *binding =
++        [self bindingSnapshotForNativeHandle:
++            pipcontroller->native_handle_identity
++            playbackGeneration:pipcontroller->playback_generation
++            outputIdentity:pipcontroller->output_identity];
++    if (binding != nil)
++        [self closeForBinding:binding];
++}
+ 
+-    BOOL isReplacement = currentGeneration != 0 &&
+-        _mediaPlaybackGeneration != 0 &&
+-        currentGeneration != _mediaPlaybackGeneration;
++- (void)closeForBinding:(VLCPictureInPictureBinding *)binding {
++    const uint64_t outputIdentity = binding.outputIdentity;
+     BOOL isActive = atomic_load_explicit(&_pictureInPictureActive,
+                                          memory_order_acquire);
+-    BOOL isSameGenerationRebuild = NO;
+-    if (isActive && !isReplacement && currentGeneration != 0 &&
+-        currentGeneration == _mediaPlaybackGeneration &&
+-        [_mediaController respondsToSelector:@selector(
+-            consumePictureInPictureVideoOutputRebuildPermit)]) {
+-        isSameGenerationRebuild = [_mediaController
+-            consumePictureInPictureVideoOutputRebuildPermit];
+-    }
+-
+-    BOOL shouldPreserve = isActive &&
+-        (isReplacement || isSameGenerationRebuild);
+-    BOOL didPreserve = NO;
+-    if (shouldPreserve && [drawable respondsToSelector:@selector(
+-            preservePictureInPictureWindowController:
+-            sameMediaGenerationRebuild:)]) {
+-        didPreserve = [drawable
++    os_unfair_lock_lock(&_bindingLock);
++    BOOL isCurrent = !atomic_load_explicit(&_closed, memory_order_acquire) &&
++        _binding == binding &&
++        atomic_load_explicit(&_boundOutputIdentity, memory_order_acquire) ==
++            outputIdentity;
++    if (isCurrent && _preparingOutputIdentity == outputIdentity)
++    {
++        _closeRequestedOutputIdentity = outputIdentity;
++        os_unfair_lock_unlock(&_bindingLock);
++        return;
++    }
++
++    uint_fast64_t expectedPreparation = outputIdentity;
++    if (isCurrent)
++        atomic_compare_exchange_strong_explicit(
++            &_pendingPreparationOutputIdentity, &expectedPreparation, 0,
++            memory_order_acq_rel, memory_order_acquire);
++    uint_fast64_t noPendingHandoff = 0;
++    BOOL didArm = isCurrent && isActive &&
++        atomic_compare_exchange_strong_explicit(
++            &_pendingHandoffOutputIdentity, &noPendingHandoff, outputIdentity,
++            memory_order_acq_rel, memory_order_acquire);
++    os_unfair_lock_unlock(&_bindingLock);
++
++    BOOL didPreserve = didArm &&
++        [binding.drawable respondsToSelector:@selector(
++        preservePictureInPictureWindowController:fromNativeHandle:
++        playbackGeneration:outputIdentity:sameMediaGenerationRebuild:)];
++    if (didPreserve)
++    {
++        didPreserve = [binding.drawable
+             preservePictureInPictureWindowController:self
+-            sameMediaGenerationRebuild:isSameGenerationRebuild];
+-    } else if (isReplacement && isActive &&
+-               [drawable respondsToSelector:@selector(
+-                   preservePictureInPictureWindowController:)]) {
+-        didPreserve = [drawable
+-            preservePictureInPictureWindowController:self];
++            fromNativeHandle:binding.nativeHandleIdentity
++            playbackGeneration:binding.playbackGeneration
++            outputIdentity:outputIdentity
++            sameMediaGenerationRebuild:NO];
+     }
+ 
+     if (didPreserve) {
+-        uint_fast64_t token = atomic_fetch_add_explicit(&_handoffToken, 1,
+-                                                        memory_order_acq_rel) + 1;
+-        atomic_store_explicit(&_awaitingSuccessor, true, memory_order_release);
+         dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                      (int64_t)(3 * NSEC_PER_SEC)),
+                        dispatch_get_main_queue(), ^{
+-            BOOL isPending =
+-                atomic_load_explicit(&self->_awaitingSuccessor,
+-                                     memory_order_acquire);
+-            uint_fast64_t currentToken =
+-                atomic_load_explicit(&self->_handoffToken,
+-                                     memory_order_acquire);
+-            if (isPending && currentToken == token) {
+-                id<VLCPictureInPictureDrawable> currentDrawable =
+-                    self->_drawable;
+-                if ([currentDrawable respondsToSelector:@selector(
+-                        pictureInPictureWindowControllerHandoffDidTimeOut:)])
+-                    [currentDrawable
+-                        pictureInPictureWindowControllerHandoffDidTimeOut:
+-                            self];
+-                [self close];
+-            }
++            [self timeOutHandoffForDrawable:binding.drawable
++                nativeHandle:binding.nativeHandleIdentity
++                playbackGeneration:binding.playbackGeneration
++                outputIdentity:outputIdentity];
+         });
+         return;
+     }
+ 
+-    [self close];
++    [self cancelAndCloseBinding:binding];
+ }
+ 
+-- (void)close {
+-    if (atomic_exchange_explicit(&_closed, true, memory_order_acq_rel))
++- (void)cancelAndCloseBinding:(VLCPictureInPictureBinding *)binding {
++    if ([binding.drawable respondsToSelector:@selector(
++            pictureInPictureWindowController:cancelHandoffForNativeHandle:
++            playbackGeneration:outputIdentity:)])
++        [binding.drawable pictureInPictureWindowController:self
++            cancelHandoffForNativeHandle:binding.nativeHandleIdentity
++            playbackGeneration:binding.playbackGeneration
++            outputIdentity:binding.outputIdentity];
++    [self closeForNativeHandle:binding.nativeHandleIdentity
++        playbackGeneration:binding.playbackGeneration
++        outputIdentity:binding.outputIdentity];
++}
++
++- (void)timeOutHandoffForDrawable:(id<VLCPictureInPictureDrawable>)drawable
++    nativeHandle:(uint64_t)nativeHandle
++    playbackGeneration:(uint64_t)playbackGeneration
++    outputIdentity:(uint64_t)outputIdentity {
++    os_unfair_lock_lock(&_bindingLock);
++    VLCPictureInPictureBinding *binding = _binding;
++    uint_fast64_t expectedPending = outputIdentity;
++    BOOL won = !atomic_load_explicit(&_closed, memory_order_acquire) &&
++        atomic_load_explicit(&_boundOutputIdentity, memory_order_acquire) ==
++            outputIdentity &&
++        binding.nativeHandleIdentity == nativeHandle &&
++        binding.playbackGeneration == playbackGeneration &&
++        binding.outputIdentity == outputIdentity &&
++        atomic_compare_exchange_strong_explicit(
++            &_pendingHandoffOutputIdentity, &expectedPending,
++            VLC_PIP_HANDOFF_TOKEN_CLAIMED, memory_order_acq_rel,
++            memory_order_acquire);
++    if (won)
++    {
++        atomic_store_explicit(&_boundOutputIdentity, 0, memory_order_release);
++        atomic_store_explicit(&_pendingPreparationOutputIdentity,
++                              VLC_PIP_HANDOFF_TOKEN_CLAIMED,
++                              memory_order_release);
++        atomic_store_explicit(&_closed, true, memory_order_release);
++    }
++    os_unfair_lock_unlock(&_bindingLock);
++    if (!won)
++        return;
++
++    if ([drawable respondsToSelector:@selector(
++            pictureInPictureWindowController:handoffDidTimeOutForNativeHandle:
++            playbackGeneration:outputIdentity:)])
++        [drawable pictureInPictureWindowController:self
++            handoffDidTimeOutForNativeHandle:nativeHandle
++            playbackGeneration:playbackGeneration
++            outputIdentity:outputIdentity];
++    [self performCloseCleanup];
++}
++
++- (void)timeOutPreparationForBinding:
++    (VLCPictureInPictureBinding *)binding {
++    os_unfair_lock_lock(&_bindingLock);
++    uint_fast64_t expectedPreparation = binding.outputIdentity;
++    BOOL won = !atomic_load_explicit(&_closed, memory_order_acquire) &&
++        _binding == binding &&
++        atomic_load_explicit(&_boundOutputIdentity, memory_order_acquire) ==
++            binding.outputIdentity &&
++        atomic_compare_exchange_strong_explicit(
++            &_pendingPreparationOutputIdentity, &expectedPreparation,
++            VLC_PIP_HANDOFF_TOKEN_CLAIMED, memory_order_acq_rel,
++            memory_order_acquire);
++    if (won)
++    {
++        atomic_store_explicit(&_boundOutputIdentity, 0, memory_order_release);
++        atomic_store_explicit(&_pendingHandoffOutputIdentity,
++                              VLC_PIP_HANDOFF_TOKEN_CLAIMED,
++                              memory_order_release);
++        atomic_store_explicit(&_closed, true, memory_order_release);
++    }
++    os_unfair_lock_unlock(&_bindingLock);
++    if (!won)
+         return;
+-    atomic_store_explicit(&_awaitingSuccessor, false, memory_order_release);
++
++    if ([binding.drawable respondsToSelector:@selector(
++            pictureInPictureWindowController:handoffDidTimeOutForNativeHandle:
++            playbackGeneration:outputIdentity:)])
++        [binding.drawable pictureInPictureWindowController:self
++            handoffDidTimeOutForNativeHandle:binding.nativeHandleIdentity
++            playbackGeneration:binding.playbackGeneration
++            outputIdentity:binding.outputIdentity];
++    [self performCloseCleanup];
++}
++
++- (void)closeForNativeHandle:(uint64_t)nativeHandle
++    playbackGeneration:(uint64_t)playbackGeneration
++    outputIdentity:(uint64_t)outputIdentity {
++    os_unfair_lock_lock(&_bindingLock);
++    VLCPictureInPictureBinding *binding = _binding;
++    BOOL won = !atomic_load_explicit(&_closed, memory_order_acquire) &&
++        atomic_load_explicit(&_boundOutputIdentity, memory_order_acquire) ==
++            outputIdentity &&
++        binding.nativeHandleIdentity == nativeHandle &&
++        binding.playbackGeneration == playbackGeneration &&
++        binding.outputIdentity == outputIdentity;
++    if (won)
++    {
++        atomic_store_explicit(&_closed, true, memory_order_release);
++        atomic_store_explicit(&_boundOutputIdentity, 0, memory_order_release);
++        atomic_store_explicit(&_pendingPreparationOutputIdentity,
++                              VLC_PIP_HANDOFF_TOKEN_CLAIMED,
++                              memory_order_release);
++        atomic_store_explicit(&_pendingHandoffOutputIdentity,
++                              VLC_PIP_HANDOFF_TOKEN_CLAIMED,
++                              memory_order_release);
++    }
++    os_unfair_lock_unlock(&_bindingLock);
++    if (won)
++        [self performCloseCleanup];
++}
++
++- (void)close {
++    os_unfair_lock_lock(&_bindingLock);
++    BOOL won = !atomic_exchange_explicit(&_closed, true,
++                                         memory_order_acq_rel);
++    if (won)
++    {
++        atomic_store_explicit(&_boundOutputIdentity, 0, memory_order_release);
++        atomic_store_explicit(&_pendingPreparationOutputIdentity,
++                              VLC_PIP_HANDOFF_TOKEN_CLAIMED,
++                              memory_order_release);
++        atomic_store_explicit(&_pendingHandoffOutputIdentity,
++                              VLC_PIP_HANDOFF_TOKEN_CLAIMED,
++                              memory_order_release);
++    }
++    os_unfair_lock_unlock(&_bindingLock);
++    if (won)
++        [self performCloseCleanup];
++}
++
++- (void)performCloseCleanup {
+     [self setOverlayCompositionEnabled:NO];
+-    atomic_fetch_add_explicit(&_handoffToken, 1, memory_order_acq_rel);
+ 
+     dispatch_block_t cleanup = ^{
+         AVPictureInPictureController *avPipController =
+@@ -269,6 +710,13 @@ - (void)close {
+         avPipController.contentSource = nil;
+         self.stateChangeEventHandler = nil;
+         self->_avPipController = nil;
++        os_unfair_lock_lock(&self->_bindingLock);
++        VLCPictureInPictureBinding *retiredBinding = self->_binding;
++        self->_binding = nil;
++        self->_preparingOutputIdentity = 0;
++        self->_closeRequestedOutputIdentity = 0;
++        os_unfair_lock_unlock(&self->_bindingLock);
++        (void)retiredBinding;
+     };
+ 
+     if ([NSThread isMainThread])
+@@ -295,9 +743,8 @@ - (void)pictureInPictureController:(AVPictureInPictureController *)pictureInPict
+ 
+ - (void)pictureInPictureController:(AVPictureInPictureController *)pictureInPictureController
+                         setPlaying:(BOOL)playing {
+-    if (atomic_load_explicit(&_closed, memory_order_acquire))
+-        return;
+-    id<VLCPictureInPictureMediaControlling> mediaController = _mediaController;
++    id<VLCPictureInPictureMediaControlling> mediaController =
++        [self activeBindingSnapshot].mediaController;
+     if (!mediaController)
+         return;
+     BOOL isPlaying = mediaController.isMediaPlaying;
+@@ -310,11 +757,8 @@ - (void)pictureInPictureController:(AVPictureInPictureController *)pictureInPict
+ - (void)pictureInPictureController:(AVPictureInPictureController *)pictureInPictureController
+                     skipByInterval:(CMTime)skipInterval
+                  completionHandler:(void (^)(void))completionHandler {
+-    if (atomic_load_explicit(&_closed, memory_order_acquire)) {
+-        completionHandler();
+-        return;
+-    }
+-    id<VLCPictureInPictureMediaControlling> mediaController = _mediaController;
++    id<VLCPictureInPictureMediaControlling> mediaController =
++        [self activeBindingSnapshot].mediaController;
+     if (!mediaController) {
+         completionHandler();
+         return;
+@@ -339,17 +783,18 @@ - (void)pictureInPictureController:(AVPictureInPictureController *)pictureInPict
+ }
+ 
+ - (BOOL)pictureInPictureControllerIsPlaybackPaused:(AVPictureInPictureController *)pictureInPictureController {
+-    if (atomic_load_explicit(&_closed, memory_order_acquire))
+-        return YES;
+-    id<VLCPictureInPictureMediaControlling> mediaController = _mediaController;
++    id<VLCPictureInPictureMediaControlling> mediaController =
++        [self activeBindingSnapshot].mediaController;
+     return mediaController ? !mediaController.isMediaPlaying : YES;
+ }
+ 
+ - (CMTimeRange)pictureInPictureControllerTimeRangeForPlayback:(AVPictureInPictureController *)pictureInPictureController {
+-    if (atomic_load_explicit(&_closed, memory_order_acquire))
+-        return kCMTimeRangeInvalid;
+-    id<VLCPictureInPictureMediaControlling> mediaController = _mediaController;
+-    if (!mediaController)
++    VLCPictureInPictureBinding *binding = [self activeBindingSnapshot];
++    id<VLCPictureInPictureMediaControlling> mediaController =
++        binding.mediaController;
++    AVSampleBufferDisplayLayer *displayLayer =
++        [self displayLayerSnapshotForBinding:binding];
++    if (!mediaController || displayLayer == nil)
+         return kCMTimeRangeInvalid;
+     const CMTimeRange live = CMTimeRangeMake(kCMTimeZero, kCMTimePositiveInfinity);
+ 
+@@ -377,7 +822,7 @@ - (CMTimeRange)pictureInPictureControllerTimeRangeForPlayback:(AVPictureInPictur
+         time = length - 1;
+ 
+     CMTime current =
+-        CMTimebaseGetTime(_displayLayer.sampleBufferRenderer.timebase);
++        CMTimebaseGetTime(displayLayer.sampleBufferRenderer.timebase);
+     if (!CMTIME_IS_NUMERIC(current))
+         current = CMClockGetTime(CMClockGetHostTimeClock());
+     CMTime start = CMTimeSubtract(current, CMTimeMake(time, 1000));
+@@ -460,7 +905,7 @@ - (void)setOverlayCompositionEnabled:(BOOL)enabled {
+     if (previous == enabled)
+         return;
+     id<VLCPictureInPictureOverlayStateObserving> observer =
+-        _overlayStateObserver;
++        [self bindingSnapshot].overlayStateObserver;
+     [observer pictureInPictureOverlayCompositionDidChange:enabled];
+ }
+ 
+@@ -469,17 +914,24 @@ - (void)setOverlayCompositionEnabled:(BOOL)enabled {
+ static void *HoldPresentationContext(pip_controller_t *pipcontroller) {
+     if (pipcontroller->p_sys == NULL)
+         return NULL;
+-    id context = (__bridge id)pipcontroller->p_sys;
++    VLCPictureInPictureController *sys =
++        (__bridge VLCPictureInPictureController *)pipcontroller->p_sys;
++    id context = [sys presentationContextForPipController:pipcontroller];
+     return (__bridge_retained void *)context;
+ }
+ 
+ static void SetDisplayLayerOnContext(void *opaque, void *layer) {
+     if (@available(macOS 12.0, iOS 15.0, tvos 15.0, *)) {
+-        VLCPictureInPictureController *sys =
+-            (__bridge VLCPictureInPictureController *)opaque;
++        if (opaque == NULL || layer == NULL)
++            return;
++        VLCPictureInPicturePresentationContext *context =
++            (__bridge VLCPictureInPicturePresentationContext *)opaque;
+         AVSampleBufferDisplayLayer *displayLayer =
+             (__bridge AVSampleBufferDisplayLayer *)layer;
+-        [sys prepare:displayLayer];
++        [context.controller prepare:displayLayer
++            nativeHandle:context.nativeHandleIdentity
++            playbackGeneration:context.playbackGeneration
++            outputIdentity:context.outputIdentity];
+     }
+ }
+ 
+@@ -505,7 +957,7 @@ static int CloseController( pip_controller_t *pipcontroller )
+             (__bridge_transfer VLCPictureInPictureController*)pipcontroller->p_sys;
+         pipcontroller->p_sys = NULL;
+ 
+-        [sys closeForVideoOutput];
++        [sys closeForVideoOutput:pipcontroller];
+     }
+     
+     return VLC_SUCCESS;
+@@ -525,40 +977,136 @@ static int OpenController( pip_controller_t *pipcontroller )
+ 
+     if (@available(macOS 12.0, iOS 15.0, tvos 15.0, *)) {
+         id<VLCPictureInPictureDrawable> drawable =
+-            (__bridge id)var_InheritAddress(pipcontroller,
+-                                             "drawable-nsobject");
+-        VLCPictureInPictureController *sys = nil;
++            (__bridge id)pipcontroller->drawable;
++        BOOL hasExactIdentity = pipcontroller->native_handle_identity != 0 &&
++            pipcontroller->playback_generation != 0 &&
++            pipcontroller->output_identity != 0 &&
++            pipcontroller->output_identity != VLC_PIP_HANDOFF_TOKEN_CLAIMED;
++        BOOL missingExactLifecycle =
++            ![drawable respondsToSelector:@selector(
++                takePreservedPictureInPictureWindowControllerForNativeHandle:
++                playbackGeneration:outputIdentity:wasSuperseded:)] ||
++            ![drawable respondsToSelector:@selector(
++                pictureInPictureWindowController:didClaimNativeHandle:
++                playbackGeneration:outputIdentity:)] ||
++            ![drawable respondsToSelector:@selector(
++                pictureInPictureControllerCreationFailedForNativeHandle:
++                playbackGeneration:outputIdentity:)] ||
++            ![drawable respondsToSelector:@selector(
++                pictureInPictureWindowController:
++                cancelHandoffForNativeHandle:
++                playbackGeneration:outputIdentity:)] ||
++            ![drawable respondsToSelector:@selector(
++                pictureInPictureWindowController:
++                didBecomeReadyForNativeHandle:
++                playbackGeneration:outputIdentity:)] ||
++            ![drawable respondsToSelector:@selector(
++                preservePictureInPictureWindowController:fromNativeHandle:
++                playbackGeneration:outputIdentity:
++                sameMediaGenerationRebuild:)] ||
++            ![drawable respondsToSelector:@selector(
++                pictureInPictureWindowController:
++                handoffDidTimeOutForNativeHandle:
++                playbackGeneration:outputIdentity:)];
++        if (!hasExactIdentity || missingExactLifecycle)
++            return VLC_EGENERIC;
++
+         BOOL handoffWasSuperseded = NO;
+-        id preserved = nil;
+-        if ([drawable conformsToProtocol:
+-                @protocol(VLCPictureInPictureDrawable)]) {
+-            if ([drawable respondsToSelector:@selector(
+-                    takePreservedPictureInPictureWindowControllerWasSuperseded:)]) {
+-                preserved = [drawable
+-                    takePreservedPictureInPictureWindowControllerWasSuperseded:
+-                        &handoffWasSuperseded];
+-            } else if ([drawable respondsToSelector:
+-                    @selector(takePreservedPictureInPictureWindowController)]) {
+-                // Compatibility with SwiftVLC builds carrying the original
+-                // continuity hook without the superseded outcome.
+-                preserved =
+-                    [drawable takePreservedPictureInPictureWindowController];
+-            }
++        id preserved = [drawable
++            takePreservedPictureInPictureWindowControllerForNativeHandle:
++                pipcontroller->native_handle_identity
++            playbackGeneration:pipcontroller->playback_generation
++            outputIdentity:pipcontroller->output_identity
++            wasSuperseded:&handoffWasSuperseded];
++        if (handoffWasSuperseded) {
++            if (preserved != nil)
++                [drawable pictureInPictureWindowController:(id)preserved
++                    cancelHandoffForNativeHandle:
++                        pipcontroller->native_handle_identity
++                    playbackGeneration:pipcontroller->playback_generation
++                    outputIdentity:pipcontroller->output_identity];
+             if ([preserved isKindOfClass:
+-                    [VLCPictureInPictureController class]]) {
+-                sys = preserved;
+-                [sys rebindToPipController:pipcontroller];
+-            }
++                    [VLCPictureInPictureController class]])
++                [(VLCPictureInPictureController *)preserved close];
++            return VLC_EGENERIC;
+         }
+-
+-        if (handoffWasSuperseded)
++        if (preserved != nil && ![preserved isKindOfClass:
++                [VLCPictureInPictureController class]]) {
++            [drawable pictureInPictureWindowController:(id)preserved
++                cancelHandoffForNativeHandle:
++                    pipcontroller->native_handle_identity
++                playbackGeneration:pipcontroller->playback_generation
++                outputIdentity:pipcontroller->output_identity];
+             return VLC_EGENERIC;
++        }
+ 
+-        if (sys == nil)
++        VLCPictureInPictureController *sys = nil;
++        if (preserved != nil) {
++            sys = preserved;
++            /* Claim the exact Swift pending owner before rebind can publish
++             * overlay state or any later preparation can report readiness. */
++            BOOL didClaim = [drawable pictureInPictureWindowController:sys
++                didClaimNativeHandle:pipcontroller->native_handle_identity
++                playbackGeneration:pipcontroller->playback_generation
++                outputIdentity:pipcontroller->output_identity];
++            if (!didClaim) {
++                [drawable pictureInPictureWindowController:sys
++                    cancelHandoffForNativeHandle:
++                        pipcontroller->native_handle_identity
++                    playbackGeneration:pipcontroller->playback_generation
++                    outputIdentity:pipcontroller->output_identity];
++                [sys close];
++                return VLC_EGENERIC;
++            }
++            if (![sys rebindToPipController:pipcontroller]) {
++                [drawable pictureInPictureWindowController:sys
++                    cancelHandoffForNativeHandle:
++                        pipcontroller->native_handle_identity
++                    playbackGeneration:pipcontroller->playback_generation
++                    outputIdentity:pipcontroller->output_identity];
++                [sys close];
++                return VLC_EGENERIC;
++            }
++        } else {
+             sys = [[VLCPictureInPictureController alloc]
+                 initWithPipController:pipcontroller];
+-        
+-        if (sys == nil) {
++            if (sys == nil) {
++                [drawable
++                    pictureInPictureControllerCreationFailedForNativeHandle:
++                        pipcontroller->native_handle_identity
++                    playbackGeneration:pipcontroller->playback_generation
++                    outputIdentity:pipcontroller->output_identity];
++                return VLC_EGENERIC;
++            }
++            BOOL didClaim = [drawable pictureInPictureWindowController:sys
++                didClaimNativeHandle:pipcontroller->native_handle_identity
++                playbackGeneration:pipcontroller->playback_generation
++                outputIdentity:pipcontroller->output_identity];
++            if (!didClaim) {
++                [drawable
++                    pictureInPictureControllerCreationFailedForNativeHandle:
++                        pipcontroller->native_handle_identity
++                    playbackGeneration:pipcontroller->playback_generation
++                    outputIdentity:pipcontroller->output_identity];
++                [sys closeForNativeHandle:pipcontroller->native_handle_identity
++                    playbackGeneration:pipcontroller->playback_generation
++                    outputIdentity:pipcontroller->output_identity];
++                return VLC_EGENERIC;
++            }
++        }
++
++        if (![sys startPreparationTimeoutForNativeHandle:
++                pipcontroller->native_handle_identity
++                playbackGeneration:pipcontroller->playback_generation
++                outputIdentity:pipcontroller->output_identity]) {
++            [drawable pictureInPictureWindowController:sys
++                cancelHandoffForNativeHandle:
++                    pipcontroller->native_handle_identity
++                playbackGeneration:pipcontroller->playback_generation
++                outputIdentity:pipcontroller->output_identity];
++            [sys closeForNativeHandle:pipcontroller->native_handle_identity
++                playbackGeneration:pipcontroller->playback_generation
++                outputIdentity:pipcontroller->output_identity];
+             return VLC_EGENERIC;
+         }
+ 
+diff --git a/modules/video_output/apple/VLCSampleBufferDisplay.m b/modules/video_output/apple/VLCSampleBufferDisplay.m
+index 5b30d8c..dc7b6e6 100644
+--- a/modules/video_output/apple/VLCSampleBufferDisplay.m
++++ b/modules/video_output/apple/VLCSampleBufferDisplay.m
+@@ -36,6 +36,7 @@
+ #include <limits.h>
+ #include <errno.h>
+ #include <inttypes.h>
++#include <string.h>
+ 
+ #import "VLCDrawable.h"
+ 
+@@ -52,6 +53,33 @@
+ 
+ #import <VideoToolbox/VideoToolbox.h>
+ 
++static atomic_uint_fast64_t pipOutputIdentitySource = ATOMIC_VAR_INIT(0);
++
++static uint64_t NextPipOutputIdentity(void)
++{
++    uint_fast64_t current = atomic_load_explicit(
++        &pipOutputIdentitySource, memory_order_relaxed);
++    for (;;)
++    {
++        /* UINT64_MAX is the permanent exhausted state and is also reserved by
++         * the controller as its claimed-token sentinel. Never wrap to an
++         * identity that a delayed output could still own. */
++        if (current >= UINT64_MAX - 1)
++        {
++            if (current == UINT64_MAX - 1)
++                atomic_compare_exchange_strong_explicit(
++                    &pipOutputIdentitySource, &current, UINT64_MAX,
++                    memory_order_relaxed, memory_order_relaxed);
++            return 0;
++        }
++        uint_fast64_t next = current + 1;
++        if (atomic_compare_exchange_weak_explicit(
++                &pipOutputIdentitySource, &current, next,
++                memory_order_relaxed, memory_order_relaxed))
++            return next;
++    }
++}
++
+ #if __is_target_os(ios)
+ #define IS_VT_ROTATION_API_AVAILABLE __IPHONE_OS_VERSION_MAX_ALLOWED >= 160000
+ #elif __is_target_os(macos)
+@@ -2587,7 +2615,32 @@ static int Control (vout_display_t *vd, int query)
+     pip_controller_t *pip_controller = vlc_object_create(vd, sizeof(pip_controller_t));
+     if (pip_controller == NULL)
+         return NULL;
++    pip_controller->p_sys = NULL;
+     pip_controller->overlay_state_observer = cbs_opaque;
++    id drawable = (__bridge id)var_InheritAddress(vd, "drawable-nsobject");
++    pip_controller->drawable = (__bridge_retained void *)drawable;
++    const void *identity =
++        var_InheritAddress(vd, "swiftvlc-pip-playback-identity");
++    if (identity != NULL)
++    {
++        swiftvlc_pip_inherited_identity_t snapshot;
++        memcpy(&snapshot, identity, sizeof(snapshot));
++        pip_controller->native_handle_identity =
++            snapshot.native_handle_identity;
++        pip_controller->playback_generation = snapshot.playback_generation;
++    }
++    else
++    {
++        pip_controller->native_handle_identity = 0;
++        pip_controller->playback_generation = 0;
++    }
++    pip_controller->output_identity = NextPipOutputIdentity();
++    if (pip_controller->output_identity == 0)
++    {
++        CFBridgingRelease(pip_controller->drawable);
++        vlc_object_delete(pip_controller);
++        return NULL;
++    }
+ 
+     module_t **mods;
+     ssize_t total = vlc_module_match("pictureinpicture", NULL, false, &mods, NULL);
+@@ -2603,6 +2656,7 @@ static int Control (vout_display_t *vd, int query)
+     }
+ 
+     free(mods);
++    CFBridgingRelease(pip_controller->drawable);
+     vlc_object_delete(pip_controller);
+     return NULL;
+ }
+@@ -2617,6 +2671,8 @@ static void DeletePipController( pip_controller_t * pip_controller )
+         pip_controller->ops->close(pip_controller);
+     }
+ 
++    CFBridgingRelease(pip_controller->drawable);
++
+     vlc_object_delete(pip_controller);
+ }
+ 
+diff --git a/modules/video_output/apple/vlc_pip_controller.h b/modules/video_output/apple/vlc_pip_controller.h
+index 745dedf..e54b0f9 100644
+--- a/modules/video_output/apple/vlc_pip_controller.h
++++ b/modules/video_output/apple/vlc_pip_controller.h
+@@ -31,6 +31,15 @@
+ 
+ typedef struct pip_controller_t pip_controller_t;
+ 
++/* Private copy target for the public media-player identity snapshot. The
++ * display uses memcpy from the inherited opaque address so module code does
++ * not depend on libvlc's public header layering or violate effective type. */
++typedef struct swiftvlc_pip_inherited_identity_t
++{
++    uint64_t native_handle_identity;
++    uint64_t playback_generation;
++} swiftvlc_pip_inherited_identity_t;
++
+ #ifdef __OBJC__
+ @protocol VLCPictureInPictureOverlayStateObserving
+ - (void)pictureInPictureOverlayCompositionDidChange:(bool)enabled;
+@@ -53,6 +62,14 @@ struct pip_controller_t
+ 
+     void               *p_sys;
+ 
++    /* Retained drawable and scalar identity snapshotted by the display before
++     * module mapping. The PiP module must never inherit them again: a delayed
++     * output from media B can otherwise observe media C's publication. */
++    void               *drawable;
++    uint64_t            native_handle_identity;
++    uint64_t            playback_generation;
++    uint64_t            output_identity;
++
+     /* Unretained Objective-C observer owned by the video output. The native
+      * controller stores it weakly before this short-lived module object can
+      * be deleted. */

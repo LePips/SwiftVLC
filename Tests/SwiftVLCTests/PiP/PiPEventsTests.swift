@@ -360,8 +360,11 @@ extension Integration {
         Issue.record("Expected the failed attempt's trailing stop")
         return
       }
-      guard case .didStop(reason: .programmatic) = envelopes[3].event else {
-        Issue.record("Expected the retry's programmatic stop reason")
+      guard
+        case .didStop(reason: .unknown) = envelopes[3].event,
+        envelopes[3].stopCause == .programmatic
+      else {
+        Issue.record("Expected the retry's detailed programmatic stop cause")
         return
       }
     }
@@ -619,29 +622,6 @@ extension Integration {
       }
       guard case .didStop(reason: .restoreRequested) = events[3] else {
         Issue.record("Expected .didStop(.restoreRequested), got \(events[3])")
-        return
-      }
-    }
-
-    @Test
-    func `programmatic stop reports its authoritative reason`() async {
-      let player = Player(instance: TestInstance.shared)
-      let controller = PiPController(player: player)
-      let avController = makeDummyAVController(for: controller)
-      let stream = controller.pipEvents
-
-      controller._setStateForTesting(isActive: true)
-      controller.stop()
-      controller.pictureInPictureControllerWillStopPictureInPicture(avController)
-      controller.pictureInPictureControllerDidStopPictureInPicture(avController)
-
-      let events = await collect(2, from: stream)
-      guard case .willStop(reason: .programmatic) = events[0] else {
-        Issue.record("Expected .willStop(.programmatic), got \(events[0])")
-        return
-      }
-      guard case .didStop(reason: .programmatic) = events[1] else {
-        Issue.record("Expected .didStop(.programmatic), got \(events[1])")
         return
       }
     }

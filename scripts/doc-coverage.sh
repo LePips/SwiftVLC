@@ -62,6 +62,24 @@ xcrun swift-symbolgraph-extract \
   -minimum-access-level public \
   -output-dir "$OUT_DIR" >/dev/null
 
+# Documentation coverage alone cannot detect a stale or ambiguous symbol link.
+# Compile the catalog from the symbol graph we already extracted instead of
+# invoking the SwiftPM DocC plugin, which would rebuild the target under a
+# different flag set in CI. Treat every DocC warning as a failure: a rendered
+# page with a broken API link is not complete public documentation.
+DOCC_LOG="$OUT_DIR/docc.log"
+if ! xcrun docc convert "Sources/SwiftVLC/SwiftVLC.docc" \
+  --additional-symbol-graph-dir "$OUT_DIR" \
+  --output-path "$OUT_DIR/$MODULE.doccarchive" \
+  --fallback-display-name "$MODULE" \
+  --fallback-bundle-identifier "org.swiftvlc.documentation" \
+  --fallback-default-module-kind "Framework" \
+  --warnings-as-errors \
+  --no-transform-for-static-hosting >"$DOCC_LOG" 2>&1; then
+  cat "$DOCC_LOG" >&2
+  exit 1
+fi
+
 /usr/bin/python3 - "$OUT_DIR/$MODULE.symbols.json" "${1:-}" <<'PY'
 import json, pathlib, collections, sys
 

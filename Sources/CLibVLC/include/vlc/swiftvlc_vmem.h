@@ -59,6 +59,35 @@ typedef unsigned (*swiftvlc_video_format_ex_cb)(
     unsigned *output_width, unsigned *output_height,
     unsigned *pitches, unsigned *lines);
 
+/**
+ * Synchronous result-bearing vmem display callback.
+ *
+ * Return zero only after the exact picture has been submitted to the final
+ * output backend. Scheduling, retaining, or deferring the picture is not a
+ * successful submission. Return a negative errno-style value otherwise.
+ */
+typedef int (*swiftvlc_video_display_status_cb)(void *opaque, void *picture);
+
+/** Sentinel passed when the vmem output-attempt picture has no valid PTS. */
+#define SWIFTVLC_VMEM_INVALID_PICTURE_PTS_US INT64_MIN
+
+/**
+ * Synchronous result-bearing vmem display callback with output-attempt PTS.
+ *
+ * @a picture_pts_us is the post-filter, vout-selected picture's media
+ * presentation timestamp in microseconds, normalized to LibVLC's public zero
+ * origin. Pictures dropped before the vmem output attempt are not observed.
+ * It is SWIFTVLC_VMEM_INVALID_PICTURE_PTS_US when the picture has no valid
+ * timestamp. A missing timestamp is metadata, not a submission failure: the
+ * callback must still decide the exact picture's submission result.
+ *
+ * Return zero only after the exact picture has been submitted to the final
+ * output backend. Scheduling, retaining, or deferring the picture is not a
+ * successful submission. Return a negative errno-style value otherwise.
+ */
+typedef int (*swiftvlc_video_display_status_v2_cb)(
+    void *opaque, void *picture, int64_t picture_pts_us);
+
 #if defined(__cplusplus)
 # define SWIFTVLC_VMEM_STATIC_ASSERT(condition, message) \
     static_assert(condition, message)

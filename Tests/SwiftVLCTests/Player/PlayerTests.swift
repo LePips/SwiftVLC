@@ -289,6 +289,16 @@ extension Integration {
     }
 
     @Test
+    func `Version 1 position seek remains usable as a one argument method reference`() {
+      let player = Player(instance: TestInstance.shared)
+      let seek: (PlaybackPosition) throws -> Void = player.seek(to:)
+
+      #expect(throws: VLCError.self) {
+        try seek(PlaybackPosition(0.5))
+      }
+    }
+
+    @Test
     func `Audio delay get and set`() {
       let player = Player(instance: TestInstance.shared)
       try? player.setAudioDelay(.milliseconds(500))

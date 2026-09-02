@@ -15,6 +15,7 @@ import Testing
     player._setStateForTesting(duration: .seconds(120), isSeekable: true)
 
     let snapshot = player.capabilitySnapshot.withLock { $0 }
+    #expect(snapshot.playbackGeneration == player.generation)
     #expect(snapshot.durationMilliseconds == 120_000)
     #expect(snapshot.isSeekable)
     #expect(!snapshot.isReset)
@@ -33,9 +34,24 @@ import Testing
 
     let after = player.capabilitySnapshot.withLock { $0 }
     #expect(after.generation == before.generation &+ 1)
+    #expect(after.playbackGeneration == player.generation)
     #expect(after.durationMilliseconds == nil)
     #expect(after.isSeekable == false)
     #expect(after.isReset)
+  }
+
+  @Test
+  func `Capability publication carries the exact playback generation`() {
+    let player = Player(instance: TestInstance.shared)
+    player.sessionGeneration = 7
+
+    player._setStateForTesting(duration: .seconds(45), isSeekable: true)
+
+    let snapshot = player.capabilitySnapshot.withLock { $0 }
+    #expect(snapshot.playbackGeneration == PlaybackGeneration(7))
+    #expect(snapshot.playbackGeneration == player.generation)
+    #expect(snapshot.durationMilliseconds == 45000)
+    #expect(snapshot.isSeekable)
   }
 
   /// `duration` and `isSeekable` publish from their own `didSet`, so clearing

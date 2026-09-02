@@ -1,6 +1,25 @@
 import CLibVLC
 import Dispatch
 
+enum MediaListPlayerNativeTransportCommand {
+  case play
+  case playAt(Int32)
+  case playMedia(OpaquePointer)
+  case stop
+  case next
+  case previous
+}
+
+private struct MediaListPlayerPlaybackStartReservation {
+  nonisolated(unsafe) let nativeListPlayer: OpaquePointer
+  let player: Player?
+  nonisolated(unsafe) let nativePlayer: OpaquePointer?
+  let nativeHandleGeneration: UInt64?
+  let mediaListOwnershipEpoch: UInt64?
+  let playbackControlRevision: UInt64?
+  let playbackStartAttempt: EventBridgeCallbackContext.PlaybackStartAttempt?
+}
+
 /// A playlist player that plays media from a ``MediaList``.
 ///
 /// Wraps `libvlc_media_list_player_t` and provides sequential, looping,
@@ -33,6 +52,10 @@ public final class MediaListPlayer {
   private var _mediaList: MediaList?
   private var _playbackMode: PlaybackMode = .default
   private let instance: VLCInstance
+  #if DEBUG
+  var _nativeTransportDispatchOverrideForTesting:
+    ((MediaListPlayerNativeTransportCommand) -> Int32)?
+  #endif
 
   /// Creates a new media list player.
   /// - Parameter instance: The VLC instance to use.
@@ -78,6 +101,12 @@ public final class MediaListPlayer {
     get { _mediaPlayer }
     set {
       guard _mediaPlayer !== newValue else { return }
+      // A committed successor can temporarily share Swift identity with a
+      // still-bound retiring native handle. Binding a list player here would
+      // let list navigation drive A while every public property describes B.
+      guard
+        newValue?.nativeHandleRepresentsCurrentMedia != false,
+        newValue?.nativePlayerNeedsReplacementBeforePlayback != true else { return }
 
       if
         let newValue,
@@ -99,7 +128,7 @@ public final class MediaListPlayer {
         }
         _mediaPlayer = newValue
         newValue.endCoordinator.setSuppressed(true)
-        newValue.attachedMediaListPlayer = self
+        newValue.transitionMediaListOwnership(to: self)
       } else {
         if let previous {
           detachForEndSynthesis(previous, nativeStopWillFollow: true)
@@ -132,7 +161,7 @@ public final class MediaListPlayer {
     let owner = previous.attachedMediaListPlayer
     guard owner === self || owner == nil else { return }
     previous.endCoordinator.setSuppressed(false)
-    previous.attachedMediaListPlayer = nil
+    previous.transitionMediaListOwnership(to: nil)
   }
 
   /// Re-binds the native list player to the attached ``Player``'s
@@ -178,10 +207,16 @@ public final class MediaListPlayer {
 
   /// Starts playing the media list from the beginning.
   public func play() {
-    libvlc_media_list_player_play(pointer)
-    if _mediaList?.isEmpty == false {
-      publishAcceptedPlayIntent()
-    }
+    guard
+      attachedPlayerHandleIsCurrent,
+      let reservation = reservePlaybackStart()
+    else { return }
+    let hasPlayableItem = _mediaList?.isEmpty == false
+    let result = dispatchNativeTransport(.play, on: reservation.nativeListPlayer)
+    settlePlaybackStart(
+      reservation,
+      accepted: result == 0 && hasPlayableItem
+    )
   }
 
   /// Toggles between playing and paused. No-op in transient states
@@ -196,6 +231,7 @@ public final class MediaListPlayer {
   /// `src/audio_output/dec.c:876`, killing the process. Mirror the
   /// guard in ``Player/togglePlayPause()``.
   public func togglePause() {
+    guard attachedPlayerHandleIsCurrent else { return }
     switch state {
     case .playing:
       pause()
@@ -210,6 +246,7 @@ public final class MediaListPlayer {
 
   /// Pauses playback.
   public func pause() {
+    guard attachedPlayerHandleIsCurrent else { return }
     if let mediaPlayer = _mediaPlayer {
       // The list-player "playing" flag can become true while the attached
       // media player is still opening or waiting for its first audio
@@ -225,6 +262,7 @@ public final class MediaListPlayer {
 
   /// Resumes playback.
   public func resume() {
+    guard attachedPlayerHandleIsCurrent else { return }
     if let mediaPlayer = _mediaPlayer {
       mediaPlayer.resume()
     } else {
@@ -234,12 +272,14 @@ public final class MediaListPlayer {
 
   /// Whether the list player is currently playing.
   public var isPlaying: Bool {
-    libvlc_media_list_player_is_playing(pointer)
+    guard attachedPlayerHandleIsCurrent else { return false }
+    return libvlc_media_list_player_is_playing(pointer)
   }
 
   /// Current playback state.
   public var state: PlayerState {
-    PlayerState(from: libvlc_media_list_player_get_state(pointer))
+    guard attachedPlayerHandleIsCurrent else { return .idle }
+    return PlayerState(from: libvlc_media_list_player_get_state(pointer))
   }
 
   /// Plays the item at the specified index.
@@ -247,6 +287,9 @@ public final class MediaListPlayer {
   ///   ``VLCError/invalidInput(_:)`` if the index is out of range for the
   ///   attached list, or ``VLCError/operationFailed(_:)`` if libVLC rejects it.
   public func play(at requestedIndex: Int) throws(VLCError) {
+    guard attachedPlayerHandleIsCurrent else {
+      throw .invalidState("The attached Player is waiting for a fresh native handle")
+    }
     let index = try checkedNonnegativeInt32(requestedIndex, parameter: "index")
     guard let count = _mediaList?.count else {
       throw .invalidState("mediaList must be set before playing by index")
@@ -254,57 +297,221 @@ public final class MediaListPlayer {
     if !(0..<count).contains(requestedIndex) {
       throw .invalidInput("index must be in 0..<\(count)")
     }
-    guard libvlc_media_list_player_play_item_at_index(pointer, index) == 0 else {
+    guard let reservation = reservePlaybackStart() else {
+      throw .invalidState("The attached Player changed before playback dispatch")
+    }
+    let result = dispatchNativeTransport(
+      .playAt(index),
+      on: reservation.nativeListPlayer
+    )
+    settlePlaybackStart(reservation, accepted: result == 0)
+    guard result == 0 else {
       throw .operationFailed("Play item at index \(index)")
     }
-    publishAcceptedPlayIntent()
   }
 
   /// Plays a specific media item from the list.
   /// - Throws: ``VLCError/invalidState(_:)`` if no media list is attached,
   ///   or ``VLCError/operationFailed(_:)`` if the item is not in the list.
   public func play(_ media: borrowing Media) throws(VLCError) {
+    guard attachedPlayerHandleIsCurrent else {
+      throw .invalidState("The attached Player is waiting for a fresh native handle")
+    }
     guard _mediaList != nil else {
       throw .invalidState("mediaList must be set before playing an item")
     }
-    guard libvlc_media_list_player_play_item(pointer, media.pointer) == 0 else {
+    guard let reservation = reservePlaybackStart() else {
+      throw .invalidState("The attached Player changed before playback dispatch")
+    }
+    let result = dispatchNativeTransport(
+      .playMedia(media.pointer),
+      on: reservation.nativeListPlayer
+    )
+    settlePlaybackStart(reservation, accepted: result == 0)
+    guard result == 0 else {
       throw .operationFailed("Play media item")
     }
-    publishAcceptedPlayIntent()
   }
 
   /// Stops playback asynchronously.
   public func stop() {
-    libvlc_media_list_player_stop_async(pointer)
-    _mediaPlayer?.clearPlaybackControlForExternalStop()
+    guard attachedPlayerHandleIsCurrent else { return }
+    let nativeListPlayer = pointer
+    if let mediaPlayer = _mediaPlayer {
+      guard
+        mediaPlayer.attachedMediaListPlayer === self,
+        let reservation = mediaPlayer.reservePlaybackStop(
+          establishesPlaybackBarrier: true
+        ),
+        pointer == nativeListPlayer,
+        _mediaPlayer === mediaPlayer,
+        mediaPlayer.attachedMediaListPlayer === self,
+        mediaPlayer.preparePlaybackStopForExternalDispatch(reservation)
+      else { return }
+      _ = dispatchNativeTransport(.stop, on: nativeListPlayer)
+    } else {
+      _ = dispatchNativeTransport(.stop, on: nativeListPlayer)
+    }
   }
 
   /// Advances to the next item in the list.
   /// - Throws: `VLCError.operationFailed` if there is no next item.
   public func next() throws(VLCError) {
-    guard libvlc_media_list_player_next(pointer) == 0 else {
+    guard attachedPlayerHandleIsCurrent else {
+      throw .invalidState("The attached Player is waiting for a fresh native handle")
+    }
+    guard let reservation = reservePlaybackStart() else {
+      throw .invalidState("The attached Player changed before playback dispatch")
+    }
+    let result = dispatchNativeTransport(.next, on: reservation.nativeListPlayer)
+    settlePlaybackStart(reservation, accepted: result == 0)
+    guard result == 0 else {
       throw .operationFailed("Advance to next item")
     }
-    publishAcceptedPlayIntent()
   }
 
   /// Goes back to the previous item in the list.
   /// - Throws: `VLCError.operationFailed` if there is no previous item.
   public func previous() throws(VLCError) {
-    guard libvlc_media_list_player_previous(pointer) == 0 else {
+    guard attachedPlayerHandleIsCurrent else {
+      throw .invalidState("The attached Player is waiting for a fresh native handle")
+    }
+    guard let reservation = reservePlaybackStart() else {
+      throw .invalidState("The attached Player changed before playback dispatch")
+    }
+    let result = dispatchNativeTransport(.previous, on: reservation.nativeListPlayer)
+    settlePlaybackStart(reservation, accepted: result == 0)
+    guard result == 0 else {
       throw .operationFailed("Go to previous item")
     }
-    publishAcceptedPlayIntent()
+  }
+
+  /// Reserves callback/control ordering before a list command enters native
+  /// code. libVLC is allowed to emit Playing or MediaChanged from inside the
+  /// call, so clearing a previous Stop quarantine afterwards is too late.
+  private func reservePlaybackStart() -> MediaListPlayerPlaybackStartReservation? {
+    let nativeListPlayer = pointer
+    guard let mediaPlayer = _mediaPlayer else {
+      return MediaListPlayerPlaybackStartReservation(
+        nativeListPlayer: nativeListPlayer,
+        player: nil,
+        nativePlayer: nil,
+        nativeHandleGeneration: nil,
+        mediaListOwnershipEpoch: nil,
+        playbackControlRevision: nil,
+        playbackStartAttempt: nil
+      )
+    }
+    guard
+      mediaPlayer.attachedMediaListPlayer === self,
+      mediaPlayer.nativeHandleRepresentsCurrentMedia,
+      !mediaPlayer.nativePlayerNeedsReplacementBeforePlayback
+    else { return nil }
+    let nativePlayer = mediaPlayer.pointer
+    let nativeHandleGeneration = mediaPlayer.eventBridge.currentNativeHandleGeneration
+    let playbackGeneration = mediaPlayer.eventBridge.currentPlaybackGeneration
+    let ownershipEpoch = mediaPlayer.mediaListOwnershipEpoch
+    let playbackControlRevision = mediaPlayer.playbackControlIntentRevision
+    let attempt = mediaPlayer.eventBridge.beginPlaybackStartAttempt(
+      playbackGeneration: playbackGeneration
+    )
+    guard
+      let attempt,
+      pointer == nativeListPlayer,
+      _mediaPlayer === mediaPlayer,
+      mediaPlayer.pointer == nativePlayer,
+      mediaPlayer.attachedMediaListPlayer === self,
+      mediaPlayer.mediaListOwnershipEpoch == ownershipEpoch,
+      mediaPlayer.eventBridge.currentNativeHandleGeneration == nativeHandleGeneration,
+      mediaPlayer.eventBridge.currentPlaybackGeneration == playbackGeneration,
+      mediaPlayer.eventBridge.currentLifecycleControlEpoch == attempt.lifecycleControlEpoch,
+      mediaPlayer.playbackControlIntentRevision == playbackControlRevision
+    else {
+      mediaPlayer.eventBridge.finishPlaybackStartAttempt(attempt, accepted: false)
+      return nil
+    }
+    return MediaListPlayerPlaybackStartReservation(
+      nativeListPlayer: nativeListPlayer,
+      player: mediaPlayer,
+      nativePlayer: nativePlayer,
+      nativeHandleGeneration: nativeHandleGeneration,
+      mediaListOwnershipEpoch: ownershipEpoch,
+      playbackControlRevision: playbackControlRevision,
+      playbackStartAttempt: attempt
+    )
+  }
+
+  /// Settles both accepted and rejected native starts. Rejection restores the
+  /// pre-existing Stop barrier; acceptance may legitimately have advanced to
+  /// a successor playlist generation while the native call was in progress.
+  private func settlePlaybackStart(
+    _ reservation: MediaListPlayerPlaybackStartReservation,
+    accepted: Bool
+  ) {
+    guard let mediaPlayer = reservation.player else { return }
+    mediaPlayer.eventBridge.finishPlaybackStartAttempt(
+      reservation.playbackStartAttempt,
+      accepted: accepted
+    )
+    guard
+      accepted,
+      pointer == reservation.nativeListPlayer,
+      _mediaPlayer === mediaPlayer,
+      mediaPlayer.pointer == reservation.nativePlayer,
+      mediaPlayer.attachedMediaListPlayer === self,
+      mediaPlayer.mediaListOwnershipEpoch == reservation.mediaListOwnershipEpoch,
+      mediaPlayer.eventBridge.currentNativeHandleGeneration
+      == reservation.nativeHandleGeneration,
+      mediaPlayer.playbackControlIntentRevision == reservation.playbackControlRevision
+    else { return }
+    publishAcceptedPlayIntent(on: mediaPlayer)
   }
 
   /// Records an accepted list play before reconciling the shared native
   /// handle. Prepublishing resume makes a stable native-idle response preserve
   /// the accepted command, while `issueResume` replaces an older deferred or
   /// in-flight pause when list playback is already starting.
-  private func publishAcceptedPlayIntent() {
-    guard let mediaPlayer = _mediaPlayer else { return }
-    mediaPlayer.setPlaybackControlIntent(.resume)
+  private func publishAcceptedPlayIntent(on mediaPlayer: Player) {
+    mediaPlayer.nativePlayerHasStartedPlayback = true
+    guard mediaPlayer.setPlaybackControlIntent(.resume) else { return }
+    let acceptedControlRevision = mediaPlayer.playbackControlIntentRevision
+    guard
+      _mediaPlayer === mediaPlayer,
+      mediaPlayer.attachedMediaListPlayer === self,
+      mediaPlayer.playbackControlIntent == .resume,
+      mediaPlayer.playbackControlIntentRevision == acceptedControlRevision,
+      !mediaPlayer.eventBridge.hasExplicitStopBarrier(
+        playbackGeneration: mediaPlayer.eventBridge.currentPlaybackGeneration
+      )
+    else { return }
     mediaPlayer.resume()
+  }
+
+  private func dispatchNativeTransport(
+    _ command: MediaListPlayerNativeTransportCommand,
+    on nativeListPlayer: OpaquePointer
+  ) -> Int32 {
+    #if DEBUG
+    if let _nativeTransportDispatchOverrideForTesting {
+      return _nativeTransportDispatchOverrideForTesting(command)
+    }
+    #endif
+    switch command {
+    case .play:
+      libvlc_media_list_player_play(nativeListPlayer)
+      return 0
+    case .playAt(let index):
+      return libvlc_media_list_player_play_item_at_index(nativeListPlayer, index)
+    case .playMedia(let media):
+      return libvlc_media_list_player_play_item(nativeListPlayer, media)
+    case .stop:
+      libvlc_media_list_player_stop_async(nativeListPlayer)
+      return 0
+    case .next:
+      return libvlc_media_list_player_next(nativeListPlayer)
+    case .previous:
+      return libvlc_media_list_player_previous(nativeListPlayer)
+    }
   }
 
   /// Relinquishes a player that another list player is about to adopt. Keep
@@ -314,7 +521,7 @@ public final class MediaListPlayer {
     guard _mediaPlayer === player else { return }
     _mediaPlayer = nil
     if player.attachedMediaListPlayer === self {
-      player.attachedMediaListPlayer = nil
+      player.transitionMediaListOwnership(to: nil)
     }
     rebuildNativePlayer(stopSharedPlayerBeforeDetaching: false)
   }
@@ -361,5 +568,19 @@ public final class MediaListPlayer {
       libvlc_media_list_player_stop_async(oldPointer)
       libvlc_media_list_player_release(oldPointer)
     }
+  }
+
+  private var attachedPlayerHandleIsCurrent: Bool {
+    _mediaPlayer?.nativeHandleRepresentsCurrentMedia != false
+      && _mediaPlayer?.nativePlayerNeedsReplacementBeforePlayback != true
+  }
+}
+
+extension Player {
+  func transitionMediaListOwnership(to owner: MediaListPlayer?) {
+    guard attachedMediaListPlayer !== owner else { return }
+    precondition(mediaListOwnershipEpoch < UInt64.max, "Media-list ownership epoch exhausted")
+    mediaListOwnershipEpoch += 1
+    attachedMediaListPlayer = owner
   }
 }

@@ -13,13 +13,18 @@ import CLibVLC
 /// try player.play(url: mediaURL)
 ///
 /// let discoverer = try RendererDiscoverer(name: service.name)
+/// let events = discoverer.events
 /// try discoverer.start()
 ///
-/// for await event in discoverer.events {
+/// for await event in events {
 ///     switch event {
 ///     case let .itemAdded(renderer):
 ///         do {
-///             try await player.recast(to: renderer)
+///             let outcome = try await player.recastAndWaitForOutcome(to: renderer)
+///             guard outcome.isSettled else {
+///                 print("Cast did not settle:", outcome)
+///                 continue
+///             }
 ///         } catch {
 ///             print("Cast failed:", error)
 ///         }
@@ -31,25 +36,27 @@ import CLibVLC
 public final class RendererDiscoverer: Sendable {
   nonisolated(unsafe) let pointer: OpaquePointer // libvlc_renderer_discoverer_t*
   private let instance: VLCInstance
-  private let broadcaster: Broadcaster<RendererEvent>
+  private let eventHub: CurrentInventoryEventHub<RendererItem, UInt, RendererEvent>
   private nonisolated(unsafe) let opaque: UnsafeMutableRawPointer
+  /// Accessed only on `DiscoveryLifecycle`'s serial queue.
+  private nonisolated(unsafe) var isStarted = false
 
-  /// Stream of renderer discovery events. A new independent stream is
-  /// returned per access; subscribers don't compete for events.
+  /// Stream of renderer discovery events. A new independent stream is returned
+  /// per access; subscribers don't compete for events. Every new stream begins
+  /// with ``RendererEvent/itemAdded(_:)`` for each renderer that is already
+  /// present, followed by later additions and removals in native callback order.
   ///
-  /// Unbounded, because this stream is the *only* record of what was
-  /// discovered. There is no queryable list of current renderers to
-  /// reconcile against, so a dropped ``RendererEvent/itemAdded(_:)`` does not
-  /// resolve itself on the next event — that renderer stays invisible until it
-  /// disappears and is discovered again, which for a device already on the
-  /// network may be never.
+  /// The inventory replay closes the race where libVLC synchronously discovers
+  /// a renderer inside ``start()`` before the caller obtains this stream. The
+  /// stream remains unbounded because each transition is required to maintain
+  /// an exact device picker and discovery is low-rate in practice.
   ///
   /// Discovery is low-rate, so unbounded costs nothing in practice. It matters
   /// when a consumer stalls: building a device picker means touching UI, and a
   /// newest-wins buffer would evict the earliest-found devices — the ones a
   /// user is most likely to be waiting for.
   public var events: AsyncStream<RendererEvent> {
-    broadcaster.subscribe(policy: .unbounded)
+    eventHub.subscribe()
   }
 
   /// Creates a renderer discoverer by service name.
@@ -58,7 +65,9 @@ public final class RendererDiscoverer: Sendable {
   /// - Parameters:
   ///   - name: The discoverer service name.
   ///   - instance: The VLC instance.
-  /// - Throws: `VLCError.instanceCreationFailed` if the discoverer cannot be created.
+  /// - Throws: `VLCError.instanceCreationFailed` if the discoverer cannot be created,
+  ///   or `VLCError.operationFailed` if its complete native event set cannot
+  ///   be registered.
   public init(name: String, instance: VLCInstance = .shared) throws(VLCError) {
     let p = DiscoveryLifecycle.sync {
       libvlc_renderer_discoverer_new(instance.pointer, name)
@@ -66,19 +75,36 @@ public final class RendererDiscoverer: Sendable {
     guard let p else {
       throw .instanceCreationFailed
     }
+    let eventHub = CurrentInventoryEventHub<RendererItem, UInt, RendererEvent>(
+      identity: { UInt(bitPattern: UnsafeRawPointer($0.pointer)) },
+      addedEvent: RendererEvent.itemAdded,
+      removedEvent: RendererEvent.itemDeleted
+    )
+    let box = Unmanaged.passRetained(eventHub).toOpaque()
+    guard
+      let em = libvlc_renderer_discoverer_event_manager(p),
+      RendererEventAttachment.attachAll(
+        attach: { eventType in
+          libvlc_event_attach(em, eventType, rendererCallback, box)
+        },
+        detach: { eventType in
+          libvlc_event_detach(em, eventType, rendererCallback, box)
+        }
+      )
+    else {
+      eventHub.terminate()
+      Unmanaged<CurrentInventoryEventHub<RendererItem, UInt, RendererEvent>>
+        .fromOpaque(box).release()
+      libvlc_renderer_discoverer_release(p)
+      throw .operationFailed("Register renderer discovery events")
+    }
+
     pointer = p
     // Retain the instance so it outlives the discoverer. See the
     // matching note in `MediaDiscoverer`.
     self.instance = instance
-
-    let broadcaster = Broadcaster<RendererEvent>(defaultBufferSize: 16)
-    self.broadcaster = broadcaster
-    let box = Unmanaged.passRetained(broadcaster).toOpaque()
+    self.eventHub = eventHub
     opaque = box
-
-    let em = libvlc_renderer_discoverer_event_manager(p)!
-    libvlc_event_attach(em, Int32(libvlc_RendererDiscovererItemAdded.rawValue), rendererCallback, box)
-    libvlc_event_attach(em, Int32(libvlc_RendererDiscovererItemDeleted.rawValue), rendererCallback, box)
   }
 
   deinit {
@@ -86,38 +112,94 @@ public final class RendererDiscoverer: Sendable {
     // libvlc_renderer_discoverer_release waits for the discovery
     // thread to stop. Offload off the calling thread. Pointers are
     // trivially transferable via `nonisolated(unsafe)` locals, and the
-    // broadcaster is Sendable so it can be captured directly.
+    // event hub is Sendable so it can be captured directly.
     nonisolated(unsafe) let discoverer = pointer
     nonisolated(unsafe) let box = opaque
     let instance = self.instance
-    let broadcaster = self.broadcaster
+    let eventHub = self.eventHub
     DiscoveryLifecycle.async {
       let em = libvlc_renderer_discoverer_event_manager(discoverer)!
-      libvlc_event_detach(em, Int32(libvlc_RendererDiscovererItemAdded.rawValue), rendererCallback, box)
-      libvlc_event_detach(em, Int32(libvlc_RendererDiscovererItemDeleted.rawValue), rendererCallback, box)
-      broadcaster.terminate()
-      Unmanaged<Broadcaster<RendererEvent>>.fromOpaque(box).release()
+      for eventType in RendererEventAttachment.eventTypes {
+        libvlc_event_detach(em, eventType, rendererCallback, box)
+      }
+      eventHub.terminate()
+      Unmanaged<CurrentInventoryEventHub<RendererItem, UInt, RendererEvent>>
+        .fromOpaque(box).release()
       libvlc_renderer_discoverer_release(discoverer)
       _ = instance
     }
   }
 
   /// Starts renderer discovery.
-  /// - Throws: `VLCError.operationFailed` if discovery cannot start.
+  /// - Throws: `VLCError.operationFailed` if discovery cannot start, or
+  ///   `VLCError.invalidState` if this discoverer is already running.
   public func start() throws(VLCError) {
-    let result = DiscoveryLifecycle.sync {
-      libvlc_renderer_discoverer_start(pointer)
+    enum StartResult {
+      case started
+      case alreadyStarted
+      case failed
     }
-    if result != 0 {
+    let result = DiscoveryLifecycle.sync { () -> StartResult in
+      guard !isStarted else { return .alreadyStarted }
+      guard libvlc_renderer_discoverer_start(pointer) == 0 else {
+        // A module can announce an item synchronously and still fail its open.
+        // Never retain that partial generation as current inventory.
+        eventHub.removeAll()
+        return .failed
+      }
+      isStarted = true
+      return .started
+    }
+    switch result {
+    case .started:
+      break
+    case .alreadyStarted:
+      throw .invalidState("Renderer discovery is already running")
+    case .failed:
       throw .operationFailed("Start renderer discovery")
     }
   }
 
   /// Stops renderer discovery.
+  ///
+  /// Existing event streams receive a ``RendererEvent/itemDeleted(_:)`` for
+  /// each currently known renderer. The streams remain open and can observe a
+  /// later ``start()`` on this discoverer.
   public func stop() {
     DiscoveryLifecycle.sync {
-      libvlc_renderer_discoverer_stop(pointer)
+      if isStarted {
+        libvlc_renderer_discoverer_stop(pointer)
+        isStarted = false
+      }
+      eventHub.removeAll()
     }
+  }
+}
+
+enum RendererEventAttachment {
+  static let eventTypes = [
+    Int32(libvlc_RendererDiscovererItemAdded.rawValue),
+    Int32(libvlc_RendererDiscovererItemDeleted.rawValue)
+  ]
+
+  /// Installs the renderer callbacks as one logical registration. libVLC
+  /// requires every detach to match a successful attach, so a partial failure
+  /// must roll back only the callbacks that were actually installed.
+  static func attachAll(
+    attach: (Int32) -> Int32,
+    detach: (Int32) -> Void
+  ) -> Bool {
+    var attached: [Int32] = []
+    for eventType in eventTypes {
+      guard attach(eventType) == 0 else {
+        for attachedType in attached.reversed() {
+          detach(attachedType)
+        }
+        return false
+      }
+      attached.append(eventType)
+    }
+    return true
   }
 }
 
@@ -254,24 +336,26 @@ extension RendererDiscoverer {
 
 // MARK: - Internals
 
-private func rendererCallback(
+func rendererCallback(
   event: UnsafePointer<libvlc_event_t>?,
   opaque: UnsafeMutableRawPointer?
 ) {
   guard let event, let opaque else { return }
-  let broadcaster = Unmanaged<Broadcaster<RendererEvent>>.fromOpaque(opaque).takeUnretainedValue()
+  let eventHub = Unmanaged<
+    CurrentInventoryEventHub<RendererItem, UInt, RendererEvent>
+  >.fromOpaque(opaque).takeUnretainedValue()
   let type = libvlc_event_e(rawValue: UInt32(event.pointee.type))
 
   switch type {
   case libvlc_RendererDiscovererItemAdded:
     guard let item = event.pointee.u.renderer_discoverer_item_added.item else { return }
     let renderer = RendererItem(retaining: item)
-    broadcaster.broadcast(.itemAdded(renderer))
+    eventHub.add(renderer)
 
   case libvlc_RendererDiscovererItemDeleted:
     guard let item = event.pointee.u.renderer_discoverer_item_deleted.item else { return }
     let renderer = RendererItem(retaining: item)
-    broadcaster.broadcast(.itemDeleted(renderer))
+    eventHub.remove(renderer)
 
   default:
     break

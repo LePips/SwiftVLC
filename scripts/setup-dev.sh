@@ -197,13 +197,27 @@ else
   fi
   RESOLVED_TAG=$(printf '%s' "$artifact_info" \
     | python3 -c 'import json,sys; print(json.load(sys.stdin)["tag"])')
+  RESOLVED_DOWNLOAD_TAG=$(printf '%s' "$artifact_info" \
+    | python3 -c 'import json,sys; value=json.load(sys.stdin); print(value.get("downloadTag", value["tag"]))')
   RESOLVED_URL=$(printf '%s' "$artifact_info" \
     | python3 -c 'import json,sys; print(json.load(sys.stdin)["url"])')
   RESOLVED_CHECKSUM=$(printf '%s' "$artifact_info" \
     | python3 -c 'import json,sys; print(json.load(sys.stdin)["checksum"])')
+  RESOLVED_IS_DRAFT=$(printf '%s' "$artifact_info" \
+    | python3 -c 'import json,sys; print("true" if json.load(sys.stdin).get("isDraft") else "false")')
 
   NEED_DOWNLOAD=false
   if [[ ! -d "$XCFW_DIR" ]]; then
+    NEED_DOWNLOAD=true
+  elif [[ "$RESOLVED_IS_DRAFT" == true ]]; then
+    # Candidate CI is release authorization. Vendor/ and its install record are
+    # restored from the same unsigned Actions cache, so the record's treeDigest
+    # cannot authenticate the adjacent tree: a poisoned cache can forge both.
+    # The release commit cryptographically binds only the ZIP checksum. Always
+    # redownload and re-extract that exact ZIP for a mutable draft candidate.
+    echo "Discarding cached Vendor bytes for draft candidate $RESOLVED_DOWNLOAD_TAG..."
+    rm -rf "$XCFW_DIR"
+    rm -f "$INSTALL_RECORD"
     NEED_DOWNLOAD=true
   elif [[ "$FORCE" == true ]]; then
     echo "Removing existing $XCFW_DIR (--force)..."
@@ -244,13 +258,13 @@ PYEOF
   if [[ "$NEED_DOWNLOAD" == true ]]; then
     mkdir -p Vendor
 
-    echo "Downloading $ZIP_NAME from $RESOLVED_TAG..."
+    echo "Downloading $ZIP_NAME from $RESOLVED_DOWNLOAD_TAG..."
     rm -f "Vendor/$ZIP_NAME"
     if [[ "$MANIFEST_ONLY" == true ]]; then
       curl --fail --location --retry 3 --output "Vendor/$ZIP_NAME" "$RESOLVED_URL"
     else
       require_gh
-      gh release download "$RESOLVED_TAG" \
+      gh release download "$RESOLVED_DOWNLOAD_TAG" \
         --repo "$REPO" --pattern "$ZIP_NAME" --dir Vendor/
     fi
 

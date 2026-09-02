@@ -100,11 +100,11 @@ extension Integration {
     }
 
     @Test
-    func `setPlaybackRate updates libVLC state`() throws {
+    func `setPlaybackRate stores requested control value before media starts`() throws {
       let player = Player(instance: TestInstance.makeAudioOnly())
       try player.setPlaybackRate(PlaybackRate(1.5))
-      // Rate is read back via libvlc_media_player_get_rate — no playback
-      // needed for the C call itself to work.
+      // With no active input, libVLC reports the saved request. This does not
+      // prove that a future input can apply the rate during playback.
       #expect(player.rate == 1.5)
     }
 

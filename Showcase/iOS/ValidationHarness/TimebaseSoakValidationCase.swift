@@ -107,7 +107,9 @@ struct TimebaseSoakValidationCase: View {
         }
       }
       await Task.yield()
-      guard controller.start() == .accepted else { throw TimebaseSoakFailure("PiP start was not accepted") }
+      guard controller.requestStart() == .accepted else {
+        throw TimebaseSoakFailure("PiP start was not accepted")
+      }
       try await waitUntil("Direct PiP did not become active", timeout: .seconds(30)) { controller.isActive }
       try await signalReady(baseURL: baseURL)
       let soakStarted = ProcessInfo.processInfo.systemUptime
@@ -346,8 +348,7 @@ struct TimebaseSoakValidationCase: View {
   }
 
   private func valueRow(_ title: String, _ value: String, _ identifier: String) -> some View {
-    HStack { Text(title); Spacer(); Text(value).foregroundStyle(.secondary) }
-      .qualificationAccessibilityValue(value, title: title, identifier: identifier)
+    HStack { Text(title); Spacer(); Text(value).foregroundStyle(.secondary).accessibilityIdentifier(identifier) }
   }
 
   fileprivate static func rate(elapsed: Int, duration: Int) -> Float {

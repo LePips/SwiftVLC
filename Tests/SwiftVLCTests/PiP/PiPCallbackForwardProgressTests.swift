@@ -132,7 +132,7 @@ struct PiPCallbackForwardProgressTests {
   @Test
   func `An invalidated snapshot reports as unattached`() {
     let snapshot = Mutex(PiPCallbackSnapshot())
-    snapshot.withLock { $0.playerPointer = try? #require(OpaquePointer(bitPattern: 0x1)) }
+    snapshot.withLock { $0.playerPointer = OpaquePointer(bitPattern: 0x1) }
     #expect(snapshot.withLock { $0.isAttached })
 
     snapshot.withLock {

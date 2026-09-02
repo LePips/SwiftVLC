@@ -11,27 +11,129 @@ private enum DirectPiPCallbackOperation: Equatable {
   case clear(UInt)
 }
 
+private enum DirectPiPNativeCallbackOperation: Equatable {
+  case atomicV2Install(UInt)
+  case atomicV2Clear(UInt)
+  case atomicInstall(UInt)
+  case atomicClear(UInt)
+  case legacyInstall(UInt)
+  case legacyClear(UInt)
+}
+
+@MainActor
+private final class DirectPiPNativeCallbackRecorder {
+  let atomicV2Available: Bool
+  let atomicAvailable: Bool
+  private var atomicV2Results: [Int32]
+  private var atomicResults: [Int32]
+  private(set) var operations: [DirectPiPNativeCallbackOperation] = []
+
+  init(
+    atomicV2Available: Bool = false,
+    atomicAvailable: Bool,
+    atomicV2Results: [Int32] = [],
+    atomicResults: [Int32] = []
+  ) {
+    self.atomicV2Available = atomicV2Available
+    self.atomicAvailable = atomicAvailable
+    self.atomicV2Results = atomicV2Results
+    self.atomicResults = atomicResults
+  }
+
+  var nativeAPI: DirectPiPVideoCallbackNativeAPI {
+    DirectPiPVideoCallbackNativeAPI(
+      atomicV2CallbacksAvailable: { [atomicV2Available] in atomicV2Available },
+      publishAtomicV2: { [weak self] handle, opaque in
+        guard let self else { return -1 }
+        let address = UInt(bitPattern: handle)
+        operations.append(
+          opaque == nil ? .atomicV2Clear(address) : .atomicV2Install(address)
+        )
+        return atomicV2Results.isEmpty ? 0 : atomicV2Results.removeFirst()
+      },
+      atomicCallbacksAvailable: { [atomicAvailable] in atomicAvailable },
+      publishAtomic: { [weak self] handle, opaque in
+        guard let self else { return -1 }
+        let address = UInt(bitPattern: handle)
+        operations.append(
+          opaque == nil ? .atomicClear(address) : .atomicInstall(address)
+        )
+        return atomicResults.isEmpty ? 0 : atomicResults.removeFirst()
+      },
+      installLegacy: { [weak self] handle, _ in
+        self?.operations.append(.legacyInstall(UInt(bitPattern: handle)))
+      },
+      clearLegacy: { [weak self] handle in
+        self?.operations.append(.legacyClear(UInt(bitPattern: handle)))
+      }
+    )
+  }
+}
+
 @MainActor
 private final class DirectPiPCallbackRecorder {
   private(set) var operations: [DirectPiPCallbackOperation] = []
   private(set) var installedHandles: [UInt] = []
   private(set) var installedOpaques: [UInt] = []
   private(set) var clearedHandles: [UInt] = []
+  private var installResults: [Bool]
+  private var clearResults: [Bool]
+  private let installedABI: DirectPiPVideoCallbackABI
+
+  init(
+    installResults: [Bool] = [],
+    clearResults: [Bool] = [],
+    installedABI: DirectPiPVideoCallbackABI = .atomicV1
+  ) {
+    self.installResults = installResults
+    self.clearResults = clearResults
+    self.installedABI = installedABI
+  }
 
   var api: DirectPiPVideoCallbackAPI {
     DirectPiPVideoCallbackAPI(
-      install: { [weak self] handle, opaque in
+      preferredABI: { [installedABI] in installedABI },
+      install: { [weak self] handle, opaque, _ in
         let address = UInt(bitPattern: handle)
         self?.operations.append(.install(address))
         self?.installedHandles.append(address)
         self?.installedOpaques.append(UInt(bitPattern: opaque))
+        return self?.takeInstallResult() ?? false
       },
-      clear: { [weak self] handle in
+      clear: { [weak self] handle, _ in
         let address = UInt(bitPattern: handle)
         self?.operations.append(.clear(address))
         self?.clearedHandles.append(address)
+        return self?.takeClearResult() ?? false
       }
     )
+  }
+
+  private func takeInstallResult() -> Bool {
+    installResults.isEmpty ? true : installResults.removeFirst()
+  }
+
+  private func takeClearResult() -> Bool {
+    clearResults.isEmpty ? true : clearResults.removeFirst()
+  }
+}
+
+@MainActor
+private final class WeakPiPControllerProbe {
+  weak var controller: PiPController?
+
+  init(_ controller: PiPController) {
+    self.controller = controller
+  }
+}
+
+/// Keeps controller construction and release outside the async test's
+/// coroutine frame, whose retained temporaries are not an ARC boundary.
+@MainActor
+private func makeDroppedPiPControllerProbe(player: Player) -> WeakPiPControllerProbe {
+  autoreleasepool {
+    let controller = PiPController(player: player)
+    return WeakPiPControllerProbe(controller)
   }
 }
 
@@ -43,29 +145,192 @@ extension Integration {
   @Suite(.tags(.mainActor, .async), .serialized)
   @MainActor struct PiPCallbackRegistrationTests {
     @Test
-    func `Older PiPController deinit leaves newer controller registered`() async {
+    func `Atomic v2 publishes one timestamp-bearing install and clear generation`() throws {
+      let recorder = DirectPiPNativeCallbackRecorder(
+        atomicV2Available: true,
+        atomicAvailable: true,
+        atomicV2Results: [0, 0]
+      )
+      let api = DirectPiPVideoCallbackAPI.resolving(native: recorder.nativeAPI)
+      let handle = try #require(OpaquePointer(bitPattern: 0xA706))
+      let opaque = try #require(UnsafeMutableRawPointer(bitPattern: 0x0A06))
+
+      #expect(api.preferredABI() == .atomicV2)
+      #expect(api.install(handle, opaque, .atomicV2))
+      #expect(api.clear(handle, .atomicV2))
+      #expect(
+        recorder.operations == [
+          .atomicV2Install(UInt(bitPattern: handle)),
+          .atomicV2Clear(UInt(bitPattern: handle))
+        ]
+      )
+    }
+
+    @Test
+    func `Atomic v2 failure never falls through to v4 or legacy publication`() throws {
+      let recorder = DirectPiPNativeCallbackRecorder(
+        atomicV2Available: true,
+        atomicAvailable: true,
+        atomicV2Results: [-12]
+      )
+      let api = DirectPiPVideoCallbackAPI.resolving(native: recorder.nativeAPI)
+      let handle = try #require(OpaquePointer(bitPattern: 0xA707))
+      let opaque = try #require(UnsafeMutableRawPointer(bitPattern: 0x0A07))
+
+      #expect(api.preferredABI() == .atomicV2)
+      #expect(!api.install(handle, opaque, .atomicV2))
+      #expect(
+        recorder.operations == [.atomicV2Install(UInt(bitPattern: handle))]
+      )
+    }
+
+    @Test
+    func `Atomic v2 clear failure never switches generation API`() throws {
+      let recorder = DirectPiPNativeCallbackRecorder(
+        atomicV2Available: true,
+        atomicAvailable: true,
+        atomicV2Results: [0, -12]
+      )
+      let api = DirectPiPVideoCallbackAPI.resolving(native: recorder.nativeAPI)
+      let handle = try #require(OpaquePointer(bitPattern: 0xA708))
+      let opaque = try #require(UnsafeMutableRawPointer(bitPattern: 0x0A08))
+
+      #expect(api.preferredABI() == .atomicV2)
+      #expect(api.install(handle, opaque, .atomicV2))
+      #expect(!api.clear(handle, .atomicV2))
+      #expect(
+        recorder.operations == [
+          .atomicV2Install(UInt(bitPattern: handle)),
+          .atomicV2Clear(UInt(bitPattern: handle))
+        ]
+      )
+    }
+
+    @Test
+    func `Atomic callback API publishes install and clear as complete generations`() throws {
+      let recorder = DirectPiPNativeCallbackRecorder(
+        atomicAvailable: true,
+        atomicResults: [0, 0]
+      )
+      let api = DirectPiPVideoCallbackAPI.resolving(native: recorder.nativeAPI)
+      let handle = try #require(OpaquePointer(bitPattern: 0xA701))
+      let opaque = try #require(UnsafeMutableRawPointer(bitPattern: 0x0A01))
+
+      #expect(api.preferredABI() == .atomicV1)
+      #expect(api.install(handle, opaque, .atomicV1))
+      #expect(api.clear(handle, .atomicV1))
+      #expect(
+        recorder.operations == [
+          .atomicInstall(UInt(bitPattern: handle)),
+          .atomicClear(UInt(bitPattern: handle))
+        ]
+      )
+    }
+
+    @Test
+    func `Atomic publication failure never falls back to mixed legacy setters`() throws {
+      let recorder = DirectPiPNativeCallbackRecorder(
+        atomicAvailable: true,
+        atomicResults: [-12]
+      )
+      let api = DirectPiPVideoCallbackAPI.resolving(native: recorder.nativeAPI)
+      let handle = try #require(OpaquePointer(bitPattern: 0xA702))
+      let opaque = try #require(UnsafeMutableRawPointer(bitPattern: 0x0A02))
+
+      #expect(api.preferredABI() == .atomicV1)
+      #expect(!api.install(handle, opaque, .atomicV1))
+      #expect(
+        recorder.operations == [.atomicInstall(UInt(bitPattern: handle))]
+      )
+    }
+
+    @Test
+    func `Genuinely unavailable atomic extension uses the complete legacy path`() throws {
+      let recorder = DirectPiPNativeCallbackRecorder(atomicAvailable: false)
+      let api = DirectPiPVideoCallbackAPI.resolving(native: recorder.nativeAPI)
+      let handle = try #require(OpaquePointer(bitPattern: 0xA703))
+      let opaque = try #require(UnsafeMutableRawPointer(bitPattern: 0x0A03))
+
+      #expect(api.preferredABI() == .legacy)
+      #expect(api.install(handle, opaque, .legacy))
+      #expect(api.clear(handle, .legacy))
+      #expect(
+        recorder.operations == [
+          .legacyInstall(UInt(bitPattern: handle)),
+          .legacyClear(UInt(bitPattern: handle))
+        ]
+      )
+    }
+
+    @Test
+    func `Initial callback installation failure leaves direct PiP unclaimed`() async {
       let player = Player(instance: TestInstance.makeAudioOnly())
-      var first: PiPController? = PiPController(player: player)
-      weak let firstProbe = first
+      let recorder = DirectPiPCallbackRecorder(installResults: [false])
+      let registration = DirectPiPVideoCallbackRegistration(
+        renderer: PixelBufferRenderer(displayLayer: AVSampleBufferDisplayLayer()),
+        api: recorder.api
+      )
+      let handle = UInt(bitPattern: player.pointer)
+
+      #expect(!player.claimDirectPiPVideoCallbacks(registration))
+      #expect(player.directPiPVideoCallbackRegistration == nil)
+      #expect(player.directPiPVideoCallbackSlot == nil)
+      #expect(player.directPiPVideoCallbackGeneration == 0)
+      #expect(!registration.isBound)
+      #expect(recorder.operations == [.install(handle)])
+
+      await player.shutdown()
+    }
+
+    @Test
+    func `Stale PiPController cleanup cannot clear newer controller registration`() async throws {
+      let player = Player(instance: TestInstance.makeAudioOnly())
+      let first = PiPController(player: player)
       let firstGeneration = player.directPiPVideoCallbackGeneration
 
-      var successor: PiPController? = PiPController(player: player)
-      weak let successorProbe = successor
+      let successor = PiPController(player: player)
+      let successorRegistration = try #require(successor.callbackRegistration)
       let successorGeneration = player.directPiPVideoCallbackGeneration
       #expect(successorGeneration > firstGeneration)
+      #expect(player.directPiPVideoCallbackRegistration === successorRegistration)
 
-      first = nil
+      first.invalidateForLifecycleEnd()
 
-      #expect(firstProbe == nil)
-      #expect(successorProbe != nil)
-      #expect(player.directPiPVideoCallbackRegistration != nil)
+      #expect(player.directPiPVideoCallbackRegistration === successorRegistration)
       #expect(player.directPiPVideoCallbackGeneration == successorGeneration)
 
-      successor = nil
+      // A delayed or duplicated lifecycle signal must remain a no-op after
+      // the stale controller has already relinquished its generation.
+      first.invalidateForLifecycleEnd()
+      #expect(player.directPiPVideoCallbackRegistration === successorRegistration)
+      #expect(player.directPiPVideoCallbackGeneration == successorGeneration)
 
-      #expect(successorProbe == nil)
+      successor.invalidateForLifecycleEnd()
       #expect(player.directPiPVideoCallbackRegistration == nil)
-      #expect(player.directPiPVideoCallbackGeneration > successorGeneration)
+      #expect(player.directPiPVideoCallbackGeneration == successorGeneration &+ 1)
+
+      let clearedGeneration = player.directPiPVideoCallbackGeneration
+      successor.invalidateForLifecycleEnd()
+      #expect(player.directPiPVideoCallbackRegistration == nil)
+      #expect(player.directPiPVideoCallbackGeneration == clearedGeneration)
+
+      await player.shutdown()
+    }
+
+    @Test
+    func `PiPController eventually deallocates after synchronous scoped drop`() async throws {
+      let player = Player(instance: TestInstance.makeAudioOnly())
+      let probe = makeDroppedPiPControllerProbe(player: player)
+
+      #expect(
+        try await poll(
+          every: .milliseconds(10),
+          timeout: .seconds(2),
+          until: { probe.controller == nil }
+        ),
+        "PiPController remained alive after its synchronous creation scope and autorelease pool ended"
+      )
+
       await player.shutdown()
     }
 
@@ -345,6 +610,51 @@ extension Integration {
     }
 
     @Test
+    func `Replacement install failure retires both routes and revokes direct PiP`() async throws {
+      let player = Player(instance: TestInstance.makeAudioOnly())
+      let recorder = DirectPiPCallbackRecorder(installResults: [true, false])
+      let registration = DirectPiPVideoCallbackRegistration(
+        renderer: PixelBufferRenderer(displayLayer: AVSampleBufferDisplayLayer()),
+        api: recorder.api
+      )
+      #expect(player.claimDirectPiPVideoCallbacks(registration))
+
+      let oldPointer = player.pointer
+      let oldHandle = UInt(bitPattern: oldPointer)
+      let oldLifetime = player.nativeHandleLifetime
+      let oldGeneration = player.directPiPVideoCallbackGeneration
+      weak let oldContext = registration.currentContextForTesting
+
+      player.setDrawable(NSObject())
+      player.stop()
+      try player.prepareDrawableForPlayback()
+
+      let newHandle = UInt(bitPattern: player.pointer)
+      #expect(newHandle != oldHandle)
+      #expect(player.directPiPVideoCallbackRegistration == nil)
+      #expect(player.directPiPVideoCallbackSlot == nil)
+      #expect(player.directPiPVideoCallbackGeneration == oldGeneration &+ 1)
+      #expect(!registration.isBound)
+      #expect(
+        recorder.operations == [
+          .install(oldHandle),
+          .install(newHandle),
+          .clear(oldHandle)
+        ]
+      )
+
+      await player.shutdown()
+      try #require(
+        await poll(timeout: .seconds(5)) { oldLifetime.isReleased },
+        "offloaded release did not finish for the failed callback replacement"
+      )
+      try #require(
+        await poll(timeout: .seconds(5)) { oldContext == nil },
+        "the failed callback replacement retained its outgoing context"
+      )
+    }
+
+    @Test
     func `Player shutdown retires callbacks on the handle being released`() async {
       let player = Player(instance: TestInstance.makeAudioOnly())
       let recorder = DirectPiPCallbackRecorder()
@@ -361,6 +671,75 @@ extension Integration {
       #expect(recorder.operations == [.install(handle), .clear(handle)])
       #expect(player.directPiPVideoCallbackRegistration == nil)
       #expect(registration.currentGeneration == nil)
+      #expect(context == nil)
+    }
+
+    @Test
+    func `Failed atomic clear keeps its opaque valid until native handle release`() throws {
+      let recorder = DirectPiPCallbackRecorder(
+        clearResults: [false],
+        installedABI: .atomicV2
+      )
+      let pointer = try #require(OpaquePointer(bitPattern: 0xD1CE_FA11))
+      let lifetime = NativePlayerHandleLifetime(pointer: pointer)
+      var retainedOpaque: UnsafeMutableRawPointer?
+      weak var context: PixelBufferRendererCallbackContext?
+
+      do {
+        let renderer = PixelBufferRenderer(displayLayer: AVSampleBufferDisplayLayer())
+        let slot = DirectPiPVideoCallbackSlot(
+          lifetime: lifetime,
+          decodeRenderer: renderer,
+          api: recorder.api
+        )
+        #expect(slot.activate(renderer: renderer))
+        retainedOpaque = slot.opaque
+        context = slot.context
+        #expect(!slot.retire())
+        #expect(slot.callbacksInstalledForTesting)
+        #expect(slot.installedABIForTesting == .atomicV2)
+        #expect(slot.context.sourceTimestampTelemetrySnapshot.isAvailable)
+      }
+
+      let opaque = try #require(retainedOpaque)
+      #expect(context != nil)
+      #expect(context?.retirementRequestedForTesting == true)
+      #expect(context?.sourceTimestampTelemetrySnapshot.isAvailable == true)
+      #expect(
+        recorder.operations == [
+          .install(UInt(bitPattern: pointer)),
+          .clear(UInt(bitPattern: pointer))
+        ]
+      )
+
+      // The failed clear left this opaque in the published native tuple. A
+      // racing future vout may therefore still copy and invoke it. Retirement
+      // suppresses display forwarding but must keep decode/cleanup safe.
+      var voutOpaque: UnsafeMutableRawPointer? = opaque
+      var chroma: [CChar] = Array(repeating: 0, count: 4)
+      var width: UInt32 = 96
+      var height: UInt32 = 54
+      var pitch: UInt32 = 0
+      var lines: UInt32 = 0
+      let bufferCount = withUnsafeMutablePointer(to: &voutOpaque) { opaquePointer in
+        chroma.withUnsafeMutableBufferPointer { chromaBuffer in
+          pixelBufferFormatCallback(
+            opaque: opaquePointer,
+            chroma: chromaBuffer.baseAddress,
+            width: &width,
+            height: &height,
+            pitches: &pitch,
+            lines: &lines
+          )
+        }
+      }
+      #expect(bufferCount > 0)
+      let childOpaque = try #require(voutOpaque)
+      #expect(childOpaque != opaque)
+      pixelBufferCleanupCallback(opaque: childOpaque)
+      #expect(context != nil)
+
+      lifetime.initialOwnerDidRelease()
       #expect(context == nil)
     }
 

@@ -33,6 +33,14 @@ enum LaunchArguments {
   static let pipLiveURL = "-UITestPiPLiveURL"
   static let pipLiveURLBase64 = "-UITestPiPLiveURLBase64"
 
+  /// Per-attempt, discontinuity-aware four-hour HLS timeline used by the
+  /// operator-assisted media-services reset lane. It must outlive the manual
+  /// Settings interaction without relying on a byte-looped finite asset.
+  static let audioMediaServicesResetURLBase64 =
+    "-UITestAudioMediaServicesResetURLBase64"
+  static let audioSessionOwnershipURLBase64 =
+    "-UITestAudioSessionOwnershipURLBase64"
+
   /// Selects the PiP implementation exercised by the physical-device
   /// validation surface: `native` for `PiPVideoView`, `direct` for a hosted
   /// `PiPController.layer`.
@@ -43,6 +51,12 @@ enum LaunchArguments {
   /// transition cannot leak into the next case's evidence.
   static let pipNativeLifecycleAction = "-UITestPiPNativeLifecycleAction"
   static let pipNativeLifecycleToken = "-UITestPiPNativeLifecycleToken"
+
+  /// Candidate-owned media and bounded post-foreground observation window
+  /// for native AVSampleBufferVideoRenderer resource-revocation recovery.
+  static let nativeRendererRecoveryURLBase64 = "-UITestNativeRendererRecoveryURLBase64"
+  static let nativeRendererRecoveryObservationDuration =
+    "-UITestNativeRendererRecoveryObservationDuration"
 
   /// Selects one isolated playback terminal transition. The physical-device
   /// test launches a fresh process for every action so one terminal generation
@@ -77,6 +91,25 @@ enum LaunchArguments {
   static let timebaseSoakDuration = "-UITestTimebaseSoakDuration"
   static let timebaseSoakMode = "-UITestTimebaseSoakMode"
   static let timebaseSoakToken = "-UITestTimebaseSoakToken"
+
+  /// Deterministic local origin for sparse-GOP seek and all-intra exact-frame
+  /// physical-device oracles.
+  static let seekFrameOracleBaseURLBase64 = "-UITestSeekFrameOracleBaseURLBase64"
+
+  /// Fixture origin and exact fixture identity for the local-file and
+  /// audio-only physical qualification surfaces. The app downloads the
+  /// candidate-bound bytes, persists them inside its own container, and then
+  /// plays only the resulting file URL.
+  static let localPlaybackBaseURLBase64 = "-UITestLocalPlaybackBaseURLBase64"
+  static let localPlaybackFixtureID = "-UITestLocalPlaybackFixtureID"
+
+  /// Per-attempt progressive HTTP seek origin. The token is shared with the
+  /// host fixture server's immutable request/response transcript.
+  static let progressiveHTTPRangeBaseURLBase64 =
+    "-UITestProgressiveHTTPRangeBaseURLBase64"
+  static let progressiveHTTPRangeAttemptToken =
+    "-UITestProgressiveHTTPRangeAttemptToken"
+  static let progressiveHTTPRangeMode = "-UITestProgressiveHTTPRangeMode"
 
   /// Name of a showcase to deep-link to on launch (e.g. `"SimplePlayback"`).
   /// When unset, the showcase opens its normal navigation tree.
@@ -123,6 +156,14 @@ enum LaunchArguments {
       ?? UserDefaults.standard.string(forKey: key(pipLiveURL)).flatMap(URL.init(string:))
   }
 
+  static var audioMediaServicesResetURLValue: URL? {
+    encodedArgumentURL(named: audioMediaServicesResetURLBase64)
+  }
+
+  static var audioSessionOwnershipURLValue: URL? {
+    encodedArgumentURL(named: audioSessionOwnershipURLBase64)
+  }
+
   static var pipRenderingPathValue: String? {
     UserDefaults.standard.string(forKey: key(pipRenderingPath))
   }
@@ -133,6 +174,15 @@ enum LaunchArguments {
 
   static var pipNativeLifecycleTokenValue: String? {
     UserDefaults.standard.string(forKey: key(pipNativeLifecycleToken))
+  }
+
+  static var nativeRendererRecoveryURLValue: URL? {
+    encodedArgumentURL(named: nativeRendererRecoveryURLBase64)
+  }
+
+  static var nativeRendererRecoveryObservationDurationValue: Int? {
+    UserDefaults.standard.string(forKey: key(nativeRendererRecoveryObservationDuration))
+      .flatMap(Int.init)
   }
 
   static var terminalOutcomeActionValue: String? {
@@ -197,6 +247,31 @@ enum LaunchArguments {
 
   static var timebaseSoakTokenValue: String? {
     UserDefaults.standard.string(forKey: key(timebaseSoakToken))
+  }
+
+  static var seekFrameOracleBaseURLValue: URL? {
+    encodedArgumentURL(named: seekFrameOracleBaseURLBase64)
+  }
+
+  static var localPlaybackBaseURLValue: URL? {
+    encodedArgumentURL(named: localPlaybackBaseURLBase64)
+  }
+
+  static var localPlaybackFixtureIDValue: String? {
+    UserDefaults.standard.string(forKey: key(localPlaybackFixtureID))
+  }
+
+  static var progressiveHTTPRangeBaseURLValue: URL? {
+    encodedArgumentURL(named: progressiveHTTPRangeBaseURLBase64)
+  }
+
+  static var progressiveHTTPRangeAttemptTokenValue: String? {
+    UserDefaults.standard.string(forKey: key(progressiveHTTPRangeAttemptToken))
+  }
+
+  static var progressiveHTTPRangeModeValue: ProgressiveHTTPRangeSeekContract.Mode? {
+    UserDefaults.standard.string(forKey: key(progressiveHTTPRangeMode))
+      .flatMap(ProgressiveHTTPRangeSeekContract.Mode.init(rawValue:))
   }
 
   static var routeValue: String? {
@@ -282,13 +357,21 @@ enum UITestRoute: String, CaseIterable {
   case pipLongStallValidation = "PiPLongStallValidation"
   case pipDismissalValidation = "PiPDismissalValidation"
   case pipInterruptionValidation = "PiPInterruptionValidation"
+  case mediaServicesResetValidation = "MediaServicesResetValidation"
+  case audioSessionOwnershipValidation = "AudioSessionOwnershipValidation"
   case pipNativeLifecycleValidation = "PiPNativeLifecycleValidation"
+  case nativeRendererRecoveryValidation = "NativeRendererRecoveryValidation"
   case terminalOutcomesValidation = "TerminalOutcomesValidation"
   case adaptiveHLSSoakValidation = "AdaptiveHLSSoakValidation"
   case pipRenderPerformanceValidation = "PiPRenderPerformanceValidation"
   case pipCadenceValidation = "PiPCadenceValidation"
+  case pipCadenceSemanticsProbe = "PiPCadenceSemanticsProbe"
   case nativeSubtitleMatrixValidation = "NativeSubtitleMatrixValidation"
   case timebaseSoakValidation = "TimebaseSoakValidation"
+  case seekFrameOracleValidation = "SeekFrameOracleValidation"
+  case localFileMatrixValidation = "LocalFileMatrixValidation"
+  case audioOnlyPlaybackValidation = "AudioOnlyPlaybackValidation"
+  case progressiveHTTPRangeSeekValidation = "ProgressiveHTTPRangeSeekValidation"
 
   static var current: UITestRoute? {
     LaunchArguments.routeValue.flatMap(UITestRoute.init(rawValue:))

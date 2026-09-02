@@ -1,4 +1,51 @@
 import CLibVLC
+import Synchronization
+
+/// A cancellation-aware wait owned only by recast. Cancelling this waiter
+/// does not cancel or reclassify the native seek; its normal resolver remains
+/// alive until the native seek reaches its own terminal outcome.
+private final class RecastSeekOutcomeWaiter: Sendable {
+  enum Resolution: Sendable {
+    case outcome(SeekOutcome)
+    case cancelled
+  }
+
+  private struct State: Sendable {
+    var resolution: Resolution?
+    var continuation: CheckedContinuation<Resolution, Never>?
+  }
+
+  private let state = Mutex(State())
+
+  func wait() async -> Resolution {
+    await withTaskCancellationHandler {
+      await withCheckedContinuation { continuation in
+        let immediate = state.withLock { state -> Resolution? in
+          guard let resolution = state.resolution else {
+            state.continuation = continuation
+            return nil
+          }
+          return resolution
+        }
+        if let immediate {
+          continuation.resume(returning: immediate)
+        }
+      }
+    } onCancel: {
+      resolve(.cancelled)
+    }
+  }
+
+  func resolve(_ resolution: Resolution) {
+    let continuation = state.withLock { state -> CheckedContinuation<Resolution, Never>? in
+      guard state.resolution == nil else { return nil }
+      state.resolution = resolution
+      defer { state.continuation = nil }
+      return state.continuation
+    }
+    continuation?.resume(returning: resolution)
+  }
+}
 
 /// DVB/MPEG-TS program selection, renderer targeting, and the
 /// deinterlace filter.
@@ -8,6 +55,10 @@ extension Player {
   /// Lists all available programs in the current media.
   public var programs: [Program] {
     access(keyPath: \.programs)
+    guard nativeHandleRepresentsCurrentMedia else { return [] }
+    #if DEBUG
+    _mediaSpecificNativeDispatchHookForTesting?(.readPrograms)
+    #endif
     guard let list = libvlc_media_player_get_programlist(pointer) else { return [] }
     defer { libvlc_player_programlist_delete(list) }
 
@@ -20,6 +71,10 @@ extension Player {
   /// The currently selected program.
   public var selectedProgram: Program? {
     access(keyPath: \.selectedProgram)
+    guard nativeHandleRepresentsCurrentMedia else { return nil }
+    #if DEBUG
+    _mediaSpecificNativeDispatchHookForTesting?(.readSelectedProgram)
+    #endif
     guard let prog = libvlc_media_player_get_selected_program(pointer) else { return nil }
     defer { libvlc_player_program_delete(prog) }
     return Program(from: prog.pointee)
@@ -27,13 +82,21 @@ extension Player {
 
   /// Selects a program by its group ID.
   public func selectProgram(id: Int) {
+    guard nativeHandleRepresentsCurrentMedia else { return }
     guard let id = Int32(exactly: id) else { return }
+    #if DEBUG
+    _mediaSpecificNativeDispatchHookForTesting?(.selectProgram)
+    #endif
     libvlc_media_player_select_program_id(pointer, id)
   }
 
   /// Whether the current program is scrambled (encrypted).
   public var isProgramScrambled: Bool {
     access(keyPath: \.isProgramScrambled)
+    guard nativeHandleRepresentsCurrentMedia else { return false }
+    #if DEBUG
+    _mediaSpecificNativeDispatchHookForTesting?(.readProgramScrambled)
+    #endif
     return libvlc_media_player_program_scrambled(pointer)
   }
 
@@ -44,7 +107,10 @@ extension Player {
   /// Pass `nil` to revert to local playback. libVLC only applies renderer
   /// selection before the first `play()` call on a native media player.
   /// Set the renderer before starting playback on this ``Player``; to
-  /// retarget after playback has started, use ``recast(to:)``.
+  /// retarget after playback has started, use ``recast(to:)``. When `load(_:)`
+  /// has already staged a new media for a mandatory fresh handle, this method
+  /// safely stages the renderer for that successor without touching the
+  /// retiring handle.
   ///
   /// > Note: On tvOS the bundled libVLC ships no renderer output
   /// > backends (the Chromecast plugin stack is absent from that binary
@@ -52,7 +118,8 @@ extension Player {
   /// > reach — applying a renderer there does not produce remote output.
   ///
   /// - Parameter renderer: A ``RendererItem`` discovered by ``RendererDiscoverer``, or `nil`.
-  /// - Throws: ``VLCError/rendererFailed`` if the renderer cannot be set,
+  /// - Throws: ``VLCError/operationFailed(_:)`` with `"Set renderer"` if
+  ///   the renderer cannot be set,
   ///   or ``VLCError/invalidState(_:)`` if the player has already started
   ///   playback or isn't in an idle-like state.
   public func setRenderer(_ renderer: RendererItem?) throws(VLCError) {
@@ -62,10 +129,19 @@ extension Player {
     default:
       throw .invalidState("setRenderer requires idle, stopped, or error state; current state is \(state)")
     }
+    if !nativeHandleRepresentsCurrentMedia {
+      // The successor has no native handle yet. Renderer choice is per-player
+      // configuration, so stage its shadow for the replacement transaction
+      // instead of writing it to the retiring media's handle.
+      selectedRenderer = renderer
+      return
+    }
     guard !nativePlayerHasStartedPlayback else {
       throw .invalidState("setRenderer must be called before the first play() on this Player")
     }
-    guard setNativeRenderer(renderer, on: pointer) == 0 else { throw .rendererFailed }
+    guard setNativeRenderer(renderer, on: pointer) == 0 else {
+      throw .operationFailed("Set renderer")
+    }
     selectedRenderer = renderer
   }
 
@@ -73,6 +149,7 @@ extension Player {
   /// selection and replacement-player selection surface the same typed error.
   func setNativeRenderer(_ renderer: RendererItem?, on player: OpaquePointer) -> Int32 {
     #if DEBUG
+    _nativeSetRendererTargetHookForTesting?(player, renderer)
     if let _nativeSetRendererOverrideForTesting {
       return _nativeSetRendererOverrideForTesting(renderer)
     }
@@ -80,9 +157,19 @@ extension Player {
     return libvlc_media_player_set_renderer(player, renderer?.pointer)
   }
 
-  /// Switches the active renderer mid-playback on this same `Player` —
-  /// drawable attachment, observation, and app-side Now-Playing wiring
-  /// all survive. Pass `nil` to return to local playback.
+  /// Switches the active renderer mid-playback on this same `Player`.
+  ///
+  /// This compatibility action waits for the same bounded replacement work as
+  /// ``recastAndWaitForOutcome(to:)`` but intentionally discards its terminal
+  /// outcome. Use that result-bearing method when the caller must distinguish
+  /// a settled recast from failure, timeout, cancellation, or supersession.
+  public func recast(to renderer: RendererItem?) async throws(VLCError) {
+    _ = try await recastAndWaitForOutcome(to: renderer)
+  }
+
+  /// Switches or stages the renderer on this same `Player` — drawable
+  /// attachment, observation, and app-side Now-Playing wiring all survive.
+  /// Pass `nil` to return to local output.
   ///
   /// libVLC applies a renderer only before a native handle's first play,
   /// so this replaces the handle under the hood (the same lazy
@@ -97,129 +184,410 @@ extension Player {
   ///
   /// If libVLC rejects the renderer the call throws with the prior
   /// renderer and local playback left intact. The audio and subtitle
-  /// selection carry over best-effort — ids are session-scoped, so the
-  /// match falls back to language then name, and an unmatched track stays
-  /// at the new session's default. A-B loop bounds, chapter/title
+  /// selection carry over best-effort — exact ids win; session-scoped ids
+  /// fall back only to unique language/name metadata, and an unmatched or
+  /// ambiguous track stays at the new session's default. A-B loop bounds, chapter/title
   /// selection, and DVB program selection reset with the new session —
   /// their ids can differ per session, so re-selection is app policy.
+  /// A seek, audio/subtitle selection, or pause/resume command issued while
+  /// this method is awaiting is newer intent and wins over captured state.
   /// System Picture-in-Picture backed by the replaced handle stops when
   /// the handle is torn down.
+  ///
+  /// Recasting a previously used handle that is now idle, stopped, or failed
+  /// stages the renderer and returns ``RecastOutcome/settled`` without
+  /// autoplay; the next explicit `play()` creates and configures a fresh
+  /// handle. Media already committed for a deferred fresh handle behaves the
+  /// same way without spending another playback generation. In these staged
+  /// cases, `settled` does not mean a receiver is already rendering output.
+  ///
+  /// A ``MediaListPlayer`` owns both list advancement and the shared native
+  /// handle while attached. libVLC exposes no atomic "replace this exact list
+  /// item" operation, so recast conservatively returns
+  /// ``RecastOutcome/superseded`` without changing the player. Detach the
+  /// list player first, or use a dedicated ``Player`` for renderer playback.
   ///
   /// > Note: On tvOS the bundled libVLC ships no renderer output
   /// > backends — see ``setRenderer(_:)``.
   ///
-  /// - Throws: ``VLCError/rendererFailed`` if the renderer is
-  ///   rejected (prior renderer and local playback left intact),
+  /// - Throws: ``VLCError/operationFailed(_:)`` with `"Set renderer"` if
+  ///   the renderer is rejected (prior renderer and local playback left intact),
   ///   ``VLCError/playbackFailed(reason:)`` if the replacement session
   ///   cannot be started (the renderer is applied at that point — the
   ///   old session is gone; retry `play()` or recast again), or whatever
   ///   ``setRenderer(_:)`` throws on the never-played path. A session
   ///   that starts and *then* fails asynchronously surfaces through
   ///   ``PlayerEvent/encounteredError-enum.case``, not a throw.
-  @discardableResult
-  public func recast(to renderer: RendererItem?) async throws(VLCError) -> RecastOutcome {
-    guard nativePlayerHasStartedPlayback || state.isActive else {
-      try setRenderer(renderer)
+  public func recastAndWaitForOutcome(
+    to renderer: RendererItem?
+  )
+    async throws(VLCError) -> RecastOutcome {
+    if Task.isCancelled || isShutdown {
+      return .cancelled
+    }
+    // A list player can advance the shared native handle from libVLC's own
+    // lane while this main-actor method is suspended. There is no C API that
+    // atomically verifies and replaces one exact list item, so an identity
+    // sample followed by replacement would still be racy. Refuse before any
+    // mutation instead.
+    guard attachedMediaListPlayer == nil else { return .superseded }
+
+    // B has been published but deliberately has no native handle yet. Recast
+    // is configuration only: do not freeze B as a second replacement, touch
+    // retiring A, start transport, or spend another playback generation.
+    guard nativeHandleRepresentsCurrentMedia else {
+      selectedRenderer = renderer
       return .settled
     }
 
-    let resumeTime = currentTime
-    let wasPlaying = isPlaybackRequestedActive
-    let priorRenderer = selectedRenderer
-    let priorPointer = pointer
-    let priorNativeHandleGeneration = eventBridge.currentNativeHandleGeneration
-    let priorNeedsReplacement = nativePlayerNeedsReplacementBeforePlayback
-    let priorNeedsRebind = needsDrawableRebindForPlayback
+    switch state {
+    case .idle, .stopped, .error:
+      if nativePlayerHasStartedPlayback {
+        // Renderer selection is a pre-first-play native property. A used idle
+        // handle cannot be retargeted in place, and recast must not autoplay.
+        // Stage the choice and force the next explicit play through a fresh
+        // handle, where normal replacement applies it before native play.
+        selectedRenderer = renderer
+        nativePlayerNeedsReplacementBeforePlayback = true
+        needsDrawableRebindForPlayback = drawable != nil
+        return .settled
+      }
+      try setRenderer(renderer)
+      return .settled
+    case .stopping:
+      return .superseded
+    case .opening, .buffering, .playing, .paused:
+      break
+    }
+
+    let ownershipEpoch = mediaListOwnershipEpoch
+    let expectedPlaybackGeneration = eventBridge.currentPlaybackGeneration
+    guard
+      expectedPlaybackGeneration == sessionGeneration,
+      expectedPlaybackGeneration < UInt64.max,
+      eventBridge.currentNativeHandleGeneration < UInt64.max else {
+      return .superseded
+    }
+    let expectation = RecastReplacementExpectation(
+      playbackGeneration: expectedPlaybackGeneration,
+      nativeHandleGeneration: eventBridge.currentNativeHandleGeneration,
+      lifecycleControlEpoch: eventBridge.currentLifecycleControlEpoch,
+      mediaIdentity: currentMedia.map { UInt(bitPattern: $0.pointer) },
+      ownershipEpoch: ownershipEpoch
+    )
+    // Public intent and physical transport state are deliberately separate.
+    // A Resume can be authoritative while the observable state still says
+    // Paused, while managed audio suspension intentionally keeps active user
+    // intent over a physically paused player.
+    let shouldRestorePhysicalPause =
+      !isPlaybackRequestedActive || preservesPlaybackIntentForManagedAudioSuspension
+    let capturedPlaybackControlRevision = playbackControlIntentRevision
     let priorSubtitle = selectedSubtitleTrack
     let priorAudio = selectedAudioTrack
-
-    selectedRenderer = renderer
-    nativePlayerNeedsReplacementBeforePlayback = true
+    let priorAudioRevision = intentRevisions.audioTrackSelection
+    let priorSubtitleRevision = intentRevisions.subtitleTrackSelection
+    let resumeBeforeRelease = shouldResumeNativePlayerBeforeStop
     let statuses = playbackStatus
-    do {
-      try play()
-    } catch {
-      // Restoration is only coherent when the throw happened before the
-      // handle replacement committed (renderer rejection releases just
-      // the candidate handle). If the replacement went through and the
-      // subsequent play call failed, the new renderer is already bound
-      // and the old session is gone — rolling the bookkeeping back would
-      // make it lie about the native state.
-      if pointer == priorPointer {
-        selectedRenderer = priorRenderer
-        nativePlayerNeedsReplacementBeforePlayback = priorNeedsReplacement
-        needsDrawableRebindForPlayback = priorNeedsRebind
-      }
-      throw error
+    guard
+      let replacementResult = try replaceNativePlayerForDrawablePlayback(
+        target: drawable,
+        resumeBeforeRelease: resumeBeforeRelease,
+        successorPlaybackGeneration: PlaybackGeneration(
+          expectedPlaybackGeneration + 1
+        ),
+        renderer: .explicit(renderer),
+        recastExpectation: expectation
+      ) else {
+      preconditionFailure("Conditional recast replacement returned no result")
+    }
+    let lease: RecastReplacementLease
+    switch replacementResult {
+    case .committed(let committedLease):
+      lease = committedLease
+    case .interrupted(let interruption):
+      return recastOutcome(for: interruption)
     }
 
     // From here the renderer change has committed and the old session is
-    // gone, so every remaining step is restoration. Each suspension is a
-    // point where the caller can be cancelled or another operation can take
-    // over, and past that point this recast must stop mutating the session.
-    sessionGeneration = eventBridge.synchronizePlaybackGeneration(
-      sessionGeneration &+ 1,
-      media: currentMedia?.pointer,
-      outgoingNativeHandleGeneration: priorNativeHandleGeneration
-    )
-    resetPlaybackHealth()
-    publishPlaybackStatus()
-    let generation = sessionGeneration
+    // gone. Its `.playing`, capability, clock, and track arrays are not facts
+    // about the replacement even though the media object is unchanged. Reset
+    // them before starting the new handle, then publish its real idle state.
+    // This guarantees that no bounded wait below can pass without successor
+    // evidence.
+    let generation = lease.playbackGeneration
+    guard
+      resetMediaDerivedState(
+        preservingPlaybackIntent: true,
+        ifPlaybackGeneration: generation
+      ) else {
+      return recastInterruption(for: lease) ?? .superseded
+    }
+    if let interruption = recastInterruption(for: lease) {
+      return interruption
+    }
+    guard
+      publishPlaybackState(
+        .idle,
+        ifPlaybackGeneration: generation,
+        nativeHandleGeneration: lease.nativeHandleGeneration
+      ) else {
+      return recastInterruption(for: lease) ?? .superseded
+    }
+    if let interruption = recastInterruption(for: lease) {
+      return interruption
+    }
+
+    let playPermit: RecastMutationPermit
+    switch eventBridge.reserveRecastMutation(for: lease) {
+    case .permitted(let permit):
+      playPermit = permit
+    case .interrupted(let interruption):
+      return recastOutcome(for: interruption)
+    }
+    guard !Task.isCancelled else {
+      eventBridge.abandonRecast(lease)
+      return .cancelled
+    }
+    do {
+      try startPlayback(recordsPlaybackControlIntent: false)
+    } catch {
+      // The replacement is already committed. Rolling back the renderer or
+      // generation would describe a handle that no longer exists.
+      if let interruption = eventBridge.finishRecastMutation(playPermit) {
+        return recastOutcome(for: interruption)
+      }
+      eventBridge.abandonRecast(lease)
+      if Task.isCancelled {
+        return .cancelled
+      }
+      throw error
+    }
+    if let interruption = eventBridge.finishRecastMutation(playPermit) {
+      return recastOutcome(for: interruption)
+    }
+    let resumeSeekRevision = intentRevisions.seek
 
     // Scoped to the generation this recast captured, not a re-read of the
     // property. They are equal here, and keeping them textually the same value
     // is what stops a later edit from silently scoping the wait to a session
     // this recast no longer owns.
-    switch await Self.awaitPlaying(on: statuses, atLeast: PlaybackGeneration(generation)) {
+    let playbackResult = await Self.awaitPlaying(
+      on: statuses,
+      atLeast: PlaybackGeneration(lease.playbackGeneration),
+      timeout: recastWaitTimeout(default: .seconds(10))
+    )
+    if let interruption = recastInterruption(for: lease) {
+      return interruption
+    }
+    switch playbackResult {
     case .playing:
       break
     case .failed:
+      eventBridge.abandonRecast(lease)
       return .failed
     case .timedOut:
+      eventBridge.abandonRecast(lease)
       return .timedOut
     case .cancelled:
+      eventBridge.abandonRecast(lease)
       return .cancelled
+    case .superseded:
+      eventBridge.abandonRecast(lease)
+      return .superseded
     }
-    guard generation == sessionGeneration else { return .superseded }
 
-    if resumeTime > .zero {
-      switch await awaitSeekability() {
+    let resumeTime = lease.outgoingTimeline.time
+    if resumeTime > .zero, intentRevisions.seek == resumeSeekRevision {
+      switch await awaitSeekability(
+        for: generation,
+        ownershipEpoch: lease.ownershipEpoch,
+        unlessSeekRevisionChangesFrom: resumeSeekRevision,
+        timeout: recastWaitTimeout(default: .seconds(2))
+      ) {
       case .ready:
-        guard generation == sessionGeneration else { return .superseded }
-        try? seek(to: resumeTime)
+        if let interruption = recastInterruption(for: lease) {
+          return interruption
+        }
+        // A newer seek submitted while readiness was pending owns the
+        // timeline. Main-actor isolation makes this check and the synchronous
+        // request submission indivisible from other public seek calls.
+        guard intentRevisions.seek == resumeSeekRevision else { break }
+        let seekPermit: RecastMutationPermit
+        switch eventBridge.reserveRecastMutation(for: lease) {
+        case .permitted(let permit):
+          seekPermit = permit
+        case .interrupted(let interruption):
+          return recastOutcome(for: interruption)
+        }
+        guard !Task.isCancelled else {
+          eventBridge.abandonRecast(lease)
+          return .cancelled
+        }
+        do {
+          let request = try requestSeek(to: resumeTime)
+          if let interruption = eventBridge.finishRecastMutation(seekPermit) {
+            return recastOutcome(for: interruption)
+          }
+          // Native acceptance is not a landing. Do not call this recast
+          // settled while its position restore is still queued or waiting for
+          // an authoritative time-watch sample.
+          switch await awaitSeekOutcomeRespectingCancellation(request) {
+          case .outcome:
+            break
+          case .cancelled:
+            eventBridge.abandonRecast(lease)
+            return .cancelled
+          }
+        } catch {
+          if let interruption = eventBridge.finishRecastMutation(seekPermit) {
+            return recastOutcome(for: interruption)
+          }
+          // Position restoration is best-effort: a renderer can withdraw
+          // seekability between the readiness sample and dispatch, or reject
+          // a target its input cannot represent. The request API guarantees
+          // that an accepted request reaches a terminal outcome above.
+          if Task.isCancelled || isShutdown {
+            eventBridge.abandonRecast(lease)
+            return .cancelled
+          }
+        }
       case .notReady:
         break
       case .cancelled:
+        eventBridge.abandonRecast(lease)
         return .cancelled
       }
     }
-    guard generation == sessionGeneration else { return .superseded }
+    if let interruption = recastInterruption(for: lease) {
+      return interruption
+    }
 
     if
-      await restoreTrackSelection(
+      let interruption = await restoreTrackSelection(
         audio: priorAudio,
+        audioRevision: priorAudioRevision,
         subtitle: priorSubtitle,
-        generation: generation
-      ) == .cancelled {
-      return .cancelled
+        subtitleRevision: priorSubtitleRevision,
+        lease: lease,
+        timeout: recastWaitTimeout(default: .seconds(3))
+      ) {
+      return interruption
     }
-    guard generation == sessionGeneration else { return .superseded }
 
-    if !wasPlaying {
-      pause()
+    if
+      shouldRestorePhysicalPause,
+      playbackControlIntentRevision == capturedPlaybackControlRevision {
+      if let interruption = recastInterruption(for: lease) {
+        return interruption
+      }
+      let pausePermit: RecastMutationPermit
+      switch eventBridge.reserveRecastMutation(for: lease) {
+      case .permitted(let permit):
+        pausePermit = permit
+      case .interrupted(let interruption):
+        return recastOutcome(for: interruption)
+      }
+      guard !Task.isCancelled else {
+        eventBridge.abandonRecast(lease)
+        return .cancelled
+      }
+      _ = issuePause(
+        playbackGeneration: generation,
+        recordsPlaybackControlIntent: false
+      )
+      if let interruption = eventBridge.finishRecastMutation(pausePermit) {
+        return recastOutcome(for: interruption)
+      }
       // The caller asked for a paused recast, so returning before the pause
       // is acknowledged would report a settled session that is still playing.
-      switch await awaitPaused() {
+      switch await awaitPaused(
+        for: generation,
+        ownershipEpoch: lease.ownershipEpoch,
+        timeout: recastWaitTimeout(default: .seconds(3))
+      ) {
       case .ready:
         break
       case .notReady:
+        eventBridge.abandonRecast(lease)
         return .timedOut
       case .cancelled:
+        eventBridge.abandonRecast(lease)
         return .cancelled
       }
-      guard generation == sessionGeneration else { return .superseded }
+      if let interruption = recastInterruption(for: lease) {
+        return interruption
+      }
+    }
+    if Task.isCancelled || isShutdown {
+      eventBridge.abandonRecast(lease)
+      return .cancelled
+    }
+    guard
+      mediaListOwnershipEpoch == lease.ownershipEpoch,
+      attachedMediaListPlayer == nil else {
+      eventBridge.abandonRecast(lease)
+      return .superseded
+    }
+    if let interruption = eventBridge.settleRecast(lease) {
+      return recastOutcome(for: interruption)
     }
     return .settled
+  }
+
+  /// Returns why recast no longer owns a replacement, if anything.
+  ///
+  private func recastInterruption(
+    for lease: RecastReplacementLease
+  ) -> RecastOutcome? {
+    if Task.isCancelled || isShutdown {
+      eventBridge.abandonRecast(lease)
+      return .cancelled
+    }
+    guard
+      attachedMediaListPlayer == nil,
+      mediaListOwnershipEpoch == lease.ownershipEpoch,
+      sessionGeneration == lease.playbackGeneration else {
+      eventBridge.abandonRecast(lease)
+      return .superseded
+    }
+    if let interruption = eventBridge.currentRecastInterruption(for: lease) {
+      eventBridge.abandonRecast(lease)
+      return recastOutcome(for: interruption)
+    }
+    return nil
+  }
+
+  private func recastOutcome(
+    for interruption: RecastTransactionInterruption
+  ) -> RecastOutcome {
+    switch interruption {
+    case .superseded:
+      .superseded
+    case .terminal(.failure):
+      .failed
+    case .terminal(.cancellation):
+      .cancelled
+    case .terminal(.naturalEnd),
+         .terminal(.requestedStop),
+         .terminal(.replacement),
+         .terminal(.unknownNativeStop):
+      .superseded
+    }
+  }
+
+  /// Races only this waiter against caller cancellation. The unstructured
+  /// observer intentionally remains alive long enough to drain the request's
+  /// real terminal outcome; cancellation must not cancel the native seek.
+  private func awaitSeekOutcomeRespectingCancellation(
+    _ request: SeekRequest
+  )
+    async -> RecastSeekOutcomeWaiter.Resolution {
+    let waiter = RecastSeekOutcomeWaiter()
+    Task.detached {
+      let outcome = await request.outcome
+      waiter.resolve(.outcome(outcome))
+    }
+    return await waiter.wait()
   }
 
   /// Why a bounded wait ended. Separate from ``RecastOutcome`` because a
@@ -237,65 +605,132 @@ extension Player {
     case failed
     case timedOut
     case cancelled
+    case superseded
   }
 
   /// Reapplies the audio and subtitle selection a prior session carried.
   ///
-  /// Track ids are session-scoped, so the new session publishes different
-  /// ids for the same logical tracks; matching falls back to language then
-  /// name. The new session auto-selects its default audio, so a track is
-  /// only reapplied when it differs from what is already selected. Tracks
+  /// Track ids are session-scoped, so the new session can publish different
+  /// ids for the same logical tracks; metadata fallback requires one unique
+  /// match and never guesses from discovery order. The new session auto-selects
+  /// its default audio, so a track is only reapplied when it differs from what
+  /// is already selected. Tracks
   /// arrive after the session reaches `.playing` (adaptive renditions parse
   /// late), so this waits briefly for the lists to populate.
   private func restoreTrackSelection(
     audio: Track?,
+    audioRevision: UInt64,
     subtitle: Track?,
-    generation: UInt64
+    subtitleRevision: UInt64,
+    lease: RecastReplacementLease,
+    timeout: Duration
   )
-    async -> RecastWaitResult {
-    guard audio != nil || subtitle != nil else { return .ready }
+    async -> RecastOutcome? {
+    guard audio != nil || subtitle != nil else {
+      return recastInterruption(for: lease)
+    }
 
-    let waited = await awaitCondition(timeout: .seconds(3)) {
-      let audioReady = audio == nil || !self.audioTracks.isEmpty
-      let subtitleReady = subtitle == nil || !self.subtitleTracks.isEmpty
+    let waited = await awaitCondition(timeout: timeout) {
+      guard
+        lease.playbackGeneration == self.sessionGeneration,
+        lease.playbackGeneration == self.eventBridge.currentPlaybackGeneration,
+        lease.ownershipEpoch == self.mediaListOwnershipEpoch,
+        !self.isShutdown,
+        self.attachedMediaListPlayer == nil,
+        !self.eventBridge.hasExplicitStopBarrier(
+          playbackGeneration: lease.playbackGeneration
+        )
+      else { return true }
+      let audioReady = audio == nil
+        || self.intentRevisions.audioTrackSelection != audioRevision
+        || audio.map { Self.matchingTrack(for: $0, in: self.audioTracks) != nil }
+        == true
+      let subtitleReady = subtitle == nil
+        || self.intentRevisions.subtitleTrackSelection != subtitleRevision
+        || subtitle.map {
+          Self.matchingTrack(for: $0, in: self.subtitleTracks) != nil
+        } == true
       return audioReady && subtitleReady
     }
     if waited == .cancelled {
+      eventBridge.abandonRecast(lease)
       return .cancelled
     }
     // The lists can still be empty on a timeout; selection below is a no-op
     // then. What must not happen is applying them to a session this recast no
     // longer owns.
-    guard generation == sessionGeneration else { return .ready }
+    if let interruption = recastInterruption(for: lease) {
+      return interruption
+    }
 
     if
+      intentRevisions.audioTrackSelection == audioRevision,
       let audio, let match = Self.matchingTrack(for: audio, in: audioTracks),
       match.id != selectedAudioTrack?.id {
+      let permit: RecastMutationPermit
+      switch eventBridge.reserveRecastMutation(for: lease) {
+      case .permitted(let value): permit = value
+      case .interrupted(let interruption): return recastOutcome(for: interruption)
+      }
+      guard !Task.isCancelled else {
+        eventBridge.abandonRecast(lease)
+        return .cancelled
+      }
       selectedAudioTrack = match
+      if let interruption = eventBridge.finishRecastMutation(permit) {
+        return recastOutcome(for: interruption)
+      }
+    }
+    if let interruption = recastInterruption(for: lease) {
+      return interruption
     }
     if
+      intentRevisions.subtitleTrackSelection == subtitleRevision,
       let subtitle, let match = Self.matchingTrack(for: subtitle, in: subtitleTracks),
       match.id != selectedSubtitleTrack?.id {
+      let permit: RecastMutationPermit
+      switch eventBridge.reserveRecastMutation(for: lease) {
+      case .permitted(let value): permit = value
+      case .interrupted(let interruption): return recastOutcome(for: interruption)
+      }
+      guard !Task.isCancelled else {
+        eventBridge.abandonRecast(lease)
+        return .cancelled
+      }
       selectedSubtitleTrack = match
+      if let interruption = eventBridge.finishRecastMutation(permit) {
+        return recastOutcome(for: interruption)
+      }
     }
-    return .ready
+    return recastInterruption(for: lease)
   }
 
   /// Finds the track in `candidates` that best corresponds to `track` from a
-  /// previous session: an exact id match, else the same language, else the
-  /// same name.
+  /// previous session. Ambiguous metadata never chooses whichever rendition
+  /// happened to arrive first.
   static func matchingTrack(for track: Track, in candidates: [Track]) -> Track? {
     if let exact = candidates.first(where: { $0.id == track.id }) {
       return exact
     }
-    if
-      let language = track.language, !language.isEmpty,
-      let byLanguage = candidates.first(where: {
-        $0.language?.lowercased() == language.lowercased()
-      }) {
-      return byLanguage
+    let language = track.language?.lowercased()
+    if let language, !language.isEmpty {
+      let exactMetadataMatches = candidates.filter {
+        $0.language?.lowercased() == language && $0.name == track.name
+      }
+      if exactMetadataMatches.count == 1 {
+        return exactMetadataMatches[0]
+      }
     }
-    return candidates.first { $0.name == track.name }
+    if let language, !language.isEmpty {
+      let languageMatches = candidates.filter {
+        $0.language?.lowercased() == language
+      }
+      if languageMatches.count == 1 {
+        return languageMatches[0]
+      }
+    }
+    let nameMatches = candidates.filter { $0.name == track.name }
+    return nameMatches.count == 1 ? nameMatches[0] : nil
   }
 
   /// - Parameter timeout: The defensive ceiling. Injectable so the outcome
@@ -310,9 +745,10 @@ extension Player {
   /// a stream of bare `PlayerState`. Accepting it would report a settled
   /// recast before the replacement had started.
   ///
-  /// `atLeast` is the generation the recast owns. Anything older belongs to a
-  /// session this recast has already superseded and is ignored, including
-  /// `.error`: a failure in the outgoing session is not this recast's failure.
+  /// `atLeast` is the exact generation the recast owns. Anything older belongs
+  /// to the session it replaced and is ignored, including `.error`. Anything
+  /// newer means another operation already took ownership and returns
+  /// `.superseded`; its `.playing` or `.error` cannot settle this recast.
   static func awaitPlaying(
     on statuses: AsyncStream<PlaybackStatus>,
     atLeast generation: PlaybackGeneration,
@@ -322,7 +758,11 @@ extension Player {
     await withTaskGroup(of: RecastPlaybackResult?.self) { group in
       group.addTask {
         for await status in statuses {
+          if Task.isCancelled {
+            return .cancelled
+          }
           guard status.generation >= generation else { continue }
+          guard status.generation == generation else { return .superseded }
           // `.error` is reported rather than silently treated as arrival:
           // the caller needs to know the replacement session failed, not
           // that it is playing.
@@ -331,6 +771,12 @@ extension Player {
           }
           if status.state == .error {
             return .failed
+          }
+          if status.state == .stopping || status.state == .stopped {
+            // State alone cannot distinguish clean EOF, requested stop, or a
+            // replacement boundary. EventBridge preserves the exact cause for
+            // the full recast path; the standalone wait remains conservative.
+            return .superseded
           }
         }
         return nil
@@ -358,12 +804,59 @@ extension Player {
     }
   }
 
-  func awaitSeekability() async -> RecastWaitResult {
-    await awaitCondition(timeout: .seconds(2)) { self.isSeekable }
+  func awaitSeekability(
+    for generation: UInt64? = nil,
+    ownershipEpoch: UInt64? = nil,
+    unlessSeekRevisionChangesFrom seekRevision: UInt64? = nil,
+    timeout: Duration = .seconds(2)
+  )
+    async -> RecastWaitResult {
+    await awaitCondition(timeout: timeout) {
+      self.isShutdown
+        || self.attachedMediaListPlayer != nil
+        || (ownershipEpoch.map { $0 != self.mediaListOwnershipEpoch } ?? false)
+        || (seekRevision.map { $0 != self.intentRevisions.seek } ?? false)
+        || (generation.map {
+          self.eventBridge.hasExplicitStopBarrier(playbackGeneration: $0)
+        } ?? false)
+        || (generation.map {
+          $0 != self.sessionGeneration
+            || $0 != self.eventBridge.currentPlaybackGeneration
+        } ?? false)
+        || self.isSeekable
+    }
   }
 
-  func awaitPaused() async -> RecastWaitResult {
-    await awaitCondition(timeout: .seconds(3)) { self.state == .paused }
+  func awaitPaused(
+    for generation: UInt64? = nil,
+    ownershipEpoch: UInt64? = nil,
+    timeout: Duration = .seconds(3)
+  )
+    async -> RecastWaitResult {
+    await awaitCondition(timeout: timeout) {
+      self.isShutdown
+        || self.attachedMediaListPlayer != nil
+        || (ownershipEpoch.map { $0 != self.mediaListOwnershipEpoch } ?? false)
+        || (generation.map {
+          self.eventBridge.hasExplicitStopBarrier(playbackGeneration: $0)
+        } ?? false)
+        || (generation.map {
+          $0 != self.sessionGeneration
+            || $0 != self.eventBridge.currentPlaybackGeneration
+        } ?? false)
+        || self.state == .paused
+    }
+  }
+
+  /// Uses production recovery budgets unless a DEBUG test deliberately
+  /// shortens them. Keeping the seam in one place prevents test-only timing
+  /// policy from leaking into the public recast surface.
+  private func recastWaitTimeout(default productionTimeout: Duration) -> Duration {
+    #if DEBUG
+    _recastWaitTimeoutForTesting ?? productionTimeout
+    #else
+    productionTimeout
+    #endif
   }
 
   /// Polls `condition` until it holds, the deadline passes, or the task is
@@ -378,7 +871,13 @@ extension Player {
   )
     async -> RecastWaitResult {
     let deadline = ContinuousClock.now + timeout
-    while !condition() {
+    while true {
+      if Task.isCancelled {
+        return .cancelled
+      }
+      if condition() {
+        return .ready
+      }
       if ContinuousClock.now >= deadline {
         return .notReady
       }
@@ -388,7 +887,6 @@ extension Player {
         return .cancelled
       }
     }
-    return .ready
   }
 
   // MARK: - Deinterlacing

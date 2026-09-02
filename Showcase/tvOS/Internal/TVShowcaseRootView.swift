@@ -522,13 +522,21 @@ extension TVShowcase {
          .pipLongStallValidation,
          .pipDismissalValidation,
          .pipInterruptionValidation,
+         .mediaServicesResetValidation,
+         .audioSessionOwnershipValidation,
          .pipNativeLifecycleValidation,
+         .nativeRendererRecoveryValidation,
          .terminalOutcomesValidation,
          .adaptiveHLSSoakValidation,
          .pipRenderPerformanceValidation,
          .pipCadenceValidation,
+         .pipCadenceSemanticsProbe,
          .nativeSubtitleMatrixValidation,
-         .timebaseSoakValidation:
+         .timebaseSoakValidation,
+         .seekFrameOracleValidation,
+         .localFileMatrixValidation,
+         .audioOnlyPlaybackValidation,
+         .progressiveHTTPRangeSeekValidation:
       return nil
     }
   }

@@ -275,8 +275,9 @@ extension Integration {
       let player = Player(instance: TestInstance.makeAudioOnly())
       let oldPointer = player.pointer
 
-      try await player.recast(to: nil)
+      let outcome = try await player.recastAndWaitForOutcome(to: nil)
 
+      #expect(outcome == .settled)
       #expect(
         player.pointer == oldPointer,
         "recast replaced the handle of a never-played player"

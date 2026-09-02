@@ -1,6 +1,6 @@
 #if os(iOS) || os(macOS)
 
-/// The immediate outcome of a ``PiPController/start()`` request.
+/// The immediate outcome of a ``PiPController/requestStart()`` request.
 ///
 /// This reports only whether the request was *issued*, not whether Picture in
 /// Picture went on to appear. AVKit can still fail asynchronously after

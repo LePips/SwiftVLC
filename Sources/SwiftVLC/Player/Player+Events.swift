@@ -2,7 +2,7 @@ import CLibVLC
 import os
 import Synchronization
 
-/// Event consumer that mirrors `PlayerEvent`s onto `Player`'s
+/// Event consumer that mirrors native player signals onto `Player`'s
 /// `@Observable` properties, plus the deferred-pause / playback-intent
 /// reconciliation state machine.
 extension Player {
@@ -21,8 +21,21 @@ extension Player {
   /// Use this for transport decisions that must account for a native stop,
   /// pause, or resume before its event reaches the main actor. Prefer
   /// ``state`` for observation-driven UI because this synchronous snapshot is
-  /// not itself observable.
+  /// not itself observable. Returns `.idle` while a newly loaded media is
+  /// waiting for its fresh native handle; the still-attached handle belongs to
+  /// the retiring media and is not a valid native snapshot of ``currentMedia``.
   public var nativePlaybackState: PlayerState {
+    guard nativeHandleRepresentsCurrentMedia else { return .idle }
+    #if DEBUG
+    _mediaSpecificNativeDispatchHookForTesting?(.readNativePlaybackState)
+    #endif
+    return nativeHandlePlaybackState
+  }
+
+  /// Raw state of the attached pointer, including a retiring handle during a
+  /// deferred media replacement. Only lifecycle teardown may use this value;
+  /// media-specific public controls must use the identity-checked property.
+  var nativeHandlePlaybackState: PlayerState {
     #if DEBUG
     if let _nativePlaybackStateOverrideForTesting {
       return _nativePlaybackStateOverrideForTesting
@@ -54,7 +67,7 @@ extension Player {
 
   // MARK: - Event consumer task
 
-  /// Spawns the event-consuming `Task` that mirrors libVLC events
+  /// Spawns the signal-consuming `Task` that mirrors libVLC events
   /// onto observable properties. Captures `eventBridge` strongly and
   /// `self` weakly to avoid the retain cycle Player → eventTask → Player.
   ///
@@ -69,16 +82,42 @@ extension Player {
   /// mirror permanently wrong about a one-shot transition.
   func startEventConsumer() {
     let bridge = eventBridge
-    let stream = bridge.makeSourcedStream(policy: .unbounded)
+    let stream = bridge.makeSourcedPlayerSignalStream(policy: .unbounded)
     eventTask = Task { [weak self] in
-      for await sourcedEvent in stream {
+      for await signal in stream {
         guard !Task.isCancelled else { return }
-        self?.handleSourcedEvent(sourcedEvent)
+        self?.handleSourcedPlayerSignal(signal)
         // Yield after each event so other main-actor work (UI updates,
         // tests, etc.) isn't starved when VLC produces events rapidly.
         await Task.yield()
       }
     }
+  }
+
+  /// Dispatches one value from the private ordered native-signal lane.
+  func handleSourcedPlayerSignal(_ signal: SourcedPlayerSignal) {
+    switch signal {
+    case .event(let sourcedEvent):
+      handleSourcedEvent(sourcedEvent)
+    case .effectivePlaybackRateResolution(let resolution):
+      handleEffectivePlaybackRateResolution(resolution)
+    }
+  }
+
+  /// Invalidates the observable native-rate getter only for the exact handle
+  /// and media session that emitted the resolution. Rate and ordinary events
+  /// share one private ordered signal lane, so a preceding media change is
+  /// adopted before its rate resolution reaches this check.
+  func handleEffectivePlaybackRateResolution(
+    _ resolution: EffectivePlaybackRateResolution
+  ) {
+    guard
+      resolution.nativeGeneration == eventBridge.currentNativePlayerGeneration,
+      resolution.playbackGeneration == PlaybackGeneration(sessionGeneration)
+    else { return }
+    // The payload is exposed on the public resolution stream, while the
+    // observable getter re-reads the same authoritative native control state.
+    withMutation(keyPath: \Player.rate) {}
   }
 
   // MARK: - handleEvent dispatch
@@ -89,15 +128,104 @@ extension Player {
     else { return }
     if case .mediaChanged = sourcedEvent.event {
       guard sourcedEvent.playbackGeneration >= sessionGeneration else { return }
+      #if os(iOS)
+      if
+        sourcedEvent.playbackGeneration > sessionGeneration,
+        let attachment = drawable as? IOSNativePiPDrawableAttachment {
+        // List navigation can reuse the live vout, whose immutable v9 output
+        // identity still names the previous media. Retire PiP before exposing
+        // the externally adopted generation. A wrapper-initiated echo equals
+        // `sessionGeneration` and intentionally skips this path.
+        attachment.failClosedForSameHandleMediaChange(
+          nativeHandle: nativeHandleLifetime.nativePiPHandleIdentity
+        )
+      }
+      #endif
       handleEvent(
         sourcedEvent.event,
-        sourcePlaybackGeneration: sourcedEvent.playbackGeneration
+        sourcePlaybackGeneration: sourcedEvent.playbackGeneration,
+        sourceNativeHandleGeneration: sourcedEvent.nativeHandleGeneration,
+        sourceLifecycleControlEpoch: sourcedEvent.lifecycleControlEpoch
       )
       return
     }
     guard sourcedEvent.playbackGeneration == sessionGeneration else { return }
+    guard isLifecycleControlEventCurrent(sourcedEvent) else { return }
     guard isTimelineSampleCurrent(sourcedEvent) else { return }
-    handleEvent(sourcedEvent.event, sourceTimelineRevision: sourcedEvent.timelineRevision)
+    guard !quarantineSeekTimelineSampleIfNeeded(sourcedEvent) else { return }
+    let expectedTimelineRevision = acceptedTimelineRevision
+    if
+      case .timeChanged = sourcedEvent.event,
+      let stamp = sourcedEvent.nativeSeekEmissionStamp {
+      commitNativeTimelineEmission(stamp.timelineEmissionSequence)
+    } else if
+      case .positionChanged = sourcedEvent.event,
+      let stamp = sourcedEvent.nativeSeekEmissionStamp {
+      commitNativeTimelineEmission(stamp.timelineEmissionSequence)
+    }
+    handleEvent(
+      sourcedEvent.event,
+      sourcePlaybackGeneration: sourcedEvent.playbackGeneration,
+      sourceNativeHandleGeneration: sourcedEvent.nativeHandleGeneration,
+      expectedTimelineRevision: expectedTimelineRevision,
+      sourceLifecycleControlEpoch: sourcedEvent.lifecycleControlEpoch
+    )
+    guard
+      sourcedEventIdentityIsCurrent(
+        nativeHandleGeneration: sourcedEvent.nativeHandleGeneration,
+        playbackGeneration: sourcedEvent.playbackGeneration
+      ),
+      expectedTimelineRevision == acceptedTimelineRevision,
+      (sourcedEvent.lifecycleControlEpoch.map {
+        $0 == eventBridge.currentLifecycleControlEpoch
+      } ?? true)
+    else { return }
+    switch sourcedEvent.event {
+    case .timeChanged, .positionChanged:
+      recordAuthoritativeTimeline(
+        position: position,
+        emissionSequence: sourcedEvent.nativeSeekEmissionStamp?
+          .timelineEmissionSequence,
+        ifPlaybackGeneration: sourcedEvent.playbackGeneration,
+        nativeHandleGeneration: sourcedEvent.nativeHandleGeneration,
+        timelineRevision: expectedTimelineRevision,
+        lifecycleControlEpoch: sourcedEvent.lifecycleControlEpoch
+      )
+    default:
+      break
+    }
+  }
+
+  /// Same-generation native state can still be stale across Stop/Play because
+  /// libVLC delivers callbacks asynchronously. Real bridge events carry the
+  /// control epoch frozen at callback entry; directly-constructed unit events
+  /// omit it and preserve their historical behavior.
+  private func isLifecycleControlEventCurrent(
+    _ sourcedEvent: SourcedPlayerEvent
+  ) -> Bool {
+    let isActiveStateEvidence = switch sourcedEvent.event {
+    case .stateChanged(let state):
+      switch state {
+      case .opening, .buffering, .playing, .paused:
+        true
+      case .idle, .stopped, .stopping, .error:
+        false
+      }
+    case .bufferingProgress:
+      true
+    default:
+      false
+    }
+    guard isActiveStateEvidence else { return true }
+    guard let lifecycleControlEpoch = sourcedEvent.lifecycleControlEpoch else {
+      return true
+    }
+    guard lifecycleControlEpoch == eventBridge.currentLifecycleControlEpoch else {
+      return false
+    }
+    return !eventBridge.hasExplicitStopBarrier(
+      playbackGeneration: sourcedEvent.playbackGeneration
+    )
   }
 
   /// Whether a clock sample still describes the authoritative timeline.
@@ -113,9 +241,24 @@ extension Player {
   private func isTimelineSampleCurrent(_ sourcedEvent: SourcedPlayerEvent) -> Bool {
     switch sourcedEvent.event {
     case .timeChanged, .positionChanged:
-      sourcedEvent.timelineRevision >= acceptedTimelineRevision
+      guard
+        let stamp = sourcedEvent.nativeSeekEmissionStamp
+      else {
+        // Directly-constructed unit events retain their historical revision-
+        // only semantics. Every real EventBridge callback carries a stamp.
+        return sourcedEvent.timelineRevision >= acceptedTimelineRevision
+      }
+      return stamp.timelineGeneration == nativeSeekMonitor.timelineGeneration
+        && stamp.externalEpoch == nativeSeekMonitor.externalSeekEpoch
+        && !stamp.externalDrainPending
+        && !stamp.externalOverlapAmbiguous
+        && canCommitNativeTimelineEmission(stamp.timelineEmissionSequence)
+        && (
+          sourcedEvent.timelineRevision >= acceptedTimelineRevision
+            || stamp.timelineEmissionSequence > acceptedNativeTimelineEmissionSequence
+        )
     default:
-      true
+      return true
     }
   }
 
@@ -125,33 +268,108 @@ extension Player {
   func handleEvent(
     _ event: PlayerEvent,
     sourcePlaybackGeneration: UInt64? = nil,
-    sourceTimelineRevision: UInt64? = nil
+    sourceNativeHandleGeneration: UInt64? = nil,
+    expectedTimelineRevision: UInt64? = nil,
+    sourceLifecycleControlEpoch: UInt64? = nil
   ) {
     let interval = Signposts.signposter.beginInterval("Player.handleEvent")
     defer { Signposts.signposter.endInterval("Player.handleEvent", interval) }
+    func sourceIsCurrent(allowsUnadoptedPlaybackGeneration: Bool = false) -> Bool {
+      guard
+        sourcedEventIdentityIsCurrent(
+          nativeHandleGeneration: sourceNativeHandleGeneration,
+          playbackGeneration: sourcePlaybackGeneration,
+          allowsUnadoptedPlaybackGeneration: allowsUnadoptedPlaybackGeneration
+        ) else { return false }
+      if let expectedTimelineRevision {
+        guard expectedTimelineRevision == acceptedTimelineRevision else { return false }
+      }
+      if let sourceLifecycleControlEpoch {
+        guard sourceLifecycleControlEpoch == eventBridge.currentLifecycleControlEpoch else {
+          return false
+        }
+      }
+      return true
+    }
+
     switch event {
     case .stateChanged(let newState):
-      publishPlaybackState(newState)
+      let previousState = state
+      guard
+        publishPlaybackState(
+          newState,
+          ifPlaybackGeneration: sourcePlaybackGeneration,
+          nativeHandleGeneration: sourceNativeHandleGeneration,
+          lifecycleControlEpoch: sourceLifecycleControlEpoch
+        ) else { return }
+      if previousState == .paused, newState == .playing {
+        prepareForPlaybackResumeBoundary()
+      }
+      guard sourceIsCurrent() else { return }
       switch newState {
       case .stopped, .error:
-        supersedePendingSeekSettlement(ifNotPredating: sourceTimelineRevision)
-        #if os(iOS)
-        nativePiPVideoOutputRebuildPermit.invalidate()
-        #endif
+        supersedeSeekWorkForTerminalBoundary()
+        cancelPendingFrameSteps()
       case .idle, .stopping:
-        supersedePendingSeekSettlement(ifNotPredating: sourceTimelineRevision)
+        supersedeSeekWorkForTerminalBoundary()
+        cancelPendingFrameSteps()
       case .opening, .buffering, .playing, .paused:
         break
       }
+      guard sourceIsCurrent() else { return }
       updatePauseTransition(for: newState)
-      reconcilePlaybackIntent(for: newState)
+      guard sourceIsCurrent() else { return }
+      guard
+        reconcilePlaybackIntent(
+          for: newState,
+          ifPlaybackGeneration: sourcePlaybackGeneration,
+          nativeHandleGeneration: sourceNativeHandleGeneration,
+          lifecycleControlEpoch: sourceLifecycleControlEpoch
+        ) else { return }
+      guard sourceIsCurrent() else { return }
       if case .stopped = newState {
-        currentTime = .zero
-        bufferFill = 0
-        withMutation(keyPath: \.position) {
-          _position = 0
-        }
-        withMutation(keyPath: \.abLoopState) {}
+        guard
+          performObservableMutation(
+            keyPath: \.currentTime,
+            ifPlaybackGeneration: sourcePlaybackGeneration,
+            nativeHandleGeneration: sourceNativeHandleGeneration,
+            timelineRevision: expectedTimelineRevision,
+            lifecycleControlEpoch: sourceLifecycleControlEpoch,
+            mutation: {
+              storeCurrentTimeWithoutNestedObservation(.zero)
+            }
+          ) else { return }
+        guard
+          performObservableMutation(
+            keyPath: \.bufferFill,
+            ifPlaybackGeneration: sourcePlaybackGeneration,
+            nativeHandleGeneration: sourceNativeHandleGeneration,
+            timelineRevision: expectedTimelineRevision,
+            lifecycleControlEpoch: sourceLifecycleControlEpoch,
+            mutation: {
+              storeBufferFillWithoutNestedObservation(0)
+            }
+          ) else { return }
+        guard
+          performObservableMutation(
+            keyPath: \.position,
+            ifPlaybackGeneration: sourcePlaybackGeneration,
+            nativeHandleGeneration: sourceNativeHandleGeneration,
+            timelineRevision: expectedTimelineRevision,
+            lifecycleControlEpoch: sourceLifecycleControlEpoch,
+            mutation: {
+              storePositionWithoutNestedObservation(0)
+            }
+          ) else { return }
+        guard
+          performObservableMutation(
+            keyPath: \.abLoopState,
+            ifPlaybackGeneration: sourcePlaybackGeneration,
+            nativeHandleGeneration: sourceNativeHandleGeneration,
+            timelineRevision: expectedTimelineRevision,
+            lifecycleControlEpoch: sourceLifecycleControlEpoch,
+            mutation: {}
+          ) else { return }
       }
       // libVLC doesn't always emit `MediaPlayerLengthChanged`,
       // `MediaPlayerSeekableChanged`, or `MediaPlayerPausableChanged`
@@ -161,45 +379,119 @@ extension Player {
       // chance to attach its event listener. Polling on every state
       // transition catches those cases. It's three C calls and is
       // idempotent when the events do fire.
-      refreshNativeStateIfNeeded()
+      guard
+        refreshNativeStateIfNeeded(
+          ifPlaybackGeneration: sourcePlaybackGeneration,
+          nativeHandleGeneration: sourceNativeHandleGeneration,
+          timelineRevision: expectedTimelineRevision,
+          lifecycleControlEpoch: sourceLifecycleControlEpoch
+        ) else { return }
       performDeferredPauseCommandIfNeeded()
+      guard sourceIsCurrent() else { return }
+      if case .paused = newState {
+        dispatchNextPendingFrameStepIfNeeded()
+      }
 
     case .timeChanged(let time):
-      currentTime = time
+      guard
+        performObservableMutation(
+          keyPath: \.currentTime,
+          ifPlaybackGeneration: sourcePlaybackGeneration,
+          nativeHandleGeneration: sourceNativeHandleGeneration,
+          timelineRevision: expectedTimelineRevision,
+          lifecycleControlEpoch: sourceLifecycleControlEpoch,
+          mutation: {
+            storeCurrentTimeWithoutNestedObservation(time)
+          }
+        ) else { return }
       if duration == nil || !isSeekable || !isPausable {
-        refreshNativeStateIfNeeded()
+        guard
+          refreshNativeStateIfNeeded(
+            ifPlaybackGeneration: sourcePlaybackGeneration,
+            nativeHandleGeneration: sourceNativeHandleGeneration,
+            timelineRevision: expectedTimelineRevision,
+            lifecycleControlEpoch: sourceLifecycleControlEpoch
+          ) else { return }
       }
       performDeferredPauseCommandIfNeeded()
 
     case .positionChanged(let pos):
-      withMutation(keyPath: \.position) {
-        _position = pos
-      }
+      guard
+        performObservableMutation(
+          keyPath: \.position,
+          ifPlaybackGeneration: sourcePlaybackGeneration,
+          nativeHandleGeneration: sourceNativeHandleGeneration,
+          timelineRevision: expectedTimelineRevision,
+          lifecycleControlEpoch: sourceLifecycleControlEpoch,
+          mutation: {
+            storePositionWithoutNestedObservation(pos)
+          }
+        ) else { return }
 
     case .lengthChanged(let length):
       if isSuppressingRawCapabilityEvents {
         suppressedRawLengthEventCount += 1
       } else {
-        duration = length
+        guard
+          performObservableMutation(
+            keyPath: \.duration,
+            ifPlaybackGeneration: sourcePlaybackGeneration,
+            nativeHandleGeneration: sourceNativeHandleGeneration,
+            lifecycleControlEpoch: sourceLifecycleControlEpoch,
+            mutation: {
+              storeDurationWithoutNestedObservation(length)
+            }
+          ) else { return }
       }
 
     case .seekableChanged(let seekable):
       if isSuppressingRawCapabilityEvents {
         suppressedRawSeekableEventCount += 1
       } else {
-        isSeekable = seekable
+        guard
+          performObservableMutation(
+            keyPath: \.isSeekable,
+            ifPlaybackGeneration: sourcePlaybackGeneration,
+            nativeHandleGeneration: sourceNativeHandleGeneration,
+            lifecycleControlEpoch: sourceLifecycleControlEpoch,
+            mutation: {
+              storeSeekableWithoutNestedObservation(seekable)
+            }
+          ) else { return }
       }
 
     case .pausableChanged(let pausable):
-      isPausable = pausable
+      guard
+        performObservableMutation(
+          keyPath: \.isPausable,
+          ifPlaybackGeneration: sourcePlaybackGeneration,
+          nativeHandleGeneration: sourceNativeHandleGeneration,
+          lifecycleControlEpoch: sourceLifecycleControlEpoch,
+          mutation: {
+            storePausableWithoutNestedObservation(pausable)
+          }
+        ) else { return }
       performDeferredPauseCommandIfNeeded()
 
     case .tracksChanged:
       let previousVideoTracks = videoTracks
-      refreshTracks()
+      guard
+        refreshTracks(
+          ifPlaybackGeneration: sourcePlaybackGeneration,
+          nativeHandleGeneration: sourceNativeHandleGeneration,
+          timelineRevision: expectedTimelineRevision,
+          lifecycleControlEpoch: sourceLifecycleControlEpoch
+        ) else { return }
       if Self.playbackHealthVideoTracksDiffer(previousVideoTracks, videoTracks) {
-        markPlaybackHealthAdaptiveSwitch()
+        guard
+          markPlaybackHealthAdaptiveSwitch(
+            ifPlaybackGeneration: sourcePlaybackGeneration,
+            nativeHandleGeneration: sourceNativeHandleGeneration,
+            timelineRevision: expectedTimelineRevision,
+            lifecycleControlEpoch: sourceLifecycleControlEpoch
+          ) else { return }
       }
+      guard sourceIsCurrent() else { return }
       // Adaptive streams can switch resolution mid-stream without any
       // dedicated size event; libVLC reports the change through the
       // track list (ES selection/update), so re-signal the decoded
@@ -207,12 +499,24 @@ extension Player {
       // selected-track probe over the same data, so it is track-driven
       // too.
       withMutation(keyPath: \.videoSize) {}
+      guard sourceIsCurrent() else { return }
       withMutation(keyPath: \.hasVideoOutput) {}
 
     case .mediaChanged:
+      guard
+        publishExternalMediaReplacementBoundaryIfNeeded(
+          successorPlaybackGeneration: sourcePlaybackGeneration,
+          nativeHandleGeneration: sourceNativeHandleGeneration,
+          lifecycleControlEpoch: sourceLifecycleControlEpoch
+        )
+      else { return }
       let previousSessionGeneration = sessionGeneration
       let playbackControlIntent = playbackControlIntent
-      syncCurrentMediaFromNative()
+      guard
+        syncCurrentMediaFromNative(
+          sourcePlaybackGeneration: sourcePlaybackGeneration,
+          sourceNativeHandleGeneration: sourceNativeHandleGeneration
+        ) else { return }
       let changedMediaIdentity = currentMedia?.pointer != sessionGenerationMedia
       // A media change the wrapper did not initiate still has to supersede
       // whatever was restoring the previous session: a `MediaListPlayer`
@@ -240,6 +544,7 @@ extension Player {
         // without this the status would keep reporting the old session.
         publishPlaybackStatus()
       }
+      guard sourceIsCurrent() else { return }
       let adoptedExternalGeneration = sessionGeneration > previousSessionGeneration
       let carriesPlaybackControl = adoptedExternalGeneration && playbackControlIntent != nil
       // `load(_:)` establishes the new generation and resets its timeline
@@ -253,37 +558,86 @@ extension Player {
         || changedMediaIdentity
         || sourcePlaybackGeneration == nil
       if replacedTimeline {
-        resetMediaDerivedState(preservingPlaybackIntent: carriesPlaybackControl)
+        guard
+          resetMediaDerivedState(
+            preservingPlaybackIntent: carriesPlaybackControl,
+            ifPlaybackGeneration: sessionGeneration,
+            nativeHandleGeneration: sourceNativeHandleGeneration,
+            lifecycleControlEpoch: sourceLifecycleControlEpoch
+          ) else { return }
       }
+      guard sourceIsCurrent() else { return }
       if adoptedExternalGeneration, let playbackControlIntent {
         reconcilePauseControlAfterExternalMediaAdoption(
           playbackGeneration: sessionGeneration,
           command: playbackControlIntent
         )
       }
-      refreshTracks()
-      notifyMediaDependentObservables()
+      guard sourceIsCurrent() else { return }
+      guard
+        refreshTracks(
+          ifPlaybackGeneration: sourcePlaybackGeneration,
+          nativeHandleGeneration: sourceNativeHandleGeneration,
+          timelineRevision: expectedTimelineRevision,
+          lifecycleControlEpoch: sourceLifecycleControlEpoch
+        ) else { return }
+      _ = notifyMediaDependentObservables(
+        ifPlaybackGeneration: sessionGeneration,
+        nativeHandleGeneration: sourceNativeHandleGeneration,
+        lifecycleControlEpoch: sourceLifecycleControlEpoch
+      )
 
     case .encounteredError:
-      publishPlaybackState(.error)
-      supersedePendingSeekSettlement(ifNotPredating: sourceTimelineRevision)
-      #if os(iOS)
-      nativePiPVideoOutputRebuildPermit.invalidate()
-      #endif
+      guard
+        publishPlaybackState(
+          .error,
+          ifPlaybackGeneration: sourcePlaybackGeneration,
+          nativeHandleGeneration: sourceNativeHandleGeneration,
+          lifecycleControlEpoch: sourceLifecycleControlEpoch
+        ) else { return }
+      supersedeSeekWorkForTerminalBoundary()
+      cancelPendingFrameSteps()
       clearPauseControlState(for: sessionGeneration)
-      reconcilePlaybackIntent(for: .error)
+      guard
+        reconcilePlaybackIntent(
+          for: .error,
+          ifPlaybackGeneration: sourcePlaybackGeneration,
+          nativeHandleGeneration: sourceNativeHandleGeneration,
+          lifecycleControlEpoch: sourceLifecycleControlEpoch
+        ) else { return }
 
     case .bufferingProgress(let pct):
       // Fill level is useful in every state, so update regardless. A
       // `.paused` player mid-preload still needs to show progress.
-      bufferFill = pct
+      guard
+        performObservableMutation(
+          keyPath: \.bufferFill,
+          ifPlaybackGeneration: sourcePlaybackGeneration,
+          nativeHandleGeneration: sourceNativeHandleGeneration,
+          lifecycleControlEpoch: sourceLifecycleControlEpoch,
+          mutation: {
+            storeBufferFillWithoutNestedObservation(pct)
+          }
+        ) else { return }
       // Only enter `.buffering` from a pre-play state. Once libVLC is
       // `.playing` or `.paused`, `.stateChanged` drives the lifecycle.
       switch state {
       case .idle, .opening, .buffering:
         if state != .buffering {
-          publishPlaybackState(.buffering)
-          reconcilePlaybackIntent(for: .buffering)
+          guard
+            publishPlaybackState(
+              .buffering,
+              ifPlaybackGeneration: sourcePlaybackGeneration,
+              nativeHandleGeneration: sourceNativeHandleGeneration,
+              lifecycleControlEpoch: sourceLifecycleControlEpoch
+            ) else { return }
+          guard
+            reconcilePlaybackIntent(
+              for: .buffering,
+              ifPlaybackGeneration: sourcePlaybackGeneration,
+              nativeHandleGeneration: sourceNativeHandleGeneration,
+              lifecycleControlEpoch: sourceLifecycleControlEpoch
+            ) else { return }
         }
       default:
         break
@@ -307,9 +661,25 @@ extension Player {
       withMutation(keyPath: \.currentTitle) {}
 
     case .voutChanged(let count):
-      activeVideoOutputs = count
-      refreshTracks()
+      guard
+        performObservableMutation(
+          keyPath: \.activeVideoOutputs,
+          ifPlaybackGeneration: sourcePlaybackGeneration,
+          nativeHandleGeneration: sourceNativeHandleGeneration,
+          lifecycleControlEpoch: sourceLifecycleControlEpoch,
+          mutation: {
+            storeActiveVideoOutputsWithoutNestedObservation(count)
+          }
+        ) else { return }
+      guard
+        refreshTracks(
+          ifPlaybackGeneration: sourcePlaybackGeneration,
+          nativeHandleGeneration: sourceNativeHandleGeneration,
+          timelineRevision: expectedTimelineRevision,
+          lifecycleControlEpoch: sourceLifecycleControlEpoch
+        ) else { return }
       withMutation(keyPath: \.videoSize) {}
+      guard sourceIsCurrent() else { return }
       withMutation(keyPath: \.hasVideoOutput) {}
 
     // Events without a matching observable property are only exposed
@@ -319,7 +689,9 @@ extension Player {
 
     case .programAdded, .programDeleted, .programSelected, .programUpdated:
       withMutation(keyPath: \.programs) {}
+      guard sourceIsCurrent() else { return }
       withMutation(keyPath: \.selectedProgram) {}
+      guard sourceIsCurrent() else { return }
       withMutation(keyPath: \.isProgramScrambled) {}
 
     case .endReached:
@@ -331,7 +703,16 @@ extension Player {
       // `.mediaChanged` is queued behind the stale `.endReached` and
       // resets the flag right after.
       if !isPlaybackRequestedActive {
-        didReachEnd = true
+        guard
+          performObservableMutation(
+            keyPath: \.didReachEnd,
+            ifPlaybackGeneration: sourcePlaybackGeneration,
+            nativeHandleGeneration: sourceNativeHandleGeneration,
+            lifecycleControlEpoch: sourceLifecycleControlEpoch,
+            mutation: {
+              storeDidReachEndWithoutNestedObservation(true)
+            }
+          ) else { return }
       }
 
     case .corked, .uncorked,
@@ -341,373 +722,24 @@ extension Player {
     }
   }
 
-  // MARK: - Playback state + intent publication
-
-  func publishPlaybackState(_ newState: PlayerState) {
-    if newState == .playing, state != .playing {
-      rearmPlaybackHealthAfterEnteringPlaying()
-    }
-    state = newState
-    withMutation(keyPath: \.isActive) {}
-    // The single funnel for `state`, and therefore the only place that can
-    // see *every* lifecycle transition. Broadcasting from here rather than
-    // from the raw `.stateChanged` event is what puts `.error` and
-    // `.buffering` on the stream at all: libVLC reports those as
-    // `.encounteredError` and `.bufferingProgress`, so neither has ever
-    // produced a `.stateChanged` to forward.
-    stateTransitionBridge.broadcast(newState)
-    publishPlaybackStatus()
-    samplePlaybackHealth()
-    reconcilePlaybackHealthSamplingTask()
-  }
-
-  /// Republishes the current state paired with the session it belongs to.
-  ///
-  /// Called from both funnels rather than one: a state change keeps the same
-  /// generation, and a media change keeps the same state, so either alone
-  /// leaves ``Player/playbackStatus`` describing a pair that was never true.
-  func publishPlaybackStatus() {
-    playbackStatusBridge.broadcast(
-      PlaybackStatus(state: state, generation: PlaybackGeneration(sessionGeneration))
-    )
-  }
-
-  func publishPlaybackIntent(_ active: Bool) {
-    guard isPlaybackRequestedActive != active else { return }
-    isPlaybackRequestedActive = active
-    // Mirrored synchronously so off-main callers — AVKit and AppKit PiP
-    // callbacks, which must answer immediately — can read the current intent
-    // without hopping to the main actor.
-    nonisolatedPlaybackIntent.store(active, ordering: .releasing)
-    withMutation(keyPath: \.isPlaying) {}
-    playbackIntentBridge.broadcast(active)
-  }
-
-  func setPlaybackIntentFromExternalControl(_ active: Bool) {
-    publishPlaybackIntent(active)
-  }
-
-  func setPlaybackControlIntent(_ command: DeferredPauseCommand) {
-    playbackControlIntent = command
-    publishPlaybackIntent(command == .resume)
-  }
-
-  /// Reconciles the published playback intent with libVLC's reported
-  /// state, *unless* a user-initiated transition is in flight. While
-  /// pausing or resuming, the intent published by `pause()`/`resume()`
-  /// wins until the matching state arrives.
-  func reconcilePlaybackIntent(for state: PlayerState) {
-    switch state {
-    case .opening, .buffering, .playing:
-      guard pauseTransition != .pausing, deferredPauseCommand != .pause else { return }
-      publishPlaybackIntent(true)
-
-    case .paused:
-      guard pauseTransition != .resuming, deferredPauseCommand != .resume else { return }
-      guard !preservesPlaybackIntentForManagedAudioSuspension else {
-        publishPlaybackIntent(true)
-        return
-      }
-      publishPlaybackIntent(false)
-
-    case .idle, .stopped, .stopping, .error:
-      guard !hasPauseControl(after: sessionGeneration) else { return }
-      clearManagedAudioSuspensionForExplicitControl()
-      publishPlaybackIntent(false)
-    }
-  }
-
-  // MARK: - Pause transition + deferred command
-
-  /// Closes out a pause/resume transition once libVLC reports the
-  /// matching state, or clears any pending state on terminal states.
-  func updatePauseTransition(for newState: PlayerState) {
-    switch (pauseTransition, newState) {
-    case (.pausing, .paused), (.resuming, .playing):
-      guard pauseTransitionPlaybackGeneration == sessionGeneration else { return }
-      pauseTransition = nil
-      performDeferredPauseCommandIfNeeded()
-    case (_, .idle), (_, .stopped), (_, .stopping), (_, .error):
-      clearPauseControlState(for: sessionGeneration)
-    default:
-      break
-    }
-  }
-
-  /// Clears only pause work owned by `playbackGeneration`. A queued event for
-  /// an outgoing playlist item must not erase work already accepted for its
-  /// successor on the callback lane.
-  func clearPauseControlState(for playbackGeneration: UInt64) {
-    if pauseTransitionPlaybackGeneration == playbackGeneration {
-      pauseTransition = nil
-    }
-    if deferredPauseCommandPlaybackGeneration == playbackGeneration {
-      deferredPauseCommand = nil
-    }
-  }
-
-  /// Whether the callback lane has already accepted pause/resume work for a
-  /// media generation that the main actor has not adopted yet.
-  func hasPauseControl(after playbackGeneration: UInt64) -> Bool {
-    (pauseTransitionPlaybackGeneration ?? 0) > playbackGeneration
-      || (deferredPauseCommandPlaybackGeneration ?? 0) > playbackGeneration
-  }
-
-  /// If a pause/resume command was deferred (because the player wasn't
-  /// in a stable state at the time), retry it now.
-  func performDeferredPauseCommandIfNeeded() {
-    guard
-      pauseTransition == nil,
-      let command = deferredPauseCommand,
-      let playbackGeneration = deferredPauseCommandPlaybackGeneration,
-      playbackGeneration == sessionGeneration
-    else {
-      return
-    }
-    guard playbackGeneration == eventBridge.currentPlaybackGeneration else {
-      // The callback lane has already adopted a successor. Retrying this
-      // outgoing command would act on the shared native handle's new media.
-      deferredPauseCommand = nil
-      return
-    }
-    deferredPauseCommand = nil
-    switch command {
-    case .pause:
-      _ = issuePause(
-        playbackGeneration: playbackGeneration,
-        recordsPlaybackControlIntent: false
-      )
-    case .resume:
-      _ = issueResume(playbackGeneration: playbackGeneration)
-    }
-  }
-
-  // MARK: - Media-derived state reset
-
-  /// Resets the observable state that depends on the current media —
-  /// times, duration, seek/pause flags, buffer fill. Called when media
-  /// is loaded or replaced.
-  func resetMediaDerivedState(preservingPlaybackIntent: Bool = false) {
-    supersedePendingSeekSettlement()
-    #if os(iOS)
-    nativePiPVideoOutputRebuildPermit.invalidate()
-    #endif
-    nativeSeekMonitor.resetForTimelineReplacement()
-    // New media, new timeline: clock samples still queued from the previous
-    // one describe a media that is no longer loaded and must not be applied.
-    acceptedTimelineRevision = eventBridge.advanceTimelineRevision()
-    // `duration` and `isSeekable` publish the capability snapshot from their
-    // own `didSet`, so clearing them one at a time would briefly expose
-    // "duration cleared, seekability still the previous media's". Suppress
-    // those partial publishes and emit one atomic snapshot below.
-    isSuppressingCapabilityPublish = true
-    if
-      let pauseTransitionPlaybackGeneration,
-      pauseTransitionPlaybackGeneration < sessionGeneration {
-      pauseTransition = nil
-    }
-    // A native MediaListPlayer can advance the event bridge and accept a
-    // pause for a later item before queued media-change events reach the main
-    // actor. Preserve current and future commands through each adoption;
-    // commands from an older media generation are still retired.
-    if
-      let deferredPauseCommandPlaybackGeneration,
-      deferredPauseCommandPlaybackGeneration < sessionGeneration {
-      deferredPauseCommand = nil
-    }
-    // A deferred command was requested after the in-flight transition, so it
-    // is the latest user intent and wins when both survive adoption.
-    let intendsActivePlayback = if preservingPlaybackIntent {
-      isPlaybackRequestedActive
-    } else {
-      switch deferredPauseCommand {
-      case .pause: false
-      case .resume: true
-      case nil: pauseTransition == .resuming
+  /// Revalidates a sourced callback after synchronous Observation or stream
+  /// publication. Direct unit-test events omit both values and intentionally
+  /// retain their legacy, unscoped behavior.
+  func sourcedEventIdentityIsCurrent(
+    nativeHandleGeneration: UInt64?,
+    playbackGeneration: UInt64?,
+    allowsUnadoptedPlaybackGeneration: Bool = false
+  ) -> Bool {
+    if let nativeHandleGeneration {
+      guard nativeHandleGeneration == eventBridge.currentNativeHandleGeneration else {
+        return false
       }
     }
-    publishPlaybackIntent(intendsActivePlayback)
-    currentTime = .zero
-    duration = nil
-    isSeekable = false
-    isPausable = false
-    bufferFill = 0
-    activeVideoOutputs = 0
-    didReachEnd = false
-    withMutation(keyPath: \.position) {
-      _position = 0
+    guard let playbackGeneration else { return true }
+    guard playbackGeneration == eventBridge.currentPlaybackGeneration else { return false }
+    if allowsUnadoptedPlaybackGeneration {
+      return playbackGeneration >= sessionGeneration
     }
-    eventBridge.updateAuthoritativeTimeline(
-      time: .zero,
-      position: 0,
-      playbackGeneration: sessionGeneration,
-      timelineRevision: acceptedTimelineRevision
-    )
-    isSuppressingCapabilityPublish = false
-    // New media, new capability generation. The bump and the reset values are
-    // written under one lock acquisition, so a reader can never see the new
-    // generation carrying the outgoing media's capability — which would make
-    // it distrust the poll for the rest of that media's lifetime.
-    advanceCapabilityGeneration()
-    resetPlaybackHealth()
-  }
-
-  /// Re-applies the latest user intent to a media generation advanced by the
-  /// native callback lane. This is the authoritative close for a media switch
-  /// that occurs after `pause()` or `resume()` performs its final generation
-  /// read: adoption cannot clear the intent or leave the successor untouched.
-  func reconcilePauseControlAfterExternalMediaAdoption(
-    playbackGeneration: UInt64,
-    command: DeferredPauseCommand
-  ) {
-    guard !hasPauseControl(after: playbackGeneration) else { return }
-    setDeferredPauseCommand(command, playbackGeneration: playbackGeneration)
-    performDeferredPauseCommandIfNeeded()
-  }
-
-  /// Signals every observable whose value is read live from libVLC and
-  /// can change when a new media is loaded. libVLC emits no standalone
-  /// events for most of these (no `RateChanged`, no `AudioDelayChanged`,
-  /// etc. on the player's event manager), so SwiftUI would otherwise
-  /// keep showing the pre-swap value. Empty `withMutation` calls force
-  /// the getters to re-run next frame.
-  func notifyMediaDependentObservables() {
-    withMutation(keyPath: \.rate) {}
-    withMutation(keyPath: \.audioDelay) {}
-    withMutation(keyPath: \.subtitleDelay) {}
-    withMutation(keyPath: \.subtitleTextScale) {}
-    withMutation(keyPath: \.role) {}
-    withMutation(keyPath: \.stereoMode) {}
-    withMutation(keyPath: \.mixMode) {}
-    withMutation(keyPath: \.teletextPage) {}
-    withMutation(keyPath: \.currentChapter) {}
-    withMutation(keyPath: \.currentTitle) {}
-    withMutation(keyPath: \.abLoopState) {}
-    withMutation(keyPath: \.programs) {}
-    withMutation(keyPath: \.selectedProgram) {}
-    withMutation(keyPath: \.isProgramScrambled) {}
-    withMutation(keyPath: \.currentAudioDevice) {}
-    withMutation(keyPath: \.selectedAudioTrack) {}
-    withMutation(keyPath: \.selectedSubtitleTrack) {}
-    withMutation(keyPath: \.videoSize) {}
-    withMutation(keyPath: \.hasVideoOutput) {}
-  }
-
-  /// Reads length / seekable / pausable directly from libVLC and
-  /// publishes any changes to the matching observable property. Called
-  /// on state transitions and early time updates as a resilient companion
-  /// to `MediaPlayerLengthChanged` / `SeekableChanged` /
-  /// `PausableChanged`, which are not guaranteed to fire on the player's
-  /// event manager for every media.
-  func refreshNativeStateIfNeeded() {
-    if duration == nil {
-      let ms = libvlc_media_player_get_length(pointer)
-      if ms > 0 {
-        duration = .milliseconds(ms)
-      }
-    }
-
-    let nativeSeekable = libvlc_media_player_is_seekable(pointer)
-    if isSeekable != nativeSeekable {
-      isSeekable = nativeSeekable
-    }
-
-    let nativePausable = libvlc_media_player_can_pause(pointer)
-    if isPausable != nativePausable {
-      isPausable = nativePausable
-    }
-
-    // libVLC reports volume/mute via `libvlc_audio_get_volume` and
-    // `libvlc_audio_get_mute`; both return negative sentinels (observed
-    // as `-100` and `-1` respectively on libVLC 4.0) when the audio
-    // output isn't initialized yet. Only sync the shadow state from
-    // valid (non-negative) reads.
-    let nativeVolume = libvlc_audio_get_volume(pointer)
-    if nativeVolume >= 0 {
-      let normalized = Float(nativeVolume) / 100.0
-      if abs(_volume - normalized) > 0.001 {
-        withMutation(keyPath: \.volume) {
-          _volume = normalized
-        }
-      }
-    }
-
-    let nativeMute = libvlc_audio_get_mute(pointer)
-    if nativeMute >= 0 {
-      let muted = nativeMute > 0
-      if _isMuted != muted {
-        withMutation(keyPath: \.isMuted) {
-          _isMuted = muted
-        }
-      }
-    }
-  }
-
-  /// Re-reads the current media from libVLC, wrapping the C pointer in
-  /// a fresh `Media` value if one is now attached. Called when libVLC
-  /// emits `MediaChanged` (for media swaps initiated from a list
-  /// player, etc.).
-  func syncCurrentMediaFromNative() {
-    guard let media = libvlc_media_player_get_media(pointer) else {
-      currentMedia = nil
-      return
-    }
-    currentMedia = Media(retaining: media)
-  }
-
-  func _handleEventForTesting(_ event: PlayerEvent) {
-    handleEvent(event)
-  }
-
-  /// Injects an event attributed to a native-handle generation, so tests can
-  /// exercise the scoping in ``handleSourcedEvent(_:)``.
-  ///
-  /// Staging the attribution is the point: a retiring handle emitting after
-  /// its replacement is a race, not something a test can schedule.
-  func _handleEventForTesting(_ event: PlayerEvent, nativeHandleGeneration: UInt64) {
-    handleSourcedEvent(
-      SourcedPlayerEvent(
-        nativeHandleGeneration: nativeHandleGeneration,
-        playbackGeneration: sessionGeneration,
-        event: event
-      )
-    )
-  }
-
-  func _hasDeferredPauseForTesting() -> Bool {
-    deferredPauseCommand == .pause
-  }
-
-  func _setStateForTesting(
-    state: PlayerState? = nil,
-    isPlaybackRequestedActive: Bool? = nil,
-    currentTime: Duration? = nil,
-    duration: Duration? = nil,
-    position: Double? = nil,
-    isSeekable: Bool? = nil,
-    isPausable: Bool? = nil
-  ) {
-    if let state {
-      self.state = state
-      publishPlaybackIntent(state.isActive)
-    }
-    if let isPlaybackRequestedActive {
-      publishPlaybackIntent(isPlaybackRequestedActive)
-    }
-    if let currentTime {
-      self.currentTime = currentTime
-    }
-    if let duration {
-      self.duration = duration
-    }
-    if let position {
-      _position = position
-    }
-    if let isSeekable {
-      self.isSeekable = isSeekable
-    }
-    if let isPausable {
-      self.isPausable = isPausable
-    }
+    return playbackGeneration == sessionGeneration
   }
 }

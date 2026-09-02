@@ -107,11 +107,13 @@ The policy is chosen per stream, by what losing an event would cost:
 - ``Player/timingEvents`` is deliberately coalesced: only the newest
   clock sample means anything.
 - ``Player/controlEvents``, ``Player/stateTransitions``,
-  ``PiPController/pipEvents``, ``DialogHandler/dialogs`` and
-  ``RendererDiscoverer/events`` are unbounded. Their events are
-  one-shot, and a dropped one does not come round again — a terminal
-  state, a discovered device, or a dialog prompt that VLC is blocked
-  waiting for a reply to.
+  ``PiPController/pipEvents`` and ``DialogHandler/dialogs`` are unbounded.
+  Their events are one-shot, and a dropped one does not come round again — a
+  terminal state or a dialog prompt that VLC is blocked waiting for a reply to.
+- ``RendererDiscoverer/events`` is also unbounded, and each new stream first
+  replays the discoverer's complete current renderer inventory. This keeps a
+  late-subscribing device picker coherent even when libVLC found a renderer
+  synchronously during `start()`.
 
 ## SwiftUI
 

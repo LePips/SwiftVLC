@@ -190,6 +190,30 @@ enum libvlc_event_e {
     libvlc_MediaPlayerTitleSelectionChanged,
     libvlc_MediaPlayerChapterChanged,
     libvlc_MediaPlayerRecordChanged,
+    /**
+     * A strict, request-correlated frame step reached a terminal state.
+     *
+     * The event is emitted exactly once for every request accepted by
+     * swiftvlc_libvlc_media_player_request_next_frame(). Success means the
+     * exact picture was accepted by output submission and its video-clock
+     * update completed. Positive values are explicit retry/end states;
+     * negative values are errno-style failures or cancellation.
+     */
+    libvlc_MediaPlayerFrameStepCompleted,
+    /**
+     * An effective player control-rate resolution was reported.
+     *
+     * The value is the rate reported by the player at notification time, not
+     * measured media throughput. After a control is queued to an active input,
+     * the event carries that input's resolved rate and is not emitted if the
+     * rate remains unchanged. With no active input, or when queuing fails, the
+     * saved/effective control state is reported immediately.
+     * The notification may repeat a previously reported value.
+     * Events do not carry request identifiers.
+     *
+     * See media_player_rate_changed in \ref libvlc_event_t.u.
+     */
+    libvlc_MediaPlayerRateChanged,
 
     /**
      * A \link #libvlc_media_t media item\endlink was added to a
@@ -423,6 +447,19 @@ typedef struct libvlc_event_t
             libvlc_media_t * media;
             libvlc_stopping_reason_t reason;
         } media_player_media_stopping;
+
+        struct
+        {
+            uint64_t request_id;
+            int64_t time_us;
+            int status;
+            float position;
+        } media_player_frame_step_completed;
+
+        struct
+        {
+            float new_rate;
+        } media_player_rate_changed;
 
 
         /* ESAdded, ESDeleted, ESUpdated */

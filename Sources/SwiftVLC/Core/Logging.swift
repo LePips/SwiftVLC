@@ -61,6 +61,21 @@ extension VLCInstance {
   ) -> AsyncStream<LogEntry> {
     logBroadcaster.subscribe(minimumLevel: minimumLevel)
   }
+
+  /// Creates a log stream only after its native callback is installed.
+  ///
+  /// Release qualification uses this handshake before writing its durable
+  /// logger-health record. Qualification records must be lossless, so this
+  /// stream is unbounded; its consumer must continuously drain it into the
+  /// durable log. It is SPI because ordinary consumers should use
+  /// ``logStream(minimumLevel:)``, whose bounded buffer cannot grow without
+  /// limit when a client falls behind.
+  @_spi(Qualification)
+  public func qualificationLogStream(
+    minimumLevel: LogLevel = .warning
+  ) -> AsyncStream<LogEntry>? {
+    logBroadcaster.subscribeAndWaitForInstallation(minimumLevel: minimumLevel)
+  }
 }
 
 // MARK: - Internal Broadcaster
@@ -173,6 +188,19 @@ final class LogBroadcaster: Sendable {
     broadcaster.subscribe { entry in
       entry.level >= minimumLevel
     }
+  }
+
+  /// Subscribes, drains the lifecycle queue, and verifies that the C bridge
+  /// owns a live callback context before returning the stream.
+  func subscribeAndWaitForInstallation(
+    minimumLevel: LogLevel
+  ) -> AsyncStream<LogEntry>? {
+    let stream = broadcaster.subscribe(policy: .unbounded) { entry in
+      entry.level >= minimumLevel
+    }
+    broadcaster.waitForLifecycleCallbacks()
+    let installed = installation.state.withLock { $0.bridgeContext != nil }
+    return installed ? stream : nil
   }
 
   /// Terminates all active subscribers and uninstalls the libVLC log

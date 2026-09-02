@@ -18,6 +18,35 @@ around freely. A typical pattern is to build a ``Media`` on a
 background task, transfer it to the main actor, and play it from
 there.
 
+## Synchronous Observation reentrancy
+
+Swift Observation invokes an `onChange` callback synchronously, before the
+mutation body that triggered it. An observer is therefore allowed to call
+back into a ``Player`` before the older control has reached libVLC.
+
+SwiftVLC gives every accepted control invocation a monotonic, per-control
+identity and captures the exact native-handle and playback generations before
+publishing its Observation change:
+
+- A newer invocation of the same control wins, including a no-op that restores
+  the value which was current when the observer ran.
+- A synchronous `load(_:)`, `play(_:)`, native-handle replacement, or
+  `shutdown()` supersedes an older control. The older call returns without
+  writing through the successor handle. A throwing control reports a native
+  error only when that invocation actually reached the handle it captured.
+- Independent controls do not supersede one another. For example, a mute
+  command issued by a volume observer remains valid unless media or native
+  identity also changes.
+- Native refreshes publish a sampled value only while both its source identity
+  and the corresponding user-control revision remain current. A refresh can
+  never overwrite a newer command or copy a retiring media's tracks into its
+  successor.
+
+``Equalizer`` applies the same last-invoked-wins rule across its band APIs and
+preamp control. These guarantees are about synchronous reentrancy as well as
+ordinary main-actor serialization; applications do not need to defer control
+changes out of Observation callbacks.
+
 ## The sending transfer
 
 ``Player/load(_:)`` and ``Player/play(_:)`` take `sending Media`:
@@ -73,9 +102,10 @@ cancellation behavior:
   and request teardown are complete before the task returns.
 
 Other asynchronous operations document their own completion contract.
-For example, ``Player/stopAndWait()`` and ``Player/shutdown()`` wait for
-native lifecycle teardown and do not advertise the parsing cancellation
-contract.
+For example, ``Player/stopAndWaitForOutcome()`` and ``Player/shutdown()`` wait
+for native lifecycle teardown and do not advertise the parsing cancellation
+contract. ``Player/stopAndWait()`` is the version-1 compatibility action that
+discards the bounded stop outcome.
 
 - Streams finish when their owning type (`Player`, `VLCInstance`, or
   a discoverer) is released.

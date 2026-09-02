@@ -101,6 +101,22 @@ try player.setPlaybackRate(.double)
 player.setSubtitleScale(.doubleSize)
 ```
 
+`setPlaybackRate(_:)` confirms only that libVLC accepted the command into its
+control path. The active input applies rate changes asynchronously and may
+fall back (commonly to `1.0` for unsupported streams), so read `player.rate`
+after the transition when the effective control setting matters. That value is
+still not a measurement of decoded or presented frame throughput.
+
+When ``Player/supportsEffectivePlaybackRateEvents`` is true,
+``Player/effectivePlaybackRateResolutions`` reports
+``EffectivePlaybackRateResolution`` values and invalidates the observable
+``Player/rate``. Each value carries the exact native-handle and playback
+generation captured at callback entry, so queued work can reject a retired
+handle or superseded media session. It is not a completion for a specific
+request: rapid requests carry no IDs. A queued active-input request is silent
+when its resolved rate is unchanged; with no input, or if native queuing fails,
+the stream may instead repeat the current effective value.
+
 The typed wrappers — ``PlaybackPosition``, ``Volume``, ``PlaybackRate``,
 ``SubtitleScale``, ``EqualizerGain`` — are `Hashable`, `Comparable`,
 and `ExpressibleByFloatLiteral` so they fit naturally into existing
@@ -120,9 +136,21 @@ player.nextFrame()             // pause + step one frame
 ```
 
 Seeks throw when the current media is not seekable or the requested time
-is outside the known playable range. Native completion is asynchronous;
-observe ``Player/currentTime`` or ``PlayerEvent/timeChanged(_:)`` for
-the final libVLC timestamp.
+is outside the known playable range. Native completion is asynchronous. When
+the caller needs to distinguish an authoritative landing from rejection,
+timeout, or supersession, use ``Player/requestSeek(to:fast:)-(Duration,_)`` (or
+its `PlaybackPosition` overload) and await the returned ``SeekRequest``:
+
+```swift
+let request = try player.requestSeek(to: .seconds(30), fast: false)
+guard request.initialOutcome == .pending else { return }
+
+switch await request.outcome {
+case .settled: updateTransportUI()
+case .timedOut, .superseded, .rejected: recoverTransportUI()
+case .pending: break // `outcome` is always terminal
+}
+```
 
 For live, timeshift, and unknown-duration media the strict seeks cannot
 validate a target. Use the best-effort, non-throwing
@@ -151,6 +179,24 @@ case .pending: break // `outcome` is always terminal
 The request is generation- and timeline-revision-bound. A matching native
 time sample settles it; a newer seek or media lifecycle change reports
 `.superseded`; and a missing sample reports `.timedOut` after a bounded wait.
+
+For frame stepping, ``Player/nextFrame()`` remains the fire-and-forget API.
+Use ``Player/requestNextFrame()`` when the caller needs an exact terminal:
+
+```swift
+let request = player.requestNextFrame()
+switch await request.outcome {
+case .submitted(let time, _): updateFrameTime(time)
+case .noFrame: showEndOfMedia()
+case .failed, .invalidEvidence, .timedOut, .superseded, .rejected: recoverTransportUI()
+case .pending: break // `outcome` is always terminal
+}
+```
+
+`.submitted` proves that libVLC accepted that request's exact picture for
+output submission and updated its video clock. It deliberately does not claim
+that display hardware scanned the picture out; release qualification verifies
+visible output independently on a physical device.
 
 ## The raw event stream
 
@@ -259,15 +305,21 @@ See <doc:ConcurrencyModel> for the full isolation story.
 - ``Player/pause()``
 - ``Player/resume()``
 - ``Player/stop()``
-- ``Player/seek(to:fast:)``
-- ``Player/seek(to:)-(PlaybackPosition)``
+- ``Player/seek(to:fast:)-(Duration,_)``
+- ``Player/seek(to:fast:)-(PlaybackPosition,_)``
 - ``Player/seek(by:fast:)``
 - ``Player/seek(toPosition:fast:)``
+- ``Player/requestSeek(to:fast:)-(Duration,_)``
+- ``Player/requestSeek(to:fast:)-(PlaybackPosition,_)``
+- ``Player/requestSeek(toPosition:fast:)``
 - ``Player/jump(by:)``
 - ``Player/requestJump(by:)``
 - ``SeekRequest``
 - ``SeekOutcome``
 - ``Player/nextFrame()``
+- ``Player/requestNextFrame()``
+- ``FrameStepRequest``
+- ``FrameStepOutcome``
 
 ### Observable properties
 - ``Player/position``

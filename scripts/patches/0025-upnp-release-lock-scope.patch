@@ -1,15 +1,53 @@
-# Do not hold the process-global UPnP wrapper lock during libupnp shutdown.
+# Serialize the process-global UPnP wrapper lifecycle without holding its
+# mutex across libupnp shutdown.
 #
-# UpnpFinish() waits for libupnp's receive workers to exit. An in-flight SSDP
-# worker can be inside UpnpInstanceWrapper::Callback(), which needs s_lock to
-# finish. release() previously retained s_lock while deleting the last wrapper,
-# so shutdown waited for the callback while the callback waited for shutdown's
-# lock. Select the object under the mutex, then destroy it after unlocking.
+# UpnpFinish() waits for receive workers that can reenter
+# UpnpInstanceWrapper::Callback(), which needs s_lock. The last release marks
+# the singleton TearingDown under the lock, destroys it after unlocking, then
+# publishes Absent and broadcasts. A concurrent get waits while teardown is in
+# progress, so a second libupnp instance cannot start before Finish completes.
+#
+# Lifecycle: Absent -> Live -> TearingDown -> Absent.
 diff --git a/modules/services_discovery/upnp-wrapper.cpp b/modules/services_discovery/upnp-wrapper.cpp
-index 2a85d681a6..716fa35aac 100644
+index 2a85d681a62cef04a4b01a32b70e1d70c42bf3bb..8618e9ec2a76b831230a6d570f17a67b7db92d75 100644
 --- a/modules/services_discovery/upnp-wrapper.cpp
 +++ b/modules/services_discovery/upnp-wrapper.cpp
-@@ -110,12 +110,15 @@ UpnpInstanceWrapper *UpnpInstanceWrapper::get(vlc_object_t *p_obj)
+@@ -31,8 +31,11 @@
+ #include "upnp-wrapper.hpp"
+ 
+ UpnpInstanceWrapper* UpnpInstanceWrapper::s_instance;
++UpnpInstanceWrapper::InstanceState UpnpInstanceWrapper::s_state =
++    UpnpInstanceWrapper::InstanceState::Absent;
+ UpnpInstanceWrapper::Listeners UpnpInstanceWrapper::s_listeners;
+ vlc::threads::mutex UpnpInstanceWrapper::s_lock;
++vlc::threads::condition_variable UpnpInstanceWrapper::s_state_changed;
+ 
+ UpnpInstanceWrapper::UpnpInstanceWrapper()
+     : m_handle( -1 )
+@@ -52,7 +55,11 @@ UpnpInstanceWrapper::~UpnpInstanceWrapper()
+ UpnpInstanceWrapper *UpnpInstanceWrapper::get(vlc_object_t *p_obj)
+ {
+     vlc::threads::mutex_locker lock( s_lock );
+-    if ( s_instance == NULL )
++    while ( s_state == InstanceState::TearingDown )
++        s_state_changed.wait( s_lock );
++
++    assert( (s_state == InstanceState::Absent) == (s_instance == NULL) );
++    if ( s_state == InstanceState::Absent )
+     {
+         UpnpInstanceWrapper* instance = new(std::nothrow) UpnpInstanceWrapper;
+         if ( unlikely( !instance ) )
+@@ -102,7 +109,9 @@ UpnpInstanceWrapper *UpnpInstanceWrapper::get(vlc_object_t *p_obj)
+             return NULL;
+         }
+         s_instance = instance;
++        s_state = InstanceState::Live;
+     }
++    assert( s_state == InstanceState::Live && s_instance != NULL );
+     s_instance->m_refcount++;
+     return s_instance;
+ }
+@@ -110,13 +119,28 @@ UpnpInstanceWrapper *UpnpInstanceWrapper::get(vlc_object_t *p_obj)
  void UpnpInstanceWrapper::release()
  {
      UpnpInstanceWrapper *p_delete = NULL;
@@ -19,13 +57,48 @@ index 2a85d681a6..716fa35aac 100644
 -        p_delete = s_instance;
 -        s_instance = NULL;
 +        vlc::threads::mutex_locker lock( s_lock );
-+        if (--s_instance->m_refcount == 0)
++        assert( s_state == InstanceState::Live );
++        assert( s_instance == this && m_refcount > 0 );
++        if (--m_refcount == 0)
 +        {
-+            p_delete = s_instance;
++            p_delete = this;
 +            s_instance = NULL;
++            s_state = InstanceState::TearingDown;
 +        }
      }
 +
      delete p_delete;
++
++    if ( p_delete != NULL )
++    {
++        vlc::threads::mutex_locker lock( s_lock );
++        assert( s_state == InstanceState::TearingDown );
++        assert( s_instance == NULL );
++        s_state = InstanceState::Absent;
++        s_state_changed.broadcast();
++    }
  }
  
+ UpnpClient_Handle UpnpInstanceWrapper::handle() const
+diff --git a/modules/services_discovery/upnp-wrapper.hpp b/modules/services_discovery/upnp-wrapper.hpp
+index 619afd764d74749419c4f6a4c39fa338f6875430..de1c4abd2df5c0239a9c92b9c5471b6b30bbdce7 100644
+--- a/modules/services_discovery/upnp-wrapper.hpp
++++ b/modules/services_discovery/upnp-wrapper.hpp
+@@ -63,8 +63,17 @@ public:
+     };
+ 
+ private:
++    enum class InstanceState
++    {
++        Absent,
++        Live,
++        TearingDown,
++    };
++
+     static UpnpInstanceWrapper* s_instance;
++    static InstanceState s_state;
+     static vlc::threads::mutex s_lock;
++    static vlc::threads::condition_variable s_state_changed;
+     UpnpClient_Handle m_handle;
+     bool m_initialized;
+     int m_refcount;

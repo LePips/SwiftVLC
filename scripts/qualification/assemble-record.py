@@ -14,6 +14,9 @@ import sys
 import tempfile
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import qualification_policy as policy
+
 
 class AssemblyError(ValueError):
     pass
@@ -26,52 +29,16 @@ ROW_ID = re.compile(r"[a-z0-9][a-z0-9-]*")
 
 def load_object(path: Path, description: str) -> dict:
     try:
-        value = json.loads(path.read_text())
-    except (OSError, ValueError) as error:
-        raise AssemblyError(f"cannot read {description} {path}: {error}") from error
-    if not isinstance(value, dict):
-        raise AssemblyError(f"{description} {path} must be a JSON object")
-    return value
+        return policy.load_json(path, description)
+    except policy.QualificationPolicyError as error:
+        raise AssemblyError(str(error)) from error
 
 
 def required_rows(matrix: dict) -> set[tuple[str, str]]:
-    scenarios = matrix.get("scenarios")
-    hardware = matrix.get("hardware")
-    if not isinstance(scenarios, list) or not isinstance(hardware, list):
-        raise AssemblyError("qualification matrix needs scenarios and hardware arrays")
-    if any(
-        not isinstance(row, dict)
-        or not ROW_ID.fullmatch(str(row.get("id", "")))
-        for row in hardware
-    ):
-        raise AssemblyError("qualification matrix has an invalid hardware id")
-    hardware_ids = {row["id"] for row in hardware}
-    if len(hardware_ids) != len(hardware):
-        raise AssemblyError("qualification matrix has invalid or duplicate hardware ids")
-
-    result: set[tuple[str, str]] = set()
-    scenario_ids: set[str] = set()
-    for scenario in scenarios:
-        if (
-            not isinstance(scenario, dict)
-            or not ROW_ID.fullmatch(str(scenario.get("id", "")))
-        ):
-            raise AssemblyError("qualification matrix has an invalid scenario id")
-        scenario_id = scenario["id"]
-        if scenario_id in scenario_ids:
-            raise AssemblyError("qualification matrix has duplicate scenario ids")
-        scenario_ids.add(scenario_id)
-        selected = scenario.get("hardware", sorted(hardware_ids))
-        if not isinstance(selected, list) or not selected:
-            raise AssemblyError(f"scenario {scenario_id!r} has no hardware rows")
-        unknown = set(selected) - hardware_ids
-        if unknown:
-            raise AssemblyError(
-                f"scenario {scenario_id!r} has unknown hardware rows: "
-                + ", ".join(sorted(unknown))
-            )
-        result.update((scenario_id, hardware_id) for hardware_id in selected)
-    return result
+    try:
+        return policy.required_rows(matrix)
+    except policy.QualificationPolicyError as error:
+        raise AssemblyError(str(error)) from error
 
 
 def safe_evidence_path(report_path: Path, relative: object) -> Path:
@@ -79,7 +46,9 @@ def safe_evidence_path(report_path: Path, relative: object) -> Path:
         raise AssemblyError(f"report {report_path} row has no evidence path")
     candidate = Path(relative)
     if candidate.is_absolute() or ".." in candidate.parts:
-        raise AssemblyError(f"report {report_path} has unsafe evidence path {relative!r}")
+        raise AssemblyError(
+            f"report {report_path} has unsafe evidence path {relative!r}"
+        )
     resolved = (report_path.parent / candidate).resolve()
     try:
         resolved.relative_to(report_path.parent.resolve())
@@ -120,7 +89,9 @@ def safe_evidence_artifact_path(
 
 def tree_digest(root: Path) -> str:
     digest = hashlib.sha256(b"SwiftVLC artifact tree digest v1\0")
-    entries = sorted(root.rglob("*"), key=lambda path: path.relative_to(root).as_posix())
+    entries = sorted(
+        root.rglob("*"), key=lambda path: path.relative_to(root).as_posix()
+    )
     if not entries:
         raise AssemblyError(f"trace is empty: {root}")
 
@@ -172,11 +143,26 @@ def retained_trace_artifacts(
         f"{description} table of contents",
         directory=False,
     )
+    summary_source, summary_relative = safe_evidence_artifact_path(
+        evidence_path,
+        trace.get("exportSummary"),
+        f"{description} xctrace export summary",
+        directory=False,
+    )
     if tree_digest(trace_source) != trace.get("treeDigest"):
         raise AssemblyError(f"evidence {evidence_path} {description} digest mismatch")
+    if (
+        trace.get("exportSummaryDigestAlgorithm") != "sha256"
+        or policy.sha256_file(summary_source) != trace.get("exportSummaryDigest")
+        or summary_source.stat().st_size != trace.get("exportSummarySizeBytes")
+    ):
+        raise AssemblyError(
+            f"evidence {evidence_path} {description} export summary mismatch"
+        )
     return [
         (trace_source, trace_relative, True),
         (toc_source, toc_relative, False),
+        (summary_source, summary_relative, False),
     ]
 
 
@@ -201,12 +187,54 @@ def retained_file_artifact(
     return [(source, relative, False)]
 
 
+def retained_progressive_transcript_artifacts(
+    report_root: Path, evidence_path: Path, records: object
+) -> list[tuple[Path, Path, bool]]:
+    if not isinstance(records, list) or not records:
+        raise AssemblyError(
+            f"evidence {evidence_path} has no progressive server transcripts"
+        )
+    artifacts: list[tuple[Path, Path, bool]] = []
+    for transcript_index, transcript in enumerate(records, 1):
+        if not isinstance(transcript, dict):
+            raise AssemblyError(
+                f"evidence {evidence_path} transcript {transcript_index} is malformed"
+            )
+        try:
+            transcript_source = policy.safe_relative_file(
+                report_root,
+                transcript.get("relativePath"),
+                f"progressive transcript {transcript_index}",
+            )
+        except policy.QualificationPolicyError as error:
+            raise AssemblyError(str(error)) from error
+        if (
+            transcript.get("digestAlgorithm") != "sha256"
+            or policy.sha256_file(transcript_source) != transcript.get("digest")
+            or transcript_source.stat().st_size != transcript.get("sizeBytes")
+        ):
+            raise AssemblyError(
+                f"evidence {evidence_path} transcript {transcript_index} binding mismatch"
+            )
+        artifacts.append(
+            (
+                transcript_source,
+                Path(transcript["relativePath"]),
+                False,
+            )
+        )
+    return artifacts
+
+
 def assemble(
     version: str,
     candidate_path: Path,
     matrix_path: Path,
     report_paths: list[Path],
     output_path: Path,
+    *,
+    feature_manifest_path: Path | None = None,
+    profiles_path: Path | None = None,
 ) -> dict:
     if not report_paths:
         raise AssemblyError("at least one device report is required")
@@ -215,15 +243,12 @@ def assemble(
     matrix_checksum = hashlib.sha256(matrix_path.read_bytes()).hexdigest()
     required = required_rows(matrix)
 
-    identity = {
-        "version": version,
-        "artifactDigestAlgorithm": "swiftvlc-tree-v1",
-        "artifactDigest": candidate.get("artifactDigest"),
-        "sourceCommit": candidate.get("sourceCommit"),
-        "releaseSourceDigestAlgorithm": "swiftvlc-git-tree-v1",
-        "releaseSourceDigest": candidate.get("releaseSourceDigest"),
-        "qualificationMatrixChecksum": matrix_checksum,
-    }
+    try:
+        policy.validate_candidate_identity(candidate, strict=True)
+    except policy.QualificationPolicyError as error:
+        raise AssemblyError(str(error)) from error
+    identity = {field: candidate.get(field) for field in policy.CORE_IDENTITY_FIELDS}
+    identity["formatVersion"] = 2
     for field, pattern in (
         ("artifactDigest", SHA256),
         ("sourceCommit", SHA1),
@@ -244,14 +269,80 @@ def assemble(
                 f"candidate metadata {field} mismatch: "
                 f"{candidate.get(field)!r} != {expected!r}"
             )
+    if identity["qualificationMatrixChecksum"] != matrix_checksum:
+        raise AssemblyError(
+            "candidate qualificationMatrixChecksum does not match the selected matrix"
+        )
+    for path, field, description in (
+        (feature_manifest_path, "featureManifestChecksum", "feature manifest"),
+        (profiles_path, "qualificationProfilesChecksum", "qualification profiles"),
+    ):
+        if path is not None:
+            actual = policy.sha256_file(path)
+            if candidate.get(field) != actual:
+                raise AssemblyError(
+                    f"candidate {field} does not match the selected {description}"
+                )
 
     rows: dict[tuple[str, str], tuple[dict, Path, list[tuple[Path, Path, bool]]]] = {}
+    runner_summaries: dict[tuple[str, str], dict] = {}
+    source_report_trees: list[tuple[Path, Path, dict]] = []
     for report_path in report_paths:
-        report = load_object(report_path, "device report")
+        try:
+            canonical_report_path = policy.safe_relative_file(
+                report_path.parent,
+                report_path.name,
+                f"source report {report_path}",
+            )
+        except policy.QualificationPolicyError as error:
+            raise AssemblyError(str(error)) from error
+        source_root = canonical_report_path.parent
+        try:
+            output_path.parent.resolve().relative_to(source_root.resolve())
+        except ValueError:
+            pass
+        else:
+            raise AssemblyError(
+                f"output directory may not be inside source report tree {source_root}"
+            )
+        try:
+            report = policy.validate_report(
+                canonical_report_path,
+                matrix,
+                candidate=candidate,
+                stable_required=True,
+                strict_provenance=True,
+            )
+        except policy.QualificationPolicyError as error:
+            raise AssemblyError(str(error)) from error
+        try:
+            source_tree_digest = policy.tree_digest(source_root)
+            source_tree_size = policy.tree_size_bytes(source_root)
+        except policy.QualificationPolicyError as error:
+            raise AssemblyError(str(error)) from error
+        source_tree_relative = Path("reports") / version / source_tree_digest
+        source_report_trees.append(
+            (
+                source_root,
+                source_tree_relative,
+                {
+                    "path": source_tree_relative.as_posix(),
+                    "reportRelativePath": canonical_report_path.name,
+                    "reportDigestAlgorithm": "sha256",
+                    "reportDigest": policy.sha256_file(canonical_report_path),
+                    "reportSizeBytes": canonical_report_path.stat().st_size,
+                    "treeDigestAlgorithm": "swiftvlc-tree-v1",
+                    "treeDigest": source_tree_digest,
+                    "treeSizeBytes": source_tree_size,
+                },
+            )
+        )
         if report.get("result") != "pass":
             raise AssemblyError(f"report {report_path} did not pass")
         if report.get("qualificationEligibleEnvironment") is not True:
-            raise AssemblyError(f"report {report_path} is not from a qualifying environment")
+            raise AssemblyError(
+                f"report {report_path} is not from a qualifying environment"
+            )
         if report.get("mode") != "qualification":
             raise AssemblyError(f"report {report_path} is not in qualification mode")
         for field, expected in identity.items():
@@ -264,6 +355,37 @@ def assemble(
         report_rows = report.get("qualificationRows")
         if not isinstance(report_rows, list) or not report_rows:
             raise AssemblyError(f"report {report_path} has no qualification rows")
+        report_hardware = {
+            row.get("hardware") for row in report_rows if isinstance(row, dict)
+        }
+        if len(report_hardware) != 1 or not all(
+            isinstance(item, str) for item in report_hardware
+        ):
+            raise AssemblyError(
+                f"report {report_path} must describe exactly one hardware row"
+            )
+        hardware_id = next(iter(report_hardware))
+        source_report_relative = (
+            source_tree_relative / canonical_report_path.name
+        ).as_posix()
+        for runner_row in report.get("scenarios", []):
+            if not isinstance(runner_row, dict):
+                raise AssemblyError(
+                    f"report {report_path} contains a non-object runner row"
+                )
+            runner_id = runner_row.get("scenario")
+            if not isinstance(runner_id, str):
+                raise AssemblyError(
+                    f"report {report_path} contains a runner without an id"
+                )
+            runner_key = (runner_id, hardware_id)
+            if runner_key in runner_summaries:
+                raise AssemblyError(
+                    f"duplicate runner scenario {runner_id} on {hardware_id}"
+                )
+            runner_summaries[runner_key] = policy.runner_record_summary(
+                runner_row, hardware_id, source_report_relative
+            )
         for row in report_rows:
             if not isinstance(row, dict):
                 raise AssemblyError(f"report {report_path} contains a non-object row")
@@ -275,31 +397,26 @@ def assemble(
                 )
             key = (scenario, hardware)
             if key not in required:
-                raise AssemblyError(f"report {report_path} contains unknown row {key!r}")
-            if key in rows:
                 raise AssemblyError(
-                    f"duplicate qualification row {key[0]} on {key[1]}"
+                    f"report {report_path} contains unknown row {key!r}"
                 )
+            if key in rows:
+                raise AssemblyError(f"duplicate qualification row {key[0]} on {key[1]}")
             if row.get("result") != "pass":
                 raise AssemblyError(f"row {key[0]} on {key[1]} did not pass")
             if row.get("osReleaseType") != "stable":
-                raise AssemblyError(f"row {key[0]} on {key[1]} is not from stable OS software")
+                raise AssemblyError(
+                    f"row {key[0]} on {key[1]} is not from stable OS software"
+                )
             evidence_path = safe_evidence_path(report_path, row.get("evidence"))
             evidence = load_object(evidence_path, "evidence")
-            for field, expected in (
-                ("artifactDigest", identity["artifactDigest"]),
-                ("releaseSourceDigest", identity["releaseSourceDigest"]),
-                ("scenario", key[0]),
-                ("hardware", key[1]),
-            ):
-                if evidence.get(field) != expected:
-                    raise AssemblyError(
-                        f"evidence {evidence_path} {field} mismatch: "
-                        f"{evidence.get(field)!r} != {expected!r}"
-                    )
             artifacts: list[tuple[Path, Path, bool]] = []
             provenance = evidence.get("allocationProvenance")
-            trace = provenance.get("instrumentsTrace") if isinstance(provenance, dict) else None
+            trace = (
+                provenance.get("instrumentsTrace")
+                if isinstance(provenance, dict)
+                else None
+            )
             if trace is not None:
                 artifacts.extend(
                     retained_trace_artifacts(evidence_path, trace, "allocation trace")
@@ -370,6 +487,14 @@ def assemble(
                         "raw timebase capture",
                     )
                 )
+            if key[0] == "progressive-http-range-seek":
+                artifacts.extend(
+                    retained_progressive_transcript_artifacts(
+                        report_path.parent,
+                        evidence_path,
+                        evidence.get("progressiveServerTranscripts"),
+                    )
+                )
             rows[key] = (row, evidence_path, artifacts)
 
     evidence_directory = output_path.parent / "evidence" / version
@@ -383,6 +508,23 @@ def assemble(
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     evidence_directory.mkdir(parents=True, exist_ok=True)
+    for source_root, relative, binding in source_report_trees:
+        destination = output_path.parent / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if destination.exists():
+            try:
+                identical = (
+                    policy.tree_digest(destination) == binding["treeDigest"]
+                    and policy.tree_size_bytes(destination) == binding["treeSizeBytes"]
+                )
+            except policy.QualificationPolicyError:
+                identical = False
+            if not identical:
+                raise AssemblyError(
+                    f"retained source report tree collision: {relative}"
+                )
+        else:
+            shutil.copytree(source_root, destination, symlinks=True)
     for key, (_, source, artifacts) in sorted(rows.items()):
         destination = evidence_directory / f"{key[0]}-{key[1]}.json"
         with tempfile.NamedTemporaryFile(
@@ -401,11 +543,13 @@ def assemble(
                 identical = (
                     is_directory
                     and artifact_destination.is_dir()
-                    and tree_digest(artifact_destination) == tree_digest(artifact_source)
+                    and tree_digest(artifact_destination)
+                    == tree_digest(artifact_source)
                 ) or (
                     not is_directory
                     and artifact_destination.is_file()
-                    and artifact_destination.read_bytes() == artifact_source.read_bytes()
+                    and artifact_destination.read_bytes()
+                    == artifact_source.read_bytes()
                 )
                 if not identical:
                     raise AssemblyError(
@@ -417,7 +561,17 @@ def assemble(
             else:
                 shutil.copyfile(artifact_source, artifact_destination)
 
-    record = {**identity, "rows": staged_rows}
+    record = {
+        **identity,
+        "sourceReports": [
+            binding
+            for _, _, binding in sorted(
+                source_report_trees, key=lambda item: item[1].as_posix()
+            )
+        ],
+        "runnerScenarios": [runner_summaries[key] for key in sorted(runner_summaries)],
+        "rows": staged_rows,
+    }
     with tempfile.NamedTemporaryFile(
         mode="w",
         dir=output_path.parent,
@@ -431,16 +585,38 @@ def assemble(
         os.replace(temporary_path, output_path)
     finally:
         temporary_path.unlink(missing_ok=True)
+    try:
+        policy.validate_record(
+            output_path,
+            matrix,
+            expected_identity=candidate,
+            strict_provenance=True,
+            require_complete=False,
+        )
+    except policy.QualificationPolicyError as error:
+        output_path.unlink(missing_ok=True)
+        raise AssemblyError(str(error)) from error
     return record
 
 
 def main() -> int:
+    script_directory = Path(__file__).resolve().parent
     parser = argparse.ArgumentParser()
     parser.add_argument("--version", required=True)
     parser.add_argument("--candidate-metadata", type=Path, required=True)
     parser.add_argument("--matrix", type=Path, required=True)
     parser.add_argument("--report", type=Path, action="append", required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--feature-manifest",
+        type=Path,
+        default=script_directory / "feature-manifest-v1.json",
+    )
+    parser.add_argument(
+        "--profiles",
+        type=Path,
+        default=script_directory / "profiles-v1.json",
+    )
     args = parser.parse_args()
     try:
         record = assemble(
@@ -449,6 +625,8 @@ def main() -> int:
             args.matrix,
             args.report,
             args.output,
+            feature_manifest_path=args.feature_manifest,
+            profiles_path=args.profiles,
         )
     except AssemblyError as error:
         print(f"Error: {error}", file=sys.stderr)

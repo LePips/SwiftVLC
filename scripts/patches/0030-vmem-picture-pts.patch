@@ -1,0 +1,354 @@
+diff --git a/include/vlc/libvlc_media_player.h b/include/vlc/libvlc_media_player.h
+index a0978dcaf0cf4ab0993af0bc15274ba639979341..3056ea17b500a60b0de300bd6544b8043991e197 100644
+--- a/include/vlc/libvlc_media_player.h
++++ b/include/vlc/libvlc_media_player.h
+@@ -387,7 +387,10 @@ typedef enum swiftvlc_frame_step_status_t
+  * time and seekability without changing the version-1 layout. Version 3 adds
+  * native PiP overlay composition. Version 4 adds strict request-correlated
+  * frame stepping and result-bearing vmem output submission. Version 5 adds a
+- * coherent native Apple sample-buffer renderer recovery snapshot.
++ * coherent native Apple sample-buffer renderer recovery snapshot. Version 6
++ * adds an atomic vmem generation whose result-bearing display callback also
++ * receives the post-filter, vout-selected picture presentation timestamp at
++ * the vmem output-attempt boundary.
+  */
+ LIBVLC_API unsigned swiftvlc_libvlc_pip_extensions_version( void );
+ 
+@@ -826,6 +829,42 @@ int swiftvlc_libvlc_video_set_callbacks_atomic(
+     libvlc_video_cleanup_cb cleanup,
+     void *opaque );
+ 
++/**
++ * Atomically install SwiftVLC's timestamp-bearing vmem generation.
++ *
++ * This is the version-6 counterpart of
++ * swiftvlc_libvlc_video_set_callbacks_atomic(). A successful enable publishes
++ * lock, unlock, legacy display, enhanced result-bearing display,
++ * geometry-aware setup, cleanup and opaque as one immutable tuple. The
++ * enhanced callback receives the presentation time of the post-filter,
++ * vout-selected picture reaching the vmem output attempt. It receives
++ * SWIFTVLC_VMEM_INVALID_PICTURE_PTS_US when that picture has no valid
++ * timestamp. The invalid sentinel does not reject the picture.
++ *
++ * A vmem output racing this call can retain only the complete old tuple or the
++ * complete new tuple. Passing NULL for every callback and opaque atomically
++ * disables the tuple. Any other partial combination is rejected without
++ * changing the currently published generation.
++ *
++ * This API is additive. It does not change the signature or behavior of
++ * swiftvlc_video_display_status_cb or
++ * swiftvlc_libvlc_video_set_callbacks_atomic().
++ *
++ * \retval 0 if the complete generation was published
++ * \retval -EINVAL if the arguments describe a partial generation
++ * \retval -ENOMEM if immutable generation allocation failed
++ */
++LIBVLC_API
++int swiftvlc_libvlc_video_set_callbacks_atomic_v2(
++    libvlc_media_player_t *mp,
++    libvlc_video_lock_cb lock,
++    libvlc_video_unlock_cb unlock,
++    libvlc_video_display_cb display,
++    swiftvlc_video_display_status_v2_cb display_status_v2,
++    swiftvlc_video_format_ex_cb setup,
++    libvlc_video_cleanup_cb cleanup,
++    void *opaque );
++
+ 
+ typedef struct libvlc_video_setup_device_cfg_t
+ {
+diff --git a/include/vlc/swiftvlc_vmem.h b/include/vlc/swiftvlc_vmem.h
+index b93e292eb1b6c11b1e9e971280c549b12342be92..226b55f57b5257b059c34c86d4294f911030750e 100644
+--- a/include/vlc/swiftvlc_vmem.h
++++ b/include/vlc/swiftvlc_vmem.h
+@@ -47,6 +47,26 @@ typedef unsigned (*swiftvlc_video_format_ex_cb)(
+  */
+ typedef int (*swiftvlc_video_display_status_cb)(void *opaque, void *picture);
+ 
++/** Sentinel passed when the vmem output-attempt picture has no valid PTS. */
++#define SWIFTVLC_VMEM_INVALID_PICTURE_PTS_US INT64_MIN
++
++/**
++ * Synchronous result-bearing vmem display callback with output-attempt PTS.
++ *
++ * @a picture_pts_us is the post-filter, vout-selected picture's media
++ * presentation timestamp in microseconds, normalized to LibVLC's public zero
++ * origin. Pictures dropped before the vmem output attempt are not observed.
++ * It is SWIFTVLC_VMEM_INVALID_PICTURE_PTS_US when the picture has no valid
++ * timestamp. A missing timestamp is metadata, not a submission failure: the
++ * callback must still decide the exact picture's submission result.
++ *
++ * Return zero only after the exact picture has been submitted to the final
++ * output backend. Scheduling, retaining, or deferring the picture is not a
++ * successful submission. Return a negative errno-style value otherwise.
++ */
++typedef int (*swiftvlc_video_display_status_v2_cb)(
++    void *opaque, void *picture, int64_t picture_pts_us);
++
+ #if defined(__cplusplus)
+ # define SWIFTVLC_VMEM_STATIC_ASSERT(condition, message) \
+     static_assert(condition, message)
+diff --git a/include/vlc_vmem_configuration.h b/include/vlc_vmem_configuration.h
+index 64d5179aba57210bcc01244d53e97bbed1104cba..0071859431c8faacd76d94d2ccec2983ddc8ee65 100644
+--- a/include/vlc_vmem_configuration.h
++++ b/include/vlc_vmem_configuration.h
+@@ -38,6 +38,7 @@ typedef struct swiftvlc_vmem_configuration
+     swiftvlc_vmem_unlock_cb unlock;
+     swiftvlc_vmem_display_cb display;
+     swiftvlc_video_display_status_cb display_status;
++    swiftvlc_video_display_status_v2_cb display_status_v2;
+     swiftvlc_vmem_format_cb setup;
+     swiftvlc_video_format_ex_cb setup_ex;
+     swiftvlc_vmem_cleanup_cb cleanup;
+@@ -78,6 +79,7 @@ swiftvlc_vmem_configuration_Clone(
+     configuration->unlock = source->unlock;
+     configuration->display = source->display;
+     configuration->display_status = source->display_status;
++    configuration->display_status_v2 = source->display_status_v2;
+     configuration->setup = source->setup;
+     configuration->setup_ex = source->setup_ex;
+     configuration->cleanup = source->cleanup;
+@@ -163,6 +165,7 @@ swiftvlc_vmem_configuration_registry_PublishCallbacks(
+          * publisher below, so it never exposes this deliberate legacy-only
+          * generation during install/rebind. */
+         next->display_status = NULL;
++        next->display_status_v2 = NULL;
+         next->opaque = opaque;
+         registry->current = next;
+     }
+@@ -193,6 +196,41 @@ swiftvlc_vmem_configuration_registry_PublishComplete(
+     next->unlock = unlock;
+     next->display = display;
+     next->display_status = display_status;
++    next->display_status_v2 = NULL;
++    next->setup_ex = setup_ex;
++    next->cleanup = cleanup;
++    next->opaque = opaque;
++
++    vlc_mutex_lock(&registry->lock);
++    swiftvlc_vmem_configuration *previous = registry->current;
++    registry->current = next;
++    vlc_mutex_unlock(&registry->lock);
++    swiftvlc_vmem_configuration_Release(previous);
++    return true;
++}
++
++static inline bool
++swiftvlc_vmem_configuration_registry_PublishCompleteV2(
++    swiftvlc_vmem_configuration_registry *registry,
++    swiftvlc_vmem_lock_cb lock, swiftvlc_vmem_unlock_cb unlock,
++    swiftvlc_vmem_display_cb display,
++    swiftvlc_video_display_status_v2_cb display_status_v2,
++    swiftvlc_video_format_ex_cb setup_ex,
++    swiftvlc_vmem_cleanup_cb cleanup, void *opaque)
++{
++    if (atomic_load_explicit(&registry->force_allocation_failure,
++                             memory_order_acquire))
++        return false;
++    swiftvlc_vmem_configuration *next =
++        swiftvlc_vmem_configuration_NewEmpty();
++    if (next == NULL)
++        return false;
++
++    next->lock = lock;
++    next->unlock = unlock;
++    next->display = display;
++    next->display_status = NULL;
++    next->display_status_v2 = display_status_v2;
+     next->setup_ex = setup_ex;
+     next->cleanup = cleanup;
+     next->opaque = opaque;
+@@ -269,6 +307,7 @@ swiftvlc_vmem_configuration_registry_PublishDisplayStatus(
+     if (next != NULL)
+     {
+         next->display_status = display_status;
++        next->display_status_v2 = NULL;
+         registry->current = next;
+     }
+     vlc_mutex_unlock(&registry->lock);
+diff --git a/lib/libvlc.sym b/lib/libvlc.sym
+index ab285ca860bd99ff363bc2d49285842db3413f32..6faae0d535ea0ebdf198ae3a99ef17ed9919e0eb 100644
+--- a/lib/libvlc.sym
++++ b/lib/libvlc.sym
+@@ -273,6 +273,7 @@ libvlc_video_set_format_callbacks
+ swiftvlc_libvlc_video_set_format_callbacks_ex
+ swiftvlc_libvlc_video_set_display_status_callback
+ swiftvlc_libvlc_video_set_callbacks_atomic
++swiftvlc_libvlc_video_set_callbacks_atomic_v2
+ libvlc_video_set_output_callbacks
+ libvlc_video_set_key_input
+ libvlc_video_set_logo_int
+diff --git a/lib/media_player.c b/lib/media_player.c
+index c9cf82e464198f07ad43ca23fd312819854fab09..7bcdf9d0cd1cc6905c79e00e202ca4bc7c57e3b5 100644
+--- a/lib/media_player.c
++++ b/lib/media_player.c
+@@ -746,6 +746,7 @@ libvlc_media_player_new( libvlc_instance_t *instance )
+     var_Create (mp, "vmem-unlock", VLC_VAR_ADDRESS);
+     var_Create (mp, "vmem-display", VLC_VAR_ADDRESS);
+     var_Create (mp, "vmem-display-status", VLC_VAR_ADDRESS);
++    var_Create (mp, "vmem-display-status-v2", VLC_VAR_ADDRESS);
+     var_Create (mp, "vmem-data", VLC_VAR_ADDRESS);
+     var_Create (mp, "vmem-setup", VLC_VAR_ADDRESS);
+     var_Create (mp, "vmem-setup-ex", VLC_VAR_ADDRESS);
+@@ -1063,7 +1064,7 @@ libvlc_media_player_get_media( libvlc_media_player_t *p_mi )
+ 
+ unsigned swiftvlc_libvlc_pip_extensions_version( void )
+ {
+-    return 5;
++    return 6;
+ }
+ 
+ bool
+@@ -1355,6 +1356,7 @@ void libvlc_video_set_callbacks( libvlc_media_player_t *mp,
+     var_SetAddress( mp, "vmem-unlock", unlock_cb );
+     var_SetAddress( mp, "vmem-display", display_cb );
+     var_SetAddress( mp, "vmem-display-status", NULL );
++    var_SetAddress( mp, "vmem-display-status-v2", NULL );
+     var_SetAddress( mp, "vmem-data", opaque );
+     var_SetString( mp, "dec-dev", "none" );
+     var_SetString( mp, "vout", "vmem" );
+@@ -1393,6 +1395,7 @@ void swiftvlc_libvlc_video_set_display_status_callback(
+             mp->vmem_configuration, display))
+         libvlc_printerr("Not enough memory to publish vmem display callback");
+     var_SetAddress( mp, "vmem-display-status", display );
++    var_SetAddress( mp, "vmem-display-status-v2", NULL );
+ }
+ 
+ int swiftvlc_libvlc_video_set_callbacks_atomic(
+@@ -1433,6 +1436,58 @@ int swiftvlc_libvlc_video_set_callbacks_atomic(
+     var_SetAddress(mp, "vmem-unlock", unlock_cb);
+     var_SetAddress(mp, "vmem-display", display_cb);
+     var_SetAddress(mp, "vmem-display-status", display_status_cb);
++    var_SetAddress(mp, "vmem-display-status-v2", NULL);
++    var_SetAddress(mp, "vmem-data", opaque);
++    var_SetAddress(mp, "vmem-setup", NULL);
++    var_SetAddress(mp, "vmem-setup-ex", setup_cb);
++    var_SetAddress(mp, "vmem-cleanup", cleanup_cb);
++
++    if (enabling)
++    {
++        var_SetString(mp, "dec-dev", "none");
++        var_SetString(mp, "vout", "vmem");
++        var_SetString(mp, "window", "dummy");
++    }
++    return 0;
++}
++
++int swiftvlc_libvlc_video_set_callbacks_atomic_v2(
++    libvlc_media_player_t *mp,
++    libvlc_video_lock_cb lock_cb,
++    libvlc_video_unlock_cb unlock_cb,
++    libvlc_video_display_cb display_cb,
++    swiftvlc_video_display_status_v2_cb display_status_v2_cb,
++    swiftvlc_video_format_ex_cb setup_cb,
++    libvlc_video_cleanup_cb cleanup_cb,
++    void *opaque)
++{
++    const bool clearing = lock_cb == NULL && unlock_cb == NULL &&
++                          display_cb == NULL && display_status_v2_cb == NULL &&
++                          setup_cb == NULL && cleanup_cb == NULL &&
++                          opaque == NULL;
++    const bool enabling = lock_cb != NULL && display_status_v2_cb != NULL &&
++                          setup_cb != NULL;
++    if (!clearing && !enabling)
++    {
++        libvlc_printerr("Invalid partial atomic v2 vmem callback generation");
++        return -EINVAL;
++    }
++
++    if (!swiftvlc_vmem_configuration_registry_PublishCompleteV2(
++            mp->vmem_configuration, lock_cb, unlock_cb, display_cb,
++            display_status_v2_cb, setup_cb, cleanup_cb, opaque))
++    {
++        libvlc_printerr("Not enough memory to publish atomic v2 vmem callbacks");
++        return -ENOMEM;
++    }
++
++    /* Diagnostic mirrors only. The retained registry above remains the sole
++     * Open-time source for LibVLC media players. */
++    var_SetAddress(mp, "vmem-lock", lock_cb);
++    var_SetAddress(mp, "vmem-unlock", unlock_cb);
++    var_SetAddress(mp, "vmem-display", display_cb);
++    var_SetAddress(mp, "vmem-display-status", NULL);
++    var_SetAddress(mp, "vmem-display-status-v2", display_status_v2_cb);
+     var_SetAddress(mp, "vmem-data", opaque);
+     var_SetAddress(mp, "vmem-setup", NULL);
+     var_SetAddress(mp, "vmem-setup-ex", setup_cb);
+diff --git a/modules/video_output/vmem.c b/modules/video_output/vmem.c
+index 504d33f34be517b8601d1e55ca195ddf14c21b0e..56cf9e0224374a281a289cbe0f43877b33587bbb 100644
+--- a/modules/video_output/vmem.c
++++ b/modules/video_output/vmem.c
+@@ -92,9 +92,11 @@ typedef struct vout_display_sys_t {
+     void (*unlock)(void *sys, void *id, void *const *plane);
+     void (*display)(void *sys, void *id);
+     swiftvlc_video_display_status_cb display_status;
++    swiftvlc_video_display_status_v2_cb display_status_v2;
+     void (*cleanup)(void *sys);
+     bool picture_ready;
+     int submission_status;
++    int64_t picture_pts_us;
+     bool extended_format;
+     const swiftvlc_vmem_configuration *configuration;
+ 
+@@ -183,6 +185,7 @@ static int Open(vout_display_t *vd,
+         sys->unlock = sys->configuration->unlock;
+         sys->display = sys->configuration->display;
+         sys->display_status = sys->configuration->display_status;
++        sys->display_status_v2 = sys->configuration->display_status_v2;
+         sys->cleanup = sys->configuration->cleanup;
+         sys->opaque = sys->configuration->opaque;
+     }
+@@ -195,6 +198,8 @@ static int Open(vout_display_t *vd,
+         sys->display = var_InheritAddress(vd, "vmem-display");
+         sys->display_status = var_InheritAddress(vd,
+                                                   "vmem-display-status");
++        sys->display_status_v2 = var_InheritAddress(
++            vd, "vmem-display-status-v2");
+         sys->cleanup = var_InheritAddress(vd, "vmem-cleanup");
+         sys->opaque = var_InheritAddress(vd, "vmem-data");
+     }
+@@ -207,6 +212,7 @@ static int Open(vout_display_t *vd,
+     }
+     sys->picture_ready = false;
+     sys->submission_status = -EIO;
++    sys->picture_pts_us = SWIFTVLC_VMEM_INVALID_PICTURE_PTS_US;
+     sys->extended_format = setup_ex != NULL;
+ 
+     /* Define the video format */
+@@ -352,6 +358,13 @@ static void Prepare(vout_display_t *vd, picture_t *pic,
+ 
+     sys->picture_ready = false;
+     sys->submission_status = -EIO;
++    /* This is the post-filter, vout-selected picture's media PTS at the vmem
++     * output attempt. The separate `date` argument is the scheduled output
++     * deadline and must never be exposed as content cadence. Missing PTS is
++     * carried as metadata and does not reject pixels. */
++    sys->picture_pts_us = pic->date >= VLC_TICK_0
++        ? US_FROM_VLC_TICK(pic->date - VLC_TICK_0)
++        : SWIFTVLC_VMEM_INVALID_PICTURE_PTS_US;
+     sys->pic_opaque = sys->lock(sys->opaque, planes);
+ 
+     picture_t *locked = picture_NewFromResource(vd->fmt, &rsc);
+@@ -389,7 +402,13 @@ static void Display(vout_display_t *vd, picture_t *pic)
+ 
+     if (sys->picture_ready)
+     {
+-        if (sys->display_status != NULL)
++        if (sys->display_status_v2 != NULL)
++        {
++            int status = sys->display_status_v2(
++                sys->opaque, sys->pic_opaque, sys->picture_pts_us);
++            sys->submission_status = status <= 0 ? status : -EIO;
++        }
++        else if (sys->display_status != NULL)
+         {
+             int status = sys->display_status(sys->opaque, sys->pic_opaque);
+             sys->submission_status = status <= 0 ? status : -EIO;
+@@ -411,6 +430,7 @@ static void Display(vout_display_t *vd, picture_t *pic)
+         }
+     }
+     sys->picture_ready = false;
++    sys->picture_pts_us = SWIFTVLC_VMEM_INVALID_PICTURE_PTS_US;
+ }
+ 
+ static int GetPictureSubmissionStatus(vout_display_t *vd, picture_t *pic)

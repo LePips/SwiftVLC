@@ -9,6 +9,24 @@ extension Integration {
   @Suite(.tags(.mainActor, .media))
   @MainActor struct PlayerWithMediaBranchTests {
     @Test
+    func `A-B loop time validation uses pinned VLC tick boundaries`() throws {
+      let player = Player(instance: TestInstance.shared)
+      let boundary = try player.checkedABLoopMilliseconds(
+        a: .milliseconds(LibVLCTimeMilliseconds.maximum - 1),
+        b: .milliseconds(LibVLCTimeMilliseconds.maximum)
+      )
+
+      #expect(boundary.a == LibVLCTimeMilliseconds.maximum - 1)
+      #expect(boundary.b == LibVLCTimeMilliseconds.maximum)
+      #expect(throws: VLCError.self) {
+        _ = try player.checkedABLoopMilliseconds(
+          a: .zero,
+          b: .milliseconds(LibVLCTimeMilliseconds.maximum + 1)
+        )
+      }
+    }
+
+    @Test
     func `setABLoop by time succeeds with media loaded`() throws {
       let player = Player(instance: TestInstance.shared)
       let media = try Media(url: TestMedia.twosecURL)

@@ -7,13 +7,6 @@ final class PiPDismissalDeviceUITests: ShowcaseIOSTestCase {
     case restore
     case close
 
-    var relativePoint: (x: Double, y: Double) {
-      switch self {
-      case .restore: (0.88, 0.18)
-      case .close: (0.12, 0.18)
-      }
-    }
-
     var expectedReason: String {
       switch self {
       case .restore: "restoreRequested"
@@ -147,7 +140,16 @@ final class PiPDismissalDeviceUITests: ShowcaseIOSTestCase {
 
     XCUIDevice.shared.press(.home)
     let region = try locateSystemPictureInPictureWindow()
-    tap(affordance, in: region)
+    let systemAffordances = try locateSystemPictureInPictureAffordances(
+      in: region,
+      attachmentName: "system-pip-\(affordance.rawValue)"
+    )
+    switch affordance {
+    case .restore:
+      systemAffordances.restore.tap()
+    case .close:
+      systemAffordances.close.tap()
+    }
 
     // Restore normally foregrounds the app while close intentionally does not.
     // Give AVKit time to finish the system action before foregrounding a close
@@ -176,42 +178,6 @@ final class PiPDismissalDeviceUITests: ShowcaseIOSTestCase {
       orderedEvents: lifecycle.label.split(separator: "|").map(String.init),
       restoreCount: count
     )
-  }
-
-  private func tap(
-    _ affordance: Affordance,
-    in region: SystemPictureInPictureWindowRegion
-  ) {
-    let springboard = XCUIApplication(bundleIdentifier: "com.apple.springboard")
-
-    // Controls auto-hide; a center tap reveals them without relying on their
-    // localized accessibility labels. Waiting first avoids toggling playback
-    // if controls happened to be visible immediately after backgrounding.
-    RunLoop.current.run(until: Date().addingTimeInterval(3))
-    springboard.coordinate(
-      withNormalizedOffset: region.normalizedPoint(x: 0.5, y: 0.5)
-    ).tap()
-    RunLoop.current.run(until: Date().addingTimeInterval(0.4))
-
-    let point = affordance.relativePoint
-    let screenPoint = region.normalizedPoint(x: point.x, y: point.y)
-    let diagnostics = XCTAttachment(
-      string: """
-      affordance=\(affordance.rawValue)
-      window=\(region)
-      normalizedTap=(\(screenPoint.dx), \(screenPoint.dy))
-      """
-    )
-    diagnostics.name = "system-pip-\(affordance.rawValue)-tap"
-    diagnostics.lifetime = .keepAlways
-    add(diagnostics)
-    let screenshot = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
-    screenshot.name = "system-pip-\(affordance.rawValue)-controls"
-    screenshot.lifetime = .keepAlways
-    add(screenshot)
-    springboard.coordinate(
-      withNormalizedOffset: screenPoint
-    ).tap()
   }
 
   private func waitForLifecyclePrefix(

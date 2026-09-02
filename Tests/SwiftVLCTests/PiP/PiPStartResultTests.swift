@@ -3,20 +3,29 @@
 import AVKit
 import Testing
 
-/// `start()` used to return `Void` from four indistinguishable early exits, so
-/// a caller could not tell a request that reached AVKit from one that never
-/// left the controller — and therefore could not decide whether to fall back to
-/// full-screen playback.
+/// `requestStart()` distinguishes the early exits that the version-1
+/// compatibility action intentionally ignores, so a caller can decide whether
+/// to fall back to full-screen playback.
 extension Integration {
   @Suite(.tags(.mainActor))
   @MainActor struct PiPStartResultTests {
+    @Test
+    func `Version 1 PiP actions remain Void method references`() {
+      let controller = PiPController(player: Player(instance: TestInstance.shared))
+      let start: () -> Void = controller.start
+      let toggle: () -> Void = controller.toggle
+
+      start()
+      toggle()
+    }
+
     @Test
     func `Starting without media reports noMedia`() {
       let player = Player(instance: TestInstance.shared)
       let controller = PiPController(player: player)
 
       #expect(player.currentMedia == nil)
-      #expect(controller.start() == .noMedia)
+      #expect(controller.requestStart() == .noMedia)
     }
 
     /// The distinction that motivates the type: with media loaded, the result
@@ -28,7 +37,7 @@ extension Integration {
       try player.load(Media(url: TestMedia.twosecURL))
       let controller = PiPController(player: player)
 
-      let result = controller.start()
+      let result = controller.requestStart()
 
       #expect(result != .noMedia)
       // Headless CI has no PiP, a Mac desktop may. Both are legitimate; what
@@ -47,7 +56,7 @@ extension Integration {
       try player.load(Media(url: TestMedia.twosecURL))
       let controller = PiPController(player: player)
 
-      let result = controller.start()
+      let result = controller.requestStart()
 
       if !controller.isPossible {
         #expect(result != .accepted, "start claimed acceptance while PiP was impossible")
@@ -68,24 +77,30 @@ extension Integration {
       }
       controller._setStateForTesting(isPossible: false)
 
-      #expect(controller.start() == .notPossible)
+      #expect(controller.requestStart() == .notPossible)
       #expect(controller.pipLifecycleAttribution == nil)
       #expect(controller.pipLifecycleAttributionPhase == .idle)
     }
 
-    /// `toggle()` has to propagate the start result when it takes the start
-    /// branch. A caller that wants to fall back on a refused start needs to
-    /// tell "I tried to start and it was refused" from "I stopped".
+    /// The reporting toggle has to propagate the start result when it takes the
+    /// start branch. A caller that wants to fall back on a refused start needs
+    /// to tell "I tried to start and it was refused" from "I stopped".
     @Test
     func `Toggle propagates the start result and reports nil for a stop`() {
       let player = Player(instance: TestInstance.shared)
       let controller = PiPController(player: player)
 
       #expect(controller.isActive == false)
-      #expect(controller.toggle() == .noMedia, "toggle discarded the start result")
+      #expect(
+        controller.toggleReportingStartResult() == .noMedia,
+        "toggle discarded the start result"
+      )
 
       controller._setStateForTesting(isActive: true)
-      #expect(controller.toggle() == nil, "toggle reported a start result for a stop")
+      #expect(
+        controller.toggleReportingStartResult() == nil,
+        "toggle reported a start result for a stop"
+      )
     }
 
     #if os(macOS)
@@ -155,7 +170,25 @@ extension Integration {
       let controller = PiPController(player: player)
       controller.pipController = nil
 
-      #expect(controller.start() == .backendUnavailable)
+      #expect(controller.requestStart() == .backendUnavailable)
+    }
+
+    @Test
+    func `A direct controller with a revoked callback route fails closed`() throws {
+      let player = Player(instance: TestInstance.shared)
+      try player.load(Media(url: TestMedia.twosecURL))
+      let controller = PiPController(player: player)
+      let registration = try #require(controller.callbackRegistration)
+
+      // This is the stable state produced when an atomic callback install on a
+      // replacement handle fails: the controller remains alive, but its direct
+      // callback registration is no longer bound to any native handle.
+      player.relinquishDirectPiPVideoCallbacks(registration)
+      controller.updatePiPPossible(true)
+
+      #expect(!registration.isBound)
+      #expect(!controller.isPossible)
+      #expect(controller.requestStart() == .backendUnavailable)
     }
 
     #if os(macOS)
@@ -169,10 +202,10 @@ extension Integration {
       backend.attach(to: player)
       let controller = PiPController(player: player, nativeBackend: backend)
 
-      #expect(controller.start() == .noMedia)
+      #expect(controller.requestStart() == .noMedia)
 
       try player.load(Media(url: TestMedia.twosecURL))
-      #expect(controller.start() == backend.start())
+      #expect(controller.requestStart() == backend.start())
     }
     #endif
 

@@ -65,22 +65,22 @@ extension Integration {
     }
 
     @Test
-    func `renderer rejection has a dedicated typed error`() throws {
+    func `renderer rejection preserves the version 1 operation error`() throws {
       let player = Player(instance: TestInstance.shared)
       player._nativeSetRendererOverrideForTesting = { _ in -1 }
 
-      #expect(throws: VLCError.rendererFailed) {
+      #expect(throws: VLCError.operationFailed("Set renderer")) {
         try player.setRenderer(nil)
       }
     }
 
     @Test
-    func `replacement player renderer rejection has a dedicated typed error`() throws {
+    func `replacement renderer rejection preserves the version 1 operation error`() throws {
       let player = Player(instance: TestInstance.shared)
       let originalPointer = player.pointer
       player._nativeSetRendererOverrideForTesting = { _ in -1 }
 
-      #expect(throws: VLCError.rendererFailed) {
+      #expect(throws: VLCError.operationFailed("Set renderer")) {
         try player.replaceNativePlayerForDrawablePlayback(target: nil)
       }
       #expect(player.pointer == originalPointer)
@@ -232,6 +232,7 @@ extension Integration {
         duration: .seconds(60),
         isSeekable: true
       )
+      player._nativeSetTimeOverrideForTesting = { _, _ in 0 }
 
       try player.seek(by: .seconds(-100))
 
@@ -247,6 +248,7 @@ extension Integration {
         duration: .seconds(60),
         isSeekable: true
       )
+      player._nativeSetTimeOverrideForTesting = { _, _ in 0 }
 
       try player.seek(by: .seconds(100))
 
@@ -263,6 +265,7 @@ extension Integration {
         duration: .seconds(60),
         isSeekable: true
       )
+      player._nativeSetTimeOverrideForTesting = { _, _ in 0 }
 
       try player.seek(by: .seconds(5))
 
@@ -305,25 +308,32 @@ extension Integration {
     func `typed position seek with known duration updates currentTime optimistically`() throws {
       let player = Player(instance: TestInstance.shared)
       player._setStateForTesting(duration: .seconds(100), isSeekable: true)
+      player._nativeSetTimeOverrideForTesting = { _, _ in 0 }
 
       try player.seek(to: PlaybackPosition(0.25))
 
       #expect(player.currentTime == .seconds(25))
     }
 
-    /// The position path scales a floating-point fraction by media
-    /// duration. Very large but representable durations must not overflow
-    /// or trap while converting the scaled value back to libVLC's
-    /// millisecond unit.
+    /// The position path scales a floating-point fraction by media duration.
+    /// A Swift-representable result which exceeds pinned libVLC's safe
+    /// millisecond domain must be rejected before reaching the native API.
     @Test
-    func `typed position seek near Int64 max duration does not overflow`() throws {
+    func `typed position seek beyond libVLC time bounds is rejected`() {
       let player = Player(instance: TestInstance.shared)
       player._setStateForTesting(duration: .milliseconds(Int64.max), isSeekable: true)
+      var nativeDispatchCount = 0
+      player._nativeSetTimeOverrideForTesting = { _, _ in
+        nativeDispatchCount += 1
+        return 0
+      }
 
-      try player.seek(to: PlaybackPosition(0.999_999_999_999_999_9))
+      #expect(throws: VLCError.self) {
+        try player.seek(to: PlaybackPosition(0.999_999_999_999_999_9))
+      }
 
-      #expect(player.currentTime >= .zero)
-      #expect(player.currentTime <= .milliseconds(Int64.max))
+      #expect(nativeDispatchCount == 0)
+      #expect(player.currentTime == .zero)
     }
 
     /// Position-based seeking needs known duration. Without it, SwiftVLC
@@ -350,6 +360,7 @@ extension Integration {
     func `seek(to:) updates currentTime optimistically`() throws {
       let player = Player(instance: TestInstance.shared)
       player._setStateForTesting(currentTime: .seconds(2), duration: .seconds(60), isSeekable: true)
+      player._nativeSetTimeOverrideForTesting = { _, _ in 0 }
 
       try player.seek(to: .seconds(42))
 

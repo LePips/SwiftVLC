@@ -2,7 +2,7 @@
 import CLibVLC
 import Testing
 
-#if canImport(AppKit)
+#if os(macOS)
 import AppKit
 #elseif canImport(UIKit)
 import UIKit
@@ -18,7 +18,7 @@ extension Integration {
     @Test
     func `NSView VideoSurface creation`() {
       let surface = VideoSurface()
-      #if canImport(AppKit)
+      #if os(macOS)
       // `wantsLayer` is set inside `VideoView.makeNSView`, not on the
       // bare `VideoSurface()` initializer. Pin that contract so a
       // refactor that moves the side effect here would fail loudly.
@@ -56,7 +56,7 @@ extension Integration {
       let surface = sizedSurface()
       surface.attach(to: player)
 
-      #if canImport(AppKit)
+      #if os(macOS)
       surface.wantsLayer = true
       surface.frame = NSRect(x: 0, y: 0, width: 640, height: 480)
       surface.layout()
@@ -204,7 +204,7 @@ extension Integration {
     @Test
     func `layout with zero bounds does not update sublayers`() {
       let surface = VideoSurface()
-      #if canImport(AppKit)
+      #if os(macOS)
       surface.wantsLayer = true
       surface.frame = NSRect(x: 0, y: 0, width: 0, height: 0)
       surface.layout()
@@ -222,7 +222,7 @@ extension Integration {
       surface.attach(to: player)
       surface.detach()
 
-      #if canImport(AppKit)
+      #if os(macOS)
       surface.wantsLayer = true
       surface.frame = NSRect(x: 0, y: 0, width: 320, height: 240)
       surface.layout()
@@ -233,7 +233,7 @@ extension Integration {
     }
 
     private func sizedSurface() -> VideoSurface {
-      #if canImport(AppKit)
+      #if os(macOS)
       VideoSurface(frame: NSRect(x: 0, y: 0, width: 320, height: 180))
       #elseif canImport(UIKit)
       VideoSurface(frame: CGRect(x: 0, y: 0, width: 320, height: 180))

@@ -81,21 +81,27 @@ struct PiPAudioSessionDisruptionTests {
     #expect(!result.reactivates)
   }
 
-  /// A media-services reset invalidates every session object, so the category
-  /// has to be set again before anything else.
+  /// A media-services reset invalidates every session object. Apple requires
+  /// rebuilding configuration without restarting playback until a fresh user
+  /// action, so the pre-reset active intent becomes an ordinary recorded pause.
   @Test
-  func `A media services reset reconfigures before reactivating`() {
+  func `A media services reset invalidates activation and waits for user action`() {
     let result = reaction(.mediaServicesReset)
-    #expect(result.reconfiguresCategory)
-    #expect(result.reactivates)
+    #expect(result.clearsActivationLatch)
+    #expect(result.pausesPlayback)
+    #expect(!result.preservesPlaybackIntentWhenPausing)
+    #expect(result.requiresFreshPlaybackIntent)
+    #expect(!result.reactivates)
+    #expect(!result.resumesManagedSuspendedPlayback)
   }
 
   @Test
-  func `A media services reset while paused reconfigures without reactivating`() {
+  func `A media services reset while paused invalidates without reactivating`() {
     let result = reaction(.mediaServicesReset, playing: false)
-    #expect(result.reconfiguresCategory, "the category is gone regardless of intent")
     #expect(!result.reactivates, "a reset must not take audio focus for a paused player")
     #expect(result.clearsActivationLatch)
+    #expect(result.pausesPlayback, "native playback can outlive an already-inactive intent")
+    #expect(result.requiresFreshPlaybackIntent)
   }
 
   @Test
@@ -108,18 +114,21 @@ struct PiPAudioSessionDisruptionTests {
   }
 
   @Test
-  func `A media services reset resumes only its own suspension`() {
+  func `A media services reset clears suspensions without resuming them`() {
     let result = reaction(.mediaServicesReset, lifecycleSuspended: true)
-    #expect(result.reconfiguresCategory)
     #expect(!result.reactivates)
     #expect(!result.resumesManagedSuspendedPlayback)
+    #expect(result.pausesPlayback)
+    #expect(result.clearsLifecycleSuspension)
 
     let mediaServicesPause = reaction(
       .mediaServicesReset,
       mediaServicesSuspended: true
     )
-    #expect(mediaServicesPause.reactivates)
-    #expect(mediaServicesPause.resumesManagedSuspendedPlayback)
+    #expect(!mediaServicesPause.reactivates)
+    #expect(!mediaServicesPause.resumesManagedSuspendedPlayback)
+    #expect(mediaServicesPause.pausesPlayback)
+    #expect(mediaServicesPause.clearsMediaServicesSuspension)
 
     let userPaused = reaction(
       .mediaServicesReset,
@@ -128,6 +137,7 @@ struct PiPAudioSessionDisruptionTests {
     )
     #expect(!userPaused.reactivates)
     #expect(!userPaused.resumesManagedSuspendedPlayback)
+    #expect(userPaused.pausesPlayback)
     #expect(userPaused.clearsMediaServicesSuspension)
   }
 
@@ -216,8 +226,9 @@ struct PiPAudioSessionDisruptionTests {
     )
     #expect(!resetWhileBackgrounded.reactivates)
     #expect(!resetWhileBackgrounded.resumesManagedSuspendedPlayback)
+    #expect(resetWhileBackgrounded.pausesPlayback)
     #expect(resetWhileBackgrounded.clearsMediaServicesSuspension)
-    #expect(!resetWhileBackgrounded.clearsLifecycleSuspension)
+    #expect(resetWhileBackgrounded.clearsLifecycleSuspension)
 
     let foregroundWhileServicesAreLost = reaction(
       .enteringForeground,
@@ -261,6 +272,7 @@ extension Integration {
     final class PauseRecorder {
       var pauseCount = 0
       var pauseRecordsPlaybackIntent: [Bool] = []
+      var acceptsPause = true
       var resumeCount = 0
       var acceptsResume = true
 
@@ -269,7 +281,7 @@ extension Integration {
           pause: { _, recordsPlaybackIntent in
             self.pauseCount += 1
             self.pauseRecordsPlaybackIntent.append(recordsPlaybackIntent)
-            return .init(accepted: true, playbackControlRevision: nil)
+            return .init(accepted: self.acceptsPause, playbackControlRevision: nil)
           },
           resume: { _ in
             self.resumeCount += 1
@@ -327,6 +339,263 @@ extension Integration {
       await player.shutdown()
     }
 
+    @Test
+    func `A media services reset quarantines late native playback until explicit resume`() async {
+      let player = Player(instance: TestInstance.makeAudioOnly())
+      let recorder = PauseRecorder()
+      let controller = makeController(player: player, recorder: recorder)
+      player._setStateForTesting(
+        state: .playing,
+        nativeState: .playing,
+        isPlaybackRequestedActive: true
+      )
+      controller.hasActivatedAudioSession = true
+      controller.isPlaybackSuspendedForManagedAudioLifecycle = true
+      controller.isPlaybackSuspendedForMediaServices = true
+
+      controller.react(to: .mediaServicesReset)
+
+      #expect(recorder.pauseCount == 1)
+      #expect(recorder.pauseRecordsPlaybackIntent == [true])
+      #expect(recorder.resumeCount == 0)
+      #expect(!controller.hasActivatedAudioSession)
+      #expect(!player.isPlaybackRequestedActive)
+      #expect(player.requiresFreshPlaybackIntentAfterMediaServicesReset)
+      #expect(player.playbackControlIntent == .pause)
+      #expect(!controller.isPlaybackSuspendedForManagedAudioLifecycle)
+      #expect(!controller.isPlaybackSuspendedForMediaServices)
+
+      // A native callback and even a stale copy already queued in the PiP
+      // observer are observations, not post-reset user permission.
+      player._handleEventForTesting(.stateChanged(.playing))
+      player.setPlaybackIntentFromExternalControl(true)
+      controller.handlePlaybackIntentChanged(true)
+      #expect(!player.isPlaybackRequestedActive)
+      #expect(!controller.hasActivatedAudioSession)
+      #expect(player.requiresFreshPlaybackIntentAfterMediaServicesReset)
+
+      // Public Resume is an explicit playback-enabling command. The native
+      // state override makes the otherwise empty test player take the real
+      // resume path without pretending a Boolean observer was user input.
+      player._setStateForTesting(
+        state: .paused,
+        nativeState: .paused,
+        isPlaybackRequestedActive: false
+      )
+      player.resume()
+      #expect(!player.requiresFreshPlaybackIntentAfterMediaServicesReset)
+      #expect(player.isPlaybackRequestedActive)
+      controller.handlePlaybackIntentChanged(true)
+      #expect(controller.hasActivatedAudioSession)
+      await player.shutdown()
+    }
+
+    @Test
+    func `Fresh Resume crosses the native reset boundary even while VLC reports playing`() async {
+      let player = Player(instance: TestInstance.makeAudioOnly())
+      player._setStateForTesting(
+        state: .playing,
+        nativeState: .playing,
+        isPlaybackRequestedActive: true
+      )
+      player.beginMediaServicesResetPlaybackQuarantine()
+      var nativeResumeCommands = 0
+      player._nativeResumeCommandOverrideForTesting = {
+        nativeResumeCommands += 1
+      }
+
+      let accepted = player.issueResume(
+        authorizesPlaybackAfterMediaServicesReset: true
+      )
+
+      #expect(accepted)
+      #expect(nativeResumeCommands == 1)
+      #expect(!player.requiresFreshPlaybackIntentAfterMediaServicesReset)
+      #expect(player.isPlaybackRequestedActive)
+
+      // Native activation can fail after Swift accepts the first command.
+      // With no native success event to consume, another explicit Resume must
+      // remain a real engine command so it can retry the retained native latch.
+      player.resume()
+      #expect(nativeResumeCommands == 2)
+      await player.shutdown()
+    }
+
+    @Test
+    func `Only accepted explicit Resume authorizes native reset recovery`() async {
+      let player = Player(instance: TestInstance.makeAudioOnly())
+      player._setStateForTesting(
+        state: .paused,
+        nativeState: .paused,
+        isPlaybackRequestedActive: false
+      )
+      var authorizations: [Bool] = []
+      player._nativeResumeAuthorizationOverrideForTesting = {
+        authorizations.append($0)
+      }
+
+      #expect(player.issueManagedAudioResume())
+      #expect(authorizations == [false])
+
+      player._setStateForTesting(
+        state: .paused,
+        nativeState: .paused,
+        isPlaybackRequestedActive: false
+      )
+      player.resume()
+      #expect(authorizations == [false, true])
+      await player.shutdown()
+    }
+
+    @Test
+    func `Rejected playback commands cannot arm a later automatic reset recovery`() async {
+      let player = Player(instance: TestInstance.makeAudioOnly())
+      player._setStateForTesting(
+        state: .idle,
+        nativeState: .idle,
+        isPlaybackRequestedActive: false
+      )
+      player.beginMediaServicesResetPlaybackQuarantine()
+      var nativeResumeCommands = 0
+      player._nativeResumeCommandOverrideForTesting = {
+        nativeResumeCommands += 1
+      }
+
+      let resumeAccepted = player.issueResume(
+        authorizesPlaybackAfterMediaServicesReset: true
+      )
+      #expect(!resumeAccepted)
+      #expect(nativeResumeCommands == 0)
+      #expect(player.requiresFreshPlaybackIntentAfterMediaServicesReset)
+      #expect(!player.isPlaybackRequestedActive)
+
+      player._nativePlayOverrideForTesting = { -1 }
+      #expect(throws: VLCError.self) {
+        try player.play()
+      }
+      #expect(player.requiresFreshPlaybackIntentAfterMediaServicesReset)
+      #expect(!player.isPlaybackRequestedActive)
+      await player.shutdown()
+    }
+
+    @Test
+    func `AVKit Play forces the native reset boundary even when playback looks active`() async {
+      let player = Player(instance: TestInstance.makeAudioOnly())
+      let controller = PiPController(
+        player: player,
+        playbackDriver: .live(player: player),
+        pauseDebounce: .milliseconds(10),
+        managesAudioSession: false
+      )
+      player._setStateForTesting(
+        state: .playing,
+        nativeState: .playing,
+        isPlaybackRequestedActive: true
+      )
+      player.beginMediaServicesResetPlaybackQuarantine()
+      var nativeResumeCommands = 0
+      player._nativeResumeCommandOverrideForTesting = {
+        nativeResumeCommands += 1
+      }
+
+      controller.handleSetPlaying(true)
+
+      #expect(nativeResumeCommands == 1)
+      #expect(!player.requiresFreshPlaybackIntentAfterMediaServicesReset)
+      #expect(player.isPlaybackRequestedActive)
+      await player.shutdown()
+    }
+
+    @Test
+    func `A rejected reset pause still installs the durable quarantine`() async {
+      let player = Player(instance: TestInstance.makeAudioOnly())
+      let recorder = PauseRecorder()
+      recorder.acceptsPause = false
+      let controller = makeController(player: player, recorder: recorder)
+      player._setStateForTesting(
+        state: .opening,
+        nativeState: .opening,
+        isPlaybackRequestedActive: false
+      )
+      controller.hasActivatedAudioSession = true
+      controller.isPlaybackSuspendedForManagedAudioLifecycle = true
+      controller.isPlaybackSuspendedForMediaServices = true
+      controller.isManagedAudioResumeDeniedByInterruption = true
+      controller.isManagedAudioResumePendingActivation = true
+
+      controller.react(to: .mediaServicesReset)
+
+      #expect(recorder.pauseCount == 1)
+      #expect(recorder.pauseRecordsPlaybackIntent == [true])
+      #expect(!controller.hasActivatedAudioSession)
+      #expect(!player.isPlaybackRequestedActive)
+      #expect(player.requiresFreshPlaybackIntentAfterMediaServicesReset)
+      #expect(player.playbackControlIntent == .pause)
+      #expect(!controller.isPlaybackSuspendedForManagedAudioLifecycle)
+      #expect(!controller.isPlaybackSuspendedForMediaServices)
+      #expect(!controller.isManagedAudioResumeDeniedByInterruption)
+      #expect(!controller.isManagedAudioResumePendingActivation)
+
+      player._handleEventForTesting(.stateChanged(.playing))
+      controller.handlePlaybackIntentChanged(true)
+      #expect(!player.isPlaybackRequestedActive)
+      #expect(!controller.hasActivatedAudioSession)
+      await player.shutdown()
+    }
+
+    @Test
+    func `A repeated reset retires pre-reset resume work without moving the boundary`() async {
+      let player = Player(instance: TestInstance.makeAudioOnly())
+      player._setStateForTesting(
+        state: .buffering,
+        nativeState: .buffering,
+        isPlaybackRequestedActive: true
+      )
+      player.pauseTransition = .resuming
+      player.deferredPauseCommand = .resume
+      player.playbackControlIntent = .resume
+
+      player.beginMediaServicesResetPlaybackQuarantine()
+      let resetRevision = player.playbackControlIntentRevision
+      player.beginMediaServicesResetPlaybackQuarantine()
+
+      #expect(player.requiresFreshPlaybackIntentAfterMediaServicesReset)
+      #expect(player.pauseTransition == nil)
+      #expect(player.deferredPauseCommand == nil)
+      #expect(player.playbackControlIntent == .pause)
+      #expect(player.playbackControlIntentRevision == resetRevision)
+      #expect(!player.isPlaybackRequestedActive)
+      await player.shutdown()
+    }
+
+    @Test
+    func `The reset quarantine survives controller reconstruction and stays player scoped`() async {
+      let resetPlayer = Player(instance: TestInstance.makeAudioOnly())
+      let unaffectedPlayer = Player(instance: TestInstance.makeAudioOnly())
+      let first = makeController(player: resetPlayer, recorder: PauseRecorder())
+      resetPlayer._setStateForTesting(
+        state: .playing,
+        nativeState: .playing,
+        isPlaybackRequestedActive: true
+      )
+
+      first.react(to: .mediaServicesReset)
+      let successor = makeController(player: resetPlayer, recorder: PauseRecorder())
+      resetPlayer._handleEventForTesting(.stateChanged(.playing))
+      successor.handlePlaybackIntentChanged(true)
+
+      #expect(resetPlayer.requiresFreshPlaybackIntentAfterMediaServicesReset)
+      #expect(!resetPlayer.isPlaybackRequestedActive)
+      #expect(!successor.hasActivatedAudioSession)
+
+      unaffectedPlayer.setPlaybackIntentFromExternalControl(true)
+      #expect(unaffectedPlayer.isPlaybackRequestedActive)
+      #expect(!unaffectedPlayer.requiresFreshPlaybackIntentAfterMediaServicesReset)
+      withExtendedLifetime(first) {}
+      await resetPlayer.shutdown()
+      await unaffectedPlayer.shutdown()
+    }
+
     /// Criterion 4, at the effect level rather than the policy level: an
     /// unmanaged controller must not pause the host app's playback either.
     @Test
@@ -338,9 +607,11 @@ extension Integration {
 
       controller.react(to: .routeLost)
       controller.react(to: .interruptionBegan)
+      controller.react(to: .mediaServicesReset)
 
       #expect(recorder.pauseCount == 0, "an unmanaged controller paused the host app's playback")
       #expect(controller.hasActivatedAudioSession)
+      #expect(!player.requiresFreshPlaybackIntentAfterMediaServicesReset)
       await player.shutdown()
     }
 
@@ -556,9 +827,113 @@ extension Integration {
       await player.shutdown()
     }
 
+    @Test
+    func `Route loss pauses a player that has no PiP controller`() async {
+      let player = Player(instance: TestInstance.makeAudioOnly())
+      player._setStateForTesting(
+        state: .playing,
+        nativeState: .playing,
+        isPlaybackRequestedActive: true
+      )
+      player._nativeCanPauseOverrideForTesting = true
+      player._nativePauseSafetyOverrideForTesting = true
+      var nativePauseCommands = 0
+      player._pauseProbeHookForTesting = { stage in
+        if case .nativePause = stage {
+          nativePauseCommands += 1
+        }
+      }
+
+      player.handleManagedAppleAudioSessionDisruption(.routeLost)
+
+      #expect(nativePauseCommands == 1)
+      #expect(!player.isPlaybackRequestedActive)
+      #expect(player.playbackControlIntent == .pause)
+      await player.shutdown()
+    }
+
+    @Test
+    func `Media-services loss suspends a player without PiP while preserving intent`() async {
+      let player = Player(instance: TestInstance.makeAudioOnly())
+      player._setStateForTesting(
+        state: .playing,
+        nativeState: .playing,
+        isPlaybackRequestedActive: true
+      )
+      player._nativeCanPauseOverrideForTesting = true
+      player._nativePauseSafetyOverrideForTesting = true
+
+      player.handleManagedAppleAudioSessionDisruption(.mediaServicesLost)
+
+      #expect(player.isPlaybackRequestedActive)
+      #expect(player.preservesPlaybackIntentForManagedAudioSuspension)
+      #expect(player.isManagedAudioMediaServicesSuspended)
+      await player.shutdown()
+    }
+
+    @Test
+    func `Media-services reset quarantines a player that has no PiP controller`() async {
+      let player = Player(instance: TestInstance.makeAudioOnly())
+      player._setStateForTesting(
+        state: .playing,
+        nativeState: .playing,
+        isPlaybackRequestedActive: true
+      )
+      player._nativeCanPauseOverrideForTesting = true
+      player._nativePauseSafetyOverrideForTesting = true
+      var nativePauseCommands = 0
+      player._pauseProbeHookForTesting = { stage in
+        if case .nativePause = stage {
+          nativePauseCommands += 1
+        }
+      }
+
+      player.handleManagedAppleAudioSessionDisruption(.mediaServicesReset)
+
+      #expect(nativePauseCommands == 1)
+      #expect(player.requiresFreshPlaybackIntentAfterMediaServicesReset)
+      #expect(!player.isPlaybackRequestedActive)
+      #expect(player.playbackControlIntent == .pause)
+
+      // A queued native callback remains an observation, not fresh user
+      // permission, even when no PiP object exists to filter it.
+      player._handleEventForTesting(.stateChanged(.playing))
+      #expect(player.requiresFreshPlaybackIntentAfterMediaServicesReset)
+      #expect(!player.isPlaybackRequestedActive)
+      await player.shutdown()
+    }
+
+    @Test
+    func `One controller handles reset effects while every live latch is invalidated`() async {
+      let player = Player(instance: TestInstance.makeAudioOnly())
+      let firstRecorder = PauseRecorder()
+      let secondRecorder = PauseRecorder()
+      let first = makeController(player: player, recorder: firstRecorder)
+      let second = makeController(player: player, recorder: secondRecorder)
+      player.registerManagedAppleAudioSessionController(first)
+      player.registerManagedAppleAudioSessionController(second)
+      first.hasActivatedAudioSession = true
+      second.hasActivatedAudioSession = true
+      player._setStateForTesting(
+        state: .playing,
+        nativeState: .playing,
+        isPlaybackRequestedActive: true
+      )
+
+      player.handleManagedAppleAudioSessionDisruption(.mediaServicesReset)
+
+      #expect(!first.hasActivatedAudioSession)
+      #expect(!second.hasActivatedAudioSession)
+      #expect(firstRecorder.pauseCount + secondRecorder.pauseCount == 1)
+      #expect(secondRecorder.pauseCount == 1, "the most recently registered owner was not selected")
+      #expect(player.requiresFreshPlaybackIntentAfterMediaServicesReset)
+      #expect(!player.isPlaybackRequestedActive)
+      await player.shutdown()
+    }
+
     #if os(iOS)
     @Test
-    func `An inactive controller cannot deactivate another active PiP user`() async {
+    func `Different players rely on the native broker rather than a Swift global heuristic`() async {
       let firstPlayer = Player(instance: TestInstance.makeAudioOnly())
       let secondPlayer = Player(instance: TestInstance.makeAudioOnly())
       let first = makeController(player: firstPlayer, recorder: PauseRecorder())
@@ -567,10 +942,23 @@ extension Integration {
       second.hasActivatedAudioSession = true
       second.updatePiPActive(true)
 
-      #expect(first.hasAnotherManagedAudioSessionUser())
+      #expect(!first.hasAnotherManagedAudioSessionUser())
 
       await firstPlayer.shutdown()
       await secondPlayer.shutdown()
+    }
+
+    @Test
+    func `Same-player successor controller preserves the shared player lease`() async {
+      let player = Player(instance: TestInstance.makeAudioOnly())
+      let first = makeController(player: player, recorder: PauseRecorder())
+      let successor = makeController(player: player, recorder: PauseRecorder())
+      first.hasActivatedAudioSession = true
+      successor.hasActivatedAudioSession = true
+      successor.updatePiPActive(true)
+
+      #expect(first.hasAnotherManagedAudioSessionUser())
+      await player.shutdown()
     }
     #endif
   }

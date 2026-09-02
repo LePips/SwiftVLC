@@ -149,40 +149,47 @@ final class PiPLiveDeviceUITests: ShowcaseIOSTestCase {
     ]
     let playbackError = app.descendants(matching: .any)[AccessibilityID.PiPLiveValidation.errorLabel]
     let toggle = app.buttons[AccessibilityID.PiPLiveValidation.toggleButton]
+    let captureDiagnostics = app.buttons[
+      AccessibilityID.PiPLiveValidation.captureDiagnosticsButton
+    ]
     let video = app.otherElements[AccessibilityID.PiPLiveValidation.videoView]
     var previousDirectRendererDiagnostics: String?
 
-    waitForLabel(state, equals: "playing", timeout: 20)
-    waitForLabel(duration, equals: "unknown", timeout: 5)
-    waitForLabel(possible, equals: "yes", timeout: 15)
-    let displayedBeforePiP = waitForIntegerLabel(
+    waitForAccessibilityValue(state, equals: "playing", timeout: 20)
+    waitForAccessibilityValue(duration, equals: "unknown", timeout: 5)
+    assertRendersNonBlackFrame(video, timeout: 10)
+
+    revealMeasurement(displayedPictures, swiping: .up)
+    let displayedBeforePiP = waitForIntegerAccessibilityValue(
       displayedPictures,
       greaterThan: 0,
       timeout: 10
     )
-    _ = waitForIntegerLabel(playedAudioBuffers, greaterThan: 0, timeout: 10)
-    assertRendersNonBlackFrame(video, timeout: 10)
+    revealMeasurement(playedAudioBuffers, swiping: .up)
+    _ = waitForIntegerAccessibilityValue(playedAudioBuffers, greaterThan: 0, timeout: 10)
+    revealMeasurement(possible, swiping: .up)
+    waitForAccessibilityValue(possible, equals: "yes", timeout: 15)
+    revealMeasurement(linearPlayback, swiping: .up)
+    waitForAccessibilityValue(linearPlayback, equals: "yes", timeout: 10)
+    let observedLinearPlayback = accessibilityValue(of: linearPlayback)
+    revealMeasurement(playbackRange, swiping: .up)
+    waitForAccessibilityValue(playbackRange, equals: "unbounded", timeout: 10)
+    let observedPlaybackRange = accessibilityValue(of: playbackRange)
     if renderingPath == "direct" {
       attachDirectRendererDiagnostics(
-        video,
+        captureDiagnostics,
         previous: &previousDirectRendererDiagnostics,
         name: "inline-before-pip"
       )
     }
 
-    // SwiftUI Forms materialize rows lazily on iOS 27. The linear-playback
-    // and range probes sit immediately below the initial iPhone viewport, so
-    // reveal them before asking XCUI for their values.
-    reveal(linearPlayback)
-    waitForLabel(linearPlayback, equals: "yes", timeout: 10)
-    reveal(playbackRange)
-    waitForLabel(playbackRange, equals: "unbounded", timeout: 10)
-
-    reveal(toggle)
+    reveal(toggle, swiping: .up)
     XCTAssertTrue(toggle.isEnabled)
     for cycle in 0..<3 {
       toggle.tap()
-      waitForLabel(active, equals: "yes", timeout: 10)
+      revealMeasurement(active, swiping: .down)
+      waitForAccessibilityValue(active, equals: "yes", timeout: 10)
+      revealMeasurement(lifecycleEvents, swiping: .up)
       waitForLifecycleEvent(
         "didStart",
         count: cycle + 1,
@@ -191,14 +198,17 @@ final class PiPLiveDeviceUITests: ShowcaseIOSTestCase {
       )
       if renderingPath == "direct" {
         attachDirectRendererDiagnostics(
-          video,
+          captureDiagnostics,
           previous: &previousDirectRendererDiagnostics,
           name: "cycle-\(cycle + 1)-started"
         )
       }
       if cycle < 2 {
+        reveal(toggle, swiping: .up)
         toggle.tap()
-        waitForLabel(active, equals: "no", timeout: 10)
+        revealMeasurement(active, swiping: .down)
+        waitForAccessibilityValue(active, equals: "no", timeout: 10)
+        revealMeasurement(lifecycleEvents, swiping: .up)
         waitForLifecycleEvent(
           "didStop:programmatic",
           count: cycle + 1,
@@ -207,11 +217,12 @@ final class PiPLiveDeviceUITests: ShowcaseIOSTestCase {
         )
         if renderingPath == "direct" {
           attachDirectRendererDiagnostics(
-            video,
+            captureDiagnostics,
             previous: &previousDirectRendererDiagnostics,
             name: "cycle-\(cycle + 1)-stopped"
           )
         }
+        reveal(toggle, swiping: .up)
       }
     }
 
@@ -221,10 +232,12 @@ final class PiPLiveDeviceUITests: ShowcaseIOSTestCase {
       // the system-window screenshot comparison below.
       XCUIDevice.shared.orientation = .landscapeRight
       RunLoop.current.run(until: Date().addingTimeInterval(1))
-      waitForLabel(active, equals: "yes", timeout: 5)
+      revealMeasurement(active, swiping: .down)
+      waitForAccessibilityValue(active, equals: "yes", timeout: 5)
       XCUIDevice.shared.orientation = .portrait
       RunLoop.current.run(until: Date().addingTimeInterval(1))
-      waitForLabel(active, equals: "yes", timeout: 5)
+      revealMeasurement(active, swiping: .down)
+      waitForAccessibilityValue(active, equals: "yes", timeout: 5)
     }
 
     XCUIDevice.shared.press(.home)
@@ -232,14 +245,17 @@ final class PiPLiveDeviceUITests: ShowcaseIOSTestCase {
     let visualFailure = captureSystemPictureInPictureMotion()
 
     app.activate()
-    waitForLabel(state, equals: "playing", timeout: 10)
-    waitForLabel(duration, equals: "unknown", timeout: 5)
-    waitForLabel(active, equals: "yes", timeout: 10)
-    _ = waitForIntegerLabel(
+    revealMeasurement(state, swiping: .down)
+    waitForAccessibilityValue(state, equals: "playing", timeout: 10)
+    revealMeasurement(duration, swiping: .up)
+    waitForAccessibilityValue(duration, equals: "unknown", timeout: 5)
+    revealMeasurement(displayedPictures, swiping: .up)
+    _ = waitForIntegerAccessibilityValue(
       displayedPictures,
       greaterThan: displayedBeforePiP,
       timeout: 10
     )
+    revealMeasurement(backgroundAudioObservation, swiping: .up)
     let audioObservation = waitForBackgroundAudioObservation(
       backgroundAudioObservation,
       timeout: 10
@@ -249,13 +265,17 @@ final class PiPLiveDeviceUITests: ShowcaseIOSTestCase {
       audioObservation.before,
       "Native audio output did not play buffers during the background interval"
     )
+    revealMeasurement(active, swiping: .up)
+    waitForAccessibilityValue(active, equals: "yes", timeout: 10)
     if renderingPath == "direct" {
       attachDirectRendererDiagnostics(
-        video,
+        captureDiagnostics,
         previous: &previousDirectRendererDiagnostics,
         name: "after-background"
       )
     }
+    revealMeasurement(lifecycleEvents, swiping: .up)
+    reveal(toggle, swiping: .up)
     XCTAssertFalse(
       playbackError.exists,
       "Validation surface reported an asynchronous playback error: \(playbackError.label)"
@@ -263,7 +283,7 @@ final class PiPLiveDeviceUITests: ShowcaseIOSTestCase {
     if let visualFailure {
       XCTFail(visualFailure)
     }
-    let events = lifecycleEvents.label.split(separator: "|").map(String.init)
+    let events = accessibilityValue(of: lifecycleEvents).split(separator: "|").map(String.init)
     XCTAssertTrue(
       lifecycleOrderIsValid(events),
       "PiP lifecycle events were missing or out of order: \(events)"
@@ -277,8 +297,8 @@ final class PiPLiveDeviceUITests: ShowcaseIOSTestCase {
     )
     assertNoLibraryErrors()
     return LiveRunEvidence(
-      playbackRange: playbackRange.label,
-      linearPlayback: linearPlayback.label == "yes",
+      playbackRange: observedPlaybackRange,
+      linearPlayback: observedLinearPlayback == "yes",
       unexpectedStopCount: unexpectedStops.count,
       playedAudioBuffersBeforeBackground: audioObservation.before,
       playedAudioBuffersAfterBackground: audioObservation.after
@@ -293,10 +313,17 @@ final class PiPLiveDeviceUITests: ShowcaseIOSTestCase {
     timeout: TimeInterval
   ) {
     let predicate = NSPredicate { _, _ in
-      element.label.split(separator: "|").count(where: { $0 == Substring(event) }) == count
+      self.accessibilityValue(of: element)
+        .split(separator: "|")
+        .count(where: { $0 == Substring(event) }) == count
     }
     let expectation = expectation(for: predicate, evaluatedWith: NSObject())
-    XCTAssertEqual(XCTWaiter.wait(for: [expectation], timeout: timeout), .completed)
+    XCTAssertEqual(
+      XCTWaiter.wait(for: [expectation], timeout: timeout),
+      .completed,
+      "Expected \(count) '\(event)' lifecycle event(s), got "
+        + "\(accessibilityValue(of: element))"
+    )
   }
 
   private func waitForBackgroundAudioObservation(
@@ -304,12 +331,14 @@ final class PiPLiveDeviceUITests: ShowcaseIOSTestCase {
     timeout: TimeInterval
   ) -> BackgroundAudioObservation {
     let predicate = NSPredicate { _, _ in
-      self.parseBackgroundAudioObservation(element.label).map { $0.after > $0.before } == true
+      self.parseBackgroundAudioObservation(self.accessibilityValue(of: element))
+        .map { $0.after > $0.before } == true
     }
     let expectation = expectation(for: predicate, evaluatedWith: NSObject())
     XCTAssertEqual(XCTWaiter.wait(for: [expectation], timeout: timeout), .completed)
-    guard let observation = parseBackgroundAudioObservation(element.label) else {
-      XCTFail("Background audio probe did not publish two counters: \(element.label)")
+    let value = accessibilityValue(of: element)
+    guard let observation = parseBackgroundAudioObservation(value) else {
+      XCTFail("Background audio probe did not publish two counters: \(value)")
       return BackgroundAudioObservation(before: Int.max, after: Int.min)
     }
     return observation
@@ -325,11 +354,22 @@ final class PiPLiveDeviceUITests: ShowcaseIOSTestCase {
     return BackgroundAudioObservation(before: before, after: after)
   }
 
-  private func reveal(_ element: XCUIElement) {
-    for _ in 0..<8 where !element.isHittable {
-      app.swipeUp()
+  private func reveal(
+    _ element: XCUIElement,
+    swiping direction: ShowcaseScrollDirection
+  ) {
+    for _ in 0..<10 where !element.isHittable {
+      switch direction {
+      case .up: app.swipeUp()
+      case .down: app.swipeDown()
+      }
     }
-    XCTAssertTrue(element.isHittable)
+    if !element.isHittable {
+      for _ in 0..<20 where !element.isHittable {
+        direction.opposite.perform(in: app)
+      }
+    }
+    XCTAssertTrue(element.isHittable, "Could not reveal \(element)")
   }
 
   private func replaceLaunchArgument(_ name: String, with value: String) {
@@ -376,9 +416,13 @@ final class PiPLiveDeviceUITests: ShowcaseIOSTestCase {
   ) {
     XCTAssertTrue(diagnosticsElement.waitForExistence(timeout: 5))
     let predicate = if let previous {
-      NSPredicate(format: "value != %@", previous)
+      NSPredicate { _, _ in
+        self.accessibilityValue(of: diagnosticsElement) != previous
+      }
     } else {
-      NSPredicate(format: "value BEGINSWITH %@", "capture=")
+      NSPredicate { _, _ in
+        self.accessibilityValue(of: diagnosticsElement).hasPrefix("capture=")
+      }
     }
     let updated = XCTNSPredicateExpectation(predicate: predicate, object: diagnosticsElement)
     XCTAssertEqual(
@@ -386,7 +430,7 @@ final class PiPLiveDeviceUITests: ShowcaseIOSTestCase {
       .completed,
       "Diagnostics capture did not publish a new snapshot"
     )
-    let current = diagnosticsElement.value as? String ?? "missing-diagnostics-value"
+    let current = accessibilityValue(of: diagnosticsElement)
     previous = current
     let attachment = XCTAttachment(string: current)
     attachment.name = "direct-renderer-diagnostics-\(name)"

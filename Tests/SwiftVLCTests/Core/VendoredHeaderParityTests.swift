@@ -77,4 +77,81 @@ struct VendoredHeaderParityTests {
     #expect(snapshot.time == 750)
     #expect(snapshot.seekable)
   }
+
+  /// Patch 0027 adds a request-correlated terminal event and submission
+  /// result. Referencing both through CLibVLC catches a rebuilt engine paired
+  /// with stale vendored headers before it reaches an application link.
+  @Test
+  func `The strict frame-step ABI is visible through the shipped headers`() {
+    #expect(swiftvlc_next_frame_request_accepted.rawValue == 0)
+    #expect(swiftvlc_next_frame_request_busy.rawValue == 1)
+    #expect(swiftvlc_next_frame_request_invalid.rawValue == 2)
+    #expect(swiftvlc_next_frame_request_unavailable.rawValue == 3)
+
+    var event = libvlc_event_t()
+    event.type = Int32(libvlc_MediaPlayerFrameStepCompleted.rawValue)
+    event.u.media_player_frame_step_completed.request_id = 42
+    event.u.media_player_frame_step_completed.status = 0
+    event.u.media_player_frame_step_completed.time_us = 1_250_000
+    event.u.media_player_frame_step_completed.position = 0.5
+
+    #expect(event.type == Int32(libvlc_MediaPlayerFrameStepCompleted.rawValue))
+    #expect(event.u.media_player_frame_step_completed.request_id == 42)
+    #expect(event.u.media_player_frame_step_completed.status == 0)
+    #expect(event.u.media_player_frame_step_completed.time_us == 1_250_000)
+    #expect(event.u.media_player_frame_step_completed.position == 0.5)
+  }
+
+  /// Patch 0031 appends an effective-rate event without growing or reordering
+  /// libVLC's released event envelope.
+  @Test
+  func `The effective playback-rate event is visible through shipped headers`() {
+    #expect(
+      libvlc_MediaPlayerRateChanged.rawValue
+        == libvlc_MediaPlayerFrameStepCompleted.rawValue + 1
+    )
+
+    var event = libvlc_event_t()
+    event.type = Int32(libvlc_MediaPlayerRateChanged.rawValue)
+    event.u.media_player_rate_changed.new_rate = 1.25
+
+    #expect(MemoryLayout.size(ofValue: event) == 40)
+    #expect(event.u.media_player_rate_changed.new_rate == 1.25)
+  }
+
+  /// Patch 0030 adds a distinct callback/setter pair so the v4 function-pointer
+  /// ABI can never silently change when source picture timing is enabled.
+  @Test
+  func `The native picture timestamp callback is additive in shipped headers`() {
+    let callback: swiftvlc_video_display_status_v2_cb? = nil
+    let setter = swiftvlc_libvlc_video_set_callbacks_atomic_v2
+
+    #expect(callback == nil)
+    _ = setter
+  }
+
+  /// The engine, weak-link shim, and Swift qualification mapping all exchange
+  /// this struct by value. Pinning every flag plus its size/alignment prevents
+  /// a reordered vendored declaration from silently corrupting live evidence.
+  @Test
+  func `The native renderer recovery ABI is visible through the shipped headers`() {
+    #expect(swiftvlc_sample_buffer_renderer_current.rawValue == 1 << 0)
+    #expect(swiftvlc_sample_buffer_renderer_requires_flush.rawValue == 1 << 1)
+    #expect(swiftvlc_sample_buffer_renderer_failed.rawValue == 1 << 2)
+    #expect(swiftvlc_sample_buffer_renderer_recovery_in_progress.rawValue == 1 << 3)
+    #expect(swiftvlc_sample_buffer_renderer_recovery_sample_available.rawValue == 1 << 4)
+
+    var snapshot = swiftvlc_sample_buffer_renderer_snapshot_t()
+    snapshot.abi_version = 1
+    snapshot.display_generation = 42
+    snapshot.successful_submission_count = 99
+    snapshot.permanent_failure_count = 3
+
+    #expect(MemoryLayout.size(ofValue: snapshot) == 136)
+    #expect(MemoryLayout.alignment(ofValue: snapshot) == 8)
+    #expect(snapshot.abi_version == 1)
+    #expect(snapshot.display_generation == 42)
+    #expect(snapshot.successful_submission_count == 99)
+    #expect(snapshot.permanent_failure_count == 3)
+  }
 }

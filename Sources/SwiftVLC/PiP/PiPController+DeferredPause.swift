@@ -175,10 +175,32 @@ extension PiPController {
       ownedPlaybackControlRevision,
       .resume
     )
-    setDeferredPauseOutcome(.rejected)
-    guard player.state.isActive else { return }
-    player.setPlaybackIntentFromExternalControl(true)
+    guard let playerRestorationLease = player.makeExternalPlaybackIntentRestorationLease()
+    else {
+      setDeferredPauseOutcome(.cancelled)
+      return
+    }
+    guard let outcomeRevision = setDeferredPauseOutcome(.rejected) else { return }
+    guard
+      ownsDeferredPauseOutcomePublication(outcomeRevision),
+      player.ownsExternalPlaybackIntentRestoration(playerRestorationLease),
+      player.restorePlaybackIntentFromExternalControl(
+        true,
+        ifCurrent: playerRestorationLease
+      ),
+      ownsDeferredPauseOutcomePublication(outcomeRevision),
+      player.ownsExternalPlaybackIntentRestoration(playerRestorationLease)
+    else { return }
     pipPlaybackActive = true
+    guard
+      ownsDeferredPauseOutcomePublication(outcomeRevision),
+      player.ownsExternalPlaybackIntentRestoration(playerRestorationLease)
+    else {
+      if ownsDeferredPauseOutcomePublication(outcomeRevision) {
+        pipPlaybackActive = false
+      }
+      return
+    }
     invalidatePictureInPicturePlaybackState()
   }
 
@@ -207,13 +229,15 @@ extension PiPController {
   /// playback driver accepted the resume request. Checks both the
   /// `.issued` state (PiP actually paused libVLC) and the player's
   /// own resume hint.
-  func requestResumeIfNeeded() -> (needed: Bool, accepted: Bool) {
+  func requestResumeIfNeeded(force: Bool = false) -> (needed: Bool, accepted: Bool) {
     let pipIssuedPause = if case .issued = deferredPause {
       true
     } else {
       false
     }
-    let shouldResume = pipIssuedPause || playbackDriver.shouldResume()
+    // A post-reset AVKit Play command must reach the native audio-output
+    // acknowledgement even when VLC's public state still says Playing.
+    let shouldResume = force || pipIssuedPause || playbackDriver.shouldResume()
     if pipIssuedPause {
       deferredPause = .idle
     }

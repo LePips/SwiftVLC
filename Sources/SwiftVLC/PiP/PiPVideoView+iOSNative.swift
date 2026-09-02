@@ -3,6 +3,7 @@
 import AVFoundation
 import AVKit
 import CLibVLC
+import Dispatch
 import os
 import Synchronization
 import UIKit
@@ -380,8 +381,69 @@ private protocol IOSNativePiPDrawable: NSObjectProtocol {
   @objc(takePreservedPictureInPictureWindowController)
   func takePreservedPictureInPictureWindowController() -> AnyObject?
 
+  @objc(takePreservedPictureInPictureWindowControllerWasSuperseded:)
+  func takePreservedPictureInPictureWindowController(
+    wasSuperseded: UnsafeMutablePointer<ObjCBool>
+  ) -> AnyObject?
+
   @objc(pictureInPictureWindowControllerHandoffDidTimeOut:)
   func pictureInPictureWindowControllerHandoffDidTimeOut(_ controller: AnyObject)
+
+  @objc(takePreservedPictureInPictureWindowControllerForNativeHandle:playbackGeneration:outputIdentity:wasSuperseded:)
+  func takePreservedPictureInPictureWindowController(
+    forNativeHandle nativeHandle: UInt64,
+    playbackGeneration: UInt64,
+    outputIdentity: UInt64,
+    wasSuperseded: UnsafeMutablePointer<ObjCBool>
+  ) -> AnyObject?
+
+  @objc(preservePictureInPictureWindowController:fromNativeHandle:playbackGeneration:outputIdentity:sameMediaGenerationRebuild:)
+  func preservePictureInPictureWindowController(
+    _ controller: AnyObject,
+    fromNativeHandle nativeHandle: UInt64,
+    playbackGeneration: UInt64,
+    outputIdentity: UInt64,
+    sameMediaGenerationRebuild: Bool
+  ) -> Bool
+
+  @objc(pictureInPictureWindowController:didBecomeReadyForNativeHandle:playbackGeneration:outputIdentity:)
+  func pictureInPictureWindowController(
+    _ controller: AnyObject,
+    didBecomeReadyForNativeHandle nativeHandle: UInt64,
+    playbackGeneration: UInt64,
+    outputIdentity: UInt64
+  ) -> Bool
+
+  @objc(pictureInPictureWindowController:didClaimNativeHandle:playbackGeneration:outputIdentity:)
+  func pictureInPictureWindowController(
+    _ controller: AnyObject,
+    didClaimNativeHandle nativeHandle: UInt64,
+    playbackGeneration: UInt64,
+    outputIdentity: UInt64
+  ) -> Bool
+
+  @objc(pictureInPictureControllerCreationFailedForNativeHandle:playbackGeneration:outputIdentity:)
+  func pictureInPictureControllerCreationFailed(
+    forNativeHandle nativeHandle: UInt64,
+    playbackGeneration: UInt64,
+    outputIdentity: UInt64
+  )
+
+  @objc(pictureInPictureWindowController:cancelHandoffForNativeHandle:playbackGeneration:outputIdentity:)
+  func pictureInPictureWindowController(
+    _ controller: AnyObject,
+    cancelHandoffForNativeHandle nativeHandle: UInt64,
+    playbackGeneration: UInt64,
+    outputIdentity: UInt64
+  )
+
+  @objc(pictureInPictureWindowController:handoffDidTimeOutForNativeHandle:playbackGeneration:outputIdentity:)
+  func pictureInPictureWindowController(
+    _ controller: AnyObject,
+    handoffDidTimeOutForNativeHandle nativeHandle: UInt64,
+    playbackGeneration: UInt64,
+    outputIdentity: UInt64
+  )
 }
 
 @objc(VLCPictureInPictureMediaControlling)
@@ -443,10 +505,22 @@ final class IOSNativePiPDrawableAttachment: UIView, IOSNativePiPDrawable {
   /// operation allowed to preserve the controller; this merely lets a faster
   /// successor output wait for it.
   func expectPictureInPictureHandoff(
-    for mediaGeneration: PlaybackGeneration
+    to successor: IOSNativePiPPlaybackBinding
   ) {
-    guard nativePiPBackend.isActive else { return }
-    continuityCoordinator.expectHandoff(for: mediaGeneration)
+    guard
+      swiftvlc_native_pip_handoff_v9_available(),
+      nativePiPBackend.isActiveForContinuityHandoff
+    else { return }
+    continuityCoordinator.expectHandoff(to: successor)
+  }
+
+  func failClosedForSameHandleMediaChange(nativeHandle: UInt64) {
+    let retiredControllers = continuityCoordinator.retireControllers(
+      forNativeHandle: nativeHandle
+    )
+    nativePiPBackend.failClosedForSameHandleMediaChange(
+      retiring: retiredControllers
+    )
   }
 
   @available(*, unavailable)
@@ -482,80 +556,201 @@ final class IOSNativePiPDrawableAttachment: UIView, IOSNativePiPDrawable {
 
   @objc(pictureInPictureReady)
   nonisolated func pictureInPictureReady() -> IOSNativePictureInPictureReadyBlock {
-    let attachment = attachment
-    let nativeMediaController = nativeMediaController
-    let continuityCoordinator = continuityCoordinator
-    return { [weak nativePiPBackend] windowController in
-      let mediaGeneration = nativeMediaController.callbackSnapshot.withLock {
-        $0.playbackGeneration
-      }
-      continuityCoordinator.didBecomeReady(
-        windowController,
-        mediaGeneration: mediaGeneration
-      )
-      nonisolated(unsafe) let windowController = windowController
-      Task { @MainActor in
-        guard
-          let nativePiPBackend,
-          let generation = nativePiPBackend.callbackGenerations.reserveReadyCallback(
-            for: attachment
-          )
-        else { return }
-        nativePiPBackend.handlePictureInPictureReady(
-          windowController,
-          generation: generation,
-          mediaGeneration: mediaGeneration
-        )
-      }
-    }
+    // v9 calls the synchronous identity-bearing readiness selector instead.
+    // A provenance-free v8 callback cannot safely identify a delayed output,
+    // so source compatibility is retained while native PiP fails closed.
+    { _ in }
   }
 
   @objc(canStartPictureInPictureAutomaticallyFromInline)
   nonisolated func canStartPictureInPictureAutomaticallyFromInline() -> Bool {
-    startsAutomaticallyFromInline
+    swiftvlc_native_pip_handoff_v9_available()
+      && startsAutomaticallyFromInline
   }
 
   @objc(preservePictureInPictureWindowController:)
   nonisolated func preservePictureInPictureWindowController(
-    _ controller: AnyObject
+    _: AnyObject
   ) -> Bool {
-    let mediaGeneration = nativeMediaController.callbackSnapshot.withLock {
-      $0.playbackGeneration
-    }
-    return continuityCoordinator.preserve(
-      controller,
-      for: mediaGeneration
-    )
+    false
   }
 
   @objc(preservePictureInPictureWindowController:sameMediaGenerationRebuild:)
   nonisolated func preservePictureInPictureWindowController(
-    _ controller: AnyObject,
-    sameMediaGenerationRebuild: Bool
+    _: AnyObject,
+    sameMediaGenerationRebuild _: Bool
   ) -> Bool {
-    let mediaGeneration = nativeMediaController.callbackSnapshot.withLock {
-      $0.playbackGeneration
-    }
-    return continuityCoordinator.preserve(
-      controller,
-      for: mediaGeneration,
-      allowsSameGenerationRebuild: sameMediaGenerationRebuild
-    )
+    false
   }
 
   @objc(takePreservedPictureInPictureWindowController)
   nonisolated func takePreservedPictureInPictureWindowController() -> AnyObject? {
-    let mediaGeneration = nativeMediaController.callbackSnapshot.withLock {
-      $0.playbackGeneration
-    }
-    return continuityCoordinator.takePreservedController(for: mediaGeneration)
+    nil
+  }
+
+  /// The explicit superseded bit prevents a displaced native output from
+  /// treating an ordinary nil Objective-C return as permission to allocate a
+  /// second AVPictureInPictureController. The zero-argument selector remains
+  /// available for older patched libVLC binaries.
+  @objc(takePreservedPictureInPictureWindowControllerWasSuperseded:)
+  nonisolated func takePreservedPictureInPictureWindowController(
+    wasSuperseded: UnsafeMutablePointer<ObjCBool>
+  ) -> AnyObject? {
+    // Version 8 has no immutable output identity. Returning an explicit
+    // superseded result makes its patched Open path fail closed instead of
+    // allocating an unprovable second AVPictureInPictureController.
+    wasSuperseded.pointee = true
+    return nil
   }
 
   @objc(pictureInPictureWindowControllerHandoffDidTimeOut:)
   nonisolated func pictureInPictureWindowControllerHandoffDidTimeOut(
-    _ controller: AnyObject
+    _: AnyObject
+  ) {}
+
+  @objc(takePreservedPictureInPictureWindowControllerForNativeHandle:playbackGeneration:outputIdentity:wasSuperseded:)
+  nonisolated func takePreservedPictureInPictureWindowController(
+    forNativeHandle nativeHandle: UInt64,
+    playbackGeneration: UInt64,
+    outputIdentity: UInt64,
+    wasSuperseded: UnsafeMutablePointer<ObjCBool>
+  ) -> AnyObject? {
+    let output = IOSNativePiPOutputIdentity(
+      nativeHandle: nativeHandle,
+      playbackGeneration: PlaybackGeneration(playbackGeneration),
+      output: outputIdentity
+    )
+    switch continuityCoordinator.takePreservedControllerOutcome(for: output) {
+    case .preserved(let controller):
+      wasSuperseded.pointee = false
+      return controller
+    case .createFresh:
+      wasSuperseded.pointee = false
+      return nil
+    case .superseded:
+      wasSuperseded.pointee = true
+      return nil
+    }
+  }
+
+  @objc(preservePictureInPictureWindowController:fromNativeHandle:playbackGeneration:outputIdentity:sameMediaGenerationRebuild:)
+  nonisolated func preservePictureInPictureWindowController(
+    _ controller: AnyObject,
+    fromNativeHandle nativeHandle: UInt64,
+    playbackGeneration: UInt64,
+    outputIdentity: UInt64,
+    sameMediaGenerationRebuild: Bool
+  ) -> Bool {
+    continuityCoordinator.preserve(
+      controller,
+      from: IOSNativePiPOutputIdentity(
+        nativeHandle: nativeHandle,
+        playbackGeneration: PlaybackGeneration(playbackGeneration),
+        output: outputIdentity
+      ),
+      allowsSameGenerationRebuild: sameMediaGenerationRebuild
+    )
+  }
+
+  @objc(pictureInPictureWindowController:didBecomeReadyForNativeHandle:playbackGeneration:outputIdentity:)
+  nonisolated func pictureInPictureWindowController(
+    _ controller: AnyObject,
+    didBecomeReadyForNativeHandle nativeHandle: UInt64,
+    playbackGeneration: UInt64,
+    outputIdentity: UInt64
+  ) -> Bool {
+    let output = IOSNativePiPOutputIdentity(
+      nativeHandle: nativeHandle,
+      playbackGeneration: PlaybackGeneration(playbackGeneration),
+      output: outputIdentity
+    )
+    guard continuityCoordinator.didBecomeReady(controller, output: output) else {
+      return false
+    }
+
+    let attachment = attachment
+    nonisolated(unsafe) let controller = controller
+    Task { @MainActor [weak nativePiPBackend] in
+      guard
+        let nativePiPBackend,
+        continuityCoordinator.isCurrentReady(controller, output: output),
+        let callback = nativePiPBackend.callbackGenerations.reserveReadyCallback(
+          for: attachment
+        )
+      else { return }
+      nativePiPBackend.handlePictureInPictureReady(
+        controller,
+        generation: callback,
+        mediaGeneration: output.binding.playbackGeneration
+      )
+    }
+    return true
+  }
+
+  @objc(pictureInPictureWindowController:didClaimNativeHandle:playbackGeneration:outputIdentity:)
+  nonisolated func pictureInPictureWindowController(
+    _ controller: AnyObject,
+    didClaimNativeHandle nativeHandle: UInt64,
+    playbackGeneration: UInt64,
+    outputIdentity: UInt64
+  ) -> Bool {
+    continuityCoordinator.didClaimFreshController(
+      controller,
+      output: IOSNativePiPOutputIdentity(
+        nativeHandle: nativeHandle,
+        playbackGeneration: PlaybackGeneration(playbackGeneration),
+        output: outputIdentity
+      )
+    )
+  }
+
+  @objc(pictureInPictureControllerCreationFailedForNativeHandle:playbackGeneration:outputIdentity:)
+  nonisolated func pictureInPictureControllerCreationFailed(
+    forNativeHandle nativeHandle: UInt64,
+    playbackGeneration: UInt64,
+    outputIdentity: UInt64
   ) {
-    continuityCoordinator.didTimeOut(controller)
+    continuityCoordinator.rollbackUnclaimedFreshController(
+      output: IOSNativePiPOutputIdentity(
+        nativeHandle: nativeHandle,
+        playbackGeneration: PlaybackGeneration(playbackGeneration),
+        output: outputIdentity
+      )
+    )
+  }
+
+  @objc(pictureInPictureWindowController:cancelHandoffForNativeHandle:playbackGeneration:outputIdentity:)
+  nonisolated func pictureInPictureWindowController(
+    _ controller: AnyObject,
+    cancelHandoffForNativeHandle nativeHandle: UInt64,
+    playbackGeneration: UInt64,
+    outputIdentity: UInt64
+  ) {
+    continuityCoordinator.didCancel(
+      controller,
+      output: IOSNativePiPOutputIdentity(
+        nativeHandle: nativeHandle,
+        playbackGeneration: PlaybackGeneration(playbackGeneration),
+        output: outputIdentity
+      )
+    )
+  }
+
+  @objc(pictureInPictureWindowController:handoffDidTimeOutForNativeHandle:playbackGeneration:outputIdentity:)
+  nonisolated func pictureInPictureWindowController(
+    _ controller: AnyObject,
+    handoffDidTimeOutForNativeHandle nativeHandle: UInt64,
+    playbackGeneration: UInt64,
+    outputIdentity: UInt64
+  ) {
+    continuityCoordinator.didTimeOut(
+      controller,
+      output: IOSNativePiPOutputIdentity(
+        nativeHandle: nativeHandle,
+        playbackGeneration: PlaybackGeneration(playbackGeneration),
+        output: outputIdentity
+      )
+    )
   }
 
   private var hasDrawableBounds: Bool {
@@ -873,8 +1068,14 @@ final class IOSNativePiPDrawableView: UIView {
 @MainActor
 final class IOSNativePiPBackend: NSObject, @unchecked Sendable {
   lazy var continuityCoordinator = IOSNativePiPContinuityCoordinator { [weak self] transition in
-    Task { @MainActor [weak self] in
-      self?.handleContinuityTransition(transition)
+    // The coordinator invokes this closure in committed transition order and
+    // does so before waking a successor output. Dispatch's main queue preserves
+    // that enqueue order, unlike independent unstructured MainActor tasks whose
+    // execution order is not a FIFO contract.
+    DispatchQueue.main.async { [weak self] in
+      MainActor.assumeIsolated {
+        self?.handleContinuityTransition(transition)
+      }
     }
   }
 
@@ -925,6 +1126,28 @@ final class IOSNativePiPBackend: NSObject, @unchecked Sendable {
   private(set) var startsAutomaticallyFromInline = true
   private(set) var playbackStateInvalidationCount: UInt64 = 0
   private var didWarnAboutVideoOutput = false
+
+  #if DEBUG
+  /// Overrides the synchronous AVKit state only, leaving the asynchronously
+  /// mirrored `isActive` value untouched so tests can reproduce that gap.
+  var _avControllerIsActiveForHandoffOverrideForTesting: Bool?
+  #endif
+
+  /// Replacement staging must not depend solely on `isActive`: native/KVO
+  /// callbacks snapshot AVKit on their originating thread, then enqueue the
+  /// mirrored update on the main actor. A replacement can enter this method
+  /// before that queued update even though AVKit is already active.
+  var isActiveForContinuityHandoff: Bool {
+    if isActive {
+      return true
+    }
+    #if DEBUG
+    if let override = _avControllerIsActiveForHandoffOverrideForTesting {
+      return override
+    }
+    #endif
+    return avPictureInPictureController?.isPictureInPictureActive == true
+  }
 
   private static let logger = Logger(
     subsystem: Signposts.subsystem,
@@ -989,6 +1212,29 @@ final class IOSNativePiPBackend: NSObject, @unchecked Sendable {
     ownerAttachment = nil
     setPossible(false)
     setActive(false)
+  }
+
+  func failClosedForSameHandleMediaChange(retiring controllers: [AnyObject]) {
+    avPictureInPictureController?
+      .canStartPictureInPictureAutomaticallyFromInline = false
+    stop()
+    var retired: Set<ObjectIdentifier> = []
+    if let windowController {
+      retired.insert(ObjectIdentifier(windowController))
+      closeNativeWindowController(windowController)
+    }
+    for case let controller as NSObject in controllers
+      where retired.insert(ObjectIdentifier(controller)).inserted {
+      closeNativeWindowController(controller)
+    }
+    clearWindowController()
+    setPossible(false)
+    setActive(false)
+  }
+
+  private func closeNativeWindowController(_ controller: NSObject) {
+    guard controller.responds(to: IOSNativePiPSelector.close) else { return }
+    _ = controller.perform(IOSNativePiPSelector.close)
   }
 
   func handlePictureInPictureReady(_ controller: AnyObject) {
@@ -1632,7 +1878,9 @@ final class IOSNativePiPMediaController: NSObject, IOSNativePiPMediaControlling,
     let pointer = player?.pointer
     let playbackGeneration = player?.generation
     callbackSnapshot.withLock { snapshot in
-      if snapshot.playerPointer != pointer {
+      if
+        snapshot.playerPointer != pointer
+        || snapshot.playbackGeneration != playbackGeneration {
         snapshot.generation &+= 1
       }
       snapshot.playerPointer = pointer
@@ -1655,20 +1903,43 @@ final class IOSNativePiPMediaController: NSObject, IOSNativePiPMediaControlling,
 
   weak var owner: PiPController?
 
-  /// The generation the callback snapshot is currently on.
-  ///
-  /// Every mutating callback below hops to the main actor, and the attached
-  /// player can be replaced during that hop. Comparing the generation captured
-  /// at entry against the one on arrival is how a command issued for the
-  /// previous session is kept from being applied to its successor.
-  private var callbackGeneration: UInt64 {
-    callbackSnapshot.withLock { $0.generation }
+  private struct CallbackCommandIdentity: Sendable, Equatable {
+    let snapshotGeneration: UInt64
+    let playbackGeneration: PlaybackGeneration?
+  }
+
+  /// Exact identity captured before a native callback hops to the main actor.
+  private var callbackCommandIdentity: CallbackCommandIdentity {
+    callbackSnapshot.withLock {
+      CallbackCommandIdentity(
+        snapshotGeneration: $0.generation,
+        playbackGeneration: $0.playbackGeneration
+      )
+    }
+  }
+
+  /// Resolves the player only while the queued command still describes both
+  /// Swift's adopted media and the callback lane's authoritative generation.
+  @MainActor
+  private func currentPlayer(for identity: CallbackCommandIdentity) -> Player? {
+    guard
+      callbackSnapshot.withLock({ snapshot in
+        snapshot.generation == identity.snapshotGeneration
+          && snapshot.playbackGeneration == identity.playbackGeneration
+      }),
+      let playbackGeneration = identity.playbackGeneration,
+      let player,
+      player.nativeHandleRepresentsCurrentMedia,
+      player.generation == playbackGeneration,
+      player.eventBridge.currentPlaybackGeneration == playbackGeneration.value
+    else { return nil }
+    return player
   }
 
   @objc func play() {
-    let issued = callbackGeneration
+    let issued = callbackCommandIdentity
     Task { @MainActor [weak self] in
-      guard let self, callbackGeneration == issued, let player else { return }
+      guard let self, let player = currentPlayer(for: issued) else { return }
       // A cold start after playback ended is not a resume — begin afresh.
       if player.state == .idle || player.state == .stopped {
         try? player.play()
@@ -1687,13 +1958,13 @@ final class IOSNativePiPMediaController: NSObject, IOSNativePiPMediaControlling,
   }
 
   @objc func pause() {
-    let issued = callbackGeneration
+    let issued = callbackCommandIdentity
     Task { @MainActor [weak self] in
-      guard let self, callbackGeneration == issued else { return }
+      guard let self, let player = currentPlayer(for: issued) else { return }
       if let owner {
         owner.handleNativePictureInPictureSetPlaying(false)
       } else {
-        player?.pause()
+        player.pause()
       }
     }
   }
@@ -1701,13 +1972,13 @@ final class IOSNativePiPMediaController: NSObject, IOSNativePiPMediaControlling,
   @objc(seekBy:completion:)
   func seek(by offset: Int64, completion: (() -> Void)?) {
     nonisolated(unsafe) let completion = completion
-    let issued = callbackGeneration
+    let issued = callbackCommandIdentity
     Task { @MainActor [weak self] in
       // The completion is owed to VLC's PiP module whether or not the seek is
       // applied. Dropping it on a superseded generation would leave the skip
       // it drives unresolved, which is worse than the stale seek being
       // rejected.
-      guard let self, callbackGeneration == issued, let player else {
+      guard let self, let player = currentPlayer(for: issued) else {
         completion?()
         return
       }
@@ -1732,8 +2003,8 @@ final class IOSNativePiPMediaController: NSObject, IOSNativePiPMediaControlling,
   /// satisfying its `void` completion contract.
   @MainActor
   func qualificationSeek(by offset: Int64) async -> PiPController.SkipOutcome {
-    let issued = callbackGeneration
-    guard callbackGeneration == issued, let player else { return .rejected }
+    let issued = callbackCommandIdentity
+    guard let player = currentPlayer(for: issued) else { return .rejected }
     let request = PiPController.performSkip(
       on: player,
       by: CMTime(value: offset, timescale: 1000)
@@ -1821,14 +2092,11 @@ final class IOSNativePiPMediaController: NSObject, IOSNativePiPMediaControlling,
     callbackSnapshot.withLock { $0.playbackGeneration?.value ?? 0 }
   }
 
-  /// Consumes the one accepted-seek permit for this exact media generation.
-  /// A normal stop or drawable teardown has no permit and must close PiP.
+  /// Version-8 source/selector compatibility only. A time-bounded seek permit
+  /// cannot prove that a same-handle vout still represents the same media, so
+  /// version 9 always fails this path closed.
   @objc func consumePictureInPictureVideoOutputRebuildPermit() -> Bool {
-    guard
-      let mediaGeneration = callbackSnapshot.withLock({ $0.playbackGeneration }),
-      let player
-    else { return false }
-    return player.nativePiPVideoOutputRebuildPermit.consume(for: mediaGeneration)
+    false
   }
 
   @objc func mediaLength() -> Int64 {
@@ -1862,6 +2130,7 @@ final class IOSNativePiPMediaController: NSObject, IOSNativePiPMediaControlling,
 private enum IOSNativePiPSelector {
   static let start = NSSelectorFromString("startPictureInPicture")
   static let stop = NSSelectorFromString("stopPictureInPicture")
+  static let close = NSSelectorFromString("close")
   static let invalidatePlaybackState = NSSelectorFromString("invalidatePlaybackState")
   static let setStateChangeEventHandler = NSSelectorFromString("setStateChangeEventHandler:")
   static let avPictureInPictureController = NSSelectorFromString("avPipController")

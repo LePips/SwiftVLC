@@ -63,6 +63,15 @@ enum AccessibilityID {
   enum Seeking {
     static let videoView = "seek.videoView"
     static let playPauseButton = "seek.playPause"
+    static let seekBurstStatus = "seek.burst.status"
+    static let seekBurstProgress = "seek.burst.progress"
+    static let seekBurstSnapshot = "seek.burst.snapshot"
+    static let seekBurstResult = "seek.burst.result"
+    static let seekBurstError = "seek.burst.error"
+
+    static func seekBurstButton(cadenceMilliseconds: Int) -> String {
+      "seek.burst.run.\(cadenceMilliseconds)ms"
+    }
   }
 
   /// Shared across every showcase that uses `SeekBar`, so consumers
@@ -101,6 +110,7 @@ enum AccessibilityID {
     static let skipBack10 = "relseek.skipBack10"
     static let skipForward10 = "relseek.skipForward10"
     static let skipForward30 = "relseek.skipForward30"
+    static let sameDirectionBurst = "relseek.sameDirectionBurst"
   }
 
   enum FrameStep {
@@ -109,6 +119,48 @@ enum AccessibilityID {
     static let pausableLabel = "framestep.pausable"
     static let timeLabel = "framestep.time"
     static let nextFrameButton = "framestep.nextFrame"
+  }
+
+  enum SeekFrameOracleValidation {
+    static let videoView = "seekFrameOracle.videoView"
+    static let stateLabel = "seekFrameOracle.state"
+    static let resultLabel = "seekFrameOracle.result"
+    static let errorLabel = "seekFrameOracle.error"
+    static let prepareSparseButton = "seekFrameOracle.prepareSparse"
+    static let preciseSeekButton = "seekFrameOracle.preciseSeek"
+    static let fastSeekButton = "seekFrameOracle.fastSeek"
+    static let overlapSeekButton = "seekFrameOracle.overlapSeek"
+    static let prepareFramesButton = "seekFrameOracle.prepareFrames"
+    static let stepOneButton = "seekFrameOracle.stepOne"
+    static let burstButton = "seekFrameOracle.burst"
+    static let resumeButton = "seekFrameOracle.resume"
+    static let eofButton = "seekFrameOracle.eof"
+    static let replacementButton = "seekFrameOracle.replacement"
+  }
+
+  enum LocalFileMatrixValidation {
+    static let videoView = "localFileMatrix.videoView"
+    static let fixtureLabel = "localFileMatrix.fixture"
+    static let stateLabel = "localFileMatrix.state"
+    static let resultLabel = "localFileMatrix.result"
+    static let errorLabel = "localFileMatrix.error"
+  }
+
+  enum AudioOnlyPlaybackValidation {
+    static let fixtureLabel = "audioOnlyPlayback.fixture"
+    static let stateLabel = "audioOnlyPlayback.state"
+    static let resultLabel = "audioOnlyPlayback.result"
+    static let errorLabel = "audioOnlyPlayback.error"
+  }
+
+  enum ProgressiveHTTPRangeSeekValidation {
+    static let videoView = "progressiveHTTPRange.videoView"
+    static let modeLabel = "progressiveHTTPRange.mode"
+    static let stateLabel = "progressiveHTTPRange.state"
+    static let resultLabel = "progressiveHTTPRange.result"
+    static let errorLabel = "progressiveHTTPRange.error"
+    static let commandButton = "progressiveHTTPRange.command"
+    static let finalizeButton = "progressiveHTTPRange.finalize"
   }
 
   enum Rate {
@@ -193,7 +245,6 @@ enum AccessibilityID {
     static let lifecycleEventsLabel = "pipContinuity.lifecycleEvents"
     static let replacementMeasurementLabel = "pipContinuity.replacementMeasurement"
     static let staleSuccessorMutationsLabel = "pipContinuity.staleSuccessorMutations"
-    static let automationSnapshot = "pipContinuity.automationSnapshot"
   }
 
   enum PiPCapabilityValidation {
@@ -286,6 +337,29 @@ enum AccessibilityID {
     static let errorLabel = "pipInterruption.error"
   }
 
+  enum MediaServicesResetValidation {
+    static let videoView = "mediaServicesReset.videoView"
+    static let phaseLabel = "mediaServicesReset.phase"
+    static let audioStateLabel = "mediaServicesReset.audioState"
+    static let videoStateLabel = "mediaServicesReset.videoState"
+    static let pictureInPictureActiveLabel = "mediaServicesReset.pipActive"
+    static let notificationCountsLabel = "mediaServicesReset.notifications"
+    static let startPictureInPictureButton = "mediaServicesReset.startPiP"
+    static let armButton = "mediaServicesReset.arm"
+    static let resumeButton = "mediaServicesReset.resume"
+    static let resultLabel = "mediaServicesReset.result"
+    static let errorLabel = "mediaServicesReset.error"
+  }
+
+  enum AudioSessionOwnershipValidation {
+    static let phaseLabel = "audioSessionOwnership.phase"
+    static let interruptionCountsLabel = "audioSessionOwnership.interruptions"
+    static let runButton = "audioSessionOwnership.run"
+    static let continueFocusProbeButton = "audioSessionOwnership.continueFocusProbe"
+    static let resultLabel = "audioSessionOwnership.result"
+    static let errorLabel = "audioSessionOwnership.error"
+  }
+
   enum PiPNativeLifecycleValidation {
     static let videoView = "pipNativeLifecycle.videoView"
     static let stateLabel = "pipNativeLifecycle.state"
@@ -295,6 +369,20 @@ enum AccessibilityID {
     static let resultLabel = "pipNativeLifecycle.result"
     static let runButton = "pipNativeLifecycle.run"
     static let errorLabel = "pipNativeLifecycle.error"
+  }
+
+  enum NativeRendererRecoveryValidation {
+    static let videoView = "nativeRendererRecovery.videoView"
+    static let stateLabel = "nativeRendererRecovery.state"
+    static let possibleLabel = "nativeRendererRecovery.possible"
+    static let activeLabel = "nativeRendererRecovery.active"
+    static let phaseLabel = "nativeRendererRecovery.phase"
+    static let resultLabel = "nativeRendererRecovery.result"
+    static let prepareButton = "nativeRendererRecovery.prepare"
+    static let armButton = "nativeRendererRecovery.arm"
+    static let evaluateButton = "nativeRendererRecovery.evaluate"
+    static let resumeButton = "nativeRendererRecovery.resume"
+    static let errorLabel = "nativeRendererRecovery.error"
   }
 
   enum TerminalOutcomesValidation {
@@ -338,6 +426,21 @@ enum AccessibilityID {
     static let resultLabel = "pipCadence.result"
     static let runButton = "pipCadence.run"
     static let errorLabel = "pipCadence.error"
+  }
+
+  /// Opt-in, report-only physical probe. Its identifiers are deliberately
+  /// separate from candidate-bound cadence qualification so its output cannot
+  /// be mistaken for release credit.
+  enum PiPCadenceSemanticsProbe {
+    static let videoView = "pipCadenceProbe.videoView"
+    static let stateLabel = "pipCadenceProbe.state"
+    static let possibleLabel = "pipCadenceProbe.possible"
+    static let activeLabel = "pipCadenceProbe.active"
+    static let progressLabel = "pipCadenceProbe.progress"
+    static let profileLabel = "pipCadenceProbe.profile"
+    static let resultLabel = "pipCadenceProbe.result"
+    static let runButton = "pipCadenceProbe.run"
+    static let errorLabel = "pipCadenceProbe.error"
   }
 
   enum NativeSubtitleMatrixValidation {

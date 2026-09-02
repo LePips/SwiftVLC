@@ -38,6 +38,14 @@ struct RelativeSeekCase: View {
         // Form row swallows individual taps and routes them through the
         // cell. See `ABLoopCase` for the same fix.
         .buttonStyle(.borderless)
+
+        Button("Burst +30s (3 × +10s)") {
+          for _ in 0..<3 {
+            try? player.seek(by: .seconds(10), fast: true)
+          }
+        }
+        .buttonStyle(.borderless)
+        .accessibilityIdentifier(AccessibilityID.RelativeSeek.sameDirectionBurst)
       }
     }
     .showcaseFormStyle()

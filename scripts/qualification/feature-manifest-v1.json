@@ -1,0 +1,1089 @@
+{
+  "formatVersion": 1,
+  "id": "swiftvlc-release-features",
+  "manifestVersion": "1.1.0",
+  "releaseVersionPrefix": "1.1.0",
+  "title": "SwiftVLC 1.1.0 physical-device feature checklist",
+  "description": "Human-facing release promises backed by candidate-bound physical-device evidence. Planned and external-lab rows remain visible as blockers instead of disappearing from a favorable coverage percentage.",
+  "requiresFreshUpstreamRiskReview": true,
+  "categories": [
+    {
+      "id": "core-playback",
+      "title": "Core playback and lifecycle"
+    },
+    {
+      "id": "seeking-controls",
+      "title": "Seeking and transport controls"
+    },
+    {
+      "id": "picture-in-picture",
+      "title": "Picture in Picture"
+    },
+    {
+      "id": "audio-lifecycle",
+      "title": "Audio and system lifecycle"
+    },
+    {
+      "id": "network-streaming",
+      "title": "Network streaming and recovery"
+    },
+    {
+      "id": "tracks-rendering",
+      "title": "Tracks, subtitles, and rendering"
+    },
+    {
+      "id": "performance-reliability",
+      "title": "Performance and long-run reliability"
+    },
+    {
+      "id": "casting",
+      "title": "Remote playback and casting"
+    }
+  ],
+  "features": [
+    {
+      "id": "playback-finite-vod",
+      "category": "core-playback",
+      "title": "Finite VOD produces moving video and remains controllable",
+      "description": "A finite local fixture reaches moving system-PiP output and remains controllable rather than merely entering the nominal playing state.",
+      "releaseRequirement": "required",
+      "execution": "automated",
+      "evidenceLevel": "system-output",
+      "scenarioIds": [
+        "vod-controls"
+      ],
+      "runnerScenarioIds": [
+        "vod-controls"
+      ]
+    },
+    {
+      "id": "playback-unbounded-live",
+      "category": "core-playback",
+      "title": "Unbounded live playback remains active",
+      "description": "An indefinite live fixture advances through native and direct output with truthful unbounded playback policy.",
+      "releaseRequirement": "required",
+      "execution": "automated",
+      "evidenceLevel": "system-output",
+      "scenarioIds": [
+        "live-media"
+      ],
+      "runnerScenarioIds": [
+        "live-media"
+      ]
+    },
+    {
+      "id": "playback-media-replacement",
+      "category": "core-playback",
+      "title": "Same-player media replacement is generation-safe",
+      "description": "VOD and live replacements retain coherent controls and prevent predecessor events from mutating the successor session.",
+      "releaseRequirement": "required",
+      "execution": "automated",
+      "evidenceLevel": "engine-output",
+      "scenarioIds": [
+        "replacement",
+        "replacement-continuity"
+      ],
+      "runnerScenarioIds": [
+        "continuity"
+      ]
+    },
+    {
+      "id": "playback-terminal-outcomes",
+      "category": "core-playback",
+      "title": "Every playback generation has one truthful terminal outcome",
+      "description": "EOF, explicit stop, replacement, source, demux, decoder, renderer, output, and network failures are classified exactly once.",
+      "releaseRequirement": "required",
+      "execution": "automated",
+      "evidenceLevel": "engine-output",
+      "scenarioIds": [
+        "terminal-outcomes"
+      ],
+      "runnerScenarioIds": [
+        "terminal-outcomes"
+      ]
+    },
+    {
+      "id": "playback-local-file-matrix",
+      "category": "core-playback",
+      "title": "Representative local containers and codecs play to output",
+      "description": "Candidate-bound H.264 MP4/fMP4/Matroska, VP9 WebM, and MPEG-2 TS files are persisted into the app container and checked using native decode/display counters, media time, and independently replayed pixels.",
+      "releaseRequirement": "required",
+      "execution": "automated",
+      "evidenceLevel": "engine-output",
+      "scenarioIds": [
+        "local-file-matrix"
+      ],
+      "runnerScenarioIds": [
+        "local-file-matrix"
+      ]
+    },
+    {
+      "id": "playback-audio-only",
+      "category": "core-playback",
+      "title": "Audio-only playback advances real output",
+      "description": "Candidate-bound AAC, ALAC, MP3, FLAC, Opus, and PCM files advance media time, native audio decode, and real played-audio-buffer counters without a video stream.",
+      "releaseRequirement": "required",
+      "execution": "automated",
+      "evidenceLevel": "system-output",
+      "scenarioIds": [
+        "audio-only-playback"
+      ],
+      "runnerScenarioIds": [
+        "audio-only-playback"
+      ]
+    },
+    {
+      "id": "playback-foreground-displaylayer-recovery",
+      "category": "core-playback",
+      "title": "Paused video recovers revoked decoder resources on foreground",
+      "description": "After backgrounding revokes AVSampleBufferDisplayLayer decoder resources, foregrounding flushes the failed layer and restores the paused frame or next accepted frame without requiring unrelated playback to kick recovery.",
+      "releaseRequirement": "required",
+      "execution": "automated",
+      "evidenceLevel": "system-output",
+      "scenarioIds": [
+        "playback-foreground-displaylayer-recovery"
+      ],
+      "runnerScenarioIds": [
+        "playback-foreground-displaylayer-recovery"
+      ]
+    },
+    {
+      "id": "transport-play-pause",
+      "category": "seeking-controls",
+      "title": "Play and pause controls change actual playback",
+      "description": "Controls pass through the production bridge, the clock remains bounded while paused, and the player resumes before subsequent output checks.",
+      "releaseRequirement": "required",
+      "execution": "automated",
+      "evidenceLevel": "system-output",
+      "scenarioIds": [
+        "vod-controls"
+      ],
+      "runnerScenarioIds": [
+        "vod-controls"
+      ]
+    },
+    {
+      "id": "seek-absolute-scrub",
+      "category": "seeking-controls",
+      "title": "Absolute scrubbing lands and presents the requested content",
+      "description": "A scrub remains within the supported tolerance, preserves output, and settles through the public timeline.",
+      "releaseRequirement": "required",
+      "execution": "automated",
+      "evidenceLevel": "system-output",
+      "scenarioIds": [
+        "vod-controls"
+      ],
+      "runnerScenarioIds": [
+        "vod-controls"
+      ]
+    },
+    {
+      "id": "seek-relative-forward-backward",
+      "category": "seeking-controls",
+      "title": "Relative forward and backward seeks land",
+      "description": "Forward and backward controls wait for the native seek monitor, move in the requested direction, and retain moving system-PiP output across the complete scenario.",
+      "releaseRequirement": "required",
+      "execution": "automated",
+      "evidenceLevel": "system-output",
+      "scenarioIds": [
+        "vod-controls"
+      ],
+      "runnerScenarioIds": [
+        "vod-controls"
+      ]
+    },
+    {
+      "id": "seek-relative-zero-boundary",
+      "category": "seeking-controls",
+      "title": "Negative relative seeks clamp safely at the start",
+      "description": "A backward relative request larger than elapsed time reaches the beginning without native assertions, wraparound, false success, or loss of subsequent controls.",
+      "releaseRequirement": "required",
+      "execution": "automated",
+      "evidenceLevel": "system-output",
+      "scenarioIds": [
+        "vod-controls"
+      ],
+      "runnerScenarioIds": [
+        "vod-controls"
+      ]
+    },
+    {
+      "id": "seek-native-hls-continuity",
+      "category": "seeking-controls",
+      "title": "HLS seeks preserve native playback continuity",
+      "description": "Forward, backward, and absolute HLS seeks return decoded video, retain controls, and stay visibly active.",
+      "releaseRequirement": "required",
+      "execution": "automated",
+      "evidenceLevel": "system-output",
+      "scenarioIds": [
+        "native-hls-seek-continuity"
+      ],
+      "runnerScenarioIds": [
+        "hls-seek"
+      ]
+    },
+    {
+      "id": "seek-capability-convergence",
+      "category": "seeking-controls",
+      "title": "Seek controls follow VOD and live capability changes",
+      "description": "Suppressed callbacks cannot leave AVKit or the player with stale seekability through VOD, live, and successor VOD transitions.",
+      "releaseRequirement": "required",
+      "execution": "automated",
+      "evidenceLevel": "system-output",
+      "scenarioIds": [
+        "capability-convergence"
+      ],
+      "runnerScenarioIds": [
+        "capability-convergence"
+      ]
+    },
+    {
+      "id": "transport-unpausable-input",
+      "category": "seeking-controls",
+      "title": "Unsupported pause requests settle truthfully",
+      "description": "Permanent and transient rejection, replacement, stop, and superseding commands do not leave endless tasks or misleading controls.",
+      "releaseRequirement": "required",
+      "execution": "automated",
+      "evidenceLevel": "engine-output",
+      "scenarioIds": [
+        "deferred-pause-rejection"
+      ],
+      "runnerScenarioIds": [
+        "deferred-pause-rejection"
+      ]
+    },
+    {
+      "id": "transport-ab-loop-boundaries",
+      "category": "seeking-controls",
+      "title": "A-B loops seek and repeat at exact lifecycle boundaries",
+      "description": "Time- and position-based loops set before initial playback or while paused reach A, repeat at B without losing the timer, and reset into normal playback.",
+      "releaseRequirement": "required",
+      "execution": "planned",
+      "evidenceLevel": "system-output",
+      "blocker": "The device matrix has no content-coded A-B loop row for initial, playing, paused, and reset states."
+    },
+    {
+      "id": "seek-local-sparse-gop",
+      "category": "seeking-controls",
+      "title": "Local sparse-GOP precise and fast seeks have content oracles",
+      "description": "Frame-coded fixtures distinguish requested time, decoder landing, and the first presented frame for precise and keyframe-aligned seeks.",
+      "releaseRequirement": "required",
+      "execution": "automated",
+      "evidenceLevel": "engine-output",
+      "scenarioIds": [
+        "seek-frame-oracles"
+      ],
+      "runnerScenarioIds": [
+        "seek-frame-oracles"
+      ]
+    },
+    {
+      "id": "seek-progressive-http-range",
+      "category": "seeking-controls",
+      "title": "Progressive HTTP Range seeking lands",
+      "description": "The release candidate issues the expected Range request, lands on decoded content, and recovers from a server without Range support.",
+      "releaseRequirement": "required",
+      "execution": "automated",
+      "evidenceLevel": "engine-output",
+      "scenarioIds": [
+        "progressive-http-range-seek"
+      ],
+      "runnerScenarioIds": [
+        "progressive-http-range-seek"
+      ]
+    },
+    {
+      "id": "seek-overlap-cancellation",
+      "category": "seeking-controls",
+      "title": "Rapid overlapping seeks make only the newest request authoritative",
+      "description": "Coalesced or ignored native seeks cannot consume stale wrapper tokens or publish a predecessor landing into the active timeline.",
+      "releaseRequirement": "required",
+      "execution": "automated",
+      "evidenceLevel": "engine-output",
+      "scenarioIds": [
+        "seek-frame-oracles"
+      ],
+      "runnerScenarioIds": [
+        "seek-frame-oracles"
+      ]
+    },
+    {
+      "id": "seek-hls-before-playback",
+      "category": "seeking-controls",
+      "title": "HLS seek before playback starts is safe and lands",
+      "description": "Setting an initial HLS time before the native clock is established must neither assert nor disappear; decoded content proves the eventual landing.",
+      "releaseRequirement": "required",
+      "execution": "planned",
+      "evidenceLevel": "engine-output",
+      "blocker": "No physical-device row currently seeks HLS before playback establishes its first native clock."
+    },
+    {
+      "id": "seek-streamed-ogg-opus-backward",
+      "category": "seeking-controls",
+      "title": "Streamed Ogg/Opus backward seeks move backward",
+      "description": "A content-coded Ogg/Opus network fixture proves that a backward request cannot land later than its pre-seek presentation point while the equivalent local file remains a control.",
+      "releaseRequirement": "required",
+      "execution": "planned",
+      "evidenceLevel": "engine-output",
+      "blocker": "The qualification matrix has no streamed Ogg/Opus direction oracle paired with a local-file control."
+    },
+    {
+      "id": "seek-degraded-network-recovery",
+      "category": "seeking-controls",
+      "title": "Seeking under degraded networking has a bounded outcome",
+      "description": "Loss, delay, and constrained bandwidth during an audio or video seek must recover playback or publish one typed failure instead of drifting from pause into an unrecoverable stop.",
+      "releaseRequirement": "required",
+      "execution": "planned",
+      "evidenceLevel": "system-output",
+      "blocker": "The current network lane stalls playback but does not inject degradation around a seek and assert its terminal outcome."
+    },
+    {
+      "id": "seek-network-ts-repeated",
+      "category": "seeking-controls",
+      "title": "Network MPEG-TS supports repeated seeks without losing duration",
+      "description": "At least three alternating seeks on a seekable network MPEG-TS fixture retain nonzero duration, truthful seekability, decoded output, and directional landing evidence.",
+      "releaseRequirement": "required",
+      "execution": "planned",
+      "evidenceLevel": "engine-output",
+      "blocker": "No candidate-bound device scenario repeats seeks on network MPEG-TS while checking duration and decoded content."
+    },
+    {
+      "id": "frame-step-exact-presentation",
+      "category": "seeking-controls",
+      "title": "Every accepted frame step presents exactly one final frame",
+      "description": "Each accepted request correlates to one final displayed frame or one explicit no-frame, canceled, or failed terminal result across static 1-to-0, 1-to-1, and 1-to-many filters.",
+      "releaseRequirement": "required",
+      "execution": "automated",
+      "evidenceLevel": "system-output",
+      "scenarioIds": [
+        "seek-frame-oracles"
+      ],
+      "runnerScenarioIds": [
+        "seek-frame-oracles"
+      ]
+    },
+    {
+      "id": "frame-step-burst",
+      "category": "seeking-controls",
+      "title": "Bursts of frame-step requests neither hang nor lose terminals",
+      "description": "Bursts larger than internal queues settle every request in order without hangs, duplicate completions, silent drops, or over-advancing final output.",
+      "releaseRequirement": "required",
+      "execution": "automated",
+      "evidenceLevel": "engine-output",
+      "scenarioIds": [
+        "seek-frame-oracles"
+      ],
+      "runnerScenarioIds": [
+        "seek-frame-oracles"
+      ]
+    },
+    {
+      "id": "frame-step-resume-clock",
+      "category": "seeking-controls",
+      "title": "Playback resumes with a coherent clock after repeated frame steps",
+      "description": "After many paused frame steps, play resumes moving audio and video without late-frame storms, frozen presentation, clock rollback, or unbounded A/V drift.",
+      "releaseRequirement": "required",
+      "execution": "automated",
+      "evidenceLevel": "system-output",
+      "scenarioIds": [
+        "seek-frame-oracles"
+      ],
+      "runnerScenarioIds": [
+        "seek-frame-oracles"
+      ]
+    },
+    {
+      "id": "frame-step-eof-transition-safety",
+      "category": "seeking-controls",
+      "title": "Frame stepping across EOF and state transitions is safe",
+      "description": "EOF, stop, replacement, error, cancellation, and mixed legacy/strict requests settle exactly once without pause-clock assertions or stranded work.",
+      "releaseRequirement": "required",
+      "execution": "automated",
+      "evidenceLevel": "engine-output",
+      "scenarioIds": [
+        "seek-frame-oracles"
+      ],
+      "runnerScenarioIds": [
+        "seek-frame-oracles"
+      ]
+    },
+    {
+      "id": "pip-live-native-direct",
+      "category": "picture-in-picture",
+      "title": "Native and direct PiP show moving live video",
+      "description": "Both backends complete repeated system-PiP cycles, retain moving pixels while backgrounded, and recover inline.",
+      "releaseRequirement": "required",
+      "execution": "automated",
+      "evidenceLevel": "system-output",
+      "scenarioIds": [
+        "live-media"
+      ],
+      "runnerScenarioIds": [
+        "live-media"
+      ]
+    },
+    {
+      "id": "pip-restore",
+      "category": "picture-in-picture",
+      "title": "System PiP restores into the app exactly once",
+      "description": "The real restore affordance produces ordered restore lifecycle events and one host completion.",
+      "releaseRequirement": "required",
+      "execution": "automated",
+      "evidenceLevel": "system-output",
+      "scenarioIds": [
+        "restore"
+      ],
+      "runnerScenarioIds": [
+        "dismissal"
+      ]
+    },
+    {
+      "id": "pip-close",
+      "category": "picture-in-picture",
+      "title": "System PiP closes with an authoritative user reason",
+      "description": "The real close affordance produces ordered user-close lifecycle events without invoking restoration.",
+      "releaseRequirement": "required",
+      "execution": "automated",
+      "evidenceLevel": "system-output",
+      "scenarioIds": [
+        "close"
+      ],
+      "runnerScenarioIds": [
+        "dismissal"
+      ]
+    },
+    {
+      "id": "pip-start-failure",
+      "category": "picture-in-picture",
+      "title": "PiP start failure is surfaced exactly once",
+      "description": "A refused or asynchronously failed start never silently succeeds or emits a later did-start event.",
+      "releaseRequirement": "required",
+      "execution": "automated",
+      "evidenceLevel": "system-output",
+      "scenarioIds": [
+        "failed-start",
+        "accepted-start-delayed-failure"
+      ],
+      "runnerScenarioIds": [
+        "failed-start"
+      ]
+    },
+    {
+      "id": "pip-replacement-active",
+      "category": "picture-in-picture",
+      "title": "Media replacement preserves or boundedly re-engages PiP",
+      "description": "The same player replaces media without unattributed stops and reports the observed recovery path.",
+      "releaseRequirement": "required",
+      "execution": "automated",
+      "evidenceLevel": "system-output",
+      "scenarioIds": [
+        "replacement"
+      ],
+      "runnerScenarioIds": [
+        "continuity"
+      ]
+    },
+    {
+      "id": "pip-native-lifecycle",
+      "category": "picture-in-picture",
+      "title": "Native PiP lifecycle events remain ordered and authoritative",
+      "description": "Close, restore, failure, stop, media end, recast, and replacement retain correct event attribution.",
+      "releaseRequirement": "required",
+      "execution": "automated",
+      "evidenceLevel": "system-output",
+      "scenarioIds": [
+        "native-lifecycle"
+      ],
+      "runnerScenarioIds": [
+        "native-lifecycle"
+      ]
+    },
+    {
+      "id": "pip-system-overlay-controls",
+      "category": "picture-in-picture",
+      "title": "Real system PiP controls drive the candidate player",
+      "description": "An operator presses the visible SpringBoard Picture in Picture play, pause, forward, and backward controls and observes both the system overlay state and candidate media clock settle after every command.",
+      "releaseRequirement": "required",
+      "execution": "operator-assisted",
+      "evidenceLevel": "system-output",
+      "blocker": "The current automated VOD lane invokes app-exposed qualification controls; it does not press the real SpringBoard PiP transport controls, and no operator-evidence row is implemented yet."
+    },
+    {
+      "id": "audio-background-continuity",
+      "category": "audio-lifecycle",
+      "title": "Audio output advances while the app is backgrounded",
+      "description": "Native played-audio-buffer counters advance while real system PiP and background application state are active.",
+      "releaseRequirement": "required",
+      "execution": "automated",
+      "evidenceLevel": "system-output",
+      "scenarioIds": [
+        "background-audio"
+      ],
+      "runnerScenarioIds": [
+        "background-audio"
+      ]
+    },
+    {
+      "id": "audio-system-interruption",
+      "category": "audio-lifecycle",
+      "title": "A real audio-session interruption recovers playback",
+      "description": "A separately installed runner causes balanced system interruption notifications and audio output advances after recovery.",
+      "releaseRequirement": "required",
+      "execution": "automated",
+      "evidenceLevel": "system-output",
+      "scenarioIds": [
+        "interruptions"
+      ],
+      "runnerScenarioIds": [
+        "interruptions"
+      ]
+    },
+    {
+      "id": "audio-route-change-injection",
+      "category": "audio-lifecycle",
+      "title": "Controlled route-loss notification follows the policy path",
+      "description": "A deterministic old-device-unavailable notification pauses without closing PiP and permits explicit resume; this is not a physical disconnect claim.",
+      "releaseRequirement": "advisory",
+      "execution": "automated",
+      "evidenceLevel": "engine-output",
+      "scenarioIds": [
+        "interruptions"
+      ],
+      "runnerScenarioIds": [
+        "interruptions"
+      ]
+    },
+    {
+      "id": "audio-physical-route-changes",
+      "category": "audio-lifecycle",
+      "title": "Physical wired, Bluetooth, HDMI, and AirPlay route changes are classified",
+      "description": "Qualification records the previous route and distinguishes unplug intent from unrelated old-device-unavailable transitions.",
+      "releaseRequirement": "required",
+      "execution": "operator-assisted",
+      "evidenceLevel": "operator-observed",
+      "blocker": "The current harness posts a controlled notification and cannot qualify a physical route transition."
+    },
+    {
+      "id": "audio-media-services-reset",
+      "category": "audio-lifecycle",
+      "title": "Media-services reset reconstructs audio and waits for user intent",
+      "description": "Player-owned reset handling rebuilds invalidated audio objects for ordinary audio-only and VideoView playback as well as PiP, and playback remains quarantined until an explicit post-reset user action.",
+      "releaseRequirement": "required",
+      "execution": "operator-assisted",
+      "evidenceLevel": "system-output",
+      "scenarioIds": [
+        "audio-media-services-reset"
+      ],
+      "runnerScenarioIds": [
+        "audio-media-services-reset"
+      ]
+    },
+    {
+      "id": "audio-session-ownership",
+      "category": "audio-lifecycle",
+      "title": "Library-managed and host-managed audio sessions respect ownership",
+      "description": "Deferred activation does not steal focus, while host-owned mode does not mutate the shared AVAudioSession.",
+      "releaseRequirement": "required",
+      "execution": "automated",
+      "evidenceLevel": "system-output",
+      "scenarioIds": [
+        "audio-session-ownership"
+      ],
+      "runnerScenarioIds": [
+        "audio-session-ownership"
+      ]
+    },
+    {
+      "id": "network-long-stall-recovery",
+      "category": "network-streaming",
+      "title": "Playback recovers from a sustained network stall",
+      "description": "Native and direct backends survive a deterministic twelve-second stall, resume moving output, and stay within the memory bound.",
+      "releaseRequirement": "required",
+      "execution": "automated",
+      "evidenceLevel": "system-output",
+      "scenarioIds": [
+        "long-stall"
+      ],
+      "runnerScenarioIds": [
+        "long-stall"
+      ]
+    },
+    {
+      "id": "network-adaptive-hls-soak",
+      "category": "network-streaming",
+      "title": "Adaptive HLS survives retries, discontinuities, and moving windows",
+      "description": "VOD, event, and sliding-live playlists across TS and fMP4 run for the release duration with retained allocation evidence.",
+      "releaseRequirement": "required",
+      "execution": "automated",
+      "evidenceLevel": "engine-output",
+      "scenarioIds": [
+        "adaptive-hls-soak"
+      ],
+      "runnerScenarioIds": [
+        "adaptive-hls-soak"
+      ]
+    },
+    {
+      "id": "tracks-native-subtitles",
+      "category": "tracks-rendering",
+      "title": "Native subtitles and OSD survive PiP transitions",
+      "description": "Text, styled, forced, bitmap, live, adaptive-resolution, HDR, and marquee overlays retain expected pixels and timing.",
+      "releaseRequirement": "required",
+      "execution": "automated",
+      "evidenceLevel": "system-output",
+      "scenarioIds": [
+        "native-subtitle-matrix"
+      ],
+      "runnerScenarioIds": [
+        "native-subtitle-matrix"
+      ]
+    },
+    {
+      "id": "render-cadence-matrix",
+      "category": "tracks-rendering",
+      "title": "CFR and VFR cadence remains monotonic through transitions",
+      "description": "Common fractional and integer rates plus true VFR survive pause, rate, replacement, and system-PiP resize transitions.",
+      "releaseRequirement": "required",
+      "execution": "automated",
+      "evidenceLevel": "system-output",
+      "scenarioIds": [
+        "cadence-matrix"
+      ],
+      "runnerScenarioIds": [
+        "cadence-matrix"
+      ]
+    },
+    {
+      "id": "tracks-selection-restoration",
+      "category": "tracks-rendering",
+      "title": "Audio and subtitle selections restore after supported transitions",
+      "description": "Recast and replacement report whether requested track selections were restored rather than silently treating timeout as success.",
+      "releaseRequirement": "required",
+      "execution": "planned",
+      "evidenceLevel": "engine-output",
+      "blocker": "Current recast track restoration is best effort and has no standalone device evidence row."
+    },
+    {
+      "id": "performance-direct-pip-1080p60",
+      "category": "performance-reliability",
+      "title": "Direct PiP sustains 1080p60 within resource budgets",
+      "description": "Presentation rate, drops, conversion cost, CPU, GPU, energy, RSS, and thermal evidence remain within release thresholds.",
+      "releaseRequirement": "required",
+      "execution": "automated",
+      "evidenceLevel": "system-output",
+      "scenarioIds": [
+        "pip-render-performance-1080p60"
+      ],
+      "runnerScenarioIds": [
+        "pip-render-performance-1080p60"
+      ]
+    },
+    {
+      "id": "performance-direct-pip-4k60",
+      "category": "performance-reliability",
+      "title": "Direct PiP handles 4K60 within documented budgets",
+      "description": "The 4K source retains effective work, bounded memory, measured conversion cost, and acceptable presentation quality.",
+      "releaseRequirement": "required",
+      "execution": "automated",
+      "evidenceLevel": "system-output",
+      "scenarioIds": [
+        "pip-render-performance-4k60"
+      ],
+      "runnerScenarioIds": [
+        "pip-render-performance-4k60"
+      ]
+    },
+    {
+      "id": "performance-vod-timebase-soak",
+      "category": "performance-reliability",
+      "title": "VOD direct-PiP timebase remains stable across rates",
+      "description": "A multi-hour run retains monotonic clocks, bounded corrections, A/V drift, and post-interruption audio recovery at 0.5x, 1x, and 2x.",
+      "releaseRequirement": "required",
+      "execution": "automated",
+      "evidenceLevel": "system-output",
+      "scenarioIds": [
+        "timebase-vod-soak"
+      ],
+      "runnerScenarioIds": [
+        "timebase-vod-soak"
+      ]
+    },
+    {
+      "id": "performance-live-timebase-soak",
+      "category": "performance-reliability",
+      "title": "Live direct-PiP timebase remains stable",
+      "description": "A multi-hour live run retains monotonic clocks, bounded corrections, A/V drift, and post-interruption audio recovery.",
+      "releaseRequirement": "required",
+      "execution": "automated",
+      "evidenceLevel": "system-output",
+      "scenarioIds": [
+        "timebase-live-soak"
+      ],
+      "runnerScenarioIds": [
+        "timebase-live-soak"
+      ]
+    },
+    {
+      "id": "performance-decoder-teardown-stress",
+      "category": "performance-reliability",
+      "title": "Decoder and packetizer teardown preserves format lifetime",
+      "description": "Repeated open failure, malformed input, replacement, and stop cycles unload decoder and packetizer modules before their input formats and owner resources are destroyed, with no crash, leak, or stale callback.",
+      "releaseRequirement": "required",
+      "execution": "planned",
+      "evidenceLevel": "engine-output",
+      "blocker": "No device stress row currently exercises decoder-load failure and packetizer teardown with lifetime diagnostics."
+    },
+    {
+      "id": "cast-discovery-identity",
+      "category": "casting",
+      "title": "Chromecast discovery has stable device identity",
+      "description": "A physical receiver is discovered, removed, and rediscovered without using a transient pointer address as durable identity.",
+      "releaseRequirement": "required",
+      "execution": "external-lab",
+      "evidenceLevel": "receiver-output",
+      "blocker": "RendererItem.id is currently only pointer-stable for one retained libVLC item, while VLCKit deduplicates by non-unique name/type; no proven durable receiver identifier or receiver-backed remove/rediscover row exists. Stable cross-discovery identity is explicitly outside patch 0034."
+    },
+    {
+      "id": "cast-receiver-playback",
+      "category": "casting",
+      "title": "Chromecast receiver plays the requested media",
+      "description": "Receiver telemetry and receiver-side audio or video prove load, buffering, playback, and terminal state for direct and transcoded media.",
+      "releaseRequirement": "required",
+      "execution": "external-lab",
+      "evidenceLevel": "receiver-output",
+      "blocker": "Local setRenderer and playing states are not receiver acknowledgements; a real Chromecast lab lane is not implemented."
+    },
+    {
+      "id": "cast-controls-seeking-tracks",
+      "category": "casting",
+      "title": "Remote pause, seek, and track controls settle on the receiver",
+      "description": "The receiver clock and selected tracks confirm controls, including recast restoration, rather than relying on optimistic local state.",
+      "releaseRequirement": "required",
+      "execution": "external-lab",
+      "evidenceLevel": "receiver-output",
+      "blocker": "The current qualification matrix has no receiver-side control or recast restoration evidence."
+    },
+    {
+      "id": "cast-recast-session-isolation",
+      "category": "casting",
+      "title": "Rapid same-receiver recast cannot be stopped by the old session",
+      "description": "An operator starts local media A, casts A to one physical receiver, rapidly recasts media B to that same receiver, then observes receiver telemetry and audio or video for 30–60 seconds to prove B remains playing and no late STOP or CLOSE from A interrupts it.",
+      "releaseRequirement": "required",
+      "execution": "external-lab",
+      "evidenceLevel": "receiver-output",
+      "blocker": "Requires a physical receiver and candidate-bound receiver-side session/telemetry capture; local player events or sender state cannot satisfy this row, and that external-lab lane is not implemented."
+    },
+    {
+      "id": "cast-network-loss-recovery",
+      "category": "casting",
+      "title": "Receiver and network loss produce truthful recovery outcomes",
+      "description": "Power loss, Wi-Fi interruption, receiver takeover, and return to local playback have bounded, generation-safe outcomes.",
+      "releaseRequirement": "required",
+      "execution": "external-lab",
+      "evidenceLevel": "receiver-output",
+      "blocker": "No controlled receiver/network fault lane currently produces candidate-bound evidence."
+    },
+    {
+      "id": "cast-hls-receiver-playback",
+      "category": "casting",
+      "title": "Chromecast plays HLS with receiver-side evidence",
+      "description": "A physical receiver proves load, sustained playback, seekability policy, and terminal behavior for representative live and VOD HLS inputs.",
+      "releaseRequirement": "required",
+      "execution": "external-lab",
+      "evidenceLevel": "receiver-output",
+      "blocker": "The external casting lane has no HLS backend and receiver-output matrix."
+    },
+    {
+      "id": "cast-end-of-stream-drain",
+      "category": "casting",
+      "title": "Chromecast drains final media before EOF",
+      "description": "Receiver telemetry proves that tail audio and video are rendered before one truthful end state instead of being discarded by the demux-filter drain path.",
+      "releaseRequirement": "required",
+      "execution": "external-lab",
+      "evidenceLevel": "receiver-output",
+      "blocker": "No receiver-side fixture currently fingerprints final frames and audio samples through Chromecast EOF."
+    },
+    {
+      "id": "cast-ipv6-discovery-connectivity",
+      "category": "casting",
+      "title": "Chromecast discovery and connection work over IPv6",
+      "description": "An IPv6-capable receiver is discovered with stable identity, resolves its scoped address, connects, and starts receiver-confirmed playback.",
+      "releaseRequirement": "required",
+      "execution": "external-lab",
+      "evidenceLevel": "receiver-output",
+      "blocker": "The external lab has no candidate-bound IPv6 discovery and receiver-connection evidence."
+    }
+  ],
+  "staticControls": [
+    {
+      "id": "libvlc-archive-feature-contract",
+      "title": "Per-architecture renderer and Chromecast archive contract",
+      "description": "Every release path verifies exact archive-member manifests plus non-negotiable renderer/Chromecast objects for every architecture, including Chromecast exclusion on tvOS.",
+      "command": "./scripts/check-libvlc-manifest.sh"
+    },
+    {
+      "id": "chromecast-native-state-contract",
+      "title": "Chromecast final load-transition and inherited native-state contract",
+      "description": "Patch 0037 is the final-source owner: it validates generation-safe load transitions, reverse-reconstructs the exact predecessor for patch 0034's frozen clock, attribution, transport, and EOF mutation proof, and runs that native truth table against the final headers.",
+      "command": "./scripts/validate-chromecast-load-transition.sh /path/to/patched-vlc-source /external/work-root"
+    },
+    {
+      "id": "chromecast-metadata-schema-contract",
+      "title": "Chromecast load-transition and inherited metadata contract",
+      "description": "Patch 0037 validates its generation-safe load-transition policy and patch 0036's metadata schema against the actual final source, then reverse-reconstructs the exact 0036 predecessor before running the frozen 0036, 0035, and 0034 adversarial suites and all three native probes.",
+      "command": "./scripts/validate-chromecast-load-transition.sh /path/to/patched-vlc-source /external/work-root"
+    },
+    {
+      "id": "native-extension-version-contract",
+      "title": "Exact native extension source, header, symbol, and archive contract",
+      "description": "One fail-closed resolver binds the ordered patch intent to a contiguous v4-v9 public surface, an exact side-effect-free version function, complete native definitions and exports, and the checked-in vendored headers. Its v9 semantic proof requires a transactional nonzero, write-once native-handle/playback publication; immutable identity nodes retained until every output joins media-player deletion; one retained drawable and copied identity pair before module mapping; a process-unique nonwrapping output identity; the complete output-scoped handoff selector surface and exact lifecycle preflight; synchronous preserved-before-rebind and fresh-after-construction controller claims; timeout arming before publication; and exact cancellation and fresh-reservation rollback. Every declared XCFramework slice and architecture must then contain exactly one strong definition of every version-owned symbol and no partial, weak-only, or future group; the host macOS slice also executes the version, type-layout, signature, and null-player probe. The checked-in weak compatibility shim must return false without side effects below v9. Patch 0033's Apple audio lease refinement remains an explicit optional profile only at the historical v8 boundary and is inherited unconditionally by v9.",
+      "command": "./scripts/validate-native-extension-contract.sh --source-root /path/to/patched-vlc-source --xcframework /path/to/libvlc.xcframework --expected-version 9 --require-apple-audio-session-leases --run-mutations"
+    },
+    {
+      "id": "apple-assembly-metadata-contract",
+      "title": "Apple assembly tool and Mach-O metadata contract",
+      "description": "Patch 0038 pins and selects the exact bundled NASM, carries its four fail-closed metadata inputs through scrubbed Meson setup and inherited compile boundaries, stamps every supported Apple NASM-produced Mach-O object with explicit build-version metadata, bounds libgcrypt text alignment, and rejects stale tools, hidden options, malformed platform inputs, and adversarial source mutations before a native build begins.",
+      "command": "./scripts/validate-apple-assembly-metadata-patch.sh /path/to/patched-vlc-source /external/work-root"
+    },
+    {
+      "id": "aom-nasm3-detection-contract",
+      "title": "libaom and NASM 3 consumer compatibility contract",
+      "description": "Patch 0039 mirrors VLC's ABI-compatible libaom 3.13.2 update and exact archive checksum. Its executable CMake contract proves separate NASM 3 optimization and object-format probes, rejects missing capabilities, and reproduces libaom 3.13.1's false rejection so this failure is caught before native compilation.",
+      "command": "./scripts/validate-aom-nasm3-detection.sh /path/to/patched-vlc-source /external/work-root"
+    },
+    {
+      "id": "headless-vout-teardown-contract",
+      "title": "Stopped video-output teardown and natural-EOF contract",
+      "description": "Patch 0040 applies VLC's established started-vout admission rule to SwiftVLC's Hold-backed emptiness query. Mutation-sensitive source and state proofs preserve strict work only for a running output, while two watchdog-bounded macOS processes prove that the real H.264 archive survives renderer-start failure through both early stop/release and natural EOF/release.",
+      "command": "./scripts/validate-headless-vout-teardown.sh --source-root /path/to/patched-vlc-source --xcframework /path/to/libvlc.xcframework --work-root /external/work-root"
+    },
+    {
+      "id": "libvlc-macho-metadata-contract",
+      "title": "Final libVLC Mach-O object contract",
+      "description": "The candidate XCFramework is parsed archive member by archive member; every Mach-O object must identify the exact Apple platform and deployment target, match its containing CPU slice, use exactly one modern build-version command, avoid legacy platform commands, and stay within architecture-specific section-alignment caps.",
+      "command": "python3 ./scripts/validate-libvlc-macho-metadata.py --xcframework /path/to/libvlc.xcframework --deployment-target ios=18.0 --deployment-target tvos=18.0 --deployment-target xros=2.0 --deployment-target macos=15.0 --deployment-target catalyst=18.0 --json-output /path/to/libvlc-macho-metadata.json"
+    }
+  ],
+  "upstreamRiskReview": {
+    "reviewedOn": "2026-09-01",
+    "maximumAgeDays": 45,
+    "policy": "Open issues and closed regressions remain explicit release obligations until candidate-bound behavior or artifact evidence proves the affected feature; upstream issue state alone is never accepted as proof.",
+    "risks": [
+      {
+        "id": "vlckit-749-hls-preplay-time-crash",
+        "sourceProject": "VLCKit",
+        "sourceIssue": 749,
+        "sourceStateAtReview": "open",
+        "sourceURL": "https://code.videolan.org/videolan/VLCKit/-/work_items/749",
+        "title": "Setting HLS time before playback can crash",
+        "failureMode": "The native clock can be uninitialized when an HLS time is set before playback starts, producing an assertion crash instead of a seek outcome.",
+        "featureIds": [
+          "seek-hls-before-playback"
+        ]
+      },
+      {
+        "id": "vlckit-734-streamed-opus-backward-seek",
+        "sourceProject": "VLCKit",
+        "sourceIssue": 734,
+        "sourceStateAtReview": "closed",
+        "sourceURL": "https://code.videolan.org/videolan/VLCKit/-/work_items/734",
+        "title": "Streamed Ogg/Opus backward seek can move forward",
+        "failureMode": "The same Ogg/Opus content seeks correctly as a local file but a network backward seek can land several seconds later instead.",
+        "featureIds": [
+          "seek-streamed-ogg-opus-backward"
+        ]
+      },
+      {
+        "id": "vlckit-445-bad-network-seek-stop",
+        "sourceProject": "VLCKit",
+        "sourceIssue": 445,
+        "sourceStateAtReview": "open",
+        "sourceURL": "https://code.videolan.org/videolan/VLCKit/-/work_items/445",
+        "title": "A seek on a degraded connection can become an unrecoverable stop",
+        "failureMode": "Under constrained bandwidth, delay, and loss, a seek can remain delayed, change to pause, then stop when play is requested.",
+        "featureIds": [
+          "seek-degraded-network-recovery",
+          "network-long-stall-recovery"
+        ]
+      },
+      {
+        "id": "vlckit-157-repeated-network-ts-seek",
+        "sourceProject": "VLCKit",
+        "sourceIssue": 157,
+        "sourceStateAtReview": "closed",
+        "sourceURL": "https://code.videolan.org/videolan/VLCKit/-/work_items/157",
+        "title": "A network MPEG-TS stream can seek only once",
+        "failureMode": "After one successful network TS seek, the media duration can collapse to zero and later seeks stop working while the local file remains healthy.",
+        "featureIds": [
+          "seek-network-ts-repeated"
+        ]
+      },
+      {
+        "id": "vlc-29487-next-frame-burst-hang",
+        "sourceProject": "VLC",
+        "sourceIssue": 29487,
+        "sourceStateAtReview": "closed",
+        "sourceURL": "https://code.videolan.org/videolan/vlc/-/work_items/29487",
+        "title": "A burst of next-frame requests can hang",
+        "failureMode": "Queued next-frame requests can be missed so a burst waits forever or fails to produce the expected ordered timecodes and EOF result.",
+        "featureIds": [
+          "frame-step-burst"
+        ]
+      },
+      {
+        "id": "vlc-26708-frame-step-resume-clock",
+        "sourceProject": "VLC",
+        "sourceIssue": 26708,
+        "sourceStateAtReview": "open",
+        "sourceURL": "https://code.videolan.org/videolan/vlc/-/work_items/26708",
+        "title": "Playback clock can break after many frame steps",
+        "failureMode": "Resuming after repeated next-frame requests can trigger audio overflow, severe late-frame dropping, and broken continued playback.",
+        "featureIds": [
+          "frame-step-resume-clock"
+        ]
+      },
+      {
+        "id": "vlc-29678-frame-step-pause-date-assert",
+        "sourceProject": "VLC",
+        "sourceIssue": 29678,
+        "sourceStateAtReview": "open",
+        "sourceURL": "https://code.videolan.org/videolan/vlc/-/work_items/29678",
+        "title": "Next/previous frame state transitions can assert on pause timing",
+        "failureMode": "The native next/previous-frame test has observed an assertion on the paused timing state during transition-heavy execution.",
+        "featureIds": [
+          "frame-step-eof-transition-safety"
+        ]
+      },
+      {
+        "id": "vlckit-758-chromecast-constructor-exception",
+        "sourceProject": "VLCKit",
+        "sourceIssue": 758,
+        "sourceStateAtReview": "open",
+        "sourceURL": "https://code.videolan.org/videolan/VLCKit/-/work_items/758",
+        "title": "Chromecast construction can terminate the iOS process",
+        "failureMode": "An uncaught C++ exception from ChromecastCommunication construction can propagate through module loading to std::terminate and SIGABRT.",
+        "featureIds": [
+          "cast-receiver-playback",
+          "cast-network-loss-recovery"
+        ],
+        "controlIds": [
+          "chromecast-native-state-contract"
+        ]
+      },
+      {
+        "id": "vlckit-744-chromecast-modules-missing",
+        "sourceProject": "VLCKit",
+        "sourceIssue": 744,
+        "sourceStateAtReview": "open",
+        "sourceURL": "https://code.videolan.org/videolan/VLCKit/-/work_items/744",
+        "title": "A packaged VLCKit can omit Chromecast modules",
+        "failureMode": "Discovery APIs can compile while the packaged artifact contains zero matching Chromecast stream-output candidates at runtime.",
+        "featureIds": [
+          "cast-discovery-identity",
+          "cast-receiver-playback"
+        ],
+        "controlIds": [
+          "libvlc-archive-feature-contract"
+        ]
+      },
+      {
+        "id": "vlc-27391-chromecast-hls-backend",
+        "sourceProject": "VLC",
+        "sourceIssue": 27391,
+        "sourceStateAtReview": "open",
+        "sourceURL": "https://code.videolan.org/videolan/vlc/-/work_items/27391",
+        "title": "Chromecast lacks a purpose-built HLS backend",
+        "failureMode": "The existing buffered live WebM approach does not provide the HLS behavior, format flexibility, and subtitle path expected by the receiver ecosystem.",
+        "featureIds": [
+          "cast-hls-receiver-playback"
+        ]
+      },
+      {
+        "id": "vlc-28141-chromecast-paused-ping-timeout",
+        "sourceProject": "VLC",
+        "sourceIssue": 28141,
+        "sourceStateAtReview": "open",
+        "sourceURL": "https://code.videolan.org/videolan/vlc/-/work_items/28141",
+        "title": "A Chromecast heartbeat timeout can skip the playlist while paused",
+        "failureMode": "A missed receiver heartbeat can mark a paused cast session failed, and the next play action can advance the playlist instead of resuming the same media.",
+        "featureIds": [
+          "cast-receiver-playback",
+          "cast-network-loss-recovery"
+        ],
+        "controlIds": [
+          "chromecast-native-state-contract"
+        ]
+      },
+      {
+        "id": "vlc-24573-chromecast-playing-to-idle",
+        "sourceProject": "VLC",
+        "sourceIssue": 24573,
+        "sourceStateAtReview": "open",
+        "sourceURL": "https://code.videolan.org/videolan/vlc/-/work_items/24573",
+        "title": "A Chromecast HTTP stream can flip from PLAYING to IDLE midstream",
+        "failureMode": "The receiver can unexpectedly publish IDLE during active HTTP playback, stopping the cast after a variable interval without a deterministic sender-side terminal classification.",
+        "featureIds": [
+          "cast-receiver-playback",
+          "cast-network-loss-recovery"
+        ],
+        "controlIds": [
+          "chromecast-native-state-contract"
+        ]
+      },
+      {
+        "id": "vlc-25116-chromecast-external-controls",
+        "sourceProject": "VLC",
+        "sourceIssue": 25116,
+        "sourceStateAtReview": "open",
+        "sourceURL": "https://code.videolan.org/videolan/vlc/-/work_items/25116",
+        "title": "External Chromecast controls can fail to affect or update VLC playback",
+        "failureMode": "Receiver-native rewind, fast-forward, skip, pause, or play actions can be ignored by VLC or overwritten by stale sender intent instead of updating the owned media session and clock.",
+        "featureIds": [
+          "cast-controls-seeking-tracks"
+        ],
+        "controlIds": [
+          "chromecast-native-state-contract"
+        ]
+      },
+      {
+        "id": "vlc-21751-chromecast-drain",
+        "sourceProject": "VLC",
+        "sourceIssue": 21751,
+        "sourceStateAtReview": "open",
+        "sourceURL": "https://code.videolan.org/videolan/vlc/-/work_items/21751",
+        "title": "Chromecast drain can ignore final blocks",
+        "failureMode": "Drained blocks can be discarded instead of passing through the demux filter, truncating receiver output at EOF.",
+        "featureIds": [
+          "cast-end-of-stream-drain"
+        ],
+        "controlIds": [
+          "chromecast-native-state-contract"
+        ]
+      },
+      {
+        "id": "vlc-27432-chromecast-ipv6",
+        "sourceProject": "VLC",
+        "sourceIssue": 27432,
+        "sourceStateAtReview": "open",
+        "sourceURL": "https://code.videolan.org/videolan/vlc/-/work_items/27432",
+        "title": "Chromecast can fail to resolve IPv6 receivers",
+        "failureMode": "An IPv6 receiver may be discovered but its address cannot be resolved or connected by the Chromecast output chain.",
+        "featureIds": [
+          "cast-ipv6-discovery-connectivity"
+        ]
+      },
+      {
+        "id": "vlc-29654-chromecast-discovery-regression",
+        "sourceProject": "VLC",
+        "sourceIssue": 29654,
+        "sourceStateAtReview": "open",
+        "sourceURL": "https://code.videolan.org/videolan/vlc/-/work_items/29654",
+        "title": "Chromecast discovery can regress to local-only",
+        "failureMode": "Previously discoverable receivers can disappear entirely from the renderer list after an engine update.",
+        "featureIds": [
+          "cast-discovery-identity"
+        ]
+      }
+    ]
+  }
+}

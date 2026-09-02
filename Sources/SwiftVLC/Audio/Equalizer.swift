@@ -25,6 +25,12 @@ public final class Equalizer {
   /// `libvlc_media_player_set_equalizer` and does not retain the reference.
   @ObservationIgnored
   var onChange: (@MainActor () -> Void)?
+  /// Separate causal identities for controls that mutate the same native
+  /// value through more than one public API. Observation calls app code before
+  /// the mutation body, so a newer reentrant command must invalidate the older
+  /// body before it reaches libVLC.
+  @ObservationIgnored var preampMutationRevision: UInt64 = 0
+  @ObservationIgnored var bandsMutationRevision: UInt64 = 0
 
   /// Creates a new equalizer with flat (0 dB) settings.
   public init() {
@@ -96,21 +102,33 @@ public final class Equalizer {
   ///
   /// - Parameter bands: One value per equalizer band.
   /// - Throws: ``VLCError/invalidInput(_:)`` when `bands.count` does not
-  ///   equal ``bandCount``.
+  ///   equal ``bandCount`` or any value is `NaN`.
   public func setBands(_ bands: [Float]) throws(VLCError) {
     guard bands.count == Self.bandCount else {
       throw .invalidInput("bands.count must equal Equalizer.bandCount (\(Self.bandCount))")
     }
+    // libVLC rejects NaN per band. Validate the complete batch before the
+    // first native write so a later invalid element cannot leave the earlier
+    // bands committed while this all-bands operation reports success.
+    guard !bands.contains(where: \.isNaN) else {
+      throw .invalidInput("bands must not contain NaN")
+    }
+    let revision = advanceControlRevision(\Equalizer.bandsMutationRevision)
     let current = (0..<Self.bandCount).map {
       libvlc_audio_equalizer_get_amp_at_index(pointer, UInt32($0))
     }
     guard current != bands else { return }
+    var didPerform = false
     withMutation(keyPath: \.bands) {
+      guard bandsMutationRevision == revision else { return }
       for (index, amp) in bands.enumerated() where current[index] != amp {
         libvlc_audio_equalizer_set_amp_at_index(pointer, amp, UInt32(index))
       }
+      didPerform = true
     }
-    onChange?()
+    if didPerform {
+      onChange?()
+    }
   }
 
   /// Returns the amplification (dB) for a specific band.
@@ -132,12 +150,18 @@ public final class Equalizer {
       throw .invalidInput("band must be in 0..<\(Self.bandCount)")
     }
     let band = try checkedUInt32(band, parameter: "band")
+    let revision = advanceControlRevision(\Equalizer.bandsMutationRevision)
     let current = libvlc_audio_equalizer_get_amp_at_index(pointer, band)
     guard current != amp else { return }
-    guard libvlc_audio_equalizer_set_amp_at_index(pointer, amp, band) == 0 else {
+    var result: Int32?
+    withMutation(keyPath: \.bands) {
+      guard bandsMutationRevision == revision else { return }
+      result = libvlc_audio_equalizer_set_amp_at_index(pointer, amp, band)
+    }
+    guard let result else { return }
+    guard result == 0 else {
       throw .operationFailed("Set equalizer amplification for band \(band)")
     }
-    withMutation(keyPath: \.bands) {}
     onChange?()
   }
 
@@ -212,10 +236,26 @@ extension Equalizer {
   }
 
   private func applyPreamp(_ newValue: Float) {
+    let revision = advanceControlRevision(\Equalizer.preampMutationRevision)
     guard libvlc_audio_equalizer_get_preamp(pointer) != newValue else { return }
-    _ = withMutation(keyPath: \.preamp) {
+    var didPerform = false
+    withMutation(keyPath: \.preamp) {
+      guard preampMutationRevision == revision else { return }
       libvlc_audio_equalizer_set_preamp(pointer, newValue)
+      didPerform = true
     }
-    onChange?()
+    if didPerform {
+      onChange?()
+    }
+  }
+
+  private func advanceControlRevision(
+    _ keyPath: ReferenceWritableKeyPath<Equalizer, UInt64>
+  ) -> UInt64 {
+    let previous = self[keyPath: keyPath]
+    precondition(previous != .max, "Equalizer control revision exhausted")
+    let revision = previous + 1
+    self[keyPath: keyPath] = revision
+    return revision
   }
 }

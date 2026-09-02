@@ -1,5 +1,20 @@
 import Foundation
 
+/// Millisecond limits which remain representable after the pinned libVLC 4
+/// converts public `libvlc_time_t` values with `VLC_TICK_FROM_MS`.
+///
+/// VLC's internal clock runs at one million ticks per second, so the public
+/// millisecond value is multiplied by 1,000. Accepting the wider `Int64`
+/// millisecond range would overflow inside VLC before it can reject the input.
+enum LibVLCTimeMilliseconds {
+  static let minimum: Int64 = .min / 1000
+  static let maximum: Int64 = .max / 1000
+
+  static func contains(_ value: Int64) -> Bool {
+    (minimum...maximum).contains(value)
+  }
+}
+
 extension Duration {
   /// Total duration in milliseconds.
   ///
@@ -47,6 +62,30 @@ extension Duration {
 
   func checkedNonnegativeMilliseconds(parameter: String) throws(VLCError) -> Int64 {
     let value = try checkedMilliseconds(parameter: parameter)
+    guard value >= 0 else {
+      throw .invalidInput("\(parameter) must be non-negative")
+    }
+    return value
+  }
+
+  /// Converts to the narrower millisecond domain accepted safely by the
+  /// pinned libVLC build's `VLC_TICK_FROM_MS` boundary.
+  func checkedLibVLCTimeMilliseconds(parameter: String) throws(VLCError) -> Int64 {
+    let value = try checkedMilliseconds(parameter: parameter)
+    guard LibVLCTimeMilliseconds.contains(value) else {
+      throw .invalidInput(
+        "\(parameter) must be between \(LibVLCTimeMilliseconds.minimum) and "
+          + "\(LibVLCTimeMilliseconds.maximum) milliseconds"
+      )
+    }
+    return value
+  }
+
+  func checkedNonnegativeLibVLCTimeMilliseconds(
+    parameter: String
+  )
+    throws(VLCError) -> Int64 {
+    let value = try checkedLibVLCTimeMilliseconds(parameter: parameter)
     guard value >= 0 else {
       throw .invalidInput("\(parameter) must be non-negative")
     }

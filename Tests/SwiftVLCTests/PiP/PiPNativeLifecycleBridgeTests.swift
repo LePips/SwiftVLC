@@ -219,8 +219,10 @@ extension Integration {
       guard
         case .willStart = received[0]?.event,
         case .didStart = received[1]?.event,
-        case .willStop(reason: .controllerReplaced) = received[2]?.event,
-        case .didStop(reason: .controllerReplaced) = received[3]?.event,
+        case .willStop(reason: .unknown) = received[2]?.event,
+        received[2]?.stopCause == .controllerReplaced,
+        case .didStop(reason: .unknown) = received[3]?.event,
+        received[3]?.stopCause == .controllerReplaced,
         case .willStart = received[4]?.event,
         case .didStart = received[5]?.event
       else {

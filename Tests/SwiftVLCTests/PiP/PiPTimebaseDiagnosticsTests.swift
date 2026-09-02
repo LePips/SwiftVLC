@@ -103,6 +103,71 @@ struct PiPTimebaseDiagnosticsTests {
   }
 
   @Test
+  func `Snapshot exposes native v6 output-attempt PTS without source claims`() throws {
+    let player = Player()
+    let controller = PiPController(player: player)
+    let context = try #require(
+      controller.callbackRegistration?.currentContextForTesting
+    )
+
+    context.setNativePictureTimestampCallbacksAvailable(true)
+    context.recordNativePictureTimestamp(
+      1_000_000,
+      playbackGeneration: player.sessionGeneration,
+      voutGeneration: 7
+    )
+    context.recordNativePictureSubmissionResult(
+      submitted: true,
+      playbackGeneration: player.sessionGeneration,
+      voutGeneration: 7
+    )
+    context.recordNativePictureTimestamp(
+      1_041_708,
+      playbackGeneration: player.sessionGeneration,
+      voutGeneration: 7
+    )
+    context.recordNativePictureSubmissionResult(
+      submitted: false,
+      playbackGeneration: player.sessionGeneration,
+      voutGeneration: 7
+    )
+
+    var snapshot = controller.timebaseDiagnosticSnapshot()
+    #expect(snapshot.sourceIntervalCounts?.fps23_976 == 1)
+    #expect(snapshot.sourceIntervalCounts?.fps24 == 0)
+    #expect(
+      snapshot.sourceTimestampProvenance
+        == "libvlc-picture_t.date-native-callback-v1"
+    )
+    #expect(
+      snapshot.vmemOutputTimestampProvenance
+        == "libvlc-vmem-post-filter-vout-selected-output-attempt-pts-v1"
+    )
+    #expect(snapshot.vmemOutputCallbackCount == 2)
+    #expect(snapshot.vmemOutputValidPTSCount == 2)
+    #expect(snapshot.vmemOutputInvalidPTSCount == 0)
+    #expect(snapshot.vmemOutputFirstPTSUS == 1_000_000)
+    #expect(snapshot.vmemOutputLastPTSUS == 1_041_708)
+    #expect(snapshot.vmemOutputSubmittedCount == 1)
+    #expect(snapshot.vmemOutputSwiftRejectedCount == 1)
+    #expect(snapshot.vmemOutputInFlightCount == 0)
+    #expect(
+      snapshot.vmemOutputDeltaHistogram == [
+        PiPVmemOutputPTSDeltaCount(deltaMicroseconds: 41708, count: 1)
+      ]
+    )
+    #expect(snapshot.effectivePlayerRate == player.rate)
+
+    context.setNativePictureTimestampCallbacksAvailable(false)
+    snapshot = controller.timebaseDiagnosticSnapshot()
+    #expect(snapshot.sourceIntervalCounts == nil)
+    #expect(snapshot.sourceTimestampProvenance == nil)
+    #expect(snapshot.vmemOutputTimestampProvenance == nil)
+    #expect(snapshot.vmemOutputCallbackCount == nil)
+    #expect(snapshot.vmemOutputDeltaHistogram == nil)
+  }
+
+  @Test
   func `Every timebase write is emitted with a monotonic sequence`() async throws {
     let player = Player()
     let controller = PiPController(player: player)

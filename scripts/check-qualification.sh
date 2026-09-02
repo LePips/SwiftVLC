@@ -1,17 +1,20 @@
 #!/usr/bin/env bash
 #
 # check-qualification.sh — refuse to release an xcframework whose physical-device
-# qualification is missing, stale, or incomplete.
+# evidence or required product-feature qualification is missing, stale, or
+# incomplete.
 #
 # Issue 88: simulator and wrapper-only coverage cannot validate system PiP,
 # native video output, audio teardown, or real libVLC playback. CI compiles the
 # iOS tests but never executes system PiP on hardware, and the sanitizer job
-# links a released xcframework rather than the engine under test. So the device
-# matrix is the acceptance gate, and nothing enforced it.
+# links a released xcframework rather than the engine under test. The device
+# matrix proves scenario evidence; the versioned feature manifest prevents a
+# complete matrix from hiding unimplemented release promises.
 #
 # This does not run the tests — a person does, on hardware. What it enforces is
-# that the results exist, that every required row was executed and passed, and
-# that they describe *this* artifact rather than an earlier one.
+# that the results exist, every required row was executed and passed, every
+# applicable required feature is satisfied, and the evidence describes *this*
+# artifact rather than an earlier one.
 #
 # The artifact is identified by a digest over the complete XCFramework tree,
 # including libraries, headers, metadata, paths, and modes. Header/ABI drift is
@@ -22,6 +25,10 @@
 #
 set -euo pipefail
 
+# Qualification imports local policy modules repeatedly. Keep those reads from
+# leaving host-specific bytecode caches in the source checkout.
+export PYTHONDONTWRITEBYTECODE=1
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$ROOT_DIR"
@@ -30,6 +37,8 @@ VERSION="${1:-}"
 XCFW="${2:-Vendor/libvlc.xcframework}"
 MATRIX="${SWIFTVLC_QUALIFICATION_MATRIX:-$SCRIPT_DIR/qualification/matrix.json}"
 RECORD="${SWIFTVLC_QUALIFICATION_RECORD:-$SCRIPT_DIR/qualification/${VERSION}.json}"
+FEATURE_MANIFEST="${SWIFTVLC_FEATURE_MANIFEST:-$SCRIPT_DIR/qualification/feature-manifest-v1.json}"
+PROFILES="${SWIFTVLC_QUALIFICATION_PROFILES:-$SCRIPT_DIR/qualification/profiles-v1.json}"
 
 if [[ -z "$VERSION" ]]; then
   echo "Usage: $0 <version> [xcframework-path]" >&2
@@ -43,6 +52,16 @@ fi
 
 if [[ ! -f "$MATRIX" ]]; then
   echo "Error: $MATRIX not found; the required rows are undefined." >&2
+  exit 1
+fi
+
+if [[ ! -f "$FEATURE_MANIFEST" ]]; then
+  echo "Error: $FEATURE_MANIFEST not found; required release features are undefined." >&2
+  exit 1
+fi
+
+if [[ ! -f "$PROFILES" ]]; then
+  echo "Error: $PROFILES not found; qualification profiles are undefined." >&2
   exit 1
 fi
 
@@ -63,9 +82,20 @@ fi
 DIGEST="$(artifact_digest)"
 SOURCE_DIGEST=$("$SCRIPT_DIR/release-source-digest.py" "$VERSION")
 MATRIX_CHECKSUM=$(shasum -a 256 "$MATRIX" | cut -d' ' -f1)
+FEATURE_MANIFEST_CHECKSUM=$(shasum -a 256 "$FEATURE_MANIFEST" | cut -d' ' -f1)
+PROFILES_CHECKSUM=$(shasum -a 256 "$PROFILES" | cut -d' ' -f1)
 CANDIDATE_SOURCE_COMMIT="${SWIFTVLC_CANDIDATE_SOURCE_COMMIT:-}"
 CANDIDATE_SOURCE_DIGEST="${SWIFTVLC_CANDIDATE_SOURCE_DIGEST:-}"
 CANDIDATE_MATRIX_CHECKSUM="${SWIFTVLC_CANDIDATE_MATRIX_CHECKSUM:-}"
+CANDIDATE_FEATURE_MANIFEST_CHECKSUM="${SWIFTVLC_CANDIDATE_FEATURE_MANIFEST_CHECKSUM:-}"
+
+if [[ -n "$CANDIDATE_FEATURE_MANIFEST_CHECKSUM" && \
+    "$FEATURE_MANIFEST_CHECKSUM" != "$CANDIDATE_FEATURE_MANIFEST_CHECKSUM" ]]; then
+  echo "Error: the selected feature policy does not match the prepared candidate." >&2
+  echo "  candidate: $CANDIDATE_FEATURE_MANIFEST_CHECKSUM" >&2
+  echo "  selected:  $FEATURE_MANIFEST_CHECKSUM" >&2
+  exit 1
+fi
 
 if [[ ! -f "$RECORD" ]]; then
   echo "Error: no device qualification record for $VERSION." >&2
@@ -73,12 +103,33 @@ if [[ ! -f "$RECORD" ]]; then
   echo "  Artifact digest: $DIGEST" >&2
   echo "  Release source digest: $SOURCE_DIGEST" >&2
   echo "  Qualification matrix checksum: $MATRIX_CHECKSUM" >&2
+  echo "  Feature manifest checksum: $FEATURE_MANIFEST_CHECKSUM" >&2
   echo "" >&2
-  echo "  The device matrix is the acceptance gate for system PiP; CI cannot" >&2
-  echo "  stand in for it. Run the matrix on hardware and record the results," >&2
-  echo "  then release. See scripts/qualification/README.md." >&2
+  echo "  CI cannot stand in for physical-device evidence. Run the matrix on" >&2
+  echo "  hardware, assemble the results, and satisfy the versioned feature" >&2
+  echo "  policy before releasing. See scripts/qualification/README.md." >&2
   exit 1
 fi
+
+# First run the shared fail-closed validator used by evidence materialization,
+# assembly, and checklist rendering.  It reopens every retained evidence file
+# and validates the exact app/runner/test-catalog binding, fixture checksum,
+# immutable stable durations, semantic assertions, and executed XCTest set.
+policy_args=(
+  validate-record
+  --record "$RECORD"
+  --matrix "$MATRIX"
+  --version "$VERSION"
+  --artifact-digest "$DIGEST"
+  --source-digest "$SOURCE_DIGEST"
+  --matrix-checksum "$MATRIX_CHECKSUM"
+  --feature-checksum "$FEATURE_MANIFEST_CHECKSUM"
+  --profiles-checksum "$PROFILES_CHECKSUM"
+)
+if [[ -n "$CANDIDATE_SOURCE_COMMIT" ]]; then
+  policy_args+=(--source-commit "$CANDIDATE_SOURCE_COMMIT")
+fi
+python3 "$SCRIPT_DIR/qualification/qualification_policy.py" "${policy_args[@]}"
 
 python3 - "$MATRIX" "$RECORD" "$DIGEST" "$VERSION" \
   "$SOURCE_DIGEST" "$MATRIX_CHECKSUM" "$CANDIDATE_SOURCE_COMMIT" \
@@ -491,3 +542,17 @@ print(
     f"for artifact {digest[:12]}… and source {source_digest[:12]}…"
 )
 PY
+
+# The scenario matrix proves its individual rows. The versioned feature policy
+# is the higher-level release contract: it also retains honest blockers for
+# receiver labs, operator-assisted lifecycle checks, and device lanes that do
+# not exist yet. A complete matrix must never bypass an incomplete feature set.
+python3 "$SCRIPT_DIR/qualification/feature-checklist.py" \
+  --manifest "$FEATURE_MANIFEST" \
+  --matrix "$MATRIX" \
+  --input "$RECORD" \
+  --check-only \
+  --enforce-canonical-policy \
+  --require-complete
+
+echo "Stable release qualification verified: scenario evidence and required features are complete."

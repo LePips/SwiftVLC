@@ -48,10 +48,15 @@ public enum PlayerEvent: Sendable, CustomStringConvertible {
   /// same `.stateChanged(.stopped)` transition; SwiftVLC synthesizes this
   /// event only when the engine's preceding stopping reason identifies a
   /// clean end of stream. An unattributed stop is never treated as EOF.
-  /// Always delivered immediately after the `.stateChanged(.stopped)` it
-  /// belongs to, from the same native handle. Not emitted while a ``MediaListPlayer``
-  /// drives this player — list advancement stops the handle between
-  /// items.
+  /// Normally delivered immediately after the `.stateChanged(.stopped)` it
+  /// belongs to, from the same native handle. One replacement-boundary
+  /// exception preserves an already-authoritative EOS when committing a new
+  /// native handle makes the outgoing handle's ordered `Stopped` callback
+  /// unobservable: SwiftVLC emits this event once after the replacement
+  /// transaction commits, with the outgoing handle and playback generation in
+  /// its ``PlayerEventEnvelope``. That exception does not assert that an
+  /// output-safe stop was observed. Not emitted while a ``MediaListPlayer``
+  /// drives this player — list advancement stops the handle between items.
   case endReached
   /// Number of active video outputs changed.
   case voutChanged(Int)

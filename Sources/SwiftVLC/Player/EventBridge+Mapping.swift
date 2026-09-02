@@ -84,6 +84,12 @@ func mapEvent(_ event: libvlc_event_t) -> PlayerEvent? {
     let vol = event.u.media_player_audio_volume.volume
     return .volumeChanged(vol)
 
+  case libvlc_MediaPlayerRateChanged:
+    // Kept outside PlayerEvent so adding the native extension does not change
+    // that public enum's exhaustive source surface. The callback routes this
+    // payload through the dedicated effective-rate resolution stream.
+    return nil
+
   case libvlc_MediaPlayerAudioDevice:
     let device = event.u.media_player_audio_device.device.map { String(cString: $0) }
     return .audioDeviceChanged(device)
@@ -132,6 +138,16 @@ func mapEvent(_ event: libvlc_event_t) -> PlayerEvent? {
   default:
     return nil
   }
+}
+
+/// Extracts the native effective-rate payload without clamping it through
+/// ``PlaybackRate``. Kept separate from `mapEvent(_:)` because
+/// ``PlayerEvent`` must retain its pre-extension exhaustive source surface.
+func mapEffectivePlaybackRateResolution(_ event: libvlc_event_t) -> Float? {
+  guard event.type == Int32(libvlc_MediaPlayerRateChanged.rawValue) else {
+    return nil
+  }
+  return event.u.media_player_rate_changed.new_rate
 }
 
 func mapPlaybackFailureKind(

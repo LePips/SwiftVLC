@@ -13,14 +13,39 @@ extension Player {
   /// `libvlc_media_player_set_equalizer` call and does not retain the
   /// reference.
   public var equalizer: Equalizer? {
-    get { _equalizer }
+    get {
+      access(keyPath: \.equalizer)
+      return _equalizer
+    }
     set {
-      _equalizer?.onChange = nil
-      _equalizer = newValue
-      libvlc_media_player_set_equalizer(pointer, newValue?.pointer)
-      newValue?.onChange = { [weak self, weak newValue] in
-        guard let self, let newValue else { return }
-        libvlc_media_player_set_equalizer(pointer, newValue.pointer)
+      guard
+        let identity = beginNativeControlMutation(
+          revision: \PlayerIntentRevisions.equalizer
+        )
+      else { return }
+      _ = performNativeControlMutation(
+        keyPath: \.equalizer,
+        identity: identity,
+        revision: \PlayerIntentRevisions.equalizer
+      ) { pointer in
+        _equalizer?.onChange = nil
+        _equalizer = newValue
+        #if DEBUG
+        recordObservableControlNativeDispatch(
+          .equalizer(newValue.map(ObjectIdentifier.init)),
+          pointer: pointer
+        )
+        #endif
+        libvlc_media_player_set_equalizer(pointer, newValue?.pointer)
+        newValue?.onChange = { [weak self, weak newValue] in
+          guard
+            let self,
+            let newValue,
+            _equalizer === newValue,
+            !isShutdown
+          else { return }
+          libvlc_media_player_set_equalizer(self.pointer, newValue.pointer)
+        }
       }
     }
   }
@@ -75,8 +100,20 @@ extension Player {
       return StereoMode(from: libvlc_audio_get_stereomode(pointer))
     }
     set {
-      _ = withMutation(keyPath: \.stereoMode) {
-        libvlc_audio_set_stereomode(pointer, newValue.cValue)
+      guard
+        let identity = beginNativeControlMutation(
+          revision: \PlayerIntentRevisions.stereoMode
+        )
+      else { return }
+      _ = performNativeControlMutation(
+        keyPath: \.stereoMode,
+        identity: identity,
+        revision: \PlayerIntentRevisions.stereoMode
+      ) { pointer in
+        #if DEBUG
+        recordObservableControlNativeDispatch(.stereoMode(newValue), pointer: pointer)
+        #endif
+        return libvlc_audio_set_stereomode(pointer, newValue.cValue)
       }
     }
   }
@@ -88,8 +125,20 @@ extension Player {
       return MixMode(from: libvlc_audio_get_mixmode(pointer))
     }
     set {
-      _ = withMutation(keyPath: \.mixMode) {
-        libvlc_audio_set_mixmode(pointer, newValue.cValue)
+      guard
+        let identity = beginNativeControlMutation(
+          revision: \PlayerIntentRevisions.mixMode
+        )
+      else { return }
+      _ = performNativeControlMutation(
+        keyPath: \.mixMode,
+        identity: identity,
+        revision: \PlayerIntentRevisions.mixMode
+      ) { pointer in
+        #if DEBUG
+        recordObservableControlNativeDispatch(.mixMode(newValue), pointer: pointer)
+        #endif
+        return libvlc_audio_set_mixmode(pointer, newValue.cValue)
       }
     }
   }

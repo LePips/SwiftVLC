@@ -1,0 +1,32 @@
+# Complete the production part of VLC MR !8180 at the pinned revision.
+#
+# Patch 0011 already carries the FIFO locking/counting, vout request counting,
+# decoder countdown/drain/EOF behavior, and input need-data flow from the MR.
+# It predates the final MR revision, however, and omitted 00d1b391762
+# ("es_out: use the buffering flag when doing next-frame"). Without this hunk,
+# a rebuffer forced by a run of frame steps can still be treated as an ordinary
+# clock update, allowing RESET_PCR/discontinuity handling in the middle of the
+# frame-step sequence.
+#
+# This is the exact production hunk from 00d1b391762, context-adapted only by
+# the line offset introduced by patches 0011 and 0013. The remaining commits
+# in 5aebff101357..afee505518f are test-only: 23e0cea2be fixes the mock demux
+# boundary, 1154701cde shortens a test, and 4b6bff1c31/afee505518 add EOF/burst
+# cases. SwiftVLC exercises equivalent EOF and burst behavior with its native
+# strict-frame validation probe added alongside patch 0027.
+diff --git a/src/input/es_out.c b/src/input/es_out.c
+index 0c05beb..3212950 100644
+--- a/src/input/es_out.c
++++ b/src/input/es_out.c
+@@ -3625,9 +3625,10 @@ static int EsOutVaControlLocked(es_out_sys_t *p_sys, input_source_t *source,
+         /* TODO do not use vlc_tick_now() but proper stream acquisition date */
+         const bool b_low_delay = priv->b_low_delay;
+         bool b_extra_buffering_allowed = !b_low_delay && EsOutIsExtraBufferingAllowed(p_sys);
++        bool buffering = p_sys->b_buffering || p_sys->p_next_frame_es != NULL;
+         vlc_tick_t i_late = input_clock_Update(
+                             p_pgrm->p_input_clock,
+-                            input_CanPaceControl(p_sys->p_input), p_sys->b_buffering,
++                            input_CanPaceControl(p_sys->p_input), buffering,
+                             b_extra_buffering_allowed,
+                             i_pcr, vlc_tick_now() );
+ 

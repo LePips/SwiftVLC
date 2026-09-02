@@ -64,9 +64,10 @@ struct DiscoveryRenderersCase: View {
 
     guard let d = try? RendererDiscoverer(name: selectedService) else { return }
     discoverer = d
+    let events = d.events
     try? d.start()
 
-    for await event in d.events {
+    for await event in events {
       switch event {
       case .itemAdded(let renderer):
         renderers.append(renderer)

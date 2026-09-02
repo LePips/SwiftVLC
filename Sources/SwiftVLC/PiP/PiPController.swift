@@ -103,7 +103,7 @@ public final class PiPController: NSObject {
         },
         resume: {
           $0
-            ? player.issueResume()
+            ? player.issueResume(authorizesPlaybackAfterMediaServicesReset: true)
             : player.issueManagedAudioResume()
         },
         cancelPendingPause: {
@@ -150,6 +150,8 @@ public final class PiPController: NSObject {
   @ObservationIgnored
   var callbackRegistration: DirectPiPVideoCallbackRegistration?
   @ObservationIgnored
+  private var didInvalidateForLifecycleEnd = false
+  @ObservationIgnored
   var controlTimebase: CMTimebase? {
     didSet { refreshCallbackSnapshot() }
   }
@@ -164,6 +166,10 @@ public final class PiPController: NSObject {
   /// for why it needs one per lane rather than one merged stream.
   @ObservationIgnored
   var timingObserverTask: Task<Void, Never>?
+  /// Effective-rate resolutions use a dedicated provenance-bearing stream so
+  /// they do not expand PlayerEvent's source-exhaustive public surface.
+  @ObservationIgnored
+  var effectivePlaybackRateObserverTask: Task<Void, Never>?
   /// The state observer's rolling view of duration and seekability.
   ///
   /// Owned by the controller rather than by an observer task because both lane
@@ -171,6 +177,10 @@ public final class PiPController: NSObject {
   /// interleave between events rather than racing within one.
   @ObservationIgnored
   var playbackStateObservation = PlaybackStateObservationState(duration: nil, isSeekable: false)
+  /// Counts raw capability callbacks rejected by this controller's independent
+  /// event subscriptions while the qualification suppression seam is active.
+  @ObservationIgnored
+  var playbackStateEventSuppression = PlaybackStateEventSuppression()
   /// Last native-active and rate values the observer acted on, for the same
   /// reason: the comparison has to survive across events from either lane.
   @ObservationIgnored
@@ -202,26 +212,37 @@ public final class PiPController: NSObject {
   let startsAutomaticallyFromInline: Bool
 
   /// Whether this controller configures and activates the shared
-  /// `AVAudioSession` (iOS only). Set by ``PiPVideoView``'s
-  /// `managesAudioSession` knob; the direct public ``init(player:)``
-  /// path uses `true`. When `true`, the
-  /// `.playback` category is set at init but `setActive(true)` is
-  /// deferred to ``start()`` or an active-playback signal. Direct
+  /// `AVAudioSession` (iOS only). Direct construction and the current
+  /// ``PiPVideoView`` initializer inherit this value from the player's
+  /// ``Player/appleAudioSessionPolicy``. The deprecated view initializer can
+  /// preserve its pre-1.1 controller-local override without changing the
+  /// instance policy used by bundled libVLC. When `true` on a library-managed
+  /// instance, native broker acquisition configures `.playback` /
+  /// `.moviePlayback` and activates as one serialized operation, deferred to
+  /// ``start()`` or an active-playback signal. An application-managed native
+  /// broker remains a no-op even if the legacy controller flag is `true`. Direct
   /// controller construction and inactive native-view construction do
   /// not take audio focus. A native view adopting a Player whose playback
   /// intent is already active activates immediately so automatic PiP cannot
-  /// start before the managed session is ready. When `false`, the session
-  /// is never touched.
+  /// start before the managed session is ready. When `false`, this controller
+  /// never touches the session; bundled libVLC continues to follow the
+  /// instance policy.
   @ObservationIgnored
   let managesAudioSession: Bool
 
-  /// Operation used by the deferred audio-session activation state machine.
-  /// The native iOS initializer accepts an override so lifecycle ordering and
-  /// retry behavior can be proven without depending on process-wide audio
-  /// state. Every public/direct initializer uses the live AVAudioSession
-  /// operation.
+  /// Records an applied, source-compatible legacy PiP controller override that
+  /// differs from the immutable instance policy. This makes the transitional
+  /// split explicit and testable; it does not claim that bundled libVLC adopted
+  /// the controller-local value.
   @ObservationIgnored
-  let audioSessionActivation: @MainActor () throws -> Void
+  let audioSessionPolicyDiagnostic: AppleAudioSessionPolicyDiagnostic?
+
+  /// Optional operation used to test the deferred audio-session activation
+  /// state machine without mutating process-wide audio state. Production
+  /// controllers leave this nil and acquire the player's unique native broker
+  /// lease instead.
+  @ObservationIgnored
+  let audioSessionActivation: (@MainActor () throws -> Void)?
 
   /// Whether the latest deferred `AVAudioSession.setActive(true)` succeeded.
   /// The latch is cleared after interruptions, media-services loss, and
@@ -334,7 +355,7 @@ public final class PiPController: NSObject {
   /// callbacks. `nil` when no discriminating signal has been observed;
   /// see ``PiPController/pipEvents`` for the resolution rules.
   @ObservationIgnored
-  var pendingStopReason: PiPStopReason?
+  var pendingStopReason: PiPStopCause?
 
   /// Playback state as PiP sees it. Updated synchronously in
   /// `setPlaying` (PiP-initiated) and by the observer (VLC-initiated,
@@ -392,8 +413,41 @@ public final class PiPController: NSObject {
   /// active playback intent after exhausting the bounded retry window.
   public private(set) var deferredPauseOutcome: DeferredPauseOutcome?
 
-  func setDeferredPauseOutcome(_ outcome: DeferredPauseOutcome?) {
-    deferredPauseOutcome = outcome
+  /// Exact ownership of a deferred-pause outcome publication. Observation
+  /// invokes app callbacks before the synthesized setter body, so an observer
+  /// can synchronously start or cancel a newer attempt while an older result is
+  /// still suspended at that boundary.
+  @ObservationIgnored
+  var deferredPauseOutcomePublicationRevision: UInt64 = 0
+
+  /// Publishes an outcome and returns the exact revision when this call still
+  /// owns the publication after Observation callbacks have run. A callback
+  /// may synchronously start a newer command before `withMutation` returns;
+  /// callers with follow-on side effects must validate this token.
+  @discardableResult
+  func setDeferredPauseOutcome(
+    _ outcome: DeferredPauseOutcome?
+  ) -> UInt64? {
+    precondition(
+      deferredPauseOutcomePublicationRevision < UInt64.max,
+      "PiP deferred-pause outcome publication revision exhausted"
+    )
+    deferredPauseOutcomePublicationRevision += 1
+    let revision = deferredPauseOutcomePublicationRevision
+    guard deferredPauseOutcome != outcome else { return revision }
+    withMutation(keyPath: \.deferredPauseOutcome) {
+      guard deferredPauseOutcomePublicationRevision == revision else { return }
+      _deferredPauseOutcome = outcome
+    }
+    guard
+      deferredPauseOutcomePublicationRevision == revision,
+      deferredPauseOutcome == outcome
+    else { return nil }
+    return revision
+  }
+
+  func ownsDeferredPauseOutcomePublication(_ revision: UInt64) -> Bool {
+    deferredPauseOutcomePublicationRevision == revision
   }
 
   enum DeferredPauseState {
@@ -438,8 +492,18 @@ public final class PiPController: NSObject {
   /// button in your UI.
   public private(set) var isPossible: Bool = false
 
+  /// Exact ownership for ``isPossible`` publication across Observation's
+  /// synchronous callback boundary.
+  @ObservationIgnored
+  var possiblePublicationRevision: UInt64 = 0
+
   /// Whether a PiP window is currently visible.
   public private(set) var isActive: Bool = false
+
+  /// Exact ownership for ``isActive`` publication across Observation's
+  /// synchronous callback boundary.
+  @ObservationIgnored
+  var activePublicationRevision: UInt64 = 0
 
   /// Invoked when the user taps the PiP window's **restore** affordance
   /// (the "return to app" control), as opposed to the **close** (X)
@@ -478,15 +542,17 @@ public final class PiPController: NSObject {
 
   /// Creates a PiP controller for the given player.
   ///
-  /// Configures the audio session and hooks up vmem rendering callbacks.
+  /// Hooks up vmem rendering callbacks and follows the player's inherited
+  /// ``Player/appleAudioSessionPolicy`` for audio-session ownership.
   /// - Parameter player: The player to control.
   public init(player: Player) {
     self.player = player
     playbackDriver = .live(player: player)
     pauseDebounce = .milliseconds(250)
     startsAutomaticallyFromInline = true
-    managesAudioSession = true
-    audioSessionActivation = Self.liveAudioSessionActivation
+    managesAudioSession = player.appleAudioSessionPolicy.managesAudioSession
+    audioSessionPolicyDiagnostic = nil
+    audioSessionActivation = nil
     displayLayer = AVSampleBufferDisplayLayer()
     renderer = PixelBufferRenderer(displayLayer: displayLayer)
     playbackDelegateProxy = PiPPlaybackDelegateProxy()
@@ -500,7 +566,6 @@ public final class PiPController: NSObject {
     displayLayer.videoGravity = .resizeAspect
     displayLayer.backgroundColor = CGColor(red: 0, green: 0, blue: 0, alpha: 1)
 
-    configureAudioSession()
     startAudioSessionObserversIfManaged()
     setupControlTimebase()
     attachCallbacks()
@@ -516,6 +581,7 @@ public final class PiPController: NSObject {
     nativeBackend: IOSNativePiPBackend,
     startsAutomaticallyFromInline: Bool = true,
     managesAudioSession: Bool = true,
+    audioSessionPolicyDiagnostic: AppleAudioSessionPolicyDiagnostic? = nil,
     audioSessionActivation: (@MainActor () throws -> Void)? = nil
   ) {
     self.player = player
@@ -523,8 +589,8 @@ public final class PiPController: NSObject {
     pauseDebounce = .milliseconds(250)
     self.startsAutomaticallyFromInline = startsAutomaticallyFromInline
     self.managesAudioSession = managesAudioSession
+    self.audioSessionPolicyDiagnostic = audioSessionPolicyDiagnostic
     self.audioSessionActivation = audioSessionActivation
-      ?? Self.liveAudioSessionActivation
     displayLayer = AVSampleBufferDisplayLayer()
     renderer = PixelBufferRenderer(displayLayer: displayLayer)
     playbackDelegateProxy = PiPPlaybackDelegateProxy()
@@ -537,7 +603,6 @@ public final class PiPController: NSObject {
     publishPiPSnapshot()
 
     playbackDelegateProxy.owner = self
-    configureAudioSession()
     startAudioSessionObserversIfManaged()
     nativeBackend.setStartsAutomaticallyFromInline(startsAutomaticallyFromInline)
 
@@ -574,14 +639,16 @@ public final class PiPController: NSObject {
     player: Player,
     nativeBackend: MacNativePiPBackend,
     startsAutomaticallyFromInline: Bool = true,
-    managesAudioSession: Bool = true
+    managesAudioSession: Bool = true,
+    audioSessionPolicyDiagnostic: AppleAudioSessionPolicyDiagnostic? = nil
   ) {
     self.player = player
     playbackDriver = .live(player: player)
     pauseDebounce = .milliseconds(250)
     self.startsAutomaticallyFromInline = startsAutomaticallyFromInline
     self.managesAudioSession = managesAudioSession
-    audioSessionActivation = Self.liveAudioSessionActivation
+    self.audioSessionPolicyDiagnostic = audioSessionPolicyDiagnostic
+    audioSessionActivation = nil
     displayLayer = AVSampleBufferDisplayLayer()
     renderer = PixelBufferRenderer(displayLayer: displayLayer)
     playbackDelegateProxy = PiPPlaybackDelegateProxy()
@@ -620,7 +687,8 @@ public final class PiPController: NSObject {
     self.pauseDebounce = pauseDebounce
     self.startsAutomaticallyFromInline = startsAutomaticallyFromInline
     self.managesAudioSession = managesAudioSession
-    audioSessionActivation = Self.liveAudioSessionActivation
+    audioSessionPolicyDiagnostic = nil
+    audioSessionActivation = nil
     displayLayer = AVSampleBufferDisplayLayer()
     renderer = PixelBufferRenderer(displayLayer: displayLayer)
     playbackDelegateProxy = PiPPlaybackDelegateProxy()
@@ -634,7 +702,6 @@ public final class PiPController: NSObject {
     displayLayer.videoGravity = .resizeAspect
     displayLayer.backgroundColor = CGColor(red: 0, green: 0, blue: 0, alpha: 1)
 
-    configureAudioSession()
     startAudioSessionObserversIfManaged()
     setupControlTimebase()
     attachCallbacks()
@@ -645,6 +712,18 @@ public final class PiPController: NSObject {
   }
 
   isolated deinit {
+    invalidateForLifecycleEnd()
+  }
+
+  /// Releases every controller-owned observation and callback claim.
+  ///
+  /// This stays internal so deterministic lifecycle tests can exercise the
+  /// same cleanup as `deinit` without using ARC timing as a synchronization
+  /// primitive. Normal clients release the controller instead.
+  func invalidateForLifecycleEnd() {
+    guard !didInvalidateForLifecycleEnd else { return }
+    didInvalidateForLifecycleEnd = true
+
     pipEventBroadcaster.terminate()
     pipEventEnvelopeBroadcaster.terminate()
     #if os(iOS)
@@ -655,10 +734,12 @@ public final class PiPController: NSObject {
     cancelDeferredPause()
     stateObserverTask?.cancel()
     timingObserverTask?.cancel()
+    effectivePlaybackRateObserverTask?.cancel()
     playbackIntentObserverTask?.cancel()
     audioSessionBackgroundPauseTask?.cancel()
     possibleObservation = nil
     activeObservation = nil
+    deactivateAudioSessionIfNeeded()
     stopAudioSessionObserversIfManaged()
     // No explicit native-backend relinquish: the backend holds its `owner`
     // weakly, so ARC clears the back-reference as this controller is torn
@@ -677,87 +758,6 @@ public final class PiPController: NSObject {
     if let callbackRegistration {
       player.relinquishDirectPiPVideoCallbacks(callbackRegistration)
     }
-  }
-
-  // MARK: - Public API
-
-  /// Starts Picture-in-Picture if possible and media is loaded.
-  ///
-  /// The returned ``PiPStartResult`` describes only whether the request was
-  /// issued. Previously every early exit returned silently, so a caller could
-  /// not tell a request that reached AVKit from one that never left the
-  /// controller — and therefore could not decide whether to fall back to
-  /// full-screen playback. Asynchronous AVKit failure after an accepted start
-  /// stays where it belongs, on ``pipEventEnvelopes`` (or the compatibility
-  /// ``pipEvents`` stream when generation attribution is not needed).
-  @discardableResult
-  public func start() -> PiPStartResult {
-    guard player.currentMedia != nil else { return .noMedia }
-    #if os(iOS)
-    if let nativeBackend {
-      // Do not take audio focus for a request the native controller cannot
-      // perform. The backend is still asked either way, both for its one-time
-      // vout diagnostic and because its answer is the authoritative one —
-      // substituting `.notPossible` here would report the controller's guess
-      // over the backend's own finding, and would hide a `.noMedia` the
-      // backend can see and this layer cannot.
-      if nativeBackend.isPossible {
-        activateAudioSessionIfNeeded()
-      }
-      return noteAcceptedPiPStartRequest(nativeBackend.start())
-    }
-    #endif
-    #if os(macOS)
-    if let nativeBackend {
-      return noteAcceptedPiPStartRequest(nativeBackend.start())
-    }
-    #endif
-    guard let pipController else { return .backendUnavailable }
-    guard isPossible else { return .notPossible }
-    activateAudioSessionIfNeeded()
-    pipController.startPictureInPicture()
-    return noteAcceptedPiPStartRequest(.accepted)
-  }
-
-  /// Stops Picture-in-Picture.
-  ///
-  /// A stop initiated through this method is reported on ``pipEvents`` with
-  /// ``PiPStopReason/programmatic``.
-  public func stop() {
-    // Recorded unconditionally: between AVKit beginning the start
-    // animation and the didStart callback, `isActive` is still false,
-    // and a stop issued in that window would otherwise be reported as
-    // the user's close tap. If no lifecycle was actually in flight, the next
-    // accepted start (or an automatic willStart/didStart) clears it.
-    notePendingStopReason(.programmatic)
-    #if os(iOS)
-    if let nativeBackend {
-      nativeBackend.stop()
-      return
-    }
-    #endif
-    #if os(macOS)
-    if let nativeBackend {
-      nativeBackend.stop()
-      return
-    }
-    #endif
-    pipController?.stopPictureInPicture()
-  }
-
-  /// Toggles Picture-in-Picture on/off.
-  /// - Returns: the ``PiPStartResult`` when this call took the start branch,
-  ///   or `nil` when it stopped an active session. A caller that wants to fall
-  ///   back on a refused start needs to distinguish "I tried to start and it
-  ///   was refused" from "I stopped"; collapsing both to `Void` made that
-  ///   impossible.
-  @discardableResult
-  public func toggle() -> PiPStartResult? {
-    if isActive {
-      stop()
-      return nil
-    }
-    return start()
   }
 
   // MARK: - Setup
@@ -788,7 +788,10 @@ public final class PiPController: NSObject {
       playbackGeneration: { bridge.currentPlaybackGeneration }
     )
     callbackRegistration = registration
-    player.claimDirectPiPVideoCallbacks(registration)
+    guard player.claimDirectPiPVideoCallbacks(registration) else {
+      invalidateCallbackSnapshot()
+      return
+    }
     // Publish the handle the AVKit callback threads will interrogate. Until
     // this runs the snapshot reports "not attached" and the synchronous
     // queries answer with their stable defaults.
@@ -796,6 +799,7 @@ public final class PiPController: NSObject {
   }
 
   private func setupPiPController() {
+    guard callbackRegistration?.isBound == true else { return }
     guard AVPictureInPictureController.isPictureInPictureSupported() else { return }
 
     // `AVPictureInPictureController.ContentSource` declares its
@@ -859,26 +863,48 @@ public final class PiPController: NSObject {
   }
 
   func updatePiPPossible(_ isPossible: Bool) {
-    guard self.isPossible != isPossible else { return }
-    self.isPossible = isPossible
+    precondition(
+      possiblePublicationRevision < UInt64.max,
+      "PiP possible publication revision exhausted"
+    )
+    possiblePublicationRevision += 1
+    let revision = possiblePublicationRevision
+    let hasRenderableBackend = callbackRegistration?.isBound ?? (nativeBackend != nil)
+    let effectiveValue = isPossible && hasRenderableBackend
+    guard self.isPossible != effectiveValue else { return }
+    var didCommit = false
+    withMutation(keyPath: \.isPossible) {
+      guard possiblePublicationRevision == revision else { return }
+      _isPossible = effectiveValue
+      didCommit = true
+    }
+    guard didCommit, possiblePublicationRevision == revision else { return }
     publishPiPSnapshot()
   }
 
   func updatePiPActive(_ isActive: Bool) {
+    precondition(
+      activePublicationRevision < UInt64.max,
+      "PiP active publication revision exhausted"
+    )
+    activePublicationRevision += 1
+    let revision = activePublicationRevision
     guard self.isActive != isActive else { return }
     // AVKit may retain sample-buffer backing storage across PiP transitions.
     // Isolate that ownership before publishing the active boundary so the
     // bounded libVLC vmem pool always has a buffer with which to make forward
     // progress. Inline playback remains zero-copy.
-    renderer.setPresentationCopyRequired(isActive)
-    callbackRegistration?.setPresentationCopyRequired(isActive)
-    #if os(iOS)
-    player.nativePiPVideoOutputRebuildPermit.setPiPActive(
-      isActive && nativeBackend != nil
-    )
-    #endif
-    self.isActive = isActive
+    var didCommit = false
+    withMutation(keyPath: \.isActive) {
+      guard activePublicationRevision == revision else { return }
+      renderer.setPresentationCopyRequired(isActive)
+      callbackRegistration?.setPresentationCopyRequired(isActive)
+      _isActive = isActive
+      didCommit = true
+    }
+    guard didCommit, activePublicationRevision == revision else { return }
     handlePiPActiveChangedForManagedAudioSession(isActive)
+    guard activePublicationRevision == revision else { return }
     publishPiPSnapshot()
   }
 
@@ -954,6 +980,10 @@ public final class PiPController: NSObject {
   }
 
   func handlePlaybackIntentChanged(_ active: Bool) {
+    // AsyncStream delivery can trail a media-services reset. Revalidate an
+    // active sample against the Player-owned intent before it can reactivate
+    // audio focus or cancel the reset's pause barrier.
+    guard !active || player.isPlaybackRequestedActive else { return }
     if active {
       // Lifecycle and media-services suspension preserve active playback
       // intent on purpose. A queued copy of that intent is therefore not a
@@ -993,6 +1023,8 @@ public final class PiPController: NSObject {
 
   func handleSetPlaying(_ playing: Bool) {
     cancelDeferredPause()
+    let requiresFreshPlaybackIntent = playing
+      && player.requiresFreshPlaybackIntentAfterMediaServicesReset
 
     // Set immediately so isPlaybackPaused returns the correct value
     // when PiP queries it right after this call (before VLC catches up).
@@ -1001,7 +1033,7 @@ public final class PiPController: NSObject {
 
     if playing {
       playbackDriver.cancelPendingPause(nil, nil, .resume)
-      let resumeRequest = requestResumeIfNeeded()
+      let resumeRequest = requestResumeIfNeeded(force: requiresFreshPlaybackIntent)
       if resumeRequest.needed, !resumeRequest.accepted {
         pendingPiPPlaybackState = nil
         player.setPlaybackIntentFromExternalControl(player.isActive)
@@ -1102,8 +1134,10 @@ public final class PiPController: NSObject {
   func handleNativePictureInPictureWillStop(
     mediaGeneration: PlaybackGeneration?
   ) {
+    let cause = resolveWillStopReason(mediaGeneration: mediaGeneration)
     publishPiPEvent(
-      .willStop(reason: resolveWillStopReason(mediaGeneration: mediaGeneration)),
+      .willStop(reason: cause.compatibilityReason),
+      stopCause: cause,
       mediaGeneration: mediaGeneration
     )
   }
@@ -1111,9 +1145,13 @@ public final class PiPController: NSObject {
   func handleNativePictureInPictureDidStop(
     mediaGeneration: PlaybackGeneration?
   ) {
-    let reason = resolveStopReason(mediaGeneration: mediaGeneration)
+    let cause = resolveStopReason(mediaGeneration: mediaGeneration)
     updatePiPActive(false)
-    publishPiPEvent(.didStop(reason: reason), mediaGeneration: mediaGeneration)
+    publishPiPEvent(
+      .didStop(reason: cause.compatibilityReason),
+      stopCause: cause,
+      mediaGeneration: mediaGeneration
+    )
   }
 
   func handleNativePictureInPictureFailedToStart(
@@ -1171,8 +1209,17 @@ public final class PiPController: NSObject {
     if isActive {
       publishPiPEvent(.didStart, mediaGeneration: mediaGeneration)
     } else {
-      publishPiPEvent(.didStop(reason: .unknown), mediaGeneration: mediaGeneration)
-      pendingStopReason = nil
+      // This synthesized fallback cannot distinguish an unprompted native
+      // close, so its version-1 event must remain `.unknown`. Preserve any
+      // detail SwiftVLC did observe (for example an explicit `stop()`) only in
+      // the extensible envelope.
+      let resolvedCause = resolveStopReason(mediaGeneration: mediaGeneration)
+      let cause: PiPStopCause = resolvedCause == .userClosed ? .unknown : resolvedCause
+      publishPiPEvent(
+        .didStop(reason: .unknown),
+        stopCause: cause,
+        mediaGeneration: mediaGeneration
+      )
     }
   }
 
@@ -1180,72 +1227,6 @@ public final class PiPController: NSObject {
     handleSetPlaying(playing)
   }
   #endif
-
-  func handleSkip(
-    by skipInterval: CMTime,
-    completion completionHandler: @escaping @Sendable () -> Void
-  ) {
-    // Cancel any pending transient pause. Skip actions should not drive
-    // libVLC through a pause → seek → resume cycle.
-    cancelDeferredPause()
-
-    // Reject an interval that cannot be expressed in libVLC's millisecond unit
-    // here rather than inside the driver, so no driver — live or injected —
-    // is ever handed one. AVKit has no contract preventing it from passing an
-    // indefinite or infinite CMTime.
-    guard Self.skipOffsetMilliseconds(skipInterval) != nil else {
-      completionHandler()
-      return
-    }
-
-    let request = playbackDriver.skip(skipInterval)
-    let tracksPendingSkip = request.initialOutcome == .pending
-    if tracksPendingSkip {
-      pendingSkipCount += 1
-    }
-    Task { @MainActor [weak self] in
-      let outcome = await request.outcome
-      guard let self else {
-        completionHandler()
-        return
-      }
-      if tracksPendingSkip {
-        pendingSkipCount = Swift.max(0, pendingSkipCount - 1)
-      }
-
-      // A refused, timed-out, or superseded skip leaves the timebase alone.
-      // Publishing the requested estimate as authoritative before native
-      // landing evidence would put AVKit ahead of playback.
-      if Self.skipMovedTimeline(outcome) {
-        lastSkipTimestamp = CFAbsoluteTimeGetCurrent()
-
-        // Apple docs: "the control timebase should reflect the current
-        // playback time and rate when the closure is invoked". Read it back
-        // only after the matching native clock event has been applied.
-        if let tb = controlTimebase {
-          let previousSeconds = CMTimebaseGetTime(tb).seconds
-          let correctedSeconds = Double(player.currentTime.milliseconds) / 1000.0
-          CMTimebaseSetTime(tb, time: CMTime(
-            seconds: correctedSeconds,
-            preferredTimescale: 1000
-          ))
-          recordTimebaseCorrection(
-            reason: .skipLanding,
-            previousTimebaseSeconds: previousSeconds,
-            correctedTimebaseSeconds: correctedSeconds,
-            mediaTimeSeconds: correctedSeconds
-          )
-          setTimebaseRate(
-            player.isActive ? Float64(player.rate) : 0.0,
-            reason: .skipLanding,
-            mediaTimeSeconds: correctedSeconds
-          )
-        }
-      }
-
-      completionHandler()
-    }
-  }
 }
 
 #endif

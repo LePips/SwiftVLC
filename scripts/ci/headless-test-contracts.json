@@ -1,0 +1,116 @@
+{
+  "minimum_reported_tests": 2100,
+  "minimum_passed_tests": 1925,
+  "minimum_source_test_declarations": 2200,
+  "counting_assumptions": [
+    "Reported and passed floors are calibrated to the macOS SwiftPM lane with Swift 6.3.1, CI=true, and Swift Testing xUnit output; review them when that toolchain or lane changes.",
+    "The source floor is a lexical inventory of @Test declarations in every Swift file under Tests/SwiftVLCTests, including declarations behind platform conditionals; it is not an executed-test count.",
+    "The uncontracted skip ceiling excludes only the exact, mutually exclusive native-version identities below while CI transitions from the released extension-version-7 artifact to the rebuilt extension-version-8 artifact. The four version-8 scenarios receive allowances only before the upgrade; the reciprocal pre-version-8 rejection scenario receives its allowance only after the upgrade, preserving the same general skip-debt ceiling on either artifact."
+  ],
+  "maximum_uncontracted_reported_skips": 175,
+  "maximum_declared_playback_gates": 119,
+  "reviewed_conditional_skips": [
+    {
+      "classname": "SwiftVLCTests.Integration.AppleAudioSessionPolicyTests",
+      "name": "`Player inherits application ownership from a version 8 instance`()",
+      "skip_reason": "Requires the extension-version-8 native audio-session contract",
+      "reason": "requires the rebuilt libVLC extension-version-8 audio-session contract"
+    },
+    {
+      "classname": "SwiftVLCTests.Integration.AppleAudioSessionPolicyTests",
+      "name": "`Simultaneously live instances retain independent ownership policies`()",
+      "skip_reason": "Requires the extension-version-8 native audio-session contract",
+      "reason": "requires the rebuilt libVLC extension-version-8 audio-session contract"
+    },
+    {
+      "classname": "SwiftVLCTests.Integration.AppleAudioSessionPiPPolicyTests",
+      "name": "`Direct PiP controller derives application ownership from Player`()",
+      "skip_reason": "Requires the extension-version-8 native audio-session contract",
+      "reason": "requires the rebuilt libVLC extension-version-8 audio-session contract"
+    },
+    {
+      "classname": "SwiftVLCTests.Integration.AppleAudioSessionPiPPolicyTests",
+      "name": "`PiPVideoView derives application ownership from Player`()",
+      "skip_reason": "Requires the extension-version-8 native audio-session contract",
+      "reason": "requires the rebuilt libVLC extension-version-8 audio-session contract"
+    },
+    {
+      "classname": "SwiftVLCTests.Integration.AppleAudioSessionPolicyTests",
+      "name": "`Current pre-version-8 archive rejects before libVLC sees an unknown option`()",
+      "skip_reason": "Current archive is already extension version 8 or newer",
+      "reason": "applies only once CI links an extension-version-8-or-newer release artifact"
+    }
+  ],
+  "required_suites": [
+    {
+      "classname": "SwiftVLCTests.Integration.DecodedFrameHarnessTests",
+      "minimum_passed": 5,
+      "reason": "real libVLC decode -> vmem -> Apple pixel-buffer pipeline"
+    },
+    {
+      "classname": "SwiftVLCTests.Integration.PlayerSeekAuthorityTests",
+      "minimum_passed": 25,
+      "reason": "seek generations, settlement, and stale-clock rejection"
+    },
+    {
+      "classname": "SwiftVLCTests.Integration.PlayerSeekSingleFlightTests",
+      "minimum_passed": 23,
+      "reason": "single native owner, queued intent, deadline, drain, and terminal-boundary semantics"
+    },
+    {
+      "classname": "SwiftVLCTests.Integration.PlayerSeekLandingReconciliationTests",
+      "minimum_passed": 27,
+      "reason": "paused landing authority and getter/watch race reconciliation"
+    },
+    {
+      "classname": "SwiftVLCTests.Integration.PlayerSeekLeaseTests",
+      "minimum_passed": 24,
+      "reason": "generation-scoped seek leases, supersession, and bounded ownership"
+    },
+    {
+      "classname": "SwiftVLCTests.Integration.PlayerSeekRequestLifecycleTests",
+      "minimum_passed": 15,
+      "reason": "public typed seek request acceptance and one-shot terminal outcomes"
+    },
+    {
+      "classname": "SwiftVLCTests.Integration.PlayerSeekDispatchAttributionTests",
+      "minimum_passed": 3,
+      "reason": "synchronous native callback attribution at the dispatch boundary"
+    },
+    {
+      "classname": "SwiftVLCTests.Integration.PlayerFrameStepAuthorityTests",
+      "minimum_passed": 28,
+      "reason": "exact frame request identity, cancellation, quarantine, and seek ordering"
+    },
+    {
+      "classname": "SwiftVLCTests.Integration.PixelBufferRendererCallbackTests",
+      "minimum_passed": 38,
+      "reason": "decoded buffer ownership and synchronous display-submission status"
+    },
+    {
+      "classname": "SwiftVLCTests.Integration.PlaybackTerminalOutcomeTests",
+      "minimum_passed": 15,
+      "reason": "one generation-scoped terminal classification without reset races"
+    },
+    {
+      "classname": "SwiftVLCTests.Integration.PlayerTerminalTimelineCheckpointTests",
+      "minimum_passed": 6,
+      "reason": "native terminal reservation and pre-reset timeline linearization"
+    },
+    {
+      "classname": "SwiftVLCTests.Integration.PlayerRecastOutcomeTests",
+      "minimum_passed": 19,
+      "reason": "renderer replacement outcome and cancellation semantics"
+    },
+    {
+      "classname": "SwiftVLCTests.Integration.EventBridgeConcurrencyTests",
+      "minimum_passed": 5,
+      "reason": "native callback fan-out and termination ordering"
+    },
+    {
+      "classname": "SwiftVLCTests.Integration.PlaybackFreeTeardownRaceTests",
+      "minimum_passed": 4,
+      "reason": "native-handle teardown races that remain runnable under CI=true"
+    }
+  ]
+}

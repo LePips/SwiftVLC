@@ -81,7 +81,17 @@ public final class Player {
   )
 
   /// The currently loaded media.
-  public internal(set) var currentMedia: Media?
+  public internal(set) var currentMedia: Media? {
+    get {
+      access(keyPath: \.currentMedia)
+      return currentMediaStorage
+    }
+    set {
+      withMutation(keyPath: \.currentMedia) {
+        currentMediaStorage = newValue
+      }
+    }
+  }
 
   /// Whether the last `stopped` transition was a natural end of media.
   ///
@@ -98,243 +108,6 @@ public final class Player {
 
   /// Available subtitle tracks.
   public internal(set) var subtitleTracks: [Track] = []
-
-  // MARK: - Observable Playback Values
-
-  /// Fractional playback position reported by libVLC, in `0.0 ... 1.0`.
-  ///
-  /// Use ``seek(to:)-(PlaybackPosition)`` for checked position-based seeking. This
-  /// property is read-only so callers cannot accidentally issue an
-  /// unchecked seek request through a raw `Double` write.
-  public var position: Double {
-    access(keyPath: \.position)
-    return _position
-  }
-
-  /// Current volume level, normalized. `0.0` is silent, `1.0` is 100%.
-  ///
-  /// Backed by a shadow `_volume` instead of a live libVLC read.
-  /// Before the audio output is initialized `libvlc_audio_get_volume`
-  /// returns a negative sentinel (`-100` on libVLC 4.0), which would
-  /// surface in the UI as `-100%` even while the user is hearing audio
-  /// at the default level. The shadow starts at `1.0` and is refreshed
-  /// from the native player on each state transition, once libVLC's
-  /// audio output can be trusted.
-  /// Use ``setAudioVolume(_:)`` to change volume through the typed
-  /// ``Volume`` range.
-  public var volume: Float {
-    access(keyPath: \.volume)
-    return _volume
-  }
-
-  /// Sets audio output volume through the typed ``Volume`` range.
-  ///
-  /// Before playback starts, libVLC may reject the native update because
-  /// there is no initialized audio output yet; SwiftVLC still records the
-  /// requested volume and re-applies it when playback creates or replaces
-  /// the native player.
-  ///
-  /// - Throws: ``VLCError/operationFailed(_:)`` if playback is active and
-  ///   libVLC rejects the native volume update.
-  public func setAudioVolume(_ newVolume: Volume) throws(VLCError) {
-    let nativeVolume = Int32((newVolume.rawValue * 100).rounded())
-    let previousVolume = _volume
-    let rc = withMutation(keyPath: \.volume) {
-      _volume = newVolume.rawValue
-      return libvlc_audio_set_volume(pointer, nativeVolume)
-    }
-    if rc != 0, currentMedia != nil, state.isActive {
-      withMutation(keyPath: \.volume) {
-        _volume = previousVolume
-      }
-      throw .operationFailed("Set audio volume to \(newVolume.rawValue)")
-    }
-  }
-
-  /// Whether audio is muted. Shadowed by `_isMuted` for the same
-  /// reason as `volume`: `libvlc_audio_get_mute` returns `-1` when the
-  /// mute status is undefined, which a naive `Int32 > 0` check would
-  /// silently map to `false` and hide a real mute toggle.
-  public var isMuted: Bool {
-    get {
-      access(keyPath: \.isMuted)
-      return _isMuted
-    }
-    set {
-      withMutation(keyPath: \.isMuted) {
-        _isMuted = newValue
-        libvlc_audio_set_mute(pointer, newValue ? 1 : 0)
-      }
-    }
-  }
-
-  /// Current playback rate. `1.0` is normal speed.
-  ///
-  /// Use ``setPlaybackRate(_:)`` to request a new rate through the typed
-  /// ``PlaybackRate`` range and receive libVLC rejection as
-  /// ``VLCError/operationFailed(_:)``.
-  public var rate: Float {
-    access(keyPath: \.rate)
-    return libvlc_media_player_get_rate(pointer)
-  }
-
-  /// Sets the playback rate, throwing if libVLC rejects the value.
-  ///
-  /// Typical rejections:
-  /// - Live streams (HLS, UDP) that only support `1.0` playback.
-  /// - No media loaded yet. libVLC ignores the call until playback
-  ///   starts.
-  /// - Format-specific decoder limitations.
-  ///
-  /// ``setPlaybackRate(_:)`` is the public mutator.
-  ///
-  /// - Parameter newRate: Target rate. `1.0` is normal speed.
-  /// - Throws: ``VLCError/operationFailed(_:)`` if libVLC rejects the rate.
-  func setRate(_ newRate: PlaybackRate) throws(VLCError) {
-    let rc = withMutation(keyPath: \.rate) {
-      libvlc_media_player_set_rate(pointer, newRate.rawValue)
-    }
-    if rc != 0 {
-      throw .operationFailed("Set rate to \(newRate.rawValue)")
-    }
-  }
-
-  /// The currently selected audio track, or `nil` if none is selected.
-  ///
-  /// Setting to `nil` deselects the active audio track. Output stays
-  /// silent until another track is chosen.
-  public var selectedAudioTrack: Track? {
-    get {
-      access(keyPath: \.selectedAudioTrack)
-      return audioTracks.first(where: \.isSelected)
-    }
-    set {
-      withMutation(keyPath: \.selectedAudioTrack) {
-        selectTrack(newValue, type: .audio)
-      }
-    }
-  }
-
-  /// The currently selected subtitle track, or `nil` if subtitles are off.
-  ///
-  /// Setting to `nil` deselects the active subtitle track.
-  public var selectedSubtitleTrack: Track? {
-    get {
-      access(keyPath: \.selectedSubtitleTrack)
-      return subtitleTracks.first(where: \.isSelected)
-    }
-    set {
-      withMutation(keyPath: \.selectedSubtitleTrack) {
-        selectTrack(newValue, type: .subtitle)
-      }
-    }
-  }
-
-  /// Video aspect ratio override.
-  public var aspectRatio: AspectRatio = .default {
-    didSet { applyAspectRatio() }
-  }
-
-  /// Audio delay relative to video. Positive values delay audio (make it play later).
-  ///
-  /// Use ``setAudioDelay(_:)`` to mutate this value with checked duration
-  /// conversion.
-  public var audioDelay: Duration {
-    access(keyPath: \.audioDelay)
-    return .microseconds(libvlc_audio_get_delay(pointer))
-  }
-
-  /// Sets the audio delay relative to video.
-  ///
-  /// - Throws: ``VLCError/invalidInput(_:)`` if the duration cannot be
-  ///   represented in libVLC's microsecond unit, or
-  ///   ``VLCError/operationFailed(_:)`` if libVLC rejects the update.
-  public func setAudioDelay(_ newDelay: Duration) throws(VLCError) {
-    let microseconds = try newDelay.checkedMicroseconds(parameter: "audioDelay")
-    let rc = withMutation(keyPath: \.audioDelay) {
-      libvlc_audio_set_delay(pointer, microseconds)
-    }
-    if rc != 0 {
-      throw .operationFailed("Set audio delay")
-    }
-  }
-
-  /// Subtitle delay relative to video. Positive values delay subtitles (make them appear later).
-  ///
-  /// Use ``setSubtitleDelay(_:)`` to mutate this value with checked
-  /// duration conversion.
-  public var subtitleDelay: Duration {
-    access(keyPath: \.subtitleDelay)
-    return .microseconds(libvlc_video_get_spu_delay(pointer))
-  }
-
-  /// Sets the subtitle delay relative to video.
-  ///
-  /// - Throws: ``VLCError/invalidInput(_:)`` if the duration cannot be
-  ///   represented in libVLC's microsecond unit, or
-  ///   ``VLCError/operationFailed(_:)`` if libVLC rejects the update.
-  public func setSubtitleDelay(_ newDelay: Duration) throws(VLCError) {
-    let microseconds = try newDelay.checkedMicroseconds(parameter: "subtitleDelay")
-    let rc = withMutation(keyPath: \.subtitleDelay) {
-      libvlc_video_set_spu_delay(pointer, microseconds)
-    }
-    if rc != 0 {
-      throw .operationFailed("Set subtitle delay")
-    }
-  }
-
-  /// Subtitle text scale factor (1.0 = 100%, 0.5 = 50%, 2.0 = 200%).
-  ///
-  /// Use ``setSubtitleScale(_:)`` to mutate this value through the typed
-  /// ``SubtitleScale`` range.
-  public var subtitleTextScale: Float {
-    access(keyPath: \.subtitleTextScale)
-    return libvlc_video_get_spu_text_scale(pointer)
-  }
-
-  /// Sets subtitle text scale through the typed ``SubtitleScale`` range.
-  public func setSubtitleScale(_ newScale: SubtitleScale) {
-    withMutation(keyPath: \.subtitleTextScale) {
-      libvlc_video_set_spu_text_scale(pointer, newScale.rawValue)
-    }
-  }
-
-  /// The player's role, used to hint the system about audio behavior.
-  public var role: PlayerRole {
-    get {
-      access(keyPath: \.role)
-      return PlayerRole(from: libvlc_media_player_get_role(pointer))
-    }
-    set {
-      _ = withMutation(keyPath: \.role) {
-        libvlc_media_player_set_role(pointer, newValue.cValue)
-      }
-    }
-  }
-
-  // MARK: - Convenience
-
-  /// Whether transport controls should currently present playback as
-  /// playing.
-  ///
-  /// This follows the latest accepted play/resume/pause intent rather
-  /// than waiting for libVLC's asynchronous ``state`` transitions. Use
-  /// ``state`` when you need the strict native lifecycle state.
-  public var isPlaying: Bool {
-    access(keyPath: \.isPlaying)
-    return isPlaybackRequestedActive
-  }
-
-  /// Whether playback is active (playing or buffering during playback).
-  public var isActive: Bool {
-    access(keyPath: \.isActive)
-    return state.isActive
-  }
-
-  /// Convenience access to current media statistics.
-  public var statistics: MediaStatistics? {
-    currentMedia?.statistics()
-  }
 
   // MARK: - Internal
 
@@ -371,15 +144,12 @@ public final class Player {
   /// main actor is what lets a teardown already waiting on them deadlock, so
   /// the value they need is published here and read atomically instead.
   nonisolated let nonisolatedPlaybackIntent = Atomic<Bool>(false)
-  #if os(iOS)
-  /// One-shot authorization for native PiP continuity across a seek-driven
-  /// video-output rebuild. Read synchronously by libVLC's callback thread.
-  nonisolated let nativePiPVideoOutputRebuildPermit = IOSNativePiPVideoOutputRebuildPermit()
-  #endif
   /// Duration and seekability tagged with the media generation they describe,
   /// for consumers that must not mistake the previous media's capability for
   /// the current one. See ``PlayerCapabilitySnapshot``.
-  nonisolated let capabilitySnapshot = Mutex(PlayerCapabilitySnapshot())
+  nonisolated let capabilitySnapshot = Mutex(
+    PlayerCapabilitySnapshot(playbackGeneration: PlaybackGeneration(0))
+  )
   #if os(iOS) || os(macOS)
   /// Consumers caching the native handle for lock-free callback reads. See
   /// ``NativeHandleSnapshotObserver``.
@@ -397,13 +167,19 @@ public final class Player {
   @ObservationIgnored var isSuppressingRawCapabilityEvents = false
   @ObservationIgnored var suppressedRawLengthEventCount = 0
   @ObservationIgnored var suppressedRawSeekableEventCount = 0
-  var eventTask: Task<Void, Never>?
-  var playbackHealthSamplingTask: Task<Void, Never>?
-  var playbackHealthMonitoringState = PlaybackHealthMonitoringState()
-  var _position: Double = 0
-  var _equalizer: Equalizer?
-  var _volume: Float = 1.0
-  var _isMuted: Bool = false
+  @ObservationIgnored var eventTask: Task<Void, Never>?
+  @ObservationIgnored var playbackHealthSamplingTask: Task<Void, Never>?
+  @ObservationIgnored var playbackHealthMonitoringState = PlaybackHealthMonitoringState()
+  /// Exact ownership of one playback-health publication. Generation and
+  /// native-handle identity reject media replacement, while this revision
+  /// rejects a newer same-generation sample published from Observation's
+  /// synchronous `onChange` callback.
+  @ObservationIgnored var playbackHealthPublicationRevision: UInt64 = 0
+  @ObservationIgnored var _position: Double = 0
+  @ObservationIgnored var _equalizer: Equalizer?
+  @ObservationIgnored var _volume: Float = 1.0
+  @ObservationIgnored var _isMuted: Bool = false
+  @ObservationIgnored var _aspectRatio: AspectRatio = .default
   enum PauseTransition {
     case pausing
     case resuming
@@ -427,6 +203,96 @@ public final class Player {
   /// that happens to target the same media generation.
   @ObservationIgnored
   var playbackControlIntentRevision: UInt64 = 0
+  /// Exact ownership of the two public playback-intent notifications. This is
+  /// distinct from `playbackControlIntentRevision`: native reconciliation and
+  /// media reset also publish intent, and either can synchronously re-enter a
+  /// newer command through Observation.
+  @ObservationIgnored var playbackIntentPublicationRevision: UInt64 = 0
+  @ObservationIgnored var intentRevisions = PlayerIntentRevisions()
+  /// Storage for ``currentMedia`` is explicit so a load transaction can
+  /// revalidate its playback generation *inside* Observation's synchronous
+  /// mutation body. A nested `load()` from `onChange` must win instead of
+  /// returning to an older synthesized setter that then overwrites it.
+  @ObservationIgnored var currentMediaStorage: Media?
+  /// Non-nil while `load(_:)` is publishing one exact generation's media and
+  /// reset state. Observation callbacks run before mutation bodies, so every
+  /// native control—including `play()`—fails closed until that transaction
+  /// either commits or is superseded by a nested load.
+  @ObservationIgnored var mediaPublicationGeneration: UInt64?
+
+  /// `@Observable`'s synthesized setters open their own `withMutation` scope.
+  /// Generation-scoped transactions already own that scope so they must write
+  /// the macro backing storage directly; otherwise a synchronously rearmed
+  /// observer can run between the generation check and the nested setter body.
+  func storeStateWithoutNestedObservation(_ value: PlayerState) {
+    _state = value
+  }
+
+  func storePlaybackIntentWithoutNestedObservation(_ value: Bool) {
+    _isPlaybackRequestedActive = value
+  }
+
+  func storeCurrentTimeWithoutNestedObservation(_ value: Duration) {
+    _currentTime = value
+  }
+
+  func storePositionWithoutNestedObservation(_ value: Double) {
+    _position = value
+  }
+
+  func storeDurationWithoutNestedObservation(_ value: Duration?) {
+    _duration = value
+    didUpdateDuration()
+  }
+
+  func storeSeekableWithoutNestedObservation(_ value: Bool) {
+    _isSeekable = value
+    publishCapabilitySnapshot()
+  }
+
+  func storePausableWithoutNestedObservation(_ value: Bool) {
+    _isPausable = value
+  }
+
+  func storeBufferFillWithoutNestedObservation(_ value: Float) {
+    _bufferFill = value
+  }
+
+  func storeActiveVideoOutputsWithoutNestedObservation(_ value: Int) {
+    _activeVideoOutputs = value
+  }
+
+  func storePlaybackHealthWithoutNestedObservation(_ value: PlaybackHealthSnapshot) {
+    _playbackHealth = value
+  }
+
+  func storeDidReachEndWithoutNestedObservation(_ value: Bool) {
+    _didReachEnd = value
+  }
+
+  func removeAllAudioTrackStorageWithoutNestedObservation() {
+    _audioTracks.removeAll(keepingCapacity: false)
+  }
+
+  func removeAllVideoTrackStorageWithoutNestedObservation() {
+    _videoTracks.removeAll(keepingCapacity: false)
+  }
+
+  func removeAllSubtitleTrackStorageWithoutNestedObservation() {
+    _subtitleTracks.removeAll(keepingCapacity: false)
+  }
+
+  func storeAudioTracksWithoutNestedObservation(_ value: [Track]) {
+    _audioTracks = value
+  }
+
+  func storeVideoTracksWithoutNestedObservation(_ value: [Track]) {
+    _videoTracks = value
+  }
+
+  func storeSubtitleTracksWithoutNestedObservation(_ value: [Track]) {
+    _subtitleTracks = value
+  }
 
   /// Receipt for the most recent pause that reached libVLC.
   ///
@@ -450,6 +316,37 @@ public final class Player {
   #endif
 
   #if DEBUG
+  enum MediaSpecificNativeDispatch: Equatable {
+    case readNativePlaybackState
+    case readVideoSize
+    case readABLoop
+    case readChapterCount
+    case readCurrentChapter
+    case readTitleCount
+    case readCurrentTitle
+    case readTitles
+    case readChapters
+    case readTracks(TrackType)
+    case readPrograms
+    case readSelectedProgram
+    case readProgramScrambled
+    case takeSnapshot
+    case startRecording
+    case stopRecording
+    case setABLoopTime
+    case setABLoopPosition
+    case resetABLoop
+    case navigate
+    case setChapter
+    case nextChapter
+    case previousChapter
+    case setTitle
+    case selectProgram
+    case addExternalTrack
+    case selectTrack
+    case unselectTrack
+  }
+
   /// Lets deterministic tests advance the callback-lane generation at the
   /// otherwise unschedulable boundaries between a native probe and its
   /// generation revalidation. Compiled out of release builds.
@@ -462,21 +359,34 @@ public final class Player {
     case resumeRollback
   }
 
-  @ObservationIgnored
-  var _pauseProbeHookForTesting: ((PauseProbeStage) -> Void)?
-  @ObservationIgnored
-  var _nativePlaybackStateOverrideForTesting: PlayerState?
-  @ObservationIgnored
-  var _nativeCanPauseOverrideForTesting: Bool?
-  @ObservationIgnored
-  var _nativePauseSafetyOverrideForTesting: Bool?
-  @ObservationIgnored
-  var _nativeSetRendererOverrideForTesting: ((RendererItem?) -> Int32)?
-  @ObservationIgnored
-  var _seekOverridesForTesting = PlayerSeekTestOverrides()
+  @ObservationIgnored var _pauseProbeHookForTesting: ((PauseProbeStage) -> Void)?
+  @ObservationIgnored var _nativePlaybackStateOverrideForTesting: PlayerState?
+  @ObservationIgnored var _nativeLengthOverrideForTesting: Int64?
+  @ObservationIgnored var _nativeSeekableOverrideForTesting: Bool?
+  @ObservationIgnored var _nativeVolumeOverrideForTesting: Int32?
+  @ObservationIgnored var _nativeMuteOverrideForTesting: Int32?
+  @ObservationIgnored var _nativeCanPauseOverrideForTesting: Bool?
+  @ObservationIgnored var _nativePauseSafetyOverrideForTesting: Bool?
+  @ObservationIgnored var _nativeSetRendererOverrideForTesting: ((RendererItem?) -> Int32)?
+  @ObservationIgnored var _nativeSetRendererTargetHookForTesting:
+    ((OpaquePointer, RendererItem?) -> Void)?
+  @ObservationIgnored var _nativePlayOverrideForTesting: (() -> Int32)?
+  @ObservationIgnored var _nativeStopOverrideForTesting: (() -> Void)?
+  @ObservationIgnored var _recastWaitTimeoutForTesting: Duration?
+  /// Runs after replacement publication and before old-handle retirement,
+  /// exposing that otherwise unschedulable ordering to deterministic tests.
+  @ObservationIgnored var _nativePlayerReplacementWillReleaseOldHandleForTesting: (() -> Void)?
+  @ObservationIgnored var _nativePlayerReplacementWillActivateForTesting: (() -> Void)?
+  @ObservationIgnored var _nativeResumeCommandOverrideForTesting: (() -> Void)?
+  @ObservationIgnored var _nativeResumeAuthorizationOverrideForTesting: ((Bool) -> Void)?
+  @ObservationIgnored var _mediaSpecificNativeDispatchHookForTesting:
+    ((MediaSpecificNativeDispatch) -> Void)?
+  @ObservationIgnored var _observableControlNativeDispatchHookForTesting:
+    ((OpaquePointer, ObservableControlNativeDispatch) -> Void)?
+  @ObservationIgnored var _seekOverridesForTesting = PlayerSeekTestOverrides()
   #endif
 
-  var pauseTransition: PauseTransition? {
+  @ObservationIgnored var pauseTransition: PauseTransition? {
     didSet {
       pauseTransitionPlaybackGeneration = pauseTransition == nil
         ? nil
@@ -485,8 +395,8 @@ public final class Player {
   }
 
   /// Native playback generation the in-flight transition was issued against.
-  var pauseTransitionPlaybackGeneration: UInt64?
-  var deferredPauseCommand: DeferredPauseCommand? {
+  @ObservationIgnored var pauseTransitionPlaybackGeneration: UInt64?
+  @ObservationIgnored var deferredPauseCommand: DeferredPauseCommand? {
     didSet {
       deferredPauseCommandPlaybackGeneration = deferredPauseCommand == nil
         ? nil
@@ -498,47 +408,86 @@ public final class Player {
   /// The event bridge can advance before its media-change event reaches the
   /// main actor, so this is more authoritative than `sessionGeneration` while
   /// a MediaListPlayer is opening its next item.
-  var deferredPauseCommandPlaybackGeneration: UInt64?
+  @ObservationIgnored var deferredPauseCommandPlaybackGeneration: UInt64?
 
   /// Managed audio lifecycle can pause the native player without changing the
   /// user's active playback intent. This ownership lives on `Player`, not on a
   /// transient PiP controller, so a same-player SwiftUI reconstruction can
   /// still recover the exact library-issued pause.
-  var preservesPlaybackIntentForManagedAudioSuspension = false
-  var isManagedAudioLifecycleSuspended = false
-  var isManagedAudioMediaServicesSuspended = false
-  var isManagedAudioResumeDeniedByInterruption = false
-  var isManagedAudioResumePendingActivation = false
+  @ObservationIgnored var preservesPlaybackIntentForManagedAudioSuspension = false
+  @ObservationIgnored var isManagedAudioLifecycleSuspended = false
+  @ObservationIgnored var isManagedAudioMediaServicesSuspended = false
+  @ObservationIgnored var isManagedAudioResumeDeniedByInterruption = false
+  @ObservationIgnored var isManagedAudioResumePendingActivation = false
+
+  #if os(iOS)
+  /// The one process-broker lease currently held for this player.
+  ///
+  /// A lease is bound to one exact native media-player handle. Keep the
+  /// owning pointer beside the opaque token so handle replacement can release
+  /// the predecessor through the correct owner before acquiring on the
+  /// successor. Token zero is reserved by the native ABI and always means
+  /// that SwiftVLC owns no managed-session claim.
+  @ObservationIgnored var managedAppleAudioSessionLease: UInt64 = 0
+  @ObservationIgnored var managedAppleAudioSessionLeaseOwner: OpaquePointer?
+  #endif
+
+  /// A media-services reset invalidates the process's audio objects and also
+  /// revokes the playback permission that existed before the reset. Keep that
+  /// boundary on the player rather than a transient PiP controller: queued
+  /// native `.playing` events and controller reconstruction must not turn an
+  /// old intent into a post-reset user action.
+  @ObservationIgnored var requiresFreshPlaybackIntentAfterMediaServicesReset = false
+
+  #if os(iOS)
+  /// One notification subscription per player, independent of whether a PiP
+  /// controller happens to exist. The player routes disruptions to one live
+  /// managed controller when possible and otherwise applies the transport-
+  /// safety fallback itself.
+  @ObservationIgnored
+  var managedAppleAudioSessionObservers: [any NSObjectProtocol] = []
+  #endif
+
+  #if os(iOS) || os(macOS)
+  @ObservationIgnored
+  let managedAppleAudioSessionControllers = NSHashTable<PiPController>.weakObjects()
+  @ObservationIgnored
+  weak var preferredManagedAppleAudioSessionController: PiPController?
+  #endif
 
   /// Shadow of the string last passed to `Marquee.setText`. libVLC's text
   /// renderer keys its glyph-bitmap cache on the text string, so a style-
   /// only write (color/opacity/fontSize) hits the cached entry and draws
   /// with the previous style. The `Marquee` setters briefly write a different
   /// text to bust the cache, then restore this value.
-  var _marqueeText: String = ""
+  @ObservationIgnored var _marqueeText: String = ""
   /// In-flight task that restores `_marqueeText` after a cache-bust write.
   /// Held on `Player` (not `Marquee`) because `Marquee` is `~Escapable`
   /// and cannot store cross-call state. A new style write cancels and
   /// replaces this task so rapid mutations collapse into a single restore
   /// scheduled from the latest write.
-  var _marqueeRestoreTask: Task<Void, Never>?
+  @ObservationIgnored var _marqueeRestoreTask: Task<Void, Never>?
   /// Shadows of per-player state that libVLC exposes no getter for (or
   /// whose live value can't be trusted mid-mutation). The native-handle
   /// replacement re-applies them to the fresh handle; without a shadow
   /// each silently reverts to its default on the first stop of
   /// drawable-hosted playback.
-  var _logoFile: String?
-  var _teletextPage: Int32?
-  var _deinterlaceState: Int32?
-  var _deinterlaceMode: String?
-  var _audioOutputModule: String?
-  var _audioOutputDevice: String?
-  var _viewpoint: Viewpoint?
+  @ObservationIgnored var _logoFile: String?
+  @ObservationIgnored var _teletextPage: Int32?
+  @ObservationIgnored var _deinterlaceState: Int32?
+  @ObservationIgnored var _deinterlaceMode: String?
+  @ObservationIgnored var _audioOutputModule: String?
+  @ObservationIgnored var _audioOutputDevice: String?
+  @ObservationIgnored var _viewpoint: Viewpoint?
   /// The list player currently driving this handle, if any. The native
   /// list player binds the raw `libvlc_media_player_t*` once, so every
   /// handle replacement must re-bind it or the list player keeps
   /// driving a released pointer.
-  weak var attachedMediaListPlayer: MediaListPlayer?
+  @ObservationIgnored weak var attachedMediaListPlayer: MediaListPlayer?
+  /// Main-actor ABA guard for list ownership. Weak identity can become nil
+  /// after attach/detach and look unchanged to a suspended recast; this epoch
+  /// advances on every ownership transition even when the final value is nil.
+  @ObservationIgnored var mediaListOwnershipEpoch: UInt64 = 0
   /// The platform view currently receiving video frames. Held strongly
   /// because libVLC stores the view as an unretained raw pointer in its
   /// `drawable-nsobject` variable and reads it asynchronously from the
@@ -549,37 +498,116 @@ public final class Player {
   /// pointer has been reset, and its lifetime is explicitly extended
   /// across the offloaded release so `libvlc_media_player_release` can
   /// tear down the vout before ARC releases the view.
-  var drawable: AnyObject?
-  var drawableOwner: ObjectIdentifier?
-  var needsDrawableRebindForPlayback = false
-  var nativePlayerHasHostedDrawable = false
-  var nativePlayerNeedsReplacementBeforePlayback = false
-  var retainedDrawablesUntilNativePlayerRelease: [AnyObject] = []
-  var selectedRenderer: RendererItem?
-  var nativePlayerHasStartedPlayback = false
+  @ObservationIgnored var drawable: AnyObject?
+  @ObservationIgnored var drawableOwner: ObjectIdentifier?
+  @ObservationIgnored var needsDrawableRebindForPlayback = false
+  @ObservationIgnored var nativePlayerHasHostedDrawable = false
+  @ObservationIgnored var nativePlayerNeedsReplacementBeforePlayback = false
+  /// True when ``load(_:)`` already committed the playback generation whose
+  /// media is waiting for a fresh drawable-hosted native handle. The next
+  /// `play()` must not mistake the retiring handle's terminal state for a
+  /// cold replay and advance that generation a second time.
+  @ObservationIgnored var nativePlayerReplacementHasCommittedMediaGeneration = false
+  /// Whether `pointer` and its synchronous media-specific API surface describe
+  /// ``currentMedia``. A drawable-safe `load(_:)` can commit the successor in
+  /// Swift while deliberately leaving the retiring media on the old handle
+  /// until `play()` installs a fresh one. During that interval native state,
+  /// timeline, tracks, chapters, programs, recording, and frame controls all
+  /// still belong to the predecessor and must fail closed.
+  var nativeHandleRepresentsCurrentMedia: Bool {
+    mediaPublicationGeneration == nil
+      && !(nativePlayerNeedsReplacementBeforePlayback
+        && nativePlayerReplacementHasCommittedMediaGeneration)
+  }
+
+  @ObservationIgnored var retainedDrawablesUntilNativePlayerRelease: [AnyObject] = []
+  @ObservationIgnored var selectedRenderer: RendererItem?
+  @ObservationIgnored var nativePlaybackStartWasObserved = false
+  /// Monotonic exact-handle start history. The local bit remains as a DEBUG-
+  /// friendly seam, while EventBridge is authoritative for list-driven and
+  /// callback-entry starts that can precede MainActor delivery.
+  var nativePlayerHasStartedPlayback: Bool {
+    get {
+      nativePlaybackStartWasObserved
+        || eventBridge.currentNativeHandleHasStartedPlayback
+    }
+    set {
+      nativePlaybackStartWasObserved = newValue
+      if newValue {
+        eventBridge.recordAcceptedPlaybackStart(
+          playbackGeneration: eventBridge.currentPlaybackGeneration
+        )
+      }
+    }
+  }
+
+  var currentPlaybackGenerationHasStartedPlayback: Bool {
+    eventBridge.currentPlaybackGenerationHasStartedPlayback
+  }
+
   /// Set synchronously by the first ``shutdown()`` caller, before it
   /// suspends, so every command issued from that point on sees a player that
   /// is already retiring.
-  var isShutdown = false
+  @ObservationIgnored var isShutdown = false
   /// The single teardown every ``shutdown()`` caller joins. Retained after
   /// completion so late callers still await a finished task rather than
   /// returning while an earlier teardown is mid-flight.
-  var shutdownTask: Task<Void, Never>?
-  /// The in-flight ``stopAndWait()``, so concurrent callers join one stop and
-  /// observe the same outcome. Cleared on completion — unlike shutdown, a
-  /// stop is repeatable, so a later call must start a fresh wait.
-  var stopAndWaitTask: Task<PlayerStopOutcome, Never>?
+  @ObservationIgnored var shutdownTask: Task<Void, Never>?
+  /// The in-flight ``stopAndWait()`` for one exact transport episode.
+  /// Concurrent callers join only while the native handle, playback
+  /// generation, and control boundary still identify that same Stop. A later
+  /// Play/Resume or media adoption must create a fresh stop instead of
+  /// inheriting the predecessor's eventual `Stopped` callback.
+  @ObservationIgnored var stopAndWaitOperation: PlayerStopAndWaitOperation?
+  @ObservationIgnored var nextStopAndWaitOperationID: UInt64 = 0
   /// The timeline revision established by the most recent accepted seek or
   /// media load. Clock samples stamped older than this are stale and are
   /// dropped rather than allowed to overwrite the seek target.
-  var acceptedTimelineRevision: UInt64 = 0
+  @ObservationIgnored var acceptedTimelineRevision: UInt64 = 0
+  /// Highest callback-order barrier committed to the observable timeline.
+  /// Unlike `timelineRevision`, this sequence is issued under one lock shared
+  /// by raw events, watched seek landings, wrapper dispatch, and exact frames.
+  @ObservationIgnored var acceptedNativeTimelineEmissionSequence: UInt64 = 0
   /// The only seek still allowed to publish a terminal result.
-  var pendingSeekSettlement: PendingSeekSettlement?
+  @ObservationIgnored var pendingSeekSettlement: PendingSeekSettlement?
+  /// The single command that has crossed into libVLC's request-ID-less v4
+  /// watcher. Its native ownership outlives public timeout or supersession.
+  @ObservationIgnored var activeNativeSeek: ActiveNativeSeek?
+  /// Latest accepted command waiting behind the active or externally-issued
+  /// native episode. Replacements never enter VLC; only this newest command is
+  /// retained for later dispatch.
+  @ObservationIgnored var queuedNativeSeek: NativeSeekCommand?
+  /// Latest raw clock samples withheld while one dispatched wrapper episode
+  /// owns the request-ID-less watcher. Its attributed landing discards them; a
+  /// timeout with no successor releases the best remaining observable truth.
+  @ObservationIgnored var quarantinedSeekTimeline: QuarantinedSeekTimeline?
+  /// Highest external seek episode whose landed point was published. The
+  /// monitor epoch is monotonic across attachment rotations, so delayed or
+  /// duplicate MainActor deliveries can never regain timeline authority.
+  @ObservationIgnored var latestAppliedExternalSeekEpoch: UInt64 = 0
+  /// Highest external epoch observed by a wrapper seek that subsequently
+  /// crossed into native code. A delayed external landing from that same
+  /// epoch is older than the wrapper dispatch even after the wrapper settles.
+  @ObservationIgnored var latestWrapperDispatchExternalSeekEpoch: UInt64 = 0
+  /// Frame commands awaiting libVLC's ID-matched post-display terminal event.
+  /// Kept as a FIFO so rapid taps serialize through the single native slot.
+  @ObservationIgnored var pendingFrameSteps: [PendingFrameStep] = []
+  /// Requests removed from the dispatch FIFO after native cancellation lost
+  /// to output commitment. Their exact terminal can settle the caller but is
+  /// never allowed to overwrite a successor timeline boundary.
+  @ObservationIgnored var committedFrameStepsAwaitingTerminal:
+    [UInt64: CommittedFrameStepAwaitingTerminal] = [:]
+  @ObservationIgnored var nextFrameRequestToken: UInt64 = 0
   /// Bumped when ``recast(to:)`` is superseded so suspended work rejects stale restoration.
-  var sessionGeneration: UInt64 = 0 {
+  /// Internal transaction identity is intentionally ignored by Observation;
+  /// public consumers receive coherent generation-tagged values through
+  /// ``playbackStatus``.
+  @ObservationIgnored var sessionGeneration: UInt64 = 0 {
     didSet {
       if sessionGeneration != oldValue {
         supersedePendingSeekSettlement()
+        resetNativeSeekMonitorForCausalBoundary()
+        cancelPendingFrameSteps()
       }
       #if os(iOS) || os(macOS)
       refreshNativeHandleSnapshots()
@@ -594,8 +622,17 @@ public final class Player {
   /// already advanced the generation and records itself here, while one that
   /// arrives from elsewhere — a ``MediaListPlayer`` advancing the list through
   /// libVLC directly — does not match and advances it.
-  var sessionGenerationMedia: OpaquePointer?
+  @ObservationIgnored var sessionGenerationMedia: OpaquePointer?
   let instance: VLCInstance
+
+  /// The Apple audio-session owner inherited from the ``VLCInstance`` that
+  /// created this player.
+  ///
+  /// The value is read-only and remains identical for every player sharing
+  /// the same instance, including PiP controllers created later.
+  public var appleAudioSessionPolicy: AppleAudioSessionPolicy {
+    instance.appleAudioSessionPolicy
+  }
 
   // MARK: - Lifecycle
 
@@ -604,15 +641,25 @@ public final class Player {
   public init(instance: VLCInstance = .shared) {
     let p = Self.makeNativePlayer(instance: instance)
     pointer = p
-    nativeHandleLifetime = NativePlayerHandleLifetime(pointer: p)
+    let initialNativeHandleLifetime = NativePlayerHandleLifetime(pointer: p)
+    nativeHandleLifetime = initialNativeHandleLifetime
     self.instance = instance
-    eventBridge = EventBridge(
+    let nativeSeekEmissionAuthority = NativeSeekEmissionAuthority()
+    let eventBridge = EventBridge(
       eventManager: libvlc_media_player_event_manager(p)!,
-      endCoordinator: endCoordinator
+      endCoordinator: endCoordinator,
+      nativeSeekEmissionAuthority: nativeSeekEmissionAuthority
     )
-    nativeSeekMonitor = NativeSeekMonitor(player: p)
+    self.eventBridge = eventBridge
+    nativeSeekMonitor = NativeSeekMonitor(
+      player: p,
+      nativeHandleGeneration: eventBridge.currentNativeHandleGeneration,
+      playbackGeneration: 0,
+      emissionAuthority: nativeSeekEmissionAuthority
+    )
     playbackIntentBridge = Broadcaster<Bool>(defaultBufferSize: 16)
     configureNativeSeekMonitor()
+    startManagedAppleAudioSessionObservationIfNeeded()
     startEventConsumer()
     // Seeded so `playbackStatus` opens with the current pair from the moment
     // the player exists: a subscriber attaching before any state change would
@@ -629,7 +676,11 @@ public final class Player {
   }
 
   isolated deinit {
+    stopManagedAppleAudioSessionObservationIfNeeded()
+    _ = releaseManagedAppleAudioSessionLeaseIfNeeded()
     supersedePendingSeekSettlement()
+    cancelPendingFrameSteps()
+    closeNativeFrameResultLaneForTeardown()
     eventBridge.finishCurrentPlaybackGeneration(
       cause: .cancellation,
       playbackGeneration: sessionGeneration
@@ -694,294 +745,6 @@ public final class Player {
         retainedDrawables: drawables,
         resumeBeforeStop: resumeBeforeRelease
       )
-    }
-  }
-
-  // MARK: - Media Loading
-
-  /// Loads media into the player, replacing whatever was previously loaded.
-  ///
-  /// `media` is declared `sending`, so callers can construct a ``Media``
-  /// on any actor or task and hand it off to this main-actor method
-  /// without a copy. The compiler enforces the transfer: the caller
-  /// cannot keep using the transferred reference after the call.
-  public func load(_ media: sending Media) {
-    // A shut-down player is inert: adopting media here would attach it to the
-    // retiring handle's inert replacement and publish a `currentMedia` the
-    // player can never play.
-    guard !isShutdown else { return }
-    // Any recast still restoring the outgoing session no longer owns it.
-    sessionGeneration = eventBridge.synchronizePlaybackGeneration(
-      sessionGeneration &+ 1,
-      media: media.pointer
-    )
-    currentMedia = media
-    sessionGenerationMedia = media.pointer
-    publishPlaybackStatus()
-    playbackControlIntent = nil
-    resetMediaDerivedState()
-    libvlc_media_player_set_media(pointer, media.pointer)
-    notifyMediaDependentObservables()
-  }
-
-  // MARK: - Playback Control
-
-  /// Loads media and starts playback in one step.
-  /// - Throws: ``VLCError/playbackFailed(reason:)`` if playback cannot
-  ///   start, or ``VLCError/rendererFailed`` if a selected renderer
-  ///   cannot be applied to a replacement native player.
-  public func play(_ media: sending Media) throws(VLCError) {
-    // Guarded here as well as in `play()`: the replacement branch below
-    // creates a fresh native handle and video output before `play()` is ever
-    // reached, which a shut-down player must never do.
-    guard !isShutdown else {
-      throw .invalidState("play(_:) called on a player that has been shut down")
-    }
-    if shouldReplaceNativePlayerBeforePlaybackLoad {
-      let outgoingNativeHandleGeneration = eventBridge.currentNativeHandleGeneration
-      let resumeBeforeRelease = shouldResumeNativePlayerBeforeStop
-      // Nothing is published until the native swap succeeds. Committing
-      // `currentMedia` first meant a rejected renderer left every public
-      // field describing the incoming media while the outgoing handle was
-      // still playing the previous one.
-      try replaceNativePlayerForDrawablePlayback(
-        target: drawable,
-        media: media,
-        resumeBeforeRelease: resumeBeforeRelease,
-        successorPlaybackGeneration: PlaybackGeneration(sessionGeneration &+ 1)
-      )
-      // Same supersession bump as `load(_:)`: this branch replaces the media
-      // without going through it.
-      sessionGeneration = eventBridge.synchronizePlaybackGeneration(
-        sessionGeneration &+ 1,
-        media: media.pointer,
-        outgoingNativeHandleGeneration: outgoingNativeHandleGeneration
-      )
-      currentMedia = media
-      sessionGenerationMedia = media.pointer
-      publishPlaybackStatus()
-      // No `notifyMediaDependentObservables()` here: the swap already issued
-      // it, and the keypaths it refreshes read from the native handle rather
-      // than from `currentMedia`, so a second pass is pure churn.
-      playbackControlIntent = nil
-      resetMediaDerivedState()
-    } else {
-      load(media)
-    }
-    try play()
-  }
-
-  /// Creates media from a direct media URL and starts playback.
-  ///
-  /// This does not expand playlist container URLs such as `.pls` or
-  /// classic `.m3u`; use ``MediaListPlayer`` or resolve those files to
-  /// an inner stream URL first. HLS `.m3u8` URLs are valid here because
-  /// they are streaming manifests.
-  /// - Throws: ``VLCError/mediaCreationFailed(source:)``,
-  ///   ``VLCError/playbackFailed(reason:)``, or
-  ///   ``VLCError/rendererFailed`` if a selected renderer cannot be
-  ///   applied to a replacement native player.
-  public func play(url: URL) throws(VLCError) {
-    try play(Media(url: url))
-  }
-
-  /// Starts playback.
-  /// - Throws: ``VLCError/playbackFailed(reason:)`` if playback cannot
-  ///   start, or ``VLCError/rendererFailed`` if a selected renderer
-  ///   cannot be applied to a replacement native player.
-  public func play() throws(VLCError) {
-    guard !isShutdown else {
-      throw .invalidState("play() called on a player that has been shut down")
-    }
-    clearManagedAudioSuspensionForExplicitControl()
-    try prepareDrawableForPlayback()
-    didReachEnd = false
-    if libvlc_media_player_play(pointer) == -1 {
-      playbackControlIntent = nil
-      publishPlaybackIntent(false)
-      publishPlaybackState(Self.stateAfterRejectedStart(previous: state))
-      let reason = libvlc_errmsg().map { String(cString: $0) } ?? "unknown"
-      throw .playbackFailed(reason: reason)
-    }
-    nativePlayerHasStartedPlayback = true
-    setPlaybackControlIntent(.resume)
-  }
-
-  /// The lifecycle state to publish when libVLC refuses to start.
-  ///
-  /// No session exists for the current media, so an *active* state can only
-  /// have been inherited from the previous one. Leaving it would describe
-  /// that previous session while every other public field already describes
-  /// the current media — the mixed identity a rejected start has to avoid —
-  /// so it is replaced with one terminal outcome. A state that is already
-  /// non-active is left alone: there is no stale session to displace, and
-  /// inventing a failure the caller never had would be its own lie.
-  ///
-  /// Pure so the rule is testable: `libvlc_media_player_play` returning `-1`
-  /// is not something a test can force, including on an empty player.
-  nonisolated static func stateAfterRejectedStart(previous: PlayerState) -> PlayerState {
-    previous.isActive ? .error : previous
-  }
-
-  var shouldResumeForExternalPlayRequest: Bool {
-    pauseTransition == .pausing
-      || state == .paused
-      || (!isPlaybackRequestedActive && state.isActive)
-      || nativePlaybackState == .paused
-  }
-
-  /// Toggles between playing and paused, or starts playback from an
-  /// idle or stopped state. Pause requests during opening or buffering
-  /// are queued until libVLC reaches a stable pausable state. No-op in
-  /// terminal or invalid transient states (`.stopping`, `.error`).
-  ///
-  /// Dispatches through explicit pause/resume requests using the
-  /// observed ``state`` and the current playback intent, rather than
-  /// calling `libvlc_media_player_pause` (which is itself a toggle). The
-  /// raw toggle is unsafe mid-transition: interleaving a pause-toggle
-  /// with the audio output's opening path corrupts
-  /// `stream->timing.pause_date` and trips the upstream assertion
-  /// `stream->timing.pause_date == VLC_TICK_INVALID` in
-  /// `src/audio_output/dec.c:876`, killing the process. This can happen
-  /// when a user taps Play/Pause immediately after a
-  /// `.task { try? player.play(url:) }` begins.
-  public func togglePlayPause() {
-    switch state {
-    case .idle, .stopped:
-      try? play()
-    case .playing, .opening, .buffering, .paused:
-      if isPlaybackRequestedActive {
-        pause()
-      } else {
-        resume()
-      }
-    case .stopping, .error:
-      // There is no stable playback target for a pause/resume command.
-      break
-    }
-  }
-
-  /// Stops playback asynchronously.
-  ///
-  /// The native stop completes later, signalled by the
-  /// `.stateChanged(.stopped)` event — use ``stopAndWait()`` when
-  /// teardown must not race the audio/video output drain (for example
-  /// before deactivating a shared `AVAudioSession`).
-  public func stop() {
-    supersedePendingSeekSettlement()
-    #if os(iOS)
-    nativePiPVideoOutputRebuildPermit.invalidate()
-    #endif
-    if shouldResumeNativePlayerBeforeStop {
-      libvlc_media_player_set_pause(pointer, 0)
-    }
-    clearPlaybackControlForExternalStop()
-    if nativePlayerHasHostedDrawable {
-      nativePlayerNeedsReplacementBeforePlayback = true
-      needsDrawableRebindForPlayback = true
-    } else {
-      needsDrawableRebindForPlayback = drawable != nil
-    }
-    // The state read and the mark are not atomic against the event
-    // thread: a natural end's `Stopped` can land in between, consuming
-    // nothing and leaving this mark stale — which costs exactly one
-    // suppressed natural end on the next session before the flag is
-    // consumed. The window is microseconds wide and the failure
-    // self-heals; closing it would need a session generation token
-    // threaded through the callback for no practical gain.
-    switch nativePlaybackState {
-    case .idle, .stopped, .error:
-      break
-    default:
-      eventBridge.markRequestedStop(playbackGeneration: sessionGeneration)
-    }
-    libvlc_media_player_stop_async(pointer)
-  }
-
-  // MARK: - External Tracks
-
-  /// Adds an external subtitle or audio file to the player.
-  ///
-  /// - Parameters:
-  ///   - url: URL of the external track file (must use a valid scheme like `file://`).
-  ///   - type: Whether this is a subtitle or audio track.
-  ///   - select: If `true`, the track is selected immediately when loaded.
-  /// - Throws: `VLCError.operationFailed` if the track cannot be added.
-  public func addExternalTrack(from url: URL, type: MediaSlaveType, select: Bool = true) throws(VLCError) {
-    let uri = url.absoluteString
-    guard libvlc_media_player_add_slave(pointer, type.cValue, uri, select) == 0 else {
-      throw .operationFailed("Add external \(type) track")
-    }
-  }
-
-  // MARK: - Track Selection
-
-  private func selectTrack(_ track: Track?, type: TrackType) {
-    if let track {
-      guard let cTrack = libvlc_media_player_get_track_from_id(pointer, track.id) else {
-        return
-      }
-      libvlc_media_player_select_track(pointer, cTrack)
-      libvlc_media_track_release(cTrack)
-    } else {
-      libvlc_media_player_unselect_track_type(pointer, type.cValue)
-    }
-    // No eager refresh here. libVLC emits `ESSelected` / `ESUpdated`
-    // once the new selection settles (typically <10ms), and the event
-    // handler's `refreshTracks()` is the single source of truth. An
-    // eager refresh would race libVLC's internal state and briefly
-    // show stale `isSelected` flags.
-  }
-
-  // MARK: - Video
-
-  func applyAspectRatio() {
-    if let ratioString = aspectRatio.vlcString {
-      ratioString.withCString { cstr in
-        libvlc_video_set_aspect_ratio(pointer, cstr)
-      }
-    } else {
-      libvlc_video_set_aspect_ratio(pointer, nil)
-    }
-
-    switch aspectRatio {
-    case .default:
-      libvlc_video_set_scale(pointer, 0) // auto
-      libvlc_video_set_display_fit(pointer, libvlc_video_fit_smaller)
-    case .ratio:
-      // Explicitly reset the fit mode so a prior `.fill` (cover) can't
-      // override the new aspect ratio visually.
-      libvlc_video_set_display_fit(pointer, libvlc_video_fit_smaller)
-    case .fill:
-      libvlc_video_set_display_fit(pointer, libvlc_video_fit_larger)
-    }
-  }
-
-  // MARK: - Track Refresh
-
-  /// Refreshes all observable track lists from the native player.
-  ///
-  /// The track arrays are asynchronously mirrored snapshots. Receiving the payload-free
-  /// ``PlayerEvent/tracksChanged-enum.case`` or ``PlayerEvent/mediaChanged-enum.case`` event does not guarantee
-  /// they are updated; consumers requiring an immediate native read should call this
-  /// method after either event. This also invalidates selected-track observations.
-  public func refreshTracks() {
-    audioTracks = fetchTracks(type: .audio)
-    videoTracks = fetchTracks(type: .video)
-    subtitleTracks = fetchTracks(type: .subtitle)
-    withMutation(keyPath: \.selectedAudioTrack) {}
-    withMutation(keyPath: \.selectedSubtitleTrack) {}
-  }
-
-  private func fetchTracks(type: TrackType) -> [Track] {
-    guard let tracklist = libvlc_media_player_get_tracklist(pointer, type.cValue, false) else {
-      return []
-    }
-    defer { libvlc_media_tracklist_delete(tracklist) }
-
-    let count = libvlc_media_tracklist_count(tracklist)
-    return (0..<count).compactMap { i in
-      libvlc_media_tracklist_at(tracklist, i).map { Track(from: $0) }
     }
   }
 }

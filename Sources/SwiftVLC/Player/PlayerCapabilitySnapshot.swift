@@ -16,6 +16,14 @@ import Synchronization
 struct PlayerCapabilitySnapshot: Sendable, Equatable {
   /// Bumped whenever the loaded media changes.
   var generation: UInt64 = 0
+  /// Exact playback session whose capability these values describe.
+  ///
+  /// `generation` above is useful to older state-machine tests and proves an
+  /// atomic capability reset occurred, but it cannot identify a session when
+  /// this observer and `Player` consume different event lanes. The playback
+  /// generation can: a reader may trust a populated snapshot immediately when
+  /// this identity matches the sourced event it just adopted.
+  var playbackGeneration: PlaybackGeneration?
   var durationMilliseconds: Int64?
   var isSeekable = false
 
@@ -39,9 +47,26 @@ extension Player {
     guard !isSuppressingCapabilityPublish else { return }
     let milliseconds = duration?.milliseconds
     let seekable = isSeekable
+    let playbackGeneration = PlaybackGeneration(sessionGeneration)
     capabilitySnapshot.withLock { snapshot in
+      snapshot.playbackGeneration = playbackGeneration
       snapshot.durationMilliseconds = milliseconds
       snapshot.isSeekable = seekable
+    }
+  }
+
+  /// Carries unchanged same-media capability into a new playback episode.
+  ///
+  /// Cold replay advances the playback generation without replacing either the
+  /// media or its native input, so its known duration and seekability remain
+  /// valid. A persistent PiP observer still needs those values tagged with the
+  /// new episode it adopts from event provenance. Native-handle replacements
+  /// deliberately use ``advanceCapabilityGeneration()`` instead: even for the
+  /// same media, the successor renderer has not proved its own capabilities.
+  func retagCapabilitySnapshotForPlaybackGeneration() {
+    let playbackGeneration = PlaybackGeneration(sessionGeneration)
+    capabilitySnapshot.withLock { snapshot in
+      snapshot.playbackGeneration = playbackGeneration
     }
   }
 
@@ -51,8 +76,10 @@ extension Player {
   /// atomic from a reader's point of view: there is no window in which the new
   /// generation is visible alongside the previous media's values.
   func advanceCapabilityGeneration() {
+    let playbackGeneration = PlaybackGeneration(sessionGeneration)
     capabilitySnapshot.withLock { snapshot in
       snapshot.generation &+= 1
+      snapshot.playbackGeneration = playbackGeneration
       snapshot.durationMilliseconds = nil
       snapshot.isSeekable = false
     }

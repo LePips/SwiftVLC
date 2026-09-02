@@ -69,9 +69,9 @@ not preserved, and stale callbacks from the predecessor cannot control the
 successor.
 
 The successor has three seconds to publish a usable display layer. Observe
-``PiPController/pipContinuityEvents`` for
-``PiPContinuityOutcome/rebuilding``, ``PiPContinuityOutcome/restored``, or
-``PiPContinuityOutcome/timedOut``. A timeout stops the retained AVKit
+`PiPController.pipContinuityEvents` for
+`PiPContinuityOutcome.rebuilding`, `PiPContinuityOutcome.restored`, or
+`PiPContinuityOutcome.timedOut`. A timeout stops the retained AVKit
 controller cleanly rather than leaving a frozen PiP window. Direct PiP does
 not rebuild a libVLC-owned controller and therefore emits no continuity
 events. Readiness arriving later from the expired controller is ignored; a
@@ -94,8 +94,8 @@ failed entry, paused subtitle changes, and inline restoration enqueue at most
 one immediate refresh sample, so they do not wait for the next decoded frame.
 
 ``PiPController/overlaySupport`` reports
-``PiPOverlaySupport/composited`` for every bundled backend when the matching
-engine artifact is linked. It reports ``PiPOverlaySupport/unavailable`` for the
+``PiPOverlaySupport/composited-enum.case`` for every bundled backend when the matching
+engine artifact is linked. It reports ``PiPOverlaySupport/unavailable-enum.case`` for the
 native iOS backend if a stale local engine predating this compositor is used.
 Physical-device qualification is still the authority for visual quality,
 subtitle timing, and CPU/GPU impact on the exact hardware and formats your app
@@ -104,22 +104,34 @@ supports.
 ## Audio session (iOS only)
 
 PiP requires a playback-category audio session. ``PiPController``
-sets the `.playback` category automatically when it is constructed, but
-direct controller construction and native-view construction for an inactive
-Player deliberately do not activate the session. Merely building an idle view
-therefore does not take audio focus.
+does not touch the process session when it is constructed. Configuration and
+activation are deferred together until ``PiPController/start()`` or the first
+active-playback signal, when the Player acquires one opaque lease from the
+same native broker used by libVLC's AudioUnit and sample-buffer audio outputs.
+That broker serializes `.playback` / `.moviePlayback` configuration,
+activation, owner counting, and final deactivation across every Player, so a
+transient PiP controller cannot deactivate another output. Merely building an
+idle view therefore neither changes category nor takes audio focus.
 
-`setActive(true)` is deferred until ``PiPController/start()`` or the
-first active-playback signal. When a native iOS view adopts an already-playing
-Player, SwiftVLC activates before publishing the successor controller as the
-native backend owner; libVLC's AVKit controller may otherwise auto-start
-without SwiftVLC receiving a will-start callback. The direct route retries at
-will-start, and the native route retries when it observes did-start. If
-activation fails transiently, SwiftVLC leaves it pending for either fallback.
+When a native iOS view adopts an already-playing Player, SwiftVLC acquires its
+lease before publishing the successor controller as the native backend owner;
+libVLC's AVKit controller may otherwise auto-start without SwiftVLC receiving
+a will-start callback. The direct route retries at will-start, and the native
+route retries when it observes did-start. A failed acquisition retains no
+Swift latch, so either signal can retry. Native-handle replacement acquires the
+successor lease before releasing the predecessor, avoiding a zero-owner focus
+gap.
 
-The managed path observes audio interruptions, output-route loss,
-media-services loss/reset, device lock, and app lifecycle. A route loss pauses
-and changes playback intent so audio cannot jump unexpectedly to the speaker.
+Each ``Player`` owns one audio-session disruption subscription, independent of
+whether a PiP controller exists. A live managed PiP controller receives those
+signals as the session-policy handler; audio-only and ordinary video playback
+use the same player-level transport fallback. This avoids both a no-PiP blind
+spot and duplicate reactions when view reconstruction briefly leaves multiple
+controllers alive.
+
+The managed path handles audio interruptions, device lock, and app lifecycle.
+A route loss always pauses and changes playback intent so audio cannot jump
+unexpectedly to the speaker.
 Device lock or backgrounding without an active PiP window instead pauses native
 playback while preserving the user's intent, releases audio focus, and resumes
 only that exact library-issued pause after a successful foreground activation.
@@ -127,10 +139,29 @@ Background handling waits one second for automatic PiP to become active; if PiP
 stops while the app remains backgrounded, playback is suspended immediately.
 Overlapping lifecycle and media-services suspensions are tracked separately, so
 neither recovery signal can resume playback while the other disruption remains.
+A media-services reset is a stronger boundary: SwiftVLC invalidates the old
+broker lease, rebuilds invalidated native audio objects, installs a
+Player-owned playback quarantine, and waits for a new Play or Resume action
+before configuring, activating, and restarting output. The
+quarantine survives PiP-controller reconstruction, retires pre-reset resume
+work, and rejects late native opening, buffering, or playing events as user
+permission. It never treats the intent that existed before the reset as
+permission to restart playback.
 
-Pass `managesAudioSession: false` to ``PiPVideoView`` when your app owns
-audio-session policy. In that mode SwiftVLC neither changes the category
-nor activates the shared session.
+Create the player's ``VLCInstance`` with
+`appleAudioSessionPolicy: .applicationManaged` when your app owns audio-session
+configuration and activation. In that mode neither SwiftVLC nor bundled libVLC
+changes category, mode, preferred format, or activation state. SwiftVLC still
+observes route loss and media-services reset because pausing VLC is a transport
+safety rule, not an `AVAudioSession` mutation; after reset, Apple requires a
+new user action before playback restarts.
+
+The deprecated `PiPVideoView(..., managesAudioSession:)` overload remains
+source- and behavior-compatible with SwiftVLC 1.0: its Boolean controls only
+the PiP controller. It cannot reconfigure the Player's immutable instance or
+make bundled libVLC audio outputs application-managed. Migrate an explicit
+`false` to an `.applicationManaged` ``VLCInstance`` when the application needs
+the complete process-session opt-out described above.
 
 Your app must also declare background modes in its Info.plist:
 
@@ -150,7 +181,7 @@ or when your layout needs more control than ``PiPVideoView`` offers:
 ```swift
 let controller = PiPController(player: player)
 container.layer.addSublayer(controller.layer)
-switch controller.start() {
+switch controller.requestStart() {
 case .accepted:
   // Observe pipEventEnvelopes for the attributed asynchronous outcome.
   break
@@ -164,8 +195,10 @@ A ``PiPStartResult/accepted`` result means only that SwiftVLC issued the
 backend request. AVKit may still reject it asynchronously. Consume
 ``PiPController/pipEventEnvelopes`` when callbacks can outlive a media change
 or controller reconstruction; each envelope carries the media and controller
-generation that owns the lifecycle. ``PiPController/pipEvents`` remains the
-unattributed compatibility stream.
+generation that owns the lifecycle and an extensible
+``PiPEventEnvelope/stopCause`` for stop events. ``PiPController/pipEvents``
+remains the unattributed version-1 compatibility stream; programmatic and
+controller-replacement stops retain its historical `.unknown` reason.
 
 PiP pause requests can be deferred while libVLC is opening or buffering.
 Observe ``PiPController/deferredPauseOutcome`` when your UI needs the terminal
@@ -283,10 +316,6 @@ compile the PiP wrapper on visionOS. ``PiPController`` and
 ### Views and controllers
 - ``PiPVideoView``
 - ``PiPController``
-
-### Replacement continuity
-- ``PiPContinuityEvent``
-- ``PiPContinuityOutcome``
 
 ### State
 - ``PiPController/isPossible``

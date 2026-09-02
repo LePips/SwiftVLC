@@ -121,7 +121,8 @@ struct PiPLiveValidationCase: View {
             captureRendererDiagnostics()
           }
           .accessibilityIdentifier(AccessibilityID.PiPLiveValidation.captureDiagnosticsButton)
-          .accessibilityLabel(capturedRendererDiagnostics)
+          .accessibilityLabel("Capture diagnostics")
+          .accessibilityValue(Text(capturedRendererDiagnostics))
         }
       }
     }
@@ -263,7 +264,7 @@ struct PiPLiveValidationCase: View {
       Text(value)
         .foregroundStyle(.secondary)
     }
-    .qualificationAccessibilityValue(value, title: title, identifier: identifier)
+    .qualificationAccessibilityValue(label: title, value: value, identifier: identifier)
   }
 }
 

@@ -1,0 +1,127 @@
+diff --git a/modules/stream_out/chromecast/chromecast_communication.cpp b/modules/stream_out/chromecast/chromecast_communication.cpp
+index 17c776428bd2d4214b94ad673a4e99bec91f9df6..87c6669eca03c325a793b0d7bc2a4f98d591b73a 100644
+--- a/modules/stream_out/chromecast/chromecast_communication.cpp
++++ b/modules/stream_out/chromecast/chromecast_communication.cpp
+@@ -373,21 +373,27 @@ std::string ChromecastCommunication::GetMedia( const std::string& mime,
+     std::string artist;
+     std::string album;
+     std::string albumartist;
+-    std::string tracknumber;
+-    std::string discnumber;
++    unsigned tracknumber = 0;
++    unsigned discnumber = 0;
++    bool has_tracknumber = false;
++    bool has_discnumber = false;
+ 
+     if( p_meta )
+     {
+         title = meta_get_escaped( p_meta, vlc_meta_Title );
+         artwork = meta_get_escaped( p_meta, vlc_meta_ArtworkURL );
+ 
+-        if( b_music && !title.empty() )
++        if( b_music )
+         {
+             artist = meta_get_escaped( p_meta, vlc_meta_Artist );
+             album = meta_get_escaped( p_meta, vlc_meta_Album );
+             albumartist = meta_get_escaped( p_meta, vlc_meta_AlbumArtist );
+-            tracknumber = meta_get_escaped( p_meta, vlc_meta_TrackNumber );
+-            discnumber = meta_get_escaped( p_meta, vlc_meta_DiscNumber );
++            const char *const track = vlc_meta_Get( p_meta, vlc_meta_TrackNumber );
++            const char *const disc = vlc_meta_Get( p_meta, vlc_meta_DiscNumber );
++            has_tracknumber = track != nullptr &&
++                chromecast_positive_metadata_integer( track, &tracknumber );
++            has_discnumber = disc != nullptr &&
++                chromecast_positive_metadata_integer( disc, &discnumber );
+         }
+         if( title.empty() )
+         {
+@@ -396,23 +402,26 @@ std::string ChromecastCommunication::GetMedia( const std::string& mime,
+                 title = meta_get_escaped( p_meta, vlc_meta_ESNowPlaying );
+         }
+ 
+-        if ( !title.empty() )
++        if ( chromecast_should_emit_metadata( b_music, title, artist, album,
++                                              albumartist, has_tracknumber,
++                                              has_discnumber ) )
+         {
+             ss << "\"metadata\":{"
+-               << " \"metadataType\":" << ( b_music ? "3" : "0" )
+-               << ",\"title\":\"" << title << "\"";
++               << " \"metadataType\":" << ( b_music ? "3" : "0" );
++            if( !title.empty() )
++                ss << ",\"title\":\"" << title << "\"";
+             if( b_music )
+             {
+                 if( !artist.empty() )
+                     ss << ",\"artist\":\"" << artist << "\"";
+                 if( !album.empty() )
+-                    ss << ",\"album\":\"" << album << "\"";
++                    ss << ",\"albumName\":\"" << album << "\"";
+                 if( !albumartist.empty() )
+                     ss << ",\"albumArtist\":\"" << albumartist << "\"";
+-                if( !tracknumber.empty() )
+-                    ss << ",\"trackNumber\":\"" << tracknumber << "\"";
+-                if( !discnumber.empty() )
+-                    ss << ",\"discNumber\":\"" << discnumber << "\"";
++                if( has_tracknumber )
++                    ss << ",\"trackNumber\":" << tracknumber;
++                if( has_discnumber )
++                    ss << ",\"discNumber\":" << discnumber;
+             }
+ 
+             if ( !artwork.empty() && !strncmp( artwork.c_str(), "http", 4 ) )
+diff --git a/modules/stream_out/chromecast/chromecast_protocol.hpp b/modules/stream_out/chromecast/chromecast_protocol.hpp
+index dc0717d77bf56f038d301df1811be8220b03f1bd..f314dc761e5d10d5a144daaf144c98d4f1d1e301 100644
+--- a/modules/stream_out/chromecast/chromecast_protocol.hpp
++++ b/modules/stream_out/chromecast/chromecast_protocol.hpp
+@@ -227,6 +227,50 @@ chromecast_request_id_value(double value, unsigned *result)
+     return true;
+ }
+ 
++/* Cast's music metadata schema requires trackNumber and discNumber to be
++ * positive JSON integers. Parse the complete VLC metadata value without
++ * accepting locale whitespace, a sign, a fraction, or arithmetic overflow. */
++static inline bool
++chromecast_positive_metadata_integer(std::string_view value, unsigned *result)
++{
++    if (result == nullptr || value.empty())
++        return false;
++
++    unsigned parsed = 0;
++    for (const unsigned char character : value)
++    {
++        if (character < '0' || character > '9')
++            return false;
++        const unsigned digit = character - '0';
++        if (parsed > (std::numeric_limits<unsigned>::max() - digit) / 10)
++            return false;
++        parsed = parsed * 10 + digit;
++    }
++
++    if (parsed == 0)
++        return false;
++    *result = parsed;
++    return true;
++}
++
++/* Music fields in Cast's metadata schema are individually optional. Generic
++ * metadata keeps VLC's existing title requirement; music metadata may be
++ * useful when any supported music field is present. Artwork-only policy is
++ * intentionally left to the caller's existing behavior. */
++static inline bool
++chromecast_should_emit_metadata(bool music, std::string_view title,
++                                std::string_view artist,
++                                std::string_view album,
++                                std::string_view album_artist,
++                                bool has_track_number,
++                                bool has_disc_number)
++{
++    return !title.empty() ||
++           (music && (!artist.empty() || !album.empty() ||
++                      !album_artist.empty() || has_track_number ||
++                      has_disc_number));
++}
++
+ static inline bool
+ chromecast_json_request_id(const struct json_object *object, unsigned *result)
+ {

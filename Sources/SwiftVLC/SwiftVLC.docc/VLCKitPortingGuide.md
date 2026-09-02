@@ -13,17 +13,39 @@ behaves differently and a mechanical translation would be wrong.
 
 | VLCKit idiom | SwiftVLC replacement |
 |---|---|
-| `player.position = x` (silently no-ops) | ``Player/seek(to:)-(PlaybackPosition)``, or lenient ``Player/seek(toPosition:fast:)`` |
+| `player.position = x` (silently no-ops) | ``Player/seek(to:fast:)-(PlaybackPosition,_)``, or lenient ``Player/seek(toPosition:fast:)`` |
 | `VLCMediaPlayerState.ended` | ``PlayerEvent/endReached-enum.case`` / ``Player/didReachEnd`` |
-| Mid-playback `setRendererItem:` | ``Player/recast(to:)`` |
+| Mid-playback `setRendererItem:` | ``Player/recastAndWaitForOutcome(to:)`` |
 | `currentAudioTrackIndex = -1` | ``Player/selectedAudioTrack`` `= nil` |
 | Rebuffering via state callbacks | ``Player/bufferFill`` `< 1` while `.playing` |
 | `mediaMetaDataDidChange` delegate | one `await` of ``Media/parse(timeout:instance:)`` |
 | Delegate thread-marshaling proxies | ``Player/events(policy:filter:)``, ``Player/stateTransitions`` |
 | `audio.volume` in `0...200` | ``Volume`` in `0.0 ... 2.0` |
-| Synchronous `stop()` | ``Player/stopAndWait()``, ``Player/shutdown()`` |
+| Synchronous `stop()` | ``Player/stopAndWaitForOutcome()``, ``Player/shutdown()`` |
 | Polling `videoSize` / `hasVideoOut` | ``Player/videoSize``, ``Player/hasVideoOutput``, ``Player/activeVideoOutputs`` — all observable |
 | Subtitle text scale by feel | ``SubtitleScale/init(approximatePoints:basePoints:)`` |
+
+## Migrating from 1.1.0-beta.8
+
+Beta 8 temporarily changed the return types of established version-1 actions
+and added cases to public enums. Stable 1.1 restores those source-compatible
+surfaces and gives the richer results distinct names:
+
+| Beta 8 call or case | Stable 1.1 replacement |
+|---|---|
+| Consume `PiPController.start()` | ``PiPController/requestStart()`` |
+| Consume `PiPController.toggle()` | ``PiPController/toggleReportingStartResult()`` |
+| Consume `Player.recast(to:)` | ``Player/recastAndWaitForOutcome(to:)`` |
+| Consume `Player.stopAndWait()` | ``Player/stopAndWaitForOutcome()`` |
+| Catch `VLCError.rendererFailed` | Catch ``VLCError/operationFailed(_:)`` or test ``VLCError/rendererFailed`` |
+| Switch on `PiPStopReason.programmatic` or `.controllerReplaced` | Read ``PiPEventEnvelope/stopCause`` and compare with ``PiPStopCause/programmatic`` or ``PiPStopCause/controllerReplaced`` |
+
+Calls that ignored the beta return value need no change. The compatibility
+actions still perform the same bounded work; they intentionally discard its
+result. Use the named outcome APIs whenever proceeding depends on acceptance,
+settlement, or output safety. The attributed PiP stream maps the two beta-only
+stop reasons to ``PiPStopReason/unknown`` in its compatibility event while
+retaining the precise cause in the envelope.
 
 ## Unconditional position writes
 
@@ -32,8 +54,8 @@ non-seekable stream was a silent no-op, so player UIs scrubbed
 optimistically and let the engine ignore them.
 
 SwiftVLC's strict seeks refuse instead of pretending.
-``Player/seek(to:fast:)`` and
-``Player/seek(to:)-(PlaybackPosition)`` throw
+``Player/seek(to:fast:)-(Duration,_)`` and
+``Player/seek(to:fast:)-(PlaybackPosition,_)`` throw
 ``VLCError/invalidState(_:)`` when the current media is not seekable
 (and ``VLCError/invalidInput(_:)`` for out-of-range targets), so a
 seek that cannot happen is visible at the call site. Check
@@ -55,7 +77,9 @@ let accepted = player.seek(toPosition: PlaybackPosition(0.95))
 ```
 
 For delegate APIs that owe an asynchronous completion, dispatch acceptance is
-not enough. ``Player/requestJump(by:)`` returns a ``SeekRequest`` whose
+not enough. ``Player/requestSeek(to:fast:)-(Duration,_)``, its
+`PlaybackPosition` overload, ``Player/requestSeek(toPosition:fast:)``, and
+``Player/requestJump(by:)`` return a ``SeekRequest`` whose
 ``SeekRequest/outcome`` distinguishes native rejection, authoritative landing,
 bounded timeout, and supersession by a newer timeline command.
 
@@ -67,13 +91,22 @@ collapses the two: both arrive as the same `stopped` transition, so
 the distinction VLCKit handed you for free no longer exists at the
 engine level.
 
-SwiftVLC synthesizes it back. When a `stopped` arrives that no
-library-issued stop, error, or media replacement accounts for, the
-player emits ``PlayerEvent/endReached-enum.case`` immediately after the
-`.stateChanged(.stopped)` it belongs to, and sets
-``Player/didReachEnd`` for `@Observable` consumers. Port
+SwiftVLC synthesizes it back. When the engine identifies an authoritative
+end-of-stream, the player normally emits
+``PlayerEvent/endReached-enum.case`` immediately after the
+`.stateChanged(.stopped)` it belongs to, and sets ``Player/didReachEnd`` for
+`@Observable` consumers. Port
 `.ended` checks to one of those two, not to ``PlayerState/stopped``,
 which fires for every teardown cause.
+
+There is one native-handle replacement exception to that adjacency. If EOS
+was already authoritative but a committed replacement makes the outgoing
+handle's ordered `Stopped` callback unobservable, the raw `endReached` event
+is emitted once after the replacement transaction commits. Its
+``PlayerEventEnvelope`` retains the outgoing native-handle and playback
+generation; it is not paired with a fabricated `stopped` event and does not
+promise that output-safe stop was observed. The current-player observable
+state continues to describe the committed successor.
 
 One suppression to know about: ``PlayerEvent/endReached-enum.case`` is not
 emitted while a ``MediaListPlayer`` drives the player, because list
@@ -87,7 +120,8 @@ restart internally. libVLC 4 applies a renderer only before a native
 handle's first play, so the naive port — stop, set renderer, play —
 forces you to rebuild drawable attachment and observation by hand.
 
-``Player/recast(to:)`` is the supported translation: it switches the
+``Player/recastAndWaitForOutcome(to:)`` is the supported translation when the
+terminal result matters: it switches the
 active renderer mid-playback on the *same* ``Player``, replacing the
 native handle under the hood while drawable attachment, observation,
 and app-side Now-Playing wiring all survive. Pass `nil` to return to
@@ -256,14 +290,16 @@ completes later, signalled by `.stateChanged(.stopped)`.
 
 The awaitable forms are the port targets:
 
-- ``Player/stopAndWait()`` suspends until the native stop completes
-  and the audio/video outputs are released. Use it before anything
-  that races the output drain:
+- ``Player/stopAndWaitForOutcome()`` suspends for the bounded native stop and
+  reports whether the audio/video outputs were released. Use it before
+  anything that races the output drain:
 
   ```swift
-  await player.stopAndWait()
-  try AVAudioSession.sharedInstance()
-      .setActive(false, options: .notifyOthersOnDeactivation)
+  let outcome = await player.stopAndWaitForOutcome()
+  if outcome.isOutputSafe {
+      try AVAudioSession.sharedInstance()
+          .setActive(false, options: .notifyOthersOnDeactivation)
+  }
   ```
 
   Deactivating the session right after a fire-and-forget `stop()`
@@ -355,11 +391,13 @@ Two ways to get "off unless the user asks":
 - ``PlayerEvent/endReached-enum.case``
 - ``Player/didReachEnd``
 - ``Player/recast(to:)``
+- ``Player/recastAndWaitForOutcome(to:)``
 - ``Player/selectedAudioTrack``
 - ``Player/selectedSubtitleTrack``
 - ``Player/bufferFill``
 - ``Player/events(policy:filter:)``
 - ``Player/stateTransitions``
 - ``Player/stopAndWait()``
+- ``Player/stopAndWaitForOutcome()``
 - ``Player/shutdown()``
 - ``Volume``

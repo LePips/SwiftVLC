@@ -14,6 +14,10 @@ extension Player {
   /// switch resolution mid-stream without any dedicated size event.
   public var videoSize: CGSize? {
     access(keyPath: \.videoSize)
+    guard nativeHandleRepresentsCurrentMedia else { return nil }
+    #if DEBUG
+    _mediaSpecificNativeDispatchHookForTesting?(.readVideoSize)
+    #endif
     var width: UInt32 = 0
     var height: UInt32 = 0
     guard

@@ -41,7 +41,7 @@ struct SnapshotCase: View {
         Section("Last snapshot") {
           Image(platformImage: snapshot)
             .resizable()
-            .aspectRatio(contentMode: .fit)
+            .scaledToFit()
             .listRowInsets(EdgeInsets())
             .accessibilityIdentifier(AccessibilityID.Snapshot.snapshotImage)
         }

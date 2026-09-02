@@ -185,7 +185,7 @@ extension Integration {
     // kept around for manual runs; a proper equivalent for CI belongs
     // in the `iOSUITests` target, which hosts the real
     // Showcase app with a real `NSApplication`.
-    #if canImport(AppKit)
+    #if os(macOS)
     @Test(.disabled("CI runners lack AppleM2ScalerParavirtDriver; run locally or via UI-test target"))
     func `NSWindow hosted surface attach play drop window 10 iterations`() async throws {
       let instance = try VLCInstance(arguments: ["--quiet"])

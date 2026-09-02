@@ -1,5 +1,6 @@
 @testable import SwiftVLC
 import CLibVLC
+import Synchronization
 import Testing
 
 extension Integration {
@@ -185,10 +186,19 @@ extension Integration {
     }
 
     @Test(.tags(.async, .media), .enabled(if: TestCondition.canPlayMedia), .timeLimit(.minutes(1)))
-    func `Loop mode restarts one short item without stopping the attached player`() async throws {
+    func `Loop mode publishes a truthful item boundary before restarting`() async throws {
       let instance = TestInstance.makePlayback()
       let listPlayer = MediaListPlayer(instance: instance)
       let player = Player(instance: instance)
+      let transitions = player.stateTransitions
+      let observedStates = Mutex<[PlayerState]>([])
+      let collector = Task.detached { @Sendable in
+        for await state in transitions {
+          observedStates.withLock { $0.append(state) }
+        }
+      }
+      defer { collector.cancel() }
+
       listPlayer.mediaPlayer = player
       let list = MediaList()
       try list.append(Media(url: TestMedia.twosecURL))
@@ -209,7 +219,44 @@ extension Integration {
         },
         "Waiting for loop mode to restart the attached player"
       )
-      #expect(player.state == .playing)
+      try #require(
+        await poll(timeout: .seconds(3)) {
+          player.state == .playing && player.currentTime > .milliseconds(100)
+        },
+        "Waiting for restarted loop playback to leave transient buffering"
+      )
+      try #require(
+        await poll(timeout: .seconds(3)) {
+          observedStates.withLock { states in
+            states.filter { $0 == .playing }.count >= 2
+          }
+        },
+        "Waiting for the restarted playing transition"
+      )
+
+      let states = observedStates.withLock { $0 }
+      let firstPlaying = try #require(
+        states.firstIndex(of: .playing),
+        "The attached player never published its initial playing transition"
+      )
+      let stopping = try #require(
+        states[firstPlaying...].firstIndex(of: .stopping),
+        "The outgoing loop item never published stopping: \(states)"
+      )
+      let stopped = try #require(
+        states[stopping...].firstIndex(of: .stopped),
+        "The outgoing loop item never published stopped: \(states)"
+      )
+      let restartedPlaying = try #require(
+        states[states.index(after: stopped)...].firstIndex(of: .playing),
+        "The successor loop item never returned to playing: \(states)"
+      )
+      let restartStates = states[states.index(after: stopped)..<restartedPlaying]
+      #expect(
+        restartStates.contains(.opening) || restartStates.contains(.buffering),
+        "The successor loop item published no opening/buffering transition: \(states)"
+      )
+      #expect(!states[firstPlaying...restartedPlaying].contains(.error))
       listPlayer.stop()
     }
 

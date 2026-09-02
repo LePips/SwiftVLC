@@ -708,8 +708,11 @@ extension Integration {
     @Test
     func `External media adoption carries pause intent to the successor`() {
       let player = Player(instance: TestInstance.shared)
-      player._nativePlaybackStateOverrideForTesting = .opening
-      player._setStateForTesting(state: .playing, isPlaybackRequestedActive: true)
+      player._setStateForTesting(
+        state: .playing,
+        nativeState: .opening,
+        isPlaybackRequestedActive: true
+      )
       player.setPlaybackControlIntent(.pause)
       _ = player.eventBridge.synchronizePlaybackGeneration(1, media: nil)
 
@@ -724,8 +727,11 @@ extension Integration {
     @Test
     func `External media adoption preserves active intent through its queued-state gap`() {
       let player = Player(instance: TestInstance.shared)
-      player._nativePlaybackStateOverrideForTesting = .playing
-      player._setStateForTesting(state: .paused, isPlaybackRequestedActive: false)
+      player._setStateForTesting(
+        state: .paused,
+        nativeState: .playing,
+        isPlaybackRequestedActive: false
+      )
       player.setPlaybackControlIntent(.resume)
       _ = player.eventBridge.synchronizePlaybackGeneration(1, media: nil)
 
@@ -740,8 +746,11 @@ extension Integration {
     @Test
     func `External media adoption retains resume until a late pause settles`() {
       let player = Player(instance: TestInstance.shared)
-      player._nativePlaybackStateOverrideForTesting = .opening
-      player._setStateForTesting(state: .playing, isPlaybackRequestedActive: false)
+      player._setStateForTesting(
+        state: .playing,
+        nativeState: .opening,
+        isPlaybackRequestedActive: false
+      )
       player.setPlaybackControlIntent(.resume)
       _ = player.eventBridge.synchronizePlaybackGeneration(1, media: nil)
 

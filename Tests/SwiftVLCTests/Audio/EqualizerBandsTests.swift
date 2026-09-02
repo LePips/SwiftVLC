@@ -1,4 +1,5 @@
 @testable import SwiftVLC
+import CustomDump
 import Testing
 
 /// Covers `Equalizer.bands`, `setBands`, and `setAmplification` error
@@ -68,6 +69,24 @@ extension Integration {
       try eq.setBands(modified)
 
       #expect(changeCount == 1, "Delta assignment should fire onChange exactly once")
+    }
+
+    @Test
+    func `setBands rejects the complete batch before an invalid later band can partially commit`() {
+      let eq = Equalizer()
+      let initialBands = eq.bands
+      var target = initialBands
+      target[0] = 5
+      target[1] = .nan
+      var changeCount = 0
+      eq.onChange = { changeCount += 1 }
+
+      #expect(throws: VLCError.invalidInput("bands must not contain NaN")) {
+        try eq.setBands(target)
+      }
+
+      expectNoDifference(eq.bands, initialBands)
+      #expect(changeCount == 0)
     }
 
     // MARK: - setAmplification

@@ -1,0 +1,107 @@
+diff --git a/include/vlc/libvlc_events.h b/include/vlc/libvlc_events.h
+index a23c9d122b..3181ce8adf 100644
+--- a/include/vlc/libvlc_events.h
++++ b/include/vlc/libvlc_events.h
+@@ -200,6 +200,20 @@ enum libvlc_event_e {
+      * negative values are errno-style failures or cancellation.
+      */
+     libvlc_MediaPlayerFrameStepCompleted,
++    /**
++     * An effective player control-rate resolution was reported.
++     *
++     * The value is the rate reported by the player at notification time, not
++     * measured media throughput. After a control is queued to an active input,
++     * the event carries that input's resolved rate and is not emitted if the
++     * rate remains unchanged. With no active input, or when queuing fails, the
++     * saved/effective control state is reported immediately.
++     * The notification may repeat a previously reported value.
++     * Events do not carry request identifiers.
++     *
++     * See media_player_rate_changed in \ref libvlc_event_t.u.
++     */
++    libvlc_MediaPlayerRateChanged,
+ 
+     /**
+      * A \link #libvlc_media_t media item\endlink was added to a
+@@ -442,6 +456,11 @@ typedef struct libvlc_event_t
+             float position;
+         } media_player_frame_step_completed;
+ 
++        struct
++        {
++            float new_rate;
++        } media_player_rate_changed;
++
+ 
+         /* ESAdded, ESDeleted, ESUpdated */
+         struct
+diff --git a/include/vlc/libvlc_media_player.h b/include/vlc/libvlc_media_player.h
+index 20b113e0d0..0335a682ec 100644
+--- a/include/vlc/libvlc_media_player.h
++++ b/include/vlc/libvlc_media_player.h
+@@ -390,7 +390,9 @@ typedef enum swiftvlc_frame_step_status_t
+  * coherent native Apple sample-buffer renderer recovery snapshot. Version 6
+  * adds an atomic vmem generation whose result-bearing display callback also
+  * receives the post-filter, vout-selected picture presentation timestamp at
+- * the vmem output-attempt boundary.
++ * the vmem output-attempt boundary. Version 7 adds the public
++ * libvlc_MediaPlayerRateChanged event for effective player control-rate
++ * resolution notifications.
+  */
+ LIBVLC_API unsigned swiftvlc_libvlc_pip_extensions_version( void );
+ 
+diff --git a/lib/media_player.c b/lib/media_player.c
+index 7bcdf9d0cd..322de3450b 100644
+--- a/lib/media_player.c
++++ b/lib/media_player.c
+@@ -68,6 +68,12 @@ _Static_assert(offsetof(libvlc_event_t,
+ _Static_assert(offsetof(libvlc_event_t,
+     u.media_player_frame_step_completed.position) == 36,
+     "strict position offset changed");
++_Static_assert(
++    sizeof(((libvlc_event_t *)0)->u.media_player_rate_changed) == 4,
++    "effective rate payload ABI changed");
++_Static_assert(offsetof(libvlc_event_t,
++    u.media_player_rate_changed.new_rate) == 16,
++    "effective rate offset changed");
+ 
+ #define ES_INIT (-2) /* -1 is reserved for ES deselect */
+ 
+@@ -259,6 +265,20 @@ on_buffering_changed(vlc_player_t *player, float new_buffering, void *data)
+     libvlc_event_send(&mp->event_manager, &event);
+ }
+ 
++static void
++on_rate_changed(vlc_player_t *player, float new_rate, void *data)
++{
++    (void) new_rate;
++
++    libvlc_media_player_t *mp = data;
++
++    libvlc_event_t event = {
++        .type = libvlc_MediaPlayerRateChanged,
++        .u.media_player_rate_changed.new_rate = vlc_player_GetRate(player),
++    };
++    libvlc_event_send(&mp->event_manager, &event);
++}
++
+ static void
+ on_capabilities_changed(vlc_player_t *player, int old_caps, int new_caps, void *data)
+ {
+@@ -651,6 +671,7 @@ static const struct vlc_player_cbs vlc_player_cbs = {
+     .on_state_changed = on_state_changed,
+     .on_error_changed = on_error_changed,
+     .on_buffering_changed = on_buffering_changed,
++    .on_rate_changed = on_rate_changed,
+     .on_capabilities_changed = on_capabilities_changed,
+     .on_position_changed = on_position_changed,
+     .on_length_changed = on_length_changed,
+@@ -1064,7 +1085,7 @@ libvlc_media_player_get_media( libvlc_media_player_t *p_mi )
+ 
+ unsigned swiftvlc_libvlc_pip_extensions_version( void )
+ {
+-    return 6;
++    return 7;
+ }
+ 
+ bool
