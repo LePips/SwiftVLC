@@ -67,7 +67,11 @@ jobs:
         run: ./scripts/verify-patch-manifest.sh >/dev/null
 
       - name: Release integrity
-        timeout-minutes: 2
+        # The fault matrix creates and merges several isolated repositories.
+        # A warm developer machine finishes in roughly 90 seconds, but a
+        # provisioned runner can cross two minutes after filesystem and git
+        # startup. Keep a bounded ceiling without killing a healthy matrix.
+        timeout-minutes: 5
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SWIFTVLC_ALLOW_DRAFT_RELEASE: ${{ ((github.event_name == 'push' && startsWith(github.ref, 'refs/heads/release-candidates/')) || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && startsWith(github.head_ref, 'release-candidates/'))) && '1' || '' }}
