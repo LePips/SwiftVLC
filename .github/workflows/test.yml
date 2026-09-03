@@ -31,11 +31,6 @@ jobs:
   # warnings are treated as errors.
   lint:
     runs-on: macos-latest
-    # release-integrity resolves the current candidate after its isolated fault
-    # matrix. The resolver still binds the exact same-repository PR, SHA, tag,
-    # release metadata, asset URL, and digest before accepting draft bytes.
-    permissions:
-      contents: write
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -100,8 +95,7 @@ jobs:
         # startup. Keep a bounded ceiling without killing a healthy matrix.
         timeout-minutes: 5
         env:
-          GH_TOKEN: ${{ ((github.event_name == 'push' && startsWith(github.ref, 'refs/heads/release-candidates/')) || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && startsWith(github.head_ref, 'release-candidates/'))) && secrets.GITHUB_TOKEN || '' }}
-          SWIFTVLC_ALLOW_DRAFT_RELEASE: ${{ ((github.event_name == 'push' && startsWith(github.ref, 'refs/heads/release-candidates/')) || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && startsWith(github.head_ref, 'release-candidates/'))) && '1' || '' }}
+          SWIFTVLC_RELEASE_CANDIDATE_LINT: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && startsWith(github.head_ref, 'release-candidates/')) && '1' || '' }}
         run: ./scripts/tests/release-integrity.sh
 
       - name: Test native filesystem safety helpers
@@ -122,9 +116,6 @@ jobs:
       # regression that made this worth surfacing.
       - name: Engine patch coverage
         timeout-minutes: 2
-        env:
-          GH_TOKEN: ${{ ((github.event_name == 'push' && startsWith(github.ref, 'refs/heads/release-candidates/')) || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && startsWith(github.head_ref, 'release-candidates/'))) && secrets.GITHUB_TOKEN || '' }}
-          SWIFTVLC_ALLOW_DRAFT_RELEASE: ${{ ((github.event_name == 'push' && startsWith(github.ref, 'refs/heads/release-candidates/')) || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && startsWith(github.head_ref, 'release-candidates/'))) && '1' || '' }}
         run: ./scripts/check-engine-coverage.sh
 
       # The accounting parser is part of the PR gate, so test it independently

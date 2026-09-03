@@ -6,11 +6,17 @@ export PYTHONDONTWRITEBYTECODE=1
 
 SCRIPT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-# Candidate CI authorizes the final live-checkout resolver probe. Keep that
-# ambient capability out of the isolated adversarial fixtures below; each
-# fixture supplies its own complete candidate context when it intends one.
-outer_allow_draft_release=${SWIFTVLC_ALLOW_DRAFT_RELEASE:-}
+# Keep ambient candidate capability out of the isolated adversarial fixtures;
+# each fixture supplies its own complete context when it intends one. The lint
+# workflow uses a non-authorizing marker to avoid duplicating authenticated
+# artifact resolution already performed by both candidate build jobs.
+candidate_lint=${SWIFTVLC_RELEASE_CANDIDATE_LINT:-}
+if [[ -n "$candidate_lint" && "$candidate_lint" != "1" ]]; then
+  echo "Error: SWIFTVLC_RELEASE_CANDIDATE_LINT must be exactly 1 when enabled." >&2
+  exit 1
+fi
 unset SWIFTVLC_ALLOW_DRAFT_RELEASE
+unset SWIFTVLC_RELEASE_CANDIDATE_LINT
 temp_dir=$(mktemp -d "${TMPDIR:-/tmp}/swiftvlc-release-tests.XXXXXX")
 trap 'rm -rf "$temp_dir"' EXIT
 
@@ -185,7 +191,7 @@ candidate_token = (
     "startsWith(github.head_ref, 'release-candidates/'))) && "
     "secrets.GITHUB_TOKEN || '' }}\n"
 )
-expected_counts = (4, 1, 1, 1, 0)
+expected_counts = (2, 1, 1, 1, 0)
 if len(sys.argv[1:]) != len(expected_counts):
     sys.exit("release workflow integrity invocation is incomplete")
 for path, expected_count in zip(sys.argv[1:], expected_counts):
@@ -225,6 +231,17 @@ for path, expected_count in zip(sys.argv[1:], expected_counts):
     for action in re.findall(r"(?m)^\s*-?\s*uses:\s*([^\s#]+)", source):
         if not re.fullmatch(r"[^@]+@[0-9a-f]{40}", action):
             sys.exit(f"{path} contains an unpinned authorizing action: {action}")
+candidate_lint_marker = (
+    "          SWIFTVLC_RELEASE_CANDIDATE_LINT: "
+    "${{ (github.event_name == 'pull_request' && "
+    "github.event.pull_request.head.repo.full_name == github.repository && "
+    "startsWith(github.head_ref, 'release-candidates/')) && '1' || '' }}\n"
+)
+if workflow.count(candidate_lint_marker) != 1:
+    sys.exit("release-integrity candidate lint marker is not exactly scoped")
+for path in sys.argv[2:]:
+    if candidate_lint_marker in open(path).read():
+        sys.exit(f"{path} unexpectedly grants the candidate lint marker")
 native_contracts = open(sys.argv[5]).read()
 vendor_manifest = open(sys.argv[3]).read()
 for marker, expected_count in (
@@ -285,7 +302,7 @@ def job(name):
 
 
 privileged_jobs = (
-    (workflow, sys.argv[1], ("lint", "ios-build", "test")),
+    (workflow, sys.argv[1], ("ios-build", "test")),
     (open(sys.argv[2]).read(), sys.argv[2], ("dynamic-host",)),
     (vendor_manifest, sys.argv[3], ("check",)),
     (open(sys.argv[4]).read(), sys.argv[4], ("sanitize",)),
@@ -5699,10 +5716,14 @@ if grep -En '\$\{[A-Za-z_][A-Za-z0-9_]*\[@\]\}' scripts/setup-dev.sh >/dev/null;
   fail "setup-dev.sh contains an array expansion that is unsafe under Bash 3.2 nounset"
 fi
 
-artifact_info=$(
-  SWIFTVLC_ALLOW_DRAFT_RELEASE="$outer_allow_draft_release" \
-    ./scripts/resolve-release-artifact.sh
-)
+if [[ "$candidate_lint" == "1" ]]; then
+  # Candidate build jobs perform the authenticated live download. Keep this
+  # broad fault-matrix/lint job read-only while still checking that its release
+  # and Showcase declarations agree.
+  artifact_info=$(python3 scripts/release-artifact-info.py Package.swift)
+else
+  artifact_info=$(./scripts/resolve-release-artifact.sh)
+fi
 actual_tag=$(printf '%s' "$artifact_info" \
   | python3 -c 'import json,sys; print(json.load(sys.stdin)["tag"])')
 showcase_version=$(sed -n \
