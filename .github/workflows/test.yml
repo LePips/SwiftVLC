@@ -12,8 +12,9 @@ on:
   push:
     branches: [main]
 
-# CI consumes source and immutable release artifacts only. Keep the workflow
-# token unable to tag, push, publish a release, or mutate repository state.
+# Default every job to immutable source/release reads. Jobs that consume an
+# exact same-repository release candidate opt into `contents: write` below:
+# GitHub deliberately hides draft releases from read-only installation tokens.
 permissions:
   contents: read
 
@@ -30,10 +31,17 @@ jobs:
   # warnings are treated as errors.
   lint:
     runs-on: macos-latest
+    # release-integrity resolves the current candidate after its isolated fault
+    # matrix. The resolver still binds the exact same-repository PR, SHA, tag,
+    # release metadata, asset URL, and digest before accepting draft bytes.
+    permissions:
+      contents: write
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         timeout-minutes: 2
+        with:
+          persist-credentials: false
 
       - name: Install pinned SwiftLint and SwiftFormat
         timeout-minutes: 3
@@ -92,7 +100,7 @@ jobs:
         # startup. Keep a bounded ceiling without killing a healthy matrix.
         timeout-minutes: 5
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ ((github.event_name == 'push' && startsWith(github.ref, 'refs/heads/release-candidates/')) || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && startsWith(github.head_ref, 'release-candidates/'))) && secrets.GITHUB_TOKEN || '' }}
           SWIFTVLC_ALLOW_DRAFT_RELEASE: ${{ ((github.event_name == 'push' && startsWith(github.ref, 'refs/heads/release-candidates/')) || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && startsWith(github.head_ref, 'release-candidates/'))) && '1' || '' }}
         run: ./scripts/tests/release-integrity.sh
 
@@ -115,7 +123,8 @@ jobs:
       - name: Engine patch coverage
         timeout-minutes: 2
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ ((github.event_name == 'push' && startsWith(github.ref, 'refs/heads/release-candidates/')) || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && startsWith(github.head_ref, 'release-candidates/'))) && secrets.GITHUB_TOKEN || '' }}
+          SWIFTVLC_ALLOW_DRAFT_RELEASE: ${{ ((github.event_name == 'push' && startsWith(github.ref, 'refs/heads/release-candidates/')) || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && startsWith(github.head_ref, 'release-candidates/'))) && '1' || '' }}
         run: ./scripts/check-engine-coverage.sh
 
       # The accounting parser is part of the PR gate, so test it independently
@@ -196,9 +205,6 @@ jobs:
       # the local SwiftVLC checkout so we compile against in-PR code.
       - name: Set up Vendor + local Swift package
         timeout-minutes: 12
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          SWIFTVLC_ALLOW_DRAFT_RELEASE: ${{ ((github.event_name == 'push' && startsWith(github.ref, 'refs/heads/release-candidates/')) || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && startsWith(github.head_ref, 'release-candidates/'))) && '1' || '' }}
         run: ./scripts/setup-dev.sh
 
       - name: Build Showcase (${{ matrix.scheme }})
@@ -228,6 +234,11 @@ jobs:
     # must understand the manifest's Swift 6.3 tools-version — needs Xcode
     # 26.4+, hence macos-26 (same rationale as the showcase job above).
     runs-on: macos-26
+    # Reading a draft release requires push-level repository access. GitHub
+    # downgrades fork pull-request tokens to read-only, and draft authorization
+    # below independently requires the exact same-repository candidate PR.
+    permissions:
+      contents: write
     # Pull requests have 67 minutes of explicit per-step ceilings below. Keep
     # one provisioned runner, but leave enough job-level headroom for every
     # bounded step to complete instead of cutting the job off at 30 minutes.
@@ -235,6 +246,8 @@ jobs:
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         timeout-minutes: 2
+        with:
+          persist-credentials: false
 
       - uses: maxim-lobanov/setup-xcode@ed7a3b1fda3918c0306d1b724322adc0b8cc0a90 # v1
         timeout-minutes: 5
@@ -252,7 +265,7 @@ jobs:
       - name: Set up Vendor + local Swift package
         timeout-minutes: 12
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ ((github.event_name == 'push' && startsWith(github.ref, 'refs/heads/release-candidates/')) || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && startsWith(github.head_ref, 'release-candidates/'))) && secrets.GITHUB_TOKEN || '' }}
           SWIFTVLC_ALLOW_DRAFT_RELEASE: ${{ ((github.event_name == 'push' && startsWith(github.ref, 'refs/heads/release-candidates/')) || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && startsWith(github.head_ref, 'release-candidates/'))) && '1' || '' }}
         run: ./scripts/setup-dev.sh
 
@@ -381,9 +394,6 @@ jobs:
 
       - name: Set up Vendor + local Swift package
         timeout-minutes: 12
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          SWIFTVLC_ALLOW_DRAFT_RELEASE: ${{ ((github.event_name == 'push' && startsWith(github.ref, 'refs/heads/release-candidates/')) || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && startsWith(github.head_ref, 'release-candidates/'))) && '1' || '' }}
         run: ./scripts/setup-dev.sh
 
       # TEST_RUNNER_CI=true is load-bearing: xcodebuild strips the
@@ -430,6 +440,10 @@ jobs:
     # can lag, so we install the Swift 6.3.1 open-source toolchain from
     # swift.org and activate it via the TOOLCHAINS env var.
     runs-on: macos-latest
+    # See ios-build: write-level contents permission makes the draft visible;
+    # it does not replace the resolver's exact candidate identity checks.
+    permissions:
+      contents: write
     # Absolute ceiling — the job CANNOT run longer than this. The wrapper
     # script and step timeouts below enforce tighter bounds; this is the
     # last line of defense if those fail.
@@ -438,6 +452,8 @@ jobs:
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         timeout-minutes: 2
+        with:
+          persist-credentials: false
 
       # Pin Xcode for SDKs / linker / simulators. Current GHA runners
       # can lag behind the package's tools-version 6.3 manifest, so we
@@ -488,7 +504,7 @@ jobs:
         id: xcf
         timeout-minutes: 12
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ ((github.event_name == 'push' && startsWith(github.ref, 'refs/heads/release-candidates/')) || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && startsWith(github.head_ref, 'release-candidates/'))) && secrets.GITHUB_TOKEN || '' }}
           SWIFTVLC_ALLOW_DRAFT_RELEASE: ${{ ((github.event_name == 'push' && startsWith(github.ref, 'refs/heads/release-candidates/')) || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && startsWith(github.head_ref, 'release-candidates/'))) && '1' || '' }}
         run: ./scripts/ci-use-released-xcframework.sh
 

@@ -6,6 +6,11 @@ export PYTHONDONTWRITEBYTECODE=1
 
 SCRIPT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+# Candidate CI authorizes the final live-checkout resolver probe. Keep that
+# ambient capability out of the isolated adversarial fixtures below; each
+# fixture supplies its own complete candidate context when it intends one.
+outer_allow_draft_release=${SWIFTVLC_ALLOW_DRAFT_RELEASE:-}
+unset SWIFTVLC_ALLOW_DRAFT_RELEASE
 temp_dir=$(mktemp -d "${TMPDIR:-/tmp}/swiftvlc-release-tests.XXXXXX")
 trap 'rm -rf "$temp_dir"' EXIT
 
@@ -171,7 +176,16 @@ draft_authorization = (
     "github.event.pull_request.head.repo.full_name == github.repository && "
     "startsWith(github.head_ref, 'release-candidates/'))) && '1' || '' }}\n"
 )
-expected_counts = (5, 1, 1, 1, 0)
+candidate_token = (
+    "          GH_TOKEN: "
+    "${{ ((github.event_name == 'push' && "
+    "startsWith(github.ref, 'refs/heads/release-candidates/')) || "
+    "(github.event_name == 'pull_request' && "
+    "github.event.pull_request.head.repo.full_name == github.repository && "
+    "startsWith(github.head_ref, 'release-candidates/'))) && "
+    "secrets.GITHUB_TOKEN || '' }}\n"
+)
+expected_counts = (4, 1, 1, 1, 0)
 if len(sys.argv[1:]) != len(expected_counts):
     sys.exit("release workflow integrity invocation is incomplete")
 for path, expected_count in zip(sys.argv[1:], expected_counts):
@@ -182,6 +196,16 @@ for path, expected_count in zip(sys.argv[1:], expected_counts):
             f"{path} must scope draft authorization to each of its "
             f"{expected_count} release-asset steps; found {count}"
         )
+    token_count = source.count(candidate_token)
+    if token_count != expected_count:
+        sys.exit(
+            f"{path} must expose the ephemeral token only to its "
+            f"{expected_count} candidate steps; found {token_count}"
+        )
+    if source.count(candidate_token + draft_authorization) != expected_count:
+        sys.exit(f"{path} candidate token and authorization are not inseparable")
+    if "GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}" in source:
+        sys.exit(f"{path} exposes a repository token outside candidate CI")
     if "  pull_request:\n    branches: [main]\n" not in source:
         sys.exit(f"{path} does not run protected release-candidate PR CI")
     if "  push:\n    branches: [main]\n" not in source:
@@ -241,16 +265,47 @@ for cache_workflow in (workflow, open(sys.argv[4]).read()):
             sys.exit("candidate PR cache isolation still relies only on github.ref")
 
 
-def job(name):
+def job_in(workflow_source, name, path):
     matches = list(
         re.finditer(
             rf"(?ms)^  {re.escape(name)}:\n.*?(?=^  [A-Za-z0-9_-]+:\n|\Z)",
-            workflow,
+            workflow_source,
         )
     )
     if len(matches) != 1:
-        sys.exit(f"expected exactly one {name} workflow job, found {len(matches)}")
+        sys.exit(
+            f"expected exactly one {name} workflow job in {path}, "
+            f"found {len(matches)}"
+        )
     return matches[0].group(0)
+
+
+def job(name):
+    return job_in(workflow, name, sys.argv[1])
+
+
+privileged_jobs = (
+    (workflow, sys.argv[1], ("lint", "ios-build", "test")),
+    (open(sys.argv[2]).read(), sys.argv[2], ("dynamic-host",)),
+    (vendor_manifest, sys.argv[3], ("check",)),
+    (open(sys.argv[4]).read(), sys.argv[4], ("sanitize",)),
+    (native_contracts, sys.argv[5], ()),
+)
+permission_marker = "    permissions:\n      contents: write\n"
+for source, path, names in privileged_jobs:
+    if source.count("permissions:\n  contents: read\n") != 1:
+        sys.exit(f"{path} must keep read-only workflow-level permissions")
+    if source.count(permission_marker) != len(names):
+        sys.exit(
+            f"{path} must grant draft visibility only to {list(names)}"
+        )
+    for name in names:
+        candidate_job = job_in(source, name, path)
+        header = candidate_job.split("\n    steps:\n", 1)[0]
+        if header.count(permission_marker.rstrip("\n")) != 1:
+            sys.exit(f"{path} job {name} lost draft-readable contents permission")
+        if candidate_job.count("          persist-credentials: false\n") != 1:
+            sys.exit(f"{path} job {name} persists its write-capable Git credential")
 
 
 def named_step(job_source, name):
@@ -531,12 +586,24 @@ checksum = "03a57454a6159c455406889c7867e0b284db028d2734a10bdf85a6a7285c862f"
 digest = os.environ.get("RESOLVER_RELEASE_DIGEST", checksum)
 requested_tag, commit = sys.argv[1:]
 tag = os.environ.get("RESOLVER_RELEASE_TAG", requested_tag)
+draft = os.environ.get("RESOLVER_RELEASE_DRAFT") == "1"
+release_locator = (
+    os.environ.get("RESOLVER_RELEASE_LOCATOR", "untagged-0123456789abcdef")
+    if draft
+    else tag
+)
+asset_locator = os.environ.get("RESOLVER_ASSET_LOCATOR", release_locator)
 print(
     json.dumps(
         {
+            "url": (
+                "https://github.com/harflabs/SwiftVLC/releases/"
+                f"tag/{release_locator}"
+            ),
             "tagName": tag,
             "targetCommitish": os.environ.get("RESOLVER_RELEASE_TARGET", commit),
-            "isDraft": os.environ.get("RESOLVER_RELEASE_DRAFT") == "1",
+            "isDraft": draft,
+            "isImmutable": False,
             "isPrerelease": True,
             "assets": [
                 {
@@ -544,7 +611,7 @@ print(
                     "digest": f"sha256:{digest}",
                     "url": (
                         "https://github.com/harflabs/SwiftVLC/releases/"
-                        f"download/{requested_tag}/libvlc.xcframework.zip"
+                        f"download/{asset_locator}/libvlc.xcframework.zip"
                     ),
                     "size": 1,
                 }
@@ -557,7 +624,54 @@ PY
 fi
 exit 2
 SH
-chmod +x "$resolver_bin/gh"
+cat > "$resolver_bin/curl" <<'SH'
+#!/bin/sh
+set -eu
+
+request_url=""
+for argument in "$@"; do
+  request_url=$argument
+done
+requested_tag=${request_url##*/}
+commit=$(/usr/bin/git rev-parse HEAD)
+python3 - "$requested_tag" "$commit" <<'PY'
+import json
+import os
+import sys
+
+checksum = "03a57454a6159c455406889c7867e0b284db028d2734a10bdf85a6a7285c862f"
+requested_tag, commit = sys.argv[1:]
+tag = os.environ.get("RESOLVER_RELEASE_TAG", requested_tag)
+print(
+    json.dumps(
+        {
+            "html_url": (
+                "https://github.com/harflabs/SwiftVLC/releases/"
+                f"tag/{tag}"
+            ),
+            "tag_name": tag,
+            "target_commitish": os.environ.get("RESOLVER_RELEASE_TARGET", commit),
+            "draft": False,
+            "immutable": False,
+            "prerelease": True,
+            "assets": [
+                {
+                    "name": "libvlc.xcframework.zip",
+                    "digest": f"sha256:{checksum}",
+                    "browser_download_url": (
+                        "https://github.com/harflabs/SwiftVLC/releases/"
+                        f"download/{tag}/libvlc.xcframework.zip"
+                    ),
+                    "size": 1,
+                    "state": "uploaded",
+                }
+            ],
+        }
+    )
+)
+PY
+SH
+chmod +x "$resolver_bin/gh" "$resolver_bin/curl"
 
 (
   cd "$resolver_repo"
@@ -668,6 +782,15 @@ if (
     ./scripts/resolve-release-artifact.sh >/dev/null 2>&1
 ); then
   fail "draft release resolved after asset digest drift"
+fi
+if (
+  cd "$resolver_repo"
+  env "${resolver_ci_env[@]}" \
+    RESOLVER_ASSET_LOCATOR=untagged-fedcba9876543210 \
+    PATH="$resolver_bin:$PATH" \
+    ./scripts/resolve-release-artifact.sh >/dev/null 2>&1
+); then
+  fail "draft release resolved an asset from a different untagged locator"
 fi
 if (
   cd "$resolver_repo"
@@ -4491,12 +4614,21 @@ if [ "${1:-}" = release ] && [ "${2:-}" = view ]; then
         "${SWIFTVLC_RELEASE_TEST_METADATA_DRIFT:-}" <<'PY'
 import hashlib
 import json
+import os
 import sys
 from pathlib import Path
 
 state_path, capture_path, tag, drift, immutable_drift, metadata_drift = sys.argv[1:]
 state = Path(state_path).read_text().strip()
 capture = Path(capture_path)
+release_locator = (
+    "untagged-0123456789abcdef" if state == "draft" else tag
+)
+asset_locator = (
+    "untagged-fedcba9876543210"
+    if os.environ.get("SWIFTVLC_RELEASE_TEST_ASSET_URL_DRIFT") == "1"
+    else release_locator
+)
 assets = []
 for path in sorted((capture / "uploaded").iterdir()):
     digest = hashlib.sha256(path.read_bytes()).hexdigest()
@@ -4508,7 +4640,7 @@ for path in sorted((capture / "uploaded").iterdir()):
             "digest": f"sha256:{digest}",
             "url": (
                 "https://github.com/harflabs/SwiftVLC/releases/download/"
-                f"{tag}/{path.name}"
+                f"{asset_locator}/{path.name}"
             ),
             "apiUrl": (
                 "https://api.github.com/repos/harflabs/SwiftVLC/"
@@ -4525,7 +4657,7 @@ for path in sorted((capture / "starters").iterdir()):
             "digest": None,
             "url": (
                 "https://github.com/harflabs/SwiftVLC/releases/download/"
-                f"{tag}/{path.name}"
+                f"{asset_locator}/{path.name}"
             ),
             "apiUrl": (
                 "https://api.github.com/repos/harflabs/SwiftVLC/"
@@ -4538,6 +4670,10 @@ for path in sorted((capture / "starters").iterdir()):
 print(
     json.dumps(
         {
+            "url": (
+                "https://github.com/harflabs/SwiftVLC/releases/"
+                f"tag/{release_locator}"
+            ),
             "tagName": tag,
             "targetCommitish": (capture / "release.commit").read_text().strip(),
             "isDraft": state == "draft",
@@ -5140,6 +5276,24 @@ for release_flow_asset in "${expected_release_assets[@]}"; do
     "$release_flow_candidate/$release_flow_asset"
 done
 
+# GitHub represents mutable draft downloads with an opaque `untagged-*`
+# locator. It must come from the exact release's top-level URL; a matching
+# digest at another draft locator is not the staged candidate.
+if (
+  cd "$release_flow_repo"
+  env "${release_flow_common_env[@]}" \
+    SWIFTVLC_RELEASE_TEST_ASSET_URL_DRIFT=1 \
+    ./scripts/release.sh 1.1.0 --candidate "$release_flow_candidate" \
+      > "$release_flow_root/draft-asset-url-drift.log" 2>&1
+); then
+  fail "release accepted a candidate asset from a different draft locator"
+fi
+grep -q 'existing candidate asset conflicts with local bytes' \
+  "$release_flow_root/draft-asset-url-drift.log" || \
+  fail "candidate draft-locator drift did not produce a fail-closed diagnostic"
+[[ $(tr -d '\n' < "$release_flow_gh_state") == draft ]] || \
+  fail "candidate draft-locator drift changed release visibility"
+
 # A checksum-looking staged Package.swift is not sufficient. Move the mutable
 # candidate anchors to a one-parent commit containing the canonical release
 # files plus an unrelated Package.swift edit; fresh finalize must reconstruct
@@ -5545,7 +5699,10 @@ if grep -En '\$\{[A-Za-z_][A-Za-z0-9_]*\[@\]\}' scripts/setup-dev.sh >/dev/null;
   fail "setup-dev.sh contains an array expansion that is unsafe under Bash 3.2 nounset"
 fi
 
-artifact_info=$(./scripts/resolve-release-artifact.sh)
+artifact_info=$(
+  SWIFTVLC_ALLOW_DRAFT_RELEASE="$outer_allow_draft_release" \
+    ./scripts/resolve-release-artifact.sh
+)
 actual_tag=$(printf '%s' "$artifact_info" \
   | python3 -c 'import json,sys; print(json.load(sys.stdin)["tag"])')
 showcase_version=$(sed -n \

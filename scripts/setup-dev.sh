@@ -260,12 +260,15 @@ PYEOF
 
     echo "Downloading $ZIP_NAME from $RESOLVED_DOWNLOAD_TAG..."
     rm -f "Vendor/$ZIP_NAME"
-    if [[ "$MANIFEST_ONLY" == true ]]; then
-      curl --fail --location --retry 3 --output "Vendor/$ZIP_NAME" "$RESOLVED_URL"
-    else
+    if [[ "$RESOLVED_IS_DRAFT" == true ]]; then
       require_gh
       gh release download "$RESOLVED_DOWNLOAD_TAG" \
         --repo "$REPO" --pattern "$ZIP_NAME" --dir Vendor/
+    else
+      # Published assets are public and checksum-bound by Package.swift. Avoid
+      # passing any repository token through ordinary PR-controlled scripts.
+      curl --disable --fail --location --retry 3 --retry-all-errors \
+        --output "Vendor/$ZIP_NAME" "$RESOLVED_URL"
     fi
 
     downloaded_checksum=$(swift package compute-checksum "Vendor/$ZIP_NAME")

@@ -1392,7 +1392,7 @@ verify_github_release() {
   local metadata="$WORK_DIR/github-release-${release_tag}.json"
 
   gh release view "$release_tag" --repo "$REPO" \
-    --json tagName,targetCommitish,isDraft,isImmutable,isPrerelease,name,body,assets \
+    --json url,tagName,targetCommitish,isDraft,isImmutable,isPrerelease,name,body,assets \
     > "$metadata"
   EXPECTED_PRERELEASE="$UNQUALIFIED" \
   EXPECTED_RELEASE_NAME="$expected_name" \
@@ -1403,6 +1403,7 @@ verify_github_release() {
 import hashlib
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -1433,6 +1434,22 @@ if release.get("name") != os.environ["EXPECTED_RELEASE_NAME"]:
 if release.get("body") != os.environ["EXPECTED_RELEASE_BODY"]:
     sys.exit("Error: GitHub release notes drifted")
 
+release_url = release.get("url")
+release_url_prefix = f"https://github.com/{repository}/releases/tag/"
+if visibility == "draft":
+    if not isinstance(release_url, str) or not release_url.startswith(
+        release_url_prefix
+    ):
+        sys.exit("Error: draft release URL does not belong to the exact repository")
+    download_ref = release_url[len(release_url_prefix) :]
+    if re.fullmatch(r"untagged-[0-9A-Za-z._-]+", download_ref) is None:
+        sys.exit("Error: draft release URL has an unsafe GitHub locator")
+else:
+    expected_release_url = f"{release_url_prefix}{url_tag}"
+    if release_url != expected_release_url:
+        sys.exit("Error: published release URL does not match its exact tag")
+    download_ref = url_tag
+
 expected = {Path(path).name: Path(path) for path in asset_paths}
 actual_assets = release.get("assets")
 if not isinstance(actual_assets, list):
@@ -1457,7 +1474,7 @@ for name, path in expected.items():
     if asset.get("digest") != f"sha256:{digest}":
         sys.exit(f"Error: GitHub release asset digest drifted: {name}")
     expected_url = (
-        f"https://github.com/{repository}/releases/download/{url_tag}/{name}"
+        f"https://github.com/{repository}/releases/download/{download_ref}/{name}"
     )
     if asset.get("url") != expected_url:
         sys.exit(f"Error: GitHub release asset URL drifted: {name}")
@@ -1512,17 +1529,36 @@ candidate_asset_status() {
   local asset_path=$1
   local metadata="$WORK_DIR/candidate-assets.json"
   gh release view "$CANDIDATE_TAG" --repo "$REPO" \
-    --json tagName,targetCommitish,isDraft,isImmutable,isPrerelease,assets \
+    --json url,tagName,targetCommitish,isDraft,isImmutable,isPrerelease,assets \
     > "$metadata"
-  python3 - "$metadata" "$asset_path" "$REPO" "$CANDIDATE_TAG" <<'PY'
+  python3 - "$metadata" "$asset_path" "$REPO" "$CANDIDATE_TAG" \
+    "$STAGED_COMMIT" "$UNQUALIFIED" <<'PY'
 import hashlib
 import json
+import re
 import sys
 from pathlib import Path
 
-metadata_path, asset_path, repository, tag = sys.argv[1:]
+metadata_path, asset_path, repository, tag, commit, prerelease = sys.argv[1:]
 path = Path(asset_path)
 release = json.load(open(metadata_path))
+if release.get("tagName") != tag:
+    raise SystemExit("Error: candidate release tag drifted")
+if release.get("targetCommitish") != commit:
+    raise SystemExit("Error: candidate release target drifted")
+if release.get("isDraft") is not True or release.get("isImmutable") is not False:
+    raise SystemExit("Error: candidate release must remain a mutable draft")
+if bool(release.get("isPrerelease")) != (prerelease == "true"):
+    raise SystemExit("Error: candidate pre-release classification drifted")
+release_url_prefix = f"https://github.com/{repository}/releases/tag/"
+release_url = release.get("url")
+if not isinstance(release_url, str) or not release_url.startswith(
+    release_url_prefix
+):
+    raise SystemExit("Error: draft release URL does not belong to the exact repository")
+download_ref = release_url[len(release_url_prefix) :]
+if re.fullmatch(r"untagged-[0-9A-Za-z._-]+", download_ref) is None:
+    raise SystemExit("Error: draft release URL has an unsafe GitHub locator")
 matches = [asset for asset in release.get("assets", []) if asset.get("name") == path.name]
 if not matches:
     print("missing")
@@ -1541,7 +1577,9 @@ if state == "starter":
 if state != "uploaded":
     raise SystemExit(f"Error: candidate asset has unsupported state {state!r}: {path.name}")
 digest = hashlib.sha256(path.read_bytes()).hexdigest()
-expected_url = f"https://github.com/{repository}/releases/download/{tag}/{path.name}"
+expected_url = (
+    f"https://github.com/{repository}/releases/download/{download_ref}/{path.name}"
+)
 if asset.get("digest") != f"sha256:{digest}" or asset.get("url") != expected_url:
     raise SystemExit(f"Error: existing candidate asset conflicts with local bytes: {path.name}")
 print("exact")
