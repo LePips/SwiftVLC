@@ -77,6 +77,41 @@ class LibVLCFeatureContractTests(unittest.TestCase):
         self.assertEqual(len(errors), 2)
         self.assertTrue(all("forbidden on tvOS" in error for error in errors))
 
+    def test_audio_session_object_is_coherent_across_architectures(self) -> None:
+        rows = self.casting_rows("arm64", "x86_64")
+        rows.extend(
+            (
+                arch,
+                VALIDATOR.APPLE_AUDIO_SESSION_OBJECT,
+            )
+            for arch in ("arm64", "x86_64")
+        )
+
+        self.assertEqual(
+            self.validate("ios-arm64_x86_64-simulator", rows), []
+        )
+
+    def test_partial_audio_session_object_is_rejected(self) -> None:
+        rows = self.casting_rows("arm64", "x86_64")
+        rows.append(("arm64", VALIDATOR.APPLE_AUDIO_SESSION_OBJECT))
+
+        errors = self.validate("ios-arm64_x86_64-simulator", rows)
+
+        self.assertEqual(len(errors), 1)
+        self.assertIn("x86_64", errors[0])
+        self.assertIn("expected exactly once", errors[0])
+
+    def test_duplicate_audio_session_object_is_rejected(self) -> None:
+        rows = self.casting_rows("arm64")
+        rows.extend(
+            [("arm64", VALIDATOR.APPLE_AUDIO_SESSION_OBJECT)] * 2
+        )
+
+        errors = self.validate("ios-arm64", rows)
+
+        self.assertEqual(len(errors), 1)
+        self.assertIn("occurs 2 times", errors[0])
+
     def test_unknown_platform_requires_an_explicit_policy(self) -> None:
         rows = [("arm64", member) for member in VALIDATOR.RENDERER_CORE_OBJECTS]
         errors = self.validate("watchos-arm64", rows)
@@ -84,8 +119,8 @@ class LibVLCFeatureContractTests(unittest.TestCase):
         self.assertIn("unsupported slice", errors[0])
 
     def test_checked_in_manifests_satisfy_the_contract(self) -> None:
-        manifest_directory = REPO_ROOT / "scripts" / "libvlc-manifests"
-        manifests = sorted(manifest_directory.glob("*.txt"))
+        manifest_directory = REPO_ROOT / "scripts" / "libvlc-manifests" / "sets"
+        manifests = sorted(manifest_directory.glob("*/*.txt"))
         self.assertGreater(len(manifests), 0)
 
         failures: list[str] = []

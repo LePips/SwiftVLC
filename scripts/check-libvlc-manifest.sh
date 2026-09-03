@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 #
 # Verifies that the archive members of every libvlc.a slice in
-# Vendor/libvlc.xcframework match the manifests checked in under
-# scripts/libvlc-manifests/. A rebuilt binary that silently drops or
-# gains plugins/objects in one slice shows up as a manifest diff. A semantic
-# validator also prevents --write from blessing a rebuild that lost required
-# renderer/Chromecast objects (or accidentally added Chromecast to tvOS).
+# Vendor/libvlc.xcframework match a content-addressed manifest set under
+# scripts/libvlc-manifests/sets/. A rebuilt binary
+# that silently drops or gains plugins/objects in one slice selects a different
+# inventory and fails unless that complete set was intentionally reviewed. A
+# semantic validator also prevents --write from blessing a rebuild that lost
+# required renderer/Chromecast objects (or accidentally added Chromecast to
+# tvOS).
 #
 # Regenerate a manifest after an intentional rebuild with:
 #   ./scripts/check-libvlc-manifest.sh --write
@@ -19,7 +21,9 @@ set -euo pipefail
 repo_root=$(cd "$(dirname "$0")/.." && pwd)
 xcframework="$repo_root/Vendor/libvlc.xcframework"
 manifests="$repo_root/scripts/libvlc-manifests"
+manifest_sets="$manifests/sets"
 feature_validator="$repo_root/scripts/validate_libvlc_feature_contract.py"
+inventory_tool="$repo_root/scripts/libvlc-manifest-set.py"
 write_mode=false
 
 while [ "$#" -gt 0 ]; do
@@ -56,9 +60,27 @@ if [ ! -f "$feature_validator" ]; then
   echo "error: $feature_validator not found" >&2
   exit 1
 fi
+if [ ! -f "$inventory_tool" ]; then
+  echo "error: $inventory_tool not found" >&2
+  exit 1
+fi
+
+# Validate every historical/prospective set, not just the one selected by the
+# current binary. Otherwise CI for the published artifact could ignore a
+# malformed inventory added for the next release.
+python3 "$inventory_tool" validate-root --root "$manifest_sets"
 
 scratch=$(mktemp -d "${TMPDIR:-/tmp}/swiftvlc-libvlc-manifest.XXXXXX")
-trap 'rm -rf -- "$scratch"' EXIT
+write_stage=""
+cleanup() {
+  rm -rf -- "$scratch"
+  if [ -n "$write_stage" ]; then
+    rm -rf -- "$write_stage"
+  fi
+}
+trap cleanup EXIT
+actual_inventory="$scratch/inventory"
+mkdir "$actual_inventory"
 
 # Prints "<arch> <member>" lines for every architecture in the archive,
 # sorted bytewise so the output is stable across machines.
@@ -95,7 +117,7 @@ for slice_dir in "$xcframework"/*/; do
   archive="$slice_dir/libvlc.a"
   [ -f "$archive" ] || continue
   slice_count=$((slice_count + 1))
-  actual="$scratch/$slice.txt"
+  actual="$actual_inventory/$slice.txt"
   list_members "$archive" > "$actual"
 
   if ! python3 "$feature_validator" --slice "$slice" --members "$actual"; then
@@ -114,19 +136,49 @@ if [ "$failures" -gt 0 ]; then
   exit 1
 fi
 
-for actual in "$scratch"/*.txt; do
-  slice=$(basename "$actual" .txt)
-  manifest="$manifests/$slice.txt"
+# This validation establishes the exact eight slices, all 13 architecture
+# blocks, canonical row encoding/sort order, the cross-slice audio-broker
+# transition, and the content address derived only from actual archive bytes.
+inventory_digest=$(python3 "$inventory_tool" digest \
+  --directory "$actual_inventory")
 
-  if $write_mode; then
-    mkdir -p "$manifests"
-    cp "$actual" "$manifest"
-    echo "WROTE $slice ($(wc -l < "$manifest" | tr -d ' ') members)"
-    continue
+if $write_mode; then
+  destination="$manifest_sets/$inventory_digest"
+  if [ -e "$destination" ]; then
+    selected=$(python3 "$inventory_tool" select \
+      --root "$manifest_sets" --digest "$inventory_digest")
+    for actual in "$actual_inventory"/*.txt; do
+      slice=$(basename "$actual" .txt)
+      diff -u "$selected/$slice.txt" "$actual"
+    done
+    echo "EXISTS libVLC manifest inventory $inventory_digest"
+    exit 0
   fi
 
+  write_stage=$(mktemp -d "$manifest_sets/.inventory.XXXXXX")
+  cp "$actual_inventory"/*.txt "$write_stage/"
+  python3 "$inventory_tool" validate \
+    --directory "$write_stage" --expected-digest "$inventory_digest"
+  mv "$write_stage" "$destination"
+  write_stage=""
+  python3 "$inventory_tool" validate-root --root "$manifest_sets"
+  echo "WROTE libVLC manifest inventory $inventory_digest"
+  exit 0
+fi
+
+if ! selected=$(python3 "$inventory_tool" select \
+    --root "$manifest_sets" --digest "$inventory_digest"); then
+  echo "FAIL  unknown libVLC archive-member inventory $inventory_digest"
+  exit 1
+fi
+echo "Selected libVLC manifest inventory $inventory_digest"
+
+for actual in "$actual_inventory"/*.txt; do
+  slice=$(basename "$actual" .txt)
+  manifest="$selected/$slice.txt"
+
   if [ ! -f "$manifest" ]; then
-    echo "FAIL  $slice — manifest missing at scripts/libvlc-manifests/$slice.txt"
+    echo "FAIL  $slice — selected inventory manifest is missing"
     failures=$((failures + 1))
     continue
   fi
@@ -139,21 +191,8 @@ for actual in "$scratch"/*.txt; do
   fi
 done
 
-# A manifest with no corresponding slice means the xcframework lost a
-# whole platform slice (or the manifest is stale) — fail either way.
-if ! $write_mode; then
-  for manifest in "$manifests"/*.txt; do
-    [ -f "$manifest" ] || continue
-    slice=$(basename "$manifest" .txt)
-    if [ ! -f "$xcframework/$slice/libvlc.a" ]; then
-      echo "FAIL  $slice — manifest exists but slice is absent from the xcframework"
-      failures=$((failures + 1))
-    fi
-  done
-
-  if [ "$failures" -gt 0 ]; then
-    echo "libvlc manifest check failed ($failures problem(s))"
-    exit 1
-  fi
-  echo "libvlc manifest check passed"
+if [ "$failures" -gt 0 ]; then
+  echo "libvlc manifest check failed ($failures problem(s))"
+  exit 1
 fi
+echo "libvlc manifest check passed"

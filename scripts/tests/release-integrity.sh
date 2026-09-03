@@ -202,6 +202,19 @@ for path, expected_count in zip(sys.argv[1:], expected_counts):
         if not re.fullmatch(r"[^@]+@[0-9a-f]{40}", action):
             sys.exit(f"{path} contains an unpinned authorizing action: {action}")
 native_contracts = open(sys.argv[5]).read()
+vendor_manifest = open(sys.argv[3]).read()
+for marker, expected_count in (
+    ("      - scripts/libvlc-manifest-set.py\n", 2),
+    ("      - scripts/tests/test_libvlc_manifest_set.py\n", 2),
+    ("            scripts/tests/test_libvlc_manifest_set.py\n", 1),
+    ("          ./scripts/check-libvlc-manifest.sh\n", 1),
+):
+    count = vendor_manifest.count(marker)
+    if count != expected_count:
+        sys.exit(
+            "vendor manifest CI lost content-addressed inventory coverage: "
+            f"{marker.strip()} occurred {count} times, expected {expected_count}"
+        )
 native_pr_trigger = native_contracts.split("  push:\n", 1)[0]
 native_push_trigger = native_contracts.split("  push:\n", 1)[1].split(
     "\npermissions:\n", 1
