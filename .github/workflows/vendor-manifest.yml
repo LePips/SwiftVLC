@@ -1,8 +1,8 @@
 # Guards the vendored libvlc binary against silent per-slice drift.
 #
-# Every slice of Vendor/libvlc.xcframework has a checked-in manifest of
-# its static-archive members (scripts/libvlc-manifests/<slice>.txt). A
-# rebuilt libvlc.a that drops or gains plugins/objects in one slice —
+# Every complete Vendor/libvlc.xcframework inventory has a content-addressed
+# checked-in manifest set under scripts/libvlc-manifests/sets/. A rebuilt
+# libvlc.a that drops or gains plugins/objects in one slice —
 # e.g. the tvOS slice intentionally lacks the Chromecast plugin stack,
 # and a careless rebuild could reintroduce it (or strip a plugin a
 # platform relies on) — passes compilation and most tests unnoticed.
@@ -18,8 +18,10 @@ on:
       - Package.swift
       - scripts/libvlc-manifests/**
       - scripts/check-libvlc-manifest.sh
+      - scripts/libvlc-manifest-set.py
       - scripts/validate_libvlc_feature_contract.py
       - scripts/tests/test_libvlc_feature_contract.py
+      - scripts/tests/test_libvlc_manifest_set.py
       - .github/workflows/vendor-manifest.yml
   push:
     branches: [main]
@@ -27,8 +29,10 @@ on:
       - Package.swift
       - scripts/libvlc-manifests/**
       - scripts/check-libvlc-manifest.sh
+      - scripts/libvlc-manifest-set.py
       - scripts/validate_libvlc_feature_contract.py
       - scripts/tests/test_libvlc_feature_contract.py
+      - scripts/tests/test_libvlc_manifest_set.py
       - .github/workflows/vendor-manifest.yml
 
 permissions:
@@ -75,5 +79,7 @@ jobs:
       - name: Check libvlc archive-member manifests
         timeout-minutes: 5
         run: |
-          python3 -m unittest scripts/tests/test_libvlc_feature_contract.py
+          python3 -m unittest \
+            scripts/tests/test_libvlc_feature_contract.py \
+            scripts/tests/test_libvlc_manifest_set.py
           ./scripts/check-libvlc-manifest.sh

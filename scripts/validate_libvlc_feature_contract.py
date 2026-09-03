@@ -28,6 +28,8 @@ CHROMECAST_OBJECTS = (
     "libstream_out_chromecast_plugin_la-renderer_common.o",
 )
 
+APPLE_AUDIO_SESSION_OBJECT = "libvlccore_objc_la-apple_audio_session.o"
+
 CASTING_SLICE_PREFIXES = ("ios-", "macos-", "xros-")
 TVOS_SLICE_PREFIX = "tvos-"
 
@@ -76,9 +78,7 @@ def validate_contract(slice_name: str, path: Path) -> list[str]:
                         f"{slice_name}/{arch}: required object occurs {count} times: "
                         f"{member}"
                     )
-        return errors
-
-    if slice_name.startswith(TVOS_SLICE_PREFIX):
+    elif slice_name.startswith(TVOS_SLICE_PREFIX):
         forbidden = set(CHROMECAST_OBJECTS)
         for arch, members in sorted(members_by_arch.items()):
             for member in RENDERER_CORE_OBJECTS:
@@ -103,12 +103,30 @@ def validate_contract(slice_name: str, path: Path) -> list[str]:
                     f"{slice_name}/{arch}: Chromecast object is forbidden on tvOS: "
                     f"{member}"
                 )
-        return errors
+    else:
+        return [
+            f"{slice_name}: unsupported slice; classify its renderer/casting policy "
+            "before accepting the artifact"
+        ]
 
-    return [
-        f"{slice_name}: unsupported slice; classify its renderer/casting policy "
-        "before accepting the artifact"
-    ]
+    # beta.8 predates the Objective-C audio-session broker, so historical
+    # inventories may omit it. Once any architecture contains the broker,
+    # require one copy in every architecture: a partial universal archive is
+    # never a valid transition state. The release gate separately requires the
+    # complete native-v9 lease contract for 1.1.0 candidates.
+    audio_counts = {
+        arch: members[APPLE_AUDIO_SESSION_OBJECT]
+        for arch, members in members_by_arch.items()
+    }
+    if any(audio_counts.values()):
+        for arch, count in sorted(audio_counts.items()):
+            if count != 1:
+                errors.append(
+                    f"{slice_name}/{arch}: Apple audio-session object occurs "
+                    f"{count} times; expected exactly once in every architecture"
+                )
+
+    return errors
 
 
 def main() -> int:
