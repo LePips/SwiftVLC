@@ -67,7 +67,7 @@ private struct TransportRow: View {
       .accessibilityIdentifier(AccessibilityID.MusicPlayer.playPauseButton)
       .accessibilityLabel(player.isPlaybackRequestedActive ? "Pause" : "Play")
       #if targetEnvironment(macCatalyst)
-        .keyboardShortcut(.space, modifiers: [])
+      .keyboardShortcut(.space, modifiers: [])
       #endif
 
       Button {
