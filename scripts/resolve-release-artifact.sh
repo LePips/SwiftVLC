@@ -49,15 +49,6 @@ if [[ -n "$ALLOW_DRAFT" && "$ALLOW_DRAFT" != "1" ]]; then
   echo "Error: SWIFTVLC_ALLOW_DRAFT_RELEASE must be exactly 1 when enabled." >&2
   exit 1
 fi
-if ! command -v gh >/dev/null 2>&1; then
-  echo "Error: GitHub CLI (gh) is required to verify release metadata." >&2
-  exit 1
-fi
-if ! gh auth status >/dev/null 2>&1; then
-  echo "Error: GitHub CLI authentication is required to verify release metadata." >&2
-  exit 1
-fi
-
 CHECKOUT_COMMIT=$(git rev-parse HEAD)
 RELEASE_TAG="$TAG"
 RELEASE_REF="refs/swiftvlc-release/$TAG"
@@ -74,6 +65,14 @@ CANDIDATE_EVENT=""
 # the unqualified final version. The tag is deterministic and bound to all 40
 # bits of the checkout commit; callers cannot supply or redirect it.
 if [[ "$ALLOW_DRAFT" == "1" ]]; then
+  if ! command -v gh >/dev/null 2>&1; then
+    echo "Error: GitHub CLI (gh) is required to verify draft release metadata." >&2
+    exit 1
+  fi
+  if ! gh auth status >/dev/null 2>&1; then
+    echo "Error: GitHub CLI authentication is required to verify draft release metadata." >&2
+    exit 1
+  fi
   if [[ "${GITHUB_ACTIONS:-}" != "true" \
       || "${GITHUB_REPOSITORY:-}" != "$REPO" ]]; then
     echo "Error: draft releases are available only to authenticated candidate CI in $REPO." >&2
@@ -152,7 +151,6 @@ PY
 
   RELEASE_TAG="swiftvlc-candidate-${TAG}-${CANDIDATE_COMMIT}"
   RELEASE_REF="refs/swiftvlc-release/$RELEASE_TAG"
-  EXPECTED_ASSET_URL="https://github.com/$REPO/releases/download/$RELEASE_TAG/$ASSET_NAME"
 
   # A final SemVer tag before publication would make this still-draft package
   # selectable by normal SwiftPM clients. Candidate CI treats that as a P0.
@@ -196,15 +194,70 @@ git show "$RELEASE_REF:Package.swift" > "$temp_dir/Package.swift"
 python3 "$SCRIPT_DIR/release-artifact-info.py" \
   "$temp_dir/Package.swift" --expect-tag "$TAG" > "$temp_dir/manifest.json"
 
-gh release view "$RELEASE_TAG" --repo "$REPO" \
-  --json tagName,targetCommitish,isDraft,isPrerelease,assets \
-  > "$temp_dir/release.json"
+if [[ "$ALLOW_DRAFT" == "1" || -n "${GH_TOKEN:-}" ]]; then
+  # GitHub-hosted runners share a small anonymous API quota. Use the job's
+  # ephemeral token for public metadata when available; draft acceptance stays
+  # independently gated by the exact candidate identity checks above.
+  if ! command -v gh >/dev/null 2>&1; then
+    echo "Error: GitHub CLI (gh) is required for authenticated release metadata." >&2
+    exit 1
+  fi
+  if ! gh auth status >/dev/null 2>&1; then
+    echo "Error: GitHub CLI authentication is required for release metadata." >&2
+    exit 1
+  fi
+  gh release view "$RELEASE_TAG" --repo "$REPO" \
+    --json url,tagName,targetCommitish,isDraft,isImmutable,isPrerelease,assets \
+    > "$temp_dir/release.json"
+else
+  # Public release metadata does not need a repository token. Keeping ordinary
+  # PRs anonymous means their checked-out scripts never receive the candidate
+  # job's write-capable token. Normalize REST names to the gh JSON contract so
+  # the verifier below has one fail-closed implementation.
+  curl --disable --fail --location --retry 3 --retry-all-errors \
+    --silent --show-error \
+    -H 'Accept: application/vnd.github+json' \
+    -H 'X-GitHub-Api-Version: 2022-11-28' \
+    "https://api.github.com/repos/$REPO/releases/tags/$RELEASE_TAG" \
+    > "$temp_dir/release-rest.json"
+  python3 - "$temp_dir/release-rest.json" "$temp_dir/release.json" <<'PY'
+import json
+import sys
+
+input_path, output_path = sys.argv[1:]
+release = json.load(open(input_path))
+assets = []
+for asset in release.get("assets", []):
+    assets.append(
+        {
+            "name": asset.get("name"),
+            "digest": asset.get("digest"),
+            "url": asset.get("browser_download_url"),
+            "size": asset.get("size"),
+            "state": asset.get("state"),
+        }
+    )
+normalized = {
+    "url": release.get("html_url"),
+    "tagName": release.get("tag_name"),
+    "targetCommitish": release.get("target_commitish"),
+    "isDraft": release.get("draft"),
+    "isImmutable": release.get("immutable"),
+    "isPrerelease": release.get("prerelease"),
+    "assets": assets,
+}
+with open(output_path, "w") as output:
+    json.dump(normalized, output)
+    output.write("\n")
+PY
+fi
 
 EXPECTED_RELEASE_TAG="$RELEASE_TAG" \
 EXPECTED_TAG_COMMIT="$TAG_COMMIT" \
 EXPECTED_CHECKOUT_COMMIT="$CHECKOUT_COMMIT" \
 EXPECTED_CANDIDATE_COMMIT="$CANDIDATE_COMMIT" \
 EXPECTED_ASSET_URL="$EXPECTED_ASSET_URL" \
+EXPECTED_REPOSITORY="$REPO" \
 python3 - \
   "$temp_dir/manifest.json" \
   "$temp_dir/release.json" \
@@ -212,6 +265,7 @@ python3 - \
   "$ALLOW_DRAFT" > "$temp_dir/resolved.json" <<'PY'
 import json
 import os
+import re
 import sys
 
 manifest_path, release_path, asset_name, allow_draft = sys.argv[1:5]
@@ -221,6 +275,7 @@ release_tag = os.environ["EXPECTED_RELEASE_TAG"]
 tag_commit = os.environ["EXPECTED_TAG_COMMIT"]
 checkout_commit = os.environ["EXPECTED_CHECKOUT_COMMIT"]
 candidate_commit = os.environ["EXPECTED_CANDIDATE_COMMIT"]
+repository = os.environ["EXPECTED_REPOSITORY"]
 
 if release.get("tagName") != release_tag:
     sys.exit(
@@ -231,6 +286,8 @@ is_draft = release.get("isDraft") is True
 if allow_draft == "1":
     if not is_draft:
         sys.exit("Error: candidate authorization may resolve only a draft release.")
+    if release.get("isImmutable") is not False:
+        sys.exit("Error: candidate release must remain mutable while it is a draft.")
     if tag_commit != candidate_commit:
         sys.exit(
             "Error: candidate tag and authenticated release commit differ.\n"
@@ -259,7 +316,27 @@ if asset.get("digest") != expected_digest:
         f"  manifest: {expected_digest}\n"
         f"  asset:    {asset.get('digest')}"
     )
-expected_url = os.environ["EXPECTED_ASSET_URL"] or manifest["url"]
+release_url = release.get("url")
+if allow_draft == "1":
+    release_url_prefix = f"https://github.com/{repository}/releases/tag/"
+    if not isinstance(release_url, str) or not release_url.startswith(
+        release_url_prefix
+    ):
+        sys.exit("Error: draft release URL does not belong to the exact repository.")
+    draft_locator = release_url[len(release_url_prefix) :]
+    if re.fullmatch(r"untagged-[0-9A-Za-z._-]+", draft_locator) is None:
+        sys.exit("Error: draft release URL has an unsafe GitHub locator.")
+    expected_url = (
+        f"https://github.com/{repository}/releases/download/"
+        f"{draft_locator}/{asset_name}"
+    )
+else:
+    expected_release_url = (
+        f"https://github.com/{repository}/releases/tag/{release_tag}"
+    )
+    if release_url != expected_release_url:
+        sys.exit("Error: public release URL does not match its exact tag.")
+    expected_url = os.environ["EXPECTED_ASSET_URL"] or manifest["url"]
 if asset.get("url") != expected_url:
     sys.exit(
         "Error: release asset URL does not match its exact release identity.\n"
