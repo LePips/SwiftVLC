@@ -40,6 +40,28 @@ class BuildPathVerifierTests(unittest.TestCase):
             check=False,
         )
 
+    def run_descriptor_verifier(
+        self,
+        parent_fd: int,
+        child: str = "libvlc.xcframework",
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPT),
+                "--xcframework-parent-fd",
+                str(parent_fd),
+                "--xcframework-child",
+                child,
+                "--forbidden-path",
+                str(self.forbidden),
+            ],
+            pass_fds=(parent_fd,),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
     def test_accepts_artifact_without_forbidden_path(self) -> None:
         self.library.write_bytes(b"deterministic native archive")
 
@@ -47,6 +69,95 @@ class BuildPathVerifierTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("no forbidden build paths embedded", result.stdout)
+
+    def test_accepts_descriptor_anchored_artifact(self) -> None:
+        self.library.write_bytes(b"deterministic native archive")
+        parent_fd = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            result = self.run_descriptor_verifier(parent_fd)
+        finally:
+            os.close(parent_fd)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("no forbidden build paths embedded", result.stdout)
+
+    def test_descriptor_anchor_cannot_be_redirected_by_parent_path_replacement(
+        self,
+    ) -> None:
+        source = self.root / "native-source"
+        stage = source / "vlc" / ".swiftvlc-native-output"
+        original_library = (
+            stage / "libvlc.xcframework" / "ios-arm64" / "libvlc.a"
+        )
+        original_library.parent.mkdir(parents=True)
+        original_library.write_bytes(os.fsencode(self.forbidden))
+        stage_fd = os.open(stage, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            source.rename(self.root / "native-source-moved")
+            replacement_library = (
+                source
+                / "vlc"
+                / ".swiftvlc-native-output"
+                / "libvlc.xcframework"
+                / "ios-arm64"
+                / "libvlc.a"
+            )
+            replacement_library.parent.mkdir(parents=True)
+            replacement_library.write_bytes(b"clean replacement")
+
+            result = self.run_descriptor_verifier(stage_fd)
+        finally:
+            os.close(stage_fd)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("release artifact embeds forbidden build path", result.stderr)
+        self.assertIn("ios-arm64/libvlc.a", result.stderr)
+
+    def test_descriptor_mode_rejects_noncomponent_child(self) -> None:
+        self.library.write_bytes(b"clean")
+        parent_fd = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            result = self.run_descriptor_verifier(
+                parent_fd, "nested/libvlc.xcframework"
+            )
+        finally:
+            os.close(parent_fd)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("must be one non-special path component", result.stderr)
+
+    def test_descriptor_mode_rejects_symlink_child(self) -> None:
+        self.library.write_bytes(b"clean")
+        real_artifact = self.root / "real-libvlc.xcframework"
+        self.artifact.rename(real_artifact)
+        self.artifact.symlink_to(real_artifact, target_is_directory=True)
+        parent_fd = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            result = self.run_descriptor_verifier(parent_fd)
+        finally:
+            os.close(parent_fd)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("XCFramework child libvlc.xcframework is not a directory", result.stderr)
+
+    def test_absolute_mode_still_rejects_relative_xcframework(self) -> None:
+        self.library.write_bytes(b"clean")
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPT),
+                "--xcframework",
+                "libvlc.xcframework",
+                "--forbidden-path",
+                str(self.forbidden),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("XCFramework must be an absolute path", result.stderr)
 
     def test_rejects_path_split_across_read_chunks(self) -> None:
         encoded = str(self.forbidden.resolve()).encode()

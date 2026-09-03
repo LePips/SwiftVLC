@@ -504,10 +504,15 @@ verify_checkout_path_not_embedded() {
     if [ "${EXTERNAL_BUILD_ROOT}" != yes ]; then
         return
     fi
+    # Open the already-anchored output CWD only for this command. The verifier
+    # resolves and walks the XCFramework below FD 7 without re-entering a
+    # replaceable external-root pathname.
     PYTHONDONTWRITEBYTECODE=1 python3 \
         "${SCRIPT_DIR}/verify-libvlc-build-paths.py" \
-        --xcframework "${OUTPUT_DIR}/libvlc.xcframework" \
-        --forbidden-path "${REPO_ROOT}"
+        --xcframework-parent-fd 7 \
+        --xcframework-child "libvlc.xcframework" \
+        --forbidden-path "${REPO_ROOT}" \
+        7<.
 }
 
 trap release_build_locks EXIT

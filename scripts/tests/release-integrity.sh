@@ -2753,11 +2753,19 @@ checkout_path_function = build[
 ]
 for marker in (
     '"${SCRIPT_DIR}/verify-libvlc-build-paths.py"',
-    '--xcframework "${OUTPUT_DIR}/libvlc.xcframework"',
+    '--xcframework-parent-fd 7',
+    '--xcframework-child "libvlc.xcframework"',
     '--forbidden-path "${REPO_ROOT}"',
+    '7<.',
 ):
     if checkout_path_function.count(marker) != 1:
         sys.exit(f"checkout-path verifier invocation is incomplete: {marker}")
+for stale_path in (
+    '${STAGED_OUTPUT_DIRECTORY}/libvlc.xcframework',
+    '${OUTPUT_DIR}/libvlc.xcframework',
+):
+    if stale_path in checkout_path_function:
+        sys.exit(f"checkout-path verifier re-entered pathname resolution: {stale_path}")
 for marker in (
     'if [ "${EXTERNAL_BUILD_ROOT}" = yes ]; then',
     'verify_checkout_path_not_embedded',
