@@ -2955,6 +2955,7 @@ arm64 libvlccore_la-vout_wrapper.o
 arm64 libvlccore_la-wait.o
 arm64 libvlccore_la-window.o
 arm64 libvlccore_la-xml.o
+arm64 libvlccore_objc_la-apple_audio_session.o
 arm64 libvlccore_objc_la-dirs.o
 arm64 libvlccore_objc_la-netconf.o
 arm64 libvorbis_plugin_la-vorbis.o
