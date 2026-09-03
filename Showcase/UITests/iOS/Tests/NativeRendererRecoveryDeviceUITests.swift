@@ -84,7 +84,7 @@ final class NativeRendererRecoveryDeviceUITests: ShowcaseIOSTestCase {
       RunLoop.current.run(until: Date().addingTimeInterval(TimeInterval(backgroundSeconds)))
 
       app.activate()
-      handleQualificationLocalNetworkPermissionIfPresent(timeout: 0)
+      handleQualificationLocalNetworkPermissionIfPresent()
       revealMeasurement(state, swiping: .down)
       waitForAccessibilityValue(state, equals: "paused", timeout: 15)
       revealMeasurement(active, swiping: .down)

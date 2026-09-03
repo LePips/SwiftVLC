@@ -90,8 +90,8 @@ extension ShowcaseIOSTestCase {
     while alert.exists && ProcessInfo.processInfo.systemUptime < readinessDeadline {
       if let grant = contract.grantButton(in: alert) {
         grant.tap()
-        XCTAssertFalse(
-          alert.waitForExistence(timeout: contract.controlReadinessTimeout),
+        XCTAssertTrue(
+          alert.waitForNonExistence(timeout: contract.controlReadinessTimeout),
           "The Local Network permission prompt remained visible after granting access"
         )
         return

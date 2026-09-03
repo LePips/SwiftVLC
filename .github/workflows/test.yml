@@ -294,16 +294,30 @@ jobs:
       # Reuse this already-provisioned Xcode/Vendor job for the one Showcase
       # build required on a pull request. The other Apple platforms run in the
       # post-merge/manual matrix above.
-      # build-for-testing also compiles the iOSUITests qualification target;
-      # it does not boot a simulator or add another billed runner.
-      - name: Compile iOS Showcase and qualification UI tests
+      # Build both SDK variants: simulator-only compilation erases every
+      # `#if targetEnvironment(simulator) ... #else` device branch and can let
+      # a broken physical qualification path reach main. Neither build boots a
+      # simulator or adds another billed runner.
+      - name: Compile iOS Showcase and qualification UI tests for both SDKs
         if: github.event_name == 'pull_request'
-        timeout-minutes: 15
+        timeout-minutes: 20
         run: |
           xcodebuild build-for-testing \
             -project Showcase/SwiftVLCShowcase.xcodeproj \
             -scheme iOS \
             -destination "generic/platform=iOS Simulator" \
+            -configuration Debug \
+            -skipPackagePluginValidation \
+            -skipMacroValidation \
+            ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO
+
+          xcodebuild build-for-testing \
+            -project Showcase/SwiftVLCShowcase.xcodeproj \
+            -scheme iOS \
+            -destination "generic/platform=iOS" \
             -configuration Debug \
             -skipPackagePluginValidation \
             -skipMacroValidation \

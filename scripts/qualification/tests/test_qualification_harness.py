@@ -2823,9 +2823,11 @@ class QualificationRunnerStorageTests(unittest.TestCase):
             "repeatedAppearanceTimeout: TimeInterval = 0.5",
             "controlReadinessTimeout: TimeInterval = 5",
             "while alert.exists",
+            "alert.waitForNonExistence(timeout:",
             "ProcessInfo.processInfo.systemUptime",
         ):
             self.assertIn(contract, permission_support)
+        self.assertNotIn("alert.waitForExistence(timeout:", permission_support)
         launch_helper = support[
             support.index("private func launchOrAttach()") : support.index(
                 "// MARK: - Log assertions"
@@ -2842,6 +2844,7 @@ class QualificationRunnerStorageTests(unittest.TestCase):
             path.name: path.read_text()
             for path in tests_root.glob("*.swift")
         }
+        all_test_sources = "\n".join(ui_test_sources.values())
 
         self.assertGreater(len(ui_test_sources), 0)
         wrapper_uses = 0
@@ -2860,6 +2863,16 @@ class QualificationRunnerStorageTests(unittest.TestCase):
                 "launchDirectlyHandlingQualificationPermissions()"
             )
         self.assertGreaterEqual(wrapper_uses, 55)
+
+        direct_handler_calls = re.findall(
+            r"handleQualificationLocalNetworkPermissionIfPresent\(([^)]*)\)",
+            all_test_sources,
+        )
+        self.assertGreaterEqual(len(direct_handler_calls), 1)
+        self.assertTrue(
+            all(not arguments.strip() for arguments in direct_handler_calls),
+            "Direct permission-handler calls must use the current no-argument contract",
+        )
 
     def test_physical_pip_capability_waits_for_the_enabled_path(self):
         source = (
