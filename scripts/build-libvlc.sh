@@ -15,14 +15,64 @@
 #   ./build-libvlc.sh --macos-only # macOS only (fastest for dev)
 #   ./build-libvlc.sh --catalyst   # Add Mac Catalyst (arm64 + x86_64)
 #   ./build-libvlc.sh --clean      # Remove build directory
-#   ./build-libvlc.sh --clean-build --all # Required when patch 0038 is selected
+#   ./build-libvlc.sh --build-root=/absolute/path --clean-build --all
+#   ./build-libvlc.sh --build-root=/absolute/path # Canonical external work root
 #   ./build-libvlc.sh --hash=abc   # Pin to a specific VLC commit
 
 set -e
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-BUILD_DIR="${SCRIPT_DIR}/.build-libvlc"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && /bin/pwd -P)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && /bin/pwd -P)"
+INVOCATION_DIRECTORY="$(/bin/pwd -P)"
+# Keep the lock-owning parent shell inside the exact scripts directory it
+# resolved. This gives checkout-local cleanup the same stable top-level anchor
+# as an external --build-root: renaming or replacing the checkout pathname
+# cannot redirect a later helper open into a different marker-bearing tree.
+cd "${SCRIPT_DIR}"
+DEFAULT_BUILD_DIR="${SCRIPT_DIR}/.build-libvlc"
+BUILD_ROOT="."
+BUILD_ROOT_HELPER="."
+BUILD_ROOT_DISPLAY="${SCRIPT_DIR}"
+BUILD_DIR=".build-libvlc"
+BUILD_DIR_DISPLAY="${DEFAULT_BUILD_DIR}"
+EXTERNAL_BUILD_ROOT=no
+BUILD_ROOT_OVERRIDE=""
+BUILD_ROOT_OVERRIDE_SET=no
+BUILD_LOCK_DIR=""
+BUILD_LOCK_DISPLAY=""
+BUILD_LOCK_PARENT_FD=8
+BUILD_LOCK_PARENT_FD_OPEN=no
+BUILD_LOCK_HELD=no
+OUTPUT_LOCK_DIR=""
+OUTPUT_LOCK_NAME=""
+OUTPUT_LOCK_DISPLAY=""
+OUTPUT_LOCK_PARENT_FD=9
+OUTPUT_LOCK_PARENT_FD_OPEN=no
+OUTPUT_LOCK_HELD=no
+LOCK_TOKEN_NAME=".swiftvlc-lock-generation-v1"
+BUILD_LOCK_TOKEN_CONTENT=""
+OUTPUT_LOCK_TOKEN_CONTENT=""
+OUTPUT_BINDING_HELD=no
+BUILD_DIRECTORY_MARKER=".swiftvlc-managed-libvlc-build-v1"
+BUILD_DIRECTORY_MARKER_CONTENT="SwiftVLC managed libVLC build directory v1"
+BUILD_DIRECTORY_CHILD=".build-libvlc"
+STAGED_OUTPUT_MARKER=".swiftvlc-managed-native-output-v1"
+STAGED_OUTPUT_MARKER_CONTENT="SwiftVLC managed native output directory v1"
+BUILD_QUARANTINE_NAME=""
+BUILD_QUARANTINE_DIR=""
+BUILD_QUARANTINE_PAYLOAD=""
+BUILD_BINDING_NAME=""
+BUILD_BINDING_CONTENT=""
+VLC_SOURCE_BINDING_NAME=""
+VLC_SOURCE_BINDING_CONTENT=""
+OUTPUT_BINDING_NAME=""
+OUTPUT_BINDING_CONTENT=""
+STAGED_OUTPUT_BINDING_NAME=""
+STAGED_OUTPUT_BINDING_CONTENT=""
+PUBLISHED_ARTIFACT_REMOVAL_BINDING_NAME=".swiftvlc-managed-artifact-removal-v1"
+PUBLISHED_ARTIFACT_REMOVAL_BINDING_CONTENT=""
+PUBLISHING_BINDING_NAME=".swiftvlc-managed-publication-binding-v1"
+PUBLISHING_BINDING_CONTENT=""
 OUTPUT_DIR="${REPO_ROOT}/Vendor"
 VLC_REPO="https://code.videolan.org/videolan/vlc.git"
 VLC_BRANCH="master"
@@ -57,6 +107,7 @@ BUILD_CATALYST=no
 # restore the asserts with --with-asserts.
 WITH_ASSERTS=no
 CLEAN_BUILD=no
+CLEAN_ONLY=no
 
 # Keep these deployment targets in sync with Package.swift.
 SWIFTVLC_MIN_IOS="18.0"
@@ -67,6 +118,21 @@ SWIFTVLC_MIN_CATALYST="18.0"
 
 BUILD_START_TIME=$(date +%s)
 BUILD_INVOCATION_ID=$(uuidgen | tr '[:upper:]' '[:lower:]')
+BUILD_QUARANTINE_NAME=".build-libvlc.removing-${BUILD_INVOCATION_ID}"
+BUILD_QUARANTINE_DIR="${SCRIPT_DIR}/${BUILD_QUARANTINE_NAME}"
+BUILD_QUARANTINE_PAYLOAD="${BUILD_QUARANTINE_DIR}/payload"
+BUILD_BINDING_NAME=".swiftvlc-managed-build-binding-v1"
+BUILD_BINDING_CONTENT="SwiftVLC managed build binding ${BUILD_INVOCATION_ID}"
+VLC_SOURCE_BINDING_NAME=".swiftvlc-managed-vlc-binding-v1"
+VLC_SOURCE_BINDING_CONTENT="SwiftVLC managed VLC binding ${BUILD_INVOCATION_ID}"
+OUTPUT_BINDING_NAME=".swiftvlc-managed-output-binding-v1"
+OUTPUT_BINDING_CONTENT="SwiftVLC managed output binding ${BUILD_INVOCATION_ID}"
+STAGED_OUTPUT_BINDING_NAME=".swiftvlc-managed-native-output-binding-v1"
+STAGED_OUTPUT_BINDING_CONTENT="SwiftVLC managed native output binding ${BUILD_INVOCATION_ID}"
+PUBLISHED_ARTIFACT_REMOVAL_BINDING_CONTENT="SwiftVLC managed artifact removal ${BUILD_INVOCATION_ID}"
+PUBLISHING_BINDING_CONTENT="SwiftVLC managed publication binding ${BUILD_INVOCATION_ID}"
+BUILD_LOCK_TOKEN_CONTENT="SwiftVLC external build-root lock ${BUILD_INVOCATION_ID}"
+OUTPUT_LOCK_TOKEN_CONTENT="SwiftVLC checkout output lock ${BUILD_INVOCATION_ID}"
 
 if [ -z "$MAKEFLAGS" ]; then
     MAKEFLAGS="-j$(sysctl -n machdep.cpu.core_count || nproc)"
@@ -113,6 +179,338 @@ error() {
     echo "[${COLOR_RED}error${COLOR_RESET}] [$(elapsed)] $1" >&2
     exit 1
 }
+
+# A release reproducibility proof uses two different SwiftVLC checkouts, but
+# VLC and several contribs retain their absolute source/configure paths in live
+# string data. Giving both sequential builds the same external working root
+# makes that otherwise-hidden input explicit and stable. BUILD_DIR is always a
+# fixed child of the user-selected root so cleanup never targets the root
+# itself. Existing children must carry our ownership marker before deletion.
+configure_external_build_root() {
+    local requested_root="$1"
+    local canonical_root
+
+    if [ -z "${requested_root}" ]; then
+        error "--build-root requires an absolute directory path."
+    fi
+    case "${requested_root}" in
+        /*) ;;
+        *) error "--build-root must be an absolute directory path: ${requested_root}" ;;
+    esac
+    while [ "${requested_root}" != "/" ] &&
+          [ "${requested_root%/}" != "${requested_root}" ]; do
+        requested_root="${requested_root%/}"
+    done
+    if [ ! -d "${requested_root}" ]; then
+        error "External build root does not exist: ${requested_root}"
+    fi
+    # Stay inside the directory we canonicalize. The shell's live CWD anchors
+    # this exact inode even if a non-cooperating process later renames or
+    # replaces the absolute root pathname.
+    cd "${requested_root}"
+    canonical_root=$(/bin/pwd -P)
+    if [ "${canonical_root}" != "${requested_root}" ]; then
+        error "--build-root must use its canonical physical path: ${canonical_root}"
+    fi
+    if [ "${canonical_root}" = "/" ]; then
+        error "Refusing to use the filesystem root as --build-root."
+    fi
+    case "${canonical_root}/" in
+        "${REPO_ROOT}/"*)
+            error "--build-root must be outside the SwiftVLC checkout so separate checkouts share one path."
+            ;;
+    esac
+    case "${REPO_ROOT}/" in
+        "${canonical_root}/swiftvlc-libvlc-build/"*)
+            error "Refusing an external build directory that contains the SwiftVLC checkout."
+            ;;
+    esac
+
+    BUILD_DIRECTORY_CHILD="swiftvlc-libvlc-build"
+    BUILD_QUARANTINE_NAME=".swiftvlc-libvlc-build.removing-${BUILD_INVOCATION_ID}"
+    BUILD_ROOT="."
+    BUILD_ROOT_HELPER="."
+    BUILD_ROOT_DISPLAY="${canonical_root}"
+    BUILD_DIR="${BUILD_DIRECTORY_CHILD}"
+    BUILD_DIR_DISPLAY="${canonical_root}/${BUILD_DIRECTORY_CHILD}"
+    BUILD_LOCK_DIR=".swiftvlc-libvlc-build.lock"
+    BUILD_LOCK_DISPLAY="${canonical_root}/.swiftvlc-libvlc-build.lock"
+    BUILD_QUARANTINE_DIR="${canonical_root}/${BUILD_QUARANTINE_NAME}"
+    BUILD_QUARANTINE_PAYLOAD="${BUILD_QUARANTINE_DIR}/payload"
+    EXTERNAL_BUILD_ROOT=yes
+}
+
+managed_build_directory_helper() {
+    local operation="$1"
+    shift
+    PYTHONDONTWRITEBYTECODE=1 python3 \
+        "${SCRIPT_DIR}/detach-managed-build-directory.py" \
+        "${operation}" \
+        --root "${BUILD_ROOT_HELPER}" \
+        --child "${BUILD_DIRECTORY_CHILD}" \
+        --marker-name "${BUILD_DIRECTORY_MARKER}" \
+        --marker-content "${BUILD_DIRECTORY_MARKER_CONTENT}" \
+        "$@"
+}
+
+bind_directory_for_handoff() {
+    local root="$1"
+    local child="$2"
+    local binding_name="$3"
+    local binding_content="$4"
+    shift 4
+    PYTHONDONTWRITEBYTECODE=1 python3 \
+        "${SCRIPT_DIR}/detach-managed-build-directory.py" \
+        bind \
+        --root "${root}" \
+        --child "${child}" \
+        --marker-name "${BUILD_DIRECTORY_MARKER}" \
+        --marker-content "${BUILD_DIRECTORY_MARKER_CONTENT}" \
+        --binding-name "${binding_name}" \
+        --binding-content "${binding_content}" \
+        "$@"
+}
+
+verify_directory_binding() {
+    local binding_name="$1"
+    local binding_content="$2"
+    local description="$3"
+    if [ -L "${binding_name}" ] || \
+       [ ! -f "${binding_name}" ] || \
+       ! printf '%s\n' "${binding_content}" | cmp -s - "${binding_name}"; then
+        error "${description} changed before it could be anchored."
+    fi
+}
+
+retire_directory_binding() {
+    local binding_name="$1"
+    local binding_content="$2"
+    local description="$3"
+    verify_directory_binding \
+        "${binding_name}" "${binding_content}" "${description}"
+    rm -f -- "${binding_name}"
+    if [ -e "${binding_name}" ] || [ -L "${binding_name}" ]; then
+        error "Could not retire ${description} binding: ${binding_name}"
+    fi
+}
+
+release_output_binding() {
+    if [ "${OUTPUT_BINDING_HELD}" != yes ]; then
+        return 0
+    fi
+    # Enter the current public Vendor path but remove a file only when it still
+    # carries this invocation's exact continuity token. If Vendor or an
+    # ancestor was replaced, leave both directories untouched for inspection.
+    (
+    if ! cd "${REPO_ROOT}/Vendor" 2>/dev/null; then
+        return 0
+    fi
+    if [ ! -e "${OUTPUT_BINDING_NAME}" ] && \
+       [ ! -L "${OUTPUT_BINDING_NAME}" ]; then
+        return 0
+    fi
+    if [ -L "${OUTPUT_BINDING_NAME}" ] || \
+       [ ! -f "${OUTPUT_BINDING_NAME}" ] || \
+       ! printf '%s\n' "${OUTPUT_BINDING_CONTENT}" | \
+         cmp -s - "${OUTPUT_BINDING_NAME}"; then
+        warn "Vendor output binding changed; leaving it untouched: ${REPO_ROOT}/Vendor/${OUTPUT_BINDING_NAME}"
+        return 0
+    fi
+    if ! rm -f -- "${OUTPUT_BINDING_NAME}"; then
+        warn "Could not remove Vendor output binding: ${REPO_ROOT}/Vendor/${OUTPUT_BINDING_NAME}"
+    fi
+    ) || true
+    OUTPUT_BINDING_HELD=no
+    return 0
+}
+
+verify_managed_build_directory() {
+    if [ "${EXTERNAL_BUILD_ROOT}" != yes ]; then
+        return
+    fi
+    if [ -L "${BUILD_DIR}" ]; then
+        error "Refusing symlinked managed build directory: ${BUILD_DIR_DISPLAY}"
+    fi
+    if [ ! -e "${BUILD_DIR}" ]; then
+        return
+    fi
+    if [ ! -d "${BUILD_DIR}" ]; then
+        error "Managed build path is not a directory: ${BUILD_DIR_DISPLAY}"
+    fi
+    if [ -L "${BUILD_DIR}/${BUILD_DIRECTORY_MARKER}" ] ||
+       [ ! -f "${BUILD_DIR}/${BUILD_DIRECTORY_MARKER}" ]; then
+        error "Refusing unowned external build directory: ${BUILD_DIR_DISPLAY}"
+    fi
+    if ! printf '%s\n' "${BUILD_DIRECTORY_MARKER_CONTENT}" | \
+         cmp -s - "${BUILD_DIR}/${BUILD_DIRECTORY_MARKER}"; then
+        error "Refusing unowned external build directory: ${BUILD_DIR_DISPLAY}"
+    fi
+}
+
+release_build_root_lock() {
+    if [ "${BUILD_LOCK_HELD}" != yes ]; then
+        return 0
+    fi
+    # Release only the exact generation acquired by this invocation. The
+    # helper retains and validates both the anchored parent descriptor and the
+    # opened lock directory, so path replacement cannot retire a successor.
+    if ! PYTHONDONTWRITEBYTECODE=1 python3 \
+        "${SCRIPT_DIR}/detach-managed-build-directory.py" lock-release \
+        --root-fd "${BUILD_LOCK_PARENT_FD}" \
+        --child "${BUILD_LOCK_DIR}" \
+        --token-name "${LOCK_TOKEN_NAME}" \
+        --token-content "${BUILD_LOCK_TOKEN_CONTENT}"; then
+        warn "Could not remove external build-root lock: ${BUILD_LOCK_DISPLAY}"
+    fi
+    BUILD_LOCK_HELD=no
+    return 0
+}
+
+close_build_lock_parent() {
+    if [ "${BUILD_LOCK_PARENT_FD_OPEN}" != yes ]; then
+        return 0
+    fi
+    exec 8<&-
+    BUILD_LOCK_PARENT_FD_OPEN=no
+    return 0
+}
+
+acquire_build_root_lock() {
+    if [ "${EXTERNAL_BUILD_ROOT}" != yes ]; then
+        return
+    fi
+    if ! exec 8<.; then
+        error "Could not anchor external build-root lock parent: ${BUILD_ROOT_DISPLAY}"
+    fi
+    BUILD_LOCK_PARENT_FD_OPEN=yes
+    if ! PYTHONDONTWRITEBYTECODE=1 python3 \
+        "${SCRIPT_DIR}/detach-managed-build-directory.py" lock-acquire \
+        --root-fd "${BUILD_LOCK_PARENT_FD}" \
+        --child "${BUILD_LOCK_DIR}" \
+        --token-name "${LOCK_TOKEN_NAME}" \
+        --token-content "${BUILD_LOCK_TOKEN_CONTENT}"; then
+        error "External build root is locked or has preserved lock state; verify no build is active and inspect this exact managed lock: ${BUILD_LOCK_DISPLAY}"
+    fi
+    BUILD_LOCK_HELD=yes
+}
+
+reject_stale_managed_build_state() {
+    local candidate
+    local candidate_name
+    local quarantine_pattern
+    if [ "${EXTERNAL_BUILD_ROOT}" = yes ]; then
+        quarantine_pattern=./.swiftvlc-libvlc-build.removing-\*
+    else
+        quarantine_pattern=./.build-libvlc.removing-\*
+    fi
+    (
+    cd "${BUILD_ROOT_HELPER}"
+    for candidate in \
+        ${quarantine_pattern} \
+        ./.swiftvlc-lock.initializing-* \
+        ./.swiftvlc-managed-build.initializing-*; do
+        if [ ! -e "${candidate}" ] && [ ! -L "${candidate}" ]; then
+            continue
+        fi
+        candidate_name=${candidate#./}
+        error "Found preserved managed-build state: ${BUILD_ROOT_DISPLAY}/${candidate_name}. Inspect and recover or remove this exact path before retrying; it is never deleted automatically."
+    done
+    )
+    return 0
+}
+
+release_output_lock() {
+    if [ "${OUTPUT_LOCK_HELD}" != yes ]; then
+        return 0
+    fi
+    # Keep the Git lock-parent descriptor opened before an external build
+    # re-anchors the shell elsewhere. Descriptor-relative removal cannot be
+    # redirected into a replacement checkout or linked-worktree metadata path.
+    if ! PYTHONDONTWRITEBYTECODE=1 python3 \
+        "${SCRIPT_DIR}/detach-managed-build-directory.py" lock-release \
+        --root-fd "${OUTPUT_LOCK_PARENT_FD}" \
+        --child "${OUTPUT_LOCK_NAME}" \
+        --token-name "${LOCK_TOKEN_NAME}" \
+        --token-content "${OUTPUT_LOCK_TOKEN_CONTENT}"; then
+        warn "Could not remove checkout artifact lock: ${OUTPUT_LOCK_DISPLAY}"
+    fi
+    OUTPUT_LOCK_HELD=no
+    return 0
+}
+
+close_output_lock_parent() {
+    if [ "${OUTPUT_LOCK_PARENT_FD_OPEN}" != yes ]; then
+        return 0
+    fi
+    exec 9<&-
+    OUTPUT_LOCK_PARENT_FD_OPEN=no
+    return 0
+}
+
+release_build_locks() {
+    release_output_binding || true
+    release_output_lock || true
+    release_build_root_lock || true
+    close_build_lock_parent || true
+    close_output_lock_parent || true
+    return 0
+}
+
+acquire_output_lock() {
+    local raw_lock_path
+    local lock_parent
+    if [ "$(/bin/pwd -P)" != "${SCRIPT_DIR}" ]; then
+        error "Checkout output lock must be anchored before leaving the scripts directory."
+    fi
+    raw_lock_path=$(git -C . rev-parse --git-path swiftvlc-libvlc-output.lock)
+    case "${raw_lock_path}" in
+        /*) ;;
+        *) raw_lock_path="${SCRIPT_DIR}/${raw_lock_path}" ;;
+    esac
+    lock_parent=$(cd "$(dirname "${raw_lock_path}")" && /bin/pwd -P)
+    OUTPUT_LOCK_NAME=$(basename "${raw_lock_path}")
+    OUTPUT_LOCK_DISPLAY="${lock_parent}/${OUTPUT_LOCK_NAME}"
+    OUTPUT_LOCK_DIR="${OUTPUT_LOCK_DISPLAY}"
+    if ! exec 9<"${lock_parent}"; then
+        error "Could not anchor checkout artifact-lock parent: ${lock_parent}"
+    fi
+    OUTPUT_LOCK_PARENT_FD_OPEN=yes
+    if ! PYTHONDONTWRITEBYTECODE=1 python3 \
+        "${SCRIPT_DIR}/detach-managed-build-directory.py" lock-acquire \
+        --root-fd "${OUTPUT_LOCK_PARENT_FD}" \
+        --child "${OUTPUT_LOCK_NAME}" \
+        --token-name "${LOCK_TOKEN_NAME}" \
+        --token-content "${OUTPUT_LOCK_TOKEN_CONTENT}"; then
+        error "This checkout already has a native build or cleanup in progress, or preserved lock state; verify no build is active and inspect this exact managed lock: ${OUTPUT_LOCK_DISPLAY}"
+    fi
+    OUTPUT_LOCK_HELD=yes
+}
+
+initialize_managed_build_directory() {
+    if [ "${CLEAN_BUILD}" = yes ]; then
+        if ! managed_build_directory_helper initialize --require-new \
+            --binding-name "${BUILD_BINDING_NAME}" \
+            --binding-content "${BUILD_BINDING_CONTENT}"; then
+            error "Could not exclusively initialize a fresh managed build directory: ${BUILD_DIR_DISPLAY}"
+        fi
+    elif ! managed_build_directory_helper initialize \
+        --binding-name "${BUILD_BINDING_NAME}" \
+        --binding-content "${BUILD_BINDING_CONTENT}"; then
+        error "Could not safely initialize managed build directory: ${BUILD_DIR_DISPLAY}"
+    fi
+}
+
+verify_checkout_path_not_embedded() {
+    if [ "${EXTERNAL_BUILD_ROOT}" != yes ]; then
+        return
+    fi
+    PYTHONDONTWRITEBYTECODE=1 python3 \
+        "${SCRIPT_DIR}/verify-libvlc-build-paths.py" \
+        --xcframework "${OUTPUT_DIR}/libvlc.xcframework" \
+        --forbidden-path "${REPO_ROOT}"
+}
+
+trap release_build_locks EXIT
 
 # --- Error trap for better failure reporting ---
 # Install only after `error` and its formatting dependencies are defined so a
@@ -204,7 +602,7 @@ check_disk_space() {
         required_gb=40
     fi
     local available_kb
-    available_kb=$(df -k "$SCRIPT_DIR" | awk 'NR==2 {print $4}')
+    available_kb=$(df -k "$BUILD_ROOT" | awk 'NR==2 {print $4}')
     local available_gb=$((available_kb / 1024 / 1024))
 
     if [ "$available_gb" -lt "$required_gb" ]; then
@@ -218,16 +616,49 @@ check_disk_space() {
 # Clean builds must start from an absent tree, so retry the whole removal and
 # fail closed if any writer keeps repopulating it.
 remove_build_directory() {
-    local attempt
-    for attempt in 1 2 3 4 5; do
-        if rm -rf "${BUILD_DIR}" && [ ! -e "${BUILD_DIR}" ]; then
-            return
+    local cleanup_status
+
+    # Verification and deletion cannot safely share the public pathname. The
+    # helper opens and verifies the exact directory, atomically renames it
+    # beneath a private quarantine, then keeps that original descriptor live
+    # while walking and unlinking entries relative to directory FDs. Use this
+    # for both external and legacy checkout-local roots; neither path gets a
+    # recursive shell fallback.
+    if managed_build_directory_helper clean \
+        --quarantine "${BUILD_QUARANTINE_NAME}"; then
+        cleanup_status=0
+    else
+        cleanup_status=$?
+    fi
+    if [ "${cleanup_status}" -eq 3 ]; then
+        if [ -e "${BUILD_DIR}" ] || [ -L "${BUILD_DIR}" ]; then
+            error "Managed build path appeared during cleanup and was left untouched: ${BUILD_DIR_DISPLAY}"
         fi
-        warn "Build directory cleanup did not settle (attempt ${attempt}/5); retrying..."
-        sleep 1
-    done
-    error "Could not completely remove build directory after 5 attempts: ${BUILD_DIR}"
+        return 0
+    fi
+    if [ "${cleanup_status}" -ne 0 ]; then
+        error "Could not safely clean managed build directory; any detached data was preserved for inspection: ${BUILD_QUARANTINE_DIR}"
+    fi
+    if [ -e "${BUILD_DIR}" ] || [ -L "${BUILD_DIR}" ]; then
+        error "Managed build path reappeared during cleanup and was left untouched: ${BUILD_DIR_DISPLAY}"
+    fi
+    return 0
 }
+
+# Resolve this before processing --clean/--clean-build: cleanup must never
+# depend on option order. Reject duplicates rather than silently selecting one
+# root and deleting another caller's managed directory.
+for arg in "$@"; do
+    case $arg in
+        --build-root=*)
+            if [ "${BUILD_ROOT_OVERRIDE_SET}" = yes ]; then
+                error "--build-root may be specified only once."
+            fi
+            BUILD_ROOT_OVERRIDE="${arg#--build-root=}"
+            BUILD_ROOT_OVERRIDE_SET=yes
+            ;;
+    esac
+done
 
 # --- Parse arguments ---
 for arg in "$@"; do
@@ -287,16 +718,10 @@ for arg in "$@"; do
             BUILD_CATALYST=yes
             ;;
         --clean)
-            echo "Removing build directory: ${BUILD_DIR}"
-            remove_build_directory
-            echo "Done."
-            exit 0
+            CLEAN_ONLY=yes
             ;;
         --clean-build)
-            echo "Removing build directory: ${BUILD_DIR}"
-            remove_build_directory
             CLEAN_BUILD=yes
-            echo "Continuing with fresh build..."
             ;;
         --with-asserts)
             WITH_ASSERTS=yes
@@ -310,10 +735,18 @@ for arg in "$@"; do
             ;;
         --patches-dir=*)
             PATCHES_DIR="${arg#--patches-dir=}"
+            case "${PATCHES_DIR}" in
+                /*) ;;
+                *) PATCHES_DIR="${INVOCATION_DIRECTORY}/${PATCHES_DIR}" ;;
+            esac
             if [ ! -d "$PATCHES_DIR" ]; then
                 echo "Error: Patches directory not found: ${PATCHES_DIR}" >&2
                 exit 1
             fi
+            ;;
+        --build-root=*)
+            # Resolved before this loop so --clean is safe regardless of
+            # argument order.
             ;;
         --help)
             cat <<HELPEOF
@@ -334,6 +767,9 @@ Platform selection:
 Build options:
   --clean            Remove the build directory and exit
   --clean-build      Remove the build directory, then build
+  --build-root=DIR   Use DIR/swiftvlc-libvlc-build as the canonical external
+                     working directory. DIR must already exist, be outside
+                     this checkout, and be identical for both release builds.
   --hash=COMMIT      Pin to a specific VLC commit (default: ${VLC_HASH})
   --patches-dir=DIR  Directory containing .patch files to apply
   --with-asserts     Enable libVLC run-time assertions (debugging only; these
@@ -348,7 +784,7 @@ Examples:
   $0 --macos-only             # Quick macOS build for development
   $0 --all                    # Full build for all platforms
   $0 --hash=abc123 --all      # Build all platforms from a specific commit
-  $0 --clean-build --all      # Fresh build for all platforms
+  $0 --build-root=/Volumes/Builds --clean-build --all
 HELPEOF
             exit 0
             ;;
@@ -359,6 +795,69 @@ HELPEOF
             ;;
     esac
 done
+
+if [ "${CLEAN_ONLY}" = yes ] && [ "${CLEAN_BUILD}" = yes ]; then
+    error "--clean and --clean-build cannot be used together."
+fi
+if [ "${CLEAN_BUILD}" = yes ] && [ "${BUILD_ROOT_OVERRIDE_SET}" != yes ]; then
+    error "--clean-build requires a canonical external --build-root so release builds cannot depend on a checkout-local path."
+fi
+
+# Every native invocation that can delete its work tree or replace Vendor must
+# own this checkout's artifact lock. Acquire it while the shell is still in its
+# original scripts-directory CWD, and retain the Git lock-parent descriptor so
+# linked-worktree or checkout path replacement cannot redirect its release.
+acquire_output_lock
+
+# Bind the original checkout's Vendor generation before an external build root
+# changes the parent shell's CWD. Later absolute-path entry must present this
+# exact invocation token; a renamed/replaced checkout therefore fails closed
+# instead of minting authority in the replacement tree.
+if [ "${CLEAN_ONLY}" != yes ]; then
+    if ! (
+        cd -P ..
+        if [ "$(/bin/pwd -P)" != "${REPO_ROOT}" ]; then
+            error "SwiftVLC checkout path changed before Vendor could be anchored."
+        fi
+        for preserved_checkout_state in \
+            ./.swiftvlc-managed-build.initializing-*; do
+            if [ -e "${preserved_checkout_state}" ] || \
+               [ -L "${preserved_checkout_state}" ]; then
+                error "Found preserved checkout publication state: ${preserved_checkout_state}. Inspect and recover or remove it before retrying."
+            fi
+        done
+        if ! bind_directory_for_handoff \
+            . Vendor \
+            "${OUTPUT_BINDING_NAME}" "${OUTPUT_BINDING_CONTENT}" \
+            --create; then
+            error "Could not safely anchor the original checkout Vendor output directory."
+        fi
+    ); then
+        error "Could not establish original checkout continuity for native output."
+    fi
+    OUTPUT_BINDING_HELD=yes
+fi
+
+# Only now may external mode re-anchor the parent at its canonical build root.
+# The checkout output lock and Vendor token above remain tied to the original
+# checkout while the build-root lock remains tied to this new live CWD.
+if [ "${BUILD_ROOT_OVERRIDE_SET}" = yes ]; then
+    configure_external_build_root "${BUILD_ROOT_OVERRIDE}"
+    acquire_build_root_lock
+    reject_stale_managed_build_state
+    verify_managed_build_directory
+    info "Canonical external build root: ${BUILD_ROOT_DISPLAY}"
+    info "Managed native build directory: ${BUILD_DIR_DISPLAY}"
+else
+    reject_stale_managed_build_state
+fi
+
+if [ "${CLEAN_ONLY}" = yes ]; then
+    echo "Removing build directory: ${BUILD_DIR_DISPLAY}"
+    remove_build_directory
+    echo "Done."
+    exit 0
+fi
 
 # Record the exact SwiftVLC commit whose build logic and vendored headers are
 # producing this artifact. A short or symbolic revision would allow a stale
@@ -389,6 +888,9 @@ verify_clean_swiftvlc_checkout() {
 # appear in this check.
 if [ "${CLEAN_BUILD}" = yes ]; then
     verify_clean_swiftvlc_checkout
+    echo "Removing build directory: ${BUILD_DIR_DISPLAY}"
+    remove_build_directory
+    echo "Continuing with fresh build..."
 fi
 
 # --- Run startup checks ---
@@ -400,13 +902,29 @@ fi
 check_disk_space
 
 # Any new native build invalidates the previous two-build evidence immediately.
+# Re-enter the public Vendor path only after the early original-checkout bind:
+# a checkout replacement cannot present this invocation's continuity token.
 # Do this before source setup/compilation so an interrupted replacement cannot
 # leave an older A record or proof looking current beside the prior artifact.
-mkdir -p "${OUTPUT_DIR}"
-rm -f "${OUTPUT_DIR}/libvlc-provenance-a.json" \
-    "${OUTPUT_DIR}/libvlc-provenance.json" \
-    "${OUTPUT_DIR}/libvlc-reproducibility.json" \
-    "${OUTPUT_DIR}/libvlc-macho-metadata.json"
+(
+cd "${OUTPUT_DIR}"
+verify_directory_binding \
+    "${OUTPUT_BINDING_NAME}" "${OUTPUT_BINDING_CONTENT}" \
+    "Checkout Vendor output directory"
+for preserved_output_state in \
+    ./.swiftvlc-native-output-publishing-* \
+    ./.swiftvlc-published-artifact.removing-* \
+    ./.swiftvlc-managed-build.initializing-* \
+    "./libvlc.xcframework/${PUBLISHED_ARTIFACT_REMOVAL_BINDING_NAME}"; do
+    if [ -e "${preserved_output_state}" ] || [ -L "${preserved_output_state}" ]; then
+        error "Found preserved Vendor publication state: ${preserved_output_state}. Inspect and recover or remove it before retrying."
+    fi
+done
+rm -f ./libvlc-provenance-a.json \
+    ./libvlc-provenance.json \
+    ./libvlc-reproducibility.json \
+    ./libvlc-macho-metadata.json
+)
 
 # Normalize architecture name for directory naming
 # VLC's build.sh accepts "aarch64" but creates "arm64" directories internally
@@ -699,19 +1217,87 @@ PYEOF
     info "VLC build system patched for Mac Catalyst"
 }
 
+# Keep the lock-owning parent shell anchored at the external root. The native
+# body runs in a child shell whose CWD becomes the exact managed directory;
+# its path and CWD changes therefore cannot redirect the parent's EXIT cleanup.
+(
+trap - EXIT
+trap 'error "Native build body failed at line $LINENO (exit code $?)"' ERR
+
 # --- Step 1: Clone VLC source ---
 info "Setting up VLC source..."
-mkdir -p "${BUILD_DIR}"
+initialize_managed_build_directory
+# Enter the exact child initialized through a no-follow root descriptor, then
+# require its one-use binding. This protects both external release roots and
+# the legacy checkout-local developer root; neither path relies on a bare
+# mkdir/marker check before native mutations begin.
 cd "${BUILD_DIR}"
+if [ -L "${BUILD_DIRECTORY_MARKER}" ] || \
+   [ ! -f "${BUILD_DIRECTORY_MARKER}" ] || \
+   ! printf '%s\n' "${BUILD_DIRECTORY_MARKER_CONTENT}" | \
+     cmp -s - "${BUILD_DIRECTORY_MARKER}"; then
+    error "Managed build directory changed before it could be anchored: ${BUILD_DIR_DISPLAY}"
+fi
+retire_directory_binding \
+    "${BUILD_BINDING_NAME}" "${BUILD_BINDING_CONTENT}" \
+    "Managed build directory"
+BUILD_DIR="."
 
-if [ ! -d "vlc" ]; then
+# A managed root authorizes its own files, but never a symlink or filesystem
+# mounted beneath its `vlc` entry. The helper creates a one-use binding in the
+# exact no-follow directory it opened; validating that binding after `cd`
+# bridges the remaining pathname race. All subsequent source mutations stay
+# relative to this live source-directory CWD.
+VLC_SOURCE_WAS_CLONED=no
+if [ -L vlc ]; then
+    error "Refusing a symlinked VLC source directory: ${BUILD_DIR_DISPLAY}/vlc"
+elif [ ! -e vlc ]; then
     info "Cloning VLC from ${VLC_REPO}..."
     git clone "${VLC_REPO}" --branch "${VLC_BRANCH}" --single-branch vlc
-    cd vlc
+    VLC_SOURCE_WAS_CLONED=yes
+elif [ ! -d vlc ]; then
+    error "VLC source path is not a directory: ${BUILD_DIR_DISPLAY}/vlc"
+fi
+if ! bind_directory_for_handoff \
+    . vlc "${VLC_SOURCE_BINDING_NAME}" "${VLC_SOURCE_BINDING_CONTENT}"; then
+    error "Could not safely anchor the managed VLC source directory."
+fi
+cd vlc
+retire_directory_binding \
+    "${VLC_SOURCE_BINDING_NAME}" "${VLC_SOURCE_BINDING_CONTENT}" \
+    "Managed VLC source directory"
+VLC_SOURCE_DIRECTORY=$(/bin/pwd -P)
+NATIVE_BUILD_PARENT=$(cd -P .. && /bin/pwd -P)
+if [ "${EXTERNAL_BUILD_ROOT}" = yes ]; then
+    if [ "${NATIVE_BUILD_PARENT}" != "${BUILD_DIR_DISPLAY}" ] || \
+       [ "${VLC_SOURCE_DIRECTORY}" != "${BUILD_DIR_DISPLAY}/vlc" ]; then
+        error "Managed native paths changed after they were anchored."
+    fi
+fi
+# Keep generated libraries, validators, and release staging beneath this same
+# anchored source CWD. Nothing later relies on `..`, whose parent relation
+# could change if a non-cooperating process renamed the source directory.
+BUILD_DIR="."
+VLC_SRC="."
+NATIVE_BUILD_DIRECTORY="${VLC_SOURCE_DIRECTORY}"
+
+# A killed helper deliberately preserves state instead of guessing whether a
+# pathname still identifies its original directory. Surface those exact
+# source-root remnants before any new output stage can hide them among a
+# multi-gigabyte VLC tree.
+for preserved_source_state in \
+    ./.swiftvlc-native-output \
+    ./.swiftvlc-native-output.removing-* \
+    ./.swiftvlc-managed-build.initializing-*; do
+    if [ -e "${preserved_source_state}" ] || \
+       [ -L "${preserved_source_state}" ]; then
+        error "Found preserved native output state: ${preserved_source_state}. Inspect and recover or remove it before retrying."
+    fi
+done
+
+if [ "${VLC_SOURCE_WAS_CLONED}" = yes ]; then
     git checkout -B build "${VLC_HASH}"
-    cd ..
 else
-    cd vlc
     # Only reset the whole checkout if HEAD isn't already at the pinned commit.
     # Step 1b verifies the exact ordered patch result and restores only
     # mismatching patch-owned paths, preserving source mtimes, unrelated
@@ -731,10 +1317,7 @@ else
     else
         info "VLC source already at ${VLC_HASH}"
     fi
-    cd ..
 fi
-
-VLC_SRC="${BUILD_DIR}/vlc"
 
 # Resolve the requested revision to a full commit ID before applying any
 # uncommitted source patches. This keeps build logs auditable even when VLC_HASH
@@ -853,8 +1436,6 @@ if [ -n "${PATCHES_DIR}" ] && [ -d "${PATCHES_DIR}" ]; then
        [ "$CLEAN_BUILD" != yes ]; then
         error "Patch 0039 requires --clean-build; cached libaom configuration or objects cannot be reused."
     fi
-    cd "${VLC_SRC}"
-
     # Ordered patches can intentionally overlap (0003 refines code introduced
     # by 0002), which makes a per-patch reverse-check ambiguous on a subsequent
     # run. Build the expected final tree in a temporary Git index first. If the
@@ -1016,7 +1597,6 @@ if [ -n "${PATCHES_DIR}" ] && [ -d "${PATCHES_DIR}" ]; then
         info "Validating Chromecast music metadata and one-shot warnings..."
         "${SCRIPT_DIR}/validate-chromecast-metadata-warning.sh" "${VLC_SRC}"
     fi
-    cd "${BUILD_DIR}"
 fi
 
 # The ordered manifest, rather than whichever checked-in header happens to be
@@ -1551,11 +2131,16 @@ patch_vlc_disable_rust
 
 # --- Step 2: Build tools ---
 info "Building VLC build tools..."
-export PATH="${VLC_SRC}/extras/tools/build/bin:$PATH"
+HOST_BUILD_PATH="$PATH"
+(
 cd "${VLC_SRC}/extras/tools"
+TOOLS_SOURCE_DIRECTORY=$(/bin/pwd -P)
+export PATH="${TOOLS_SOURCE_DIRECTORY}/build/bin:${HOST_BUILD_PATH}"
 ./bootstrap
 make ${MAKEFLAGS}
-cd "${BUILD_DIR}"
+)
+VLC_TOOLS_BIN=$(cd "${VLC_SRC}/extras/tools/build/bin" && /bin/pwd -P)
+export PATH="${VLC_TOOLS_BIN}:${HOST_BUILD_PATH}"
 
 # Patches 0028/0034's linked gates use the tools produced above. Run them
 # before any platform compile so malformed Cast JSON handling, unreachable
@@ -1615,15 +2200,16 @@ compile_libvlc() {
     # This matches what VLC's build.sh creates internally
     local BUILDDIR="${VLC_SRC}/build-${PLATFORM}-${ACTUAL_ARCH}"
     mkdir -p "${BUILDDIR}"
+    (
     cd "${BUILDDIR}"
 
-    "${VLC_SRC}/extras/package/apple/build.sh" \
+    PATH="${VLC_TOOLS_BIN}:${HOST_BUILD_PATH}" \
+    "../extras/package/apple/build.sh" \
         --arch="${ARCH}" \
         --sdk="${PLATFORM}${SDK_VERSION}" \
         "${VLC_DEBUG_ARGS[@]}" \
         ${MAKEFLAGS}
-
-    cd "${BUILD_DIR}"
+    )
 
     local platform_end=$(date +%s)
     local platform_secs=$((platform_end - platform_start))
@@ -1647,16 +2233,17 @@ compile_libvlc_catalyst() {
     # Use a separate build directory to avoid colliding with native macOS builds
     local BUILDDIR="${VLC_SRC}/build-maccatalyst-${ACTUAL_ARCH}"
     mkdir -p "${BUILDDIR}"
+    (
     cd "${BUILDDIR}"
 
-    "${VLC_SRC}/extras/package/apple/build.sh" \
+    PATH="${VLC_TOOLS_BIN}:${HOST_BUILD_PATH}" \
+    "../extras/package/apple/build.sh" \
         --arch="${ARCH}" \
         --sdk="macosx${SDK_VERSION}" \
         --catalyst \
         "${VLC_DEBUG_ARGS[@]}" \
         ${MAKEFLAGS}
-
-    cd "${BUILD_DIR}"
+    )
 
     local platform_end=$(date +%s)
     local platform_secs=$((platform_end - platform_start))
@@ -1700,8 +2287,8 @@ if [ "$BUILD_IOS" = "yes" ]; then
     cp "${VLC_SRC}/build-iphoneos-arm64/static-lib/libvlc-full-static.a" \
        "${BUILD_DIR}/libs/ios-device/libvlc.a"
 
-    XCFRAMEWORK_ARGS+=(-library "${BUILD_DIR}/libs/ios-device/libvlc.a" -headers "${REPO_ROOT}/Sources/CLibVLC/include")
-    XCFRAMEWORK_ARGS+=(-library "${BUILD_DIR}/libs/ios-simulator/libvlc.a" -headers "${REPO_ROOT}/Sources/CLibVLC/include")
+    XCFRAMEWORK_ARGS+=(-library "${NATIVE_BUILD_DIRECTORY}/libs/ios-device/libvlc.a" -headers "${REPO_ROOT}/Sources/CLibVLC/include")
+    XCFRAMEWORK_ARGS+=(-library "${NATIVE_BUILD_DIRECTORY}/libs/ios-simulator/libvlc.a" -headers "${REPO_ROOT}/Sources/CLibVLC/include")
 fi
 
 if [ "$BUILD_TVOS" = "yes" ]; then
@@ -1719,8 +2306,8 @@ if [ "$BUILD_TVOS" = "yes" ]; then
     cp "${VLC_SRC}/build-appletvos-arm64/static-lib/libvlc-full-static.a" \
        "${BUILD_DIR}/libs/tvos-device/libvlc.a"
 
-    XCFRAMEWORK_ARGS+=(-library "${BUILD_DIR}/libs/tvos-device/libvlc.a" -headers "${REPO_ROOT}/Sources/CLibVLC/include")
-    XCFRAMEWORK_ARGS+=(-library "${BUILD_DIR}/libs/tvos-simulator/libvlc.a" -headers "${REPO_ROOT}/Sources/CLibVLC/include")
+    XCFRAMEWORK_ARGS+=(-library "${NATIVE_BUILD_DIRECTORY}/libs/tvos-device/libvlc.a" -headers "${REPO_ROOT}/Sources/CLibVLC/include")
+    XCFRAMEWORK_ARGS+=(-library "${NATIVE_BUILD_DIRECTORY}/libs/tvos-simulator/libvlc.a" -headers "${REPO_ROOT}/Sources/CLibVLC/include")
 fi
 
 if [ "$BUILD_VISIONOS" = "yes" ]; then
@@ -1738,8 +2325,8 @@ if [ "$BUILD_VISIONOS" = "yes" ]; then
     cp "${VLC_SRC}/build-xros-arm64/static-lib/libvlc-full-static.a" \
        "${BUILD_DIR}/libs/visionos-device/libvlc.a"
 
-    XCFRAMEWORK_ARGS+=(-library "${BUILD_DIR}/libs/visionos-device/libvlc.a" -headers "${REPO_ROOT}/Sources/CLibVLC/include")
-    XCFRAMEWORK_ARGS+=(-library "${BUILD_DIR}/libs/visionos-simulator/libvlc.a" -headers "${REPO_ROOT}/Sources/CLibVLC/include")
+    XCFRAMEWORK_ARGS+=(-library "${NATIVE_BUILD_DIRECTORY}/libs/visionos-device/libvlc.a" -headers "${REPO_ROOT}/Sources/CLibVLC/include")
+    XCFRAMEWORK_ARGS+=(-library "${NATIVE_BUILD_DIRECTORY}/libs/visionos-simulator/libvlc.a" -headers "${REPO_ROOT}/Sources/CLibVLC/include")
 fi
 
 if [ "$BUILD_MACOS" = "yes" ]; then
@@ -1752,7 +2339,7 @@ if [ "$BUILD_MACOS" = "yes" ]; then
         "${VLC_SRC}/build-macosx-x86_64/static-lib/libvlc-full-static.a" \
         -create -output "${BUILD_DIR}/libs/macos/libvlc.a"
 
-    XCFRAMEWORK_ARGS+=(-library "${BUILD_DIR}/libs/macos/libvlc.a" -headers "${REPO_ROOT}/Sources/CLibVLC/include")
+    XCFRAMEWORK_ARGS+=(-library "${NATIVE_BUILD_DIRECTORY}/libs/macos/libvlc.a" -headers "${REPO_ROOT}/Sources/CLibVLC/include")
 fi
 
 if [ "$BUILD_CATALYST" = "yes" ]; then
@@ -1768,7 +2355,7 @@ if [ "$BUILD_CATALYST" = "yes" ]; then
         "${VLC_SRC}/build-maccatalyst-x86_64/static-lib/libvlc-full-static.a" \
         -create -output "${BUILD_DIR}/libs/maccatalyst/libvlc.a"
 
-    XCFRAMEWORK_ARGS+=(-library "${BUILD_DIR}/libs/maccatalyst/libvlc.a" -headers "${REPO_ROOT}/Sources/CLibVLC/include")
+    XCFRAMEWORK_ARGS+=(-library "${NATIVE_BUILD_DIRECTORY}/libs/maccatalyst/libvlc.a" -headers "${REPO_ROOT}/Sources/CLibVLC/include")
 fi
 
 # --- Step 4: Create XCFramework ---
@@ -1776,14 +2363,44 @@ if [ ${#XCFRAMEWORK_ARGS[@]} -eq 0 ]; then
     error "No platforms were built. Use --macos, --ios-only, --tvos-only, --visionos-only, --catalyst-only, --tvos, --visionos, --macos, --catalyst, or --all"
 fi
 
+# Build and validate the complete release payload beneath the already-anchored
+# VLC source CWD. Vendor is touched again only during the final bound publish,
+# so replacing the checkout path during a long native build cannot redirect
+# any intermediate deletion or mutation.
+STAGED_OUTPUT_CHILD=".swiftvlc-native-output"
+if [ -e "${STAGED_OUTPUT_CHILD}" ] || [ -L "${STAGED_OUTPUT_CHILD}" ]; then
+    error "Stable native output staging path already exists; inspect or clean the managed build before retrying: ${STAGED_OUTPUT_CHILD}"
+fi
+if ! PYTHONDONTWRITEBYTECODE=1 python3 \
+    "${SCRIPT_DIR}/detach-managed-build-directory.py" initialize \
+    --root . \
+    --child "${STAGED_OUTPUT_CHILD}" \
+    --marker-name "${STAGED_OUTPUT_MARKER}" \
+    --marker-content "${STAGED_OUTPUT_MARKER_CONTENT}" \
+    --binding-name "${STAGED_OUTPUT_BINDING_NAME}" \
+    --binding-content "${STAGED_OUTPUT_BINDING_CONTENT}" \
+    --require-new; then
+    error "Could not create stable native output staging directory."
+fi
+PUBLISHED_OUTPUT_DIR="${REPO_ROOT}/Vendor"
+(
+cd "${STAGED_OUTPUT_CHILD}"
+verify_directory_binding \
+    "${STAGED_OUTPUT_BINDING_NAME}" "${STAGED_OUTPUT_BINDING_CONTENT}" \
+    "Native output staging directory"
+STAGED_OUTPUT_DIRECTORY=$(/bin/pwd -P)
+if [ "${STAGED_OUTPUT_DIRECTORY}" != \
+     "${VLC_SOURCE_DIRECTORY}/${STAGED_OUTPUT_CHILD}" ]; then
+    error "Native output staging path changed before it was anchored."
+fi
+OUTPUT_DIR="."
+# The output phase remains in its own anchored CWD. Source inputs use the
+# physical path captured while the parent shell was still anchored in VLC.
+VLC_SRC="${VLC_SOURCE_DIRECTORY}"
+BUILD_DIR="${NATIVE_BUILD_DIRECTORY}"
+
 info "Creating libvlc.xcframework..."
-mkdir -p "${OUTPUT_DIR}"
 MACHO_METADATA_REPORT="${OUTPUT_DIR}/libvlc-macho-metadata.json"
-rm -f "${OUTPUT_DIR}/libvlc-provenance-a.json" \
-    "${OUTPUT_DIR}/libvlc-provenance.json" \
-    "${OUTPUT_DIR}/libvlc-reproducibility.json" \
-    "${MACHO_METADATA_REPORT}"
-rm -rf "${OUTPUT_DIR}/libvlc.xcframework"
 
 xcodebuild -create-xcframework \
     "${XCFRAMEWORK_ARGS[@]}" \
@@ -1971,6 +2588,15 @@ find "${OUTPUT_DIR}/libvlc.xcframework" -name '*.a' -exec strip -S {} \;
 info "Normalizing archive indexes after stripping..."
 find "${OUTPUT_DIR}/libvlc.xcframework" -name '*.a' -exec xcrun ranlib -D {} \;
 
+# The external working root is intentionally stable across clean builds, but
+# the two SwiftVLC checkout paths must remain independent. Reject any future
+# build-system change that copies a checkout-local absolute path into a shipped
+# library or header; such a leak would make the proof location-dependent again.
+if [ "${EXTERNAL_BUILD_ROOT}" = yes ]; then
+    info "Verifying that the release artifact contains no checkout-local paths..."
+    verify_checkout_path_not_embedded
+fi
+
 # Re-evaluate the manifest-owned identity across every exact archive after the
 # final archive mutation. The central gate inspects every declared architecture
 # and additionally executes its probe when a host-runnable macOS slice exists.
@@ -2013,8 +2639,9 @@ info "Verified every Mach-O object; report: ${MACHO_METADATA_REPORT}"
 #
 # Provenance is deliberately written only after the complete per-object metadata
 # gate passes. The artifact is also stripped above, before hashing, so the two-
-# clean-build proof covers the exact tree release.sh packages; no post-proof
-# rebind is permitted.
+# clean-build proof covers the exact tree release.sh packages. Final publication
+# copies that immutable tree into an invocation-private Vendor staging directory
+# and verifies the provenance tree digest again before replacing the old output.
 if [ "${CLEAN_BUILD}" = yes ]; then
     # Recheck after compilation so a checkout edit or branch move during the
     # long build cannot be attributed to the revision captured at startup.
@@ -2032,8 +2659,10 @@ provenance_args=(
     --source-date-epoch "${SOURCE_DATE_EPOCH}"
     --build-invocation-id "${BUILD_INVOCATION_ID}"
     --build-configuration-file "build-libvlc.sh=${SCRIPT_DIR}/build-libvlc.sh"
+    --build-configuration-file "detach-managed-build-directory.py=${SCRIPT_DIR}/detach-managed-build-directory.py"
     --build-configuration-file "fix-duplicate-symbols.sh=${SCRIPT_DIR}/fix-duplicate-symbols.sh"
     --build-configuration-file "validate-libvlc-macho-metadata.py=${SCRIPT_DIR}/validate-libvlc-macho-metadata.py"
+    --build-configuration-file "verify-libvlc-build-paths.py=${SCRIPT_DIR}/verify-libvlc-build-paths.py"
     --build-configuration-file "validate-apple-assembly-metadata-patch.sh=${SCRIPT_DIR}/validate-apple-assembly-metadata-patch.sh"
     --build-configuration-file "validate-aom-nasm3-detection.sh=${SCRIPT_DIR}/validate-aom-nasm3-detection.sh"
     --build-configuration-file "validate-headless-vout-teardown.sh=${SCRIPT_DIR}/validate-headless-vout-teardown.sh"
@@ -2063,11 +2692,156 @@ fi
 "${provenance_args[@]}"
 info "Recorded verified build provenance: ${PROVENANCE_FILE}"
 
+# Publish only the fully validated payload. The helper binds the exact Vendor
+# directory without following a symlink; the publishing shell then stays in
+# that directory and uses only direct relative destinations. A checkout-path
+# replacement therefore cannot redirect deletion into unrelated data.
+if [ "$(/bin/pwd -P)" != "${STAGED_OUTPUT_DIRECTORY}" ]; then
+    error "Native output staging path changed before artifact publication."
+fi
+verify_directory_binding \
+    "${STAGED_OUTPUT_BINDING_NAME}" "${STAGED_OUTPUT_BINDING_CONTENT}" \
+    "Native output staging directory"
+STAGED_OUTPUT_DIRECTORY=$(cd "${OUTPUT_DIR}" && /bin/pwd -P)
+if [ "${STAGED_OUTPUT_DIRECTORY}" != \
+     "${VLC_SOURCE_DIRECTORY}/${STAGED_OUTPUT_CHILD}" ]; then
+    error "Invocation output path changed before publication."
+fi
+STAGED_PROVENANCE_SHA256=$(shasum -a 256 \
+    "${STAGED_OUTPUT_DIRECTORY}/libvlc-provenance.json" | awk '{print $1}')
+STAGED_MACHO_REPORT_SHA256=$(shasum -a 256 \
+    "${STAGED_OUTPUT_DIRECTORY}/libvlc-macho-metadata.json" | awk '{print $1}')
+if ! [[ "${STAGED_PROVENANCE_SHA256}" =~ ^[0-9a-f]{64}$ ]] || \
+   ! [[ "${STAGED_MACHO_REPORT_SHA256}" =~ ^[0-9a-f]{64}$ ]]; then
+    error "Could not capture exact staged-output identities before publication."
+fi
+(
+cd "${REPO_ROOT}/Vendor"
+retire_directory_binding \
+    "${OUTPUT_BINDING_NAME}" "${OUTPUT_BINDING_CONTENT}" \
+    "Checkout Vendor output directory"
+
+PUBLISHING_CHILD=".swiftvlc-native-output-publishing-${BUILD_INVOCATION_ID}"
+if ! bind_directory_for_handoff \
+    . "${PUBLISHING_CHILD}" \
+    "${PUBLISHING_BINDING_NAME}" "${PUBLISHING_BINDING_CONTENT}" \
+    --create; then
+    error "Could not safely initialize the Vendor publication staging directory."
+fi
+(
+cd "${PUBLISHING_CHILD}"
+verify_directory_binding \
+    "${PUBLISHING_BINDING_NAME}" "${PUBLISHING_BINDING_CONTENT}" \
+    "Vendor publication staging directory"
+/usr/bin/ditto \
+    "${STAGED_OUTPUT_DIRECTORY}/libvlc.xcframework" \
+    ./libvlc.xcframework
+cp -p "${STAGED_OUTPUT_DIRECTORY}/libvlc-provenance.json" \
+    ./libvlc-provenance.json
+cp -p "${STAGED_OUTPUT_DIRECTORY}/libvlc-macho-metadata.json" \
+    ./libvlc-macho-metadata.json
+
+# libvlc-provenance.py's tree identity includes entry kinds, permissions,
+# symlink targets, and file bytes. First bind the copied provenance/report to
+# hashes captured while the source CWD was still anchored, then verify the copy
+# against that immutable provenance record. Re-reading a replaceable source
+# pathname can therefore never make two attacker substitutions compare equal.
+PUBLISHED_PROVENANCE_SHA256=$(shasum -a 256 \
+    ./libvlc-provenance.json | awk '{print $1}')
+PUBLISHED_MACHO_REPORT_SHA256=$(shasum -a 256 \
+    ./libvlc-macho-metadata.json | awk '{print $1}')
+if [ "${PUBLISHED_PROVENANCE_SHA256}" != "${STAGED_PROVENANCE_SHA256}" ]; then
+    error "Published provenance record differs from its validated staging input."
+fi
+if [ "${PUBLISHED_MACHO_REPORT_SHA256}" != "${STAGED_MACHO_REPORT_SHA256}" ]; then
+    error "Published Mach-O report differs from its validated staging input."
+fi
+PYTHONDONTWRITEBYTECODE=1 python3 - \
+    "${SCRIPT_DIR}/libvlc-provenance.py" \
+    ./libvlc-provenance.json \
+    ./libvlc.xcframework <<'PYEOF'
+import importlib.util
+import sys
+from pathlib import Path
+
+module_path, provenance_path, published_path = map(Path, sys.argv[1:])
+spec = importlib.util.spec_from_file_location("swiftvlc_provenance", module_path)
+if spec is None or spec.loader is None:
+    raise SystemExit("could not load libVLC provenance implementation")
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+record = module.load_record(provenance_path)
+module.verify_recorded_artifact(record, published_path, "published XCFramework")
+PYEOF
+)
+
+if [ -L ./libvlc.xcframework ]; then
+    # rm of a final symlink removes that one Vendor entry and never follows it.
+    rm -f ./libvlc.xcframework
+elif [ -e ./libvlc.xcframework ]; then
+    if [ ! -d ./libvlc.xcframework ]; then
+        error "Existing Vendor/libvlc.xcframework is not a directory or symlink."
+    fi
+    if ! bind_directory_for_handoff \
+        . libvlc.xcframework \
+        "${PUBLISHED_ARTIFACT_REMOVAL_BINDING_NAME}" \
+        "${PUBLISHED_ARTIFACT_REMOVAL_BINDING_CONTENT}"; then
+        error "Could not safely authorize replacement of the existing XCFramework."
+    fi
+    if ! PYTHONDONTWRITEBYTECODE=1 python3 \
+        "${SCRIPT_DIR}/detach-managed-build-directory.py" clean \
+        --root . \
+        --child libvlc.xcframework \
+        --quarantine ".swiftvlc-published-artifact.removing-${BUILD_INVOCATION_ID}" \
+        --marker-name "${PUBLISHED_ARTIFACT_REMOVAL_BINDING_NAME}" \
+        --marker-content "${PUBLISHED_ARTIFACT_REMOVAL_BINDING_CONTENT}"; then
+        error "Existing XCFramework replacement stopped safely; inspect the preserved Vendor quarantine."
+    fi
+fi
+rm -f ./libvlc-provenance-a.json \
+    ./libvlc-provenance.json \
+    ./libvlc-reproducibility.json \
+    ./libvlc-macho-metadata.json
+# Publish in commit order with atomic no-replace renames. Provenance is last:
+# if any earlier move fails, release.sh cannot mistake a partial handoff for a
+# complete artifact, and the helper leaves all state in place for inspection.
+if ! PYTHONDONTWRITEBYTECODE=1 python3 \
+    "${SCRIPT_DIR}/detach-managed-build-directory.py" publish \
+    --root . \
+    --child "${PUBLISHING_CHILD}" \
+    --marker-name "${BUILD_DIRECTORY_MARKER}" \
+    --marker-content "${BUILD_DIRECTORY_MARKER_CONTENT}" \
+    --binding-name "${PUBLISHING_BINDING_NAME}" \
+    --binding-content "${PUBLISHING_BINDING_CONTENT}" \
+    --entry libvlc.xcframework \
+    --entry libvlc-macho-metadata.json \
+    --entry libvlc-provenance.json; then
+    error "Verified native artifact publication stopped safely; inspect the preserved Vendor publication state."
+fi
+)
+info "Published verified native artifact: ${PUBLISHED_OUTPUT_DIR}/libvlc.xcframework"
+)
+# The published copy has already passed the exact tree-digest comparison.
+# Retire the source staging tree through the same fd-relative cleanup used for
+# the main external build directory. Its invocation-unique binding stays live
+# for the entire output phase and authorizes this exact generation; a static
+# ownership marker alone must never authorize a replacement at the public path.
+if ! PYTHONDONTWRITEBYTECODE=1 python3 \
+    "${SCRIPT_DIR}/detach-managed-build-directory.py" clean \
+    --root . \
+    --child "${STAGED_OUTPUT_CHILD}" \
+    --quarantine ".swiftvlc-native-output.removing-${BUILD_INVOCATION_ID}" \
+    --marker-name "${STAGED_OUTPUT_BINDING_NAME}" \
+    --marker-content "${STAGED_OUTPUT_BINDING_CONTENT}"; then
+    error "Published successfully, but could not safely retire native output staging."
+fi
+
 echo ""
 info "Build complete!"
-echo "  XCFramework: ${OUTPUT_DIR}/libvlc.xcframework"
+echo "  XCFramework: ${PUBLISHED_OUTPUT_DIR}/libvlc.xcframework"
 echo "  Architectures:"
-find "${OUTPUT_DIR}/libvlc.xcframework" -name "*.a" -exec lipo -info {} \;
+find "${PUBLISHED_OUTPUT_DIR}/libvlc.xcframework" -name "*.a" -exec lipo -info {} \;
 
 local_end=$(date +%s)
 local_total=$((local_end - BUILD_START_TIME))
@@ -2076,3 +2850,4 @@ echo ""
 echo "  Total time: ${local_mins}m$((local_total % 60))s"
 echo ""
 echo "To use: run 'swift build' in the SwiftVLC directory"
+)

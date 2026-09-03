@@ -2190,11 +2190,42 @@ for retained_evidence in (
     if post_pin_validator.count(retained_evidence) != 1:
         sys.exit(f"post-pin linked/native evidence was dropped: {retained_evidence}")
 
-artifact_replacement = build.index('rm -rf "${OUTPUT_DIR}/libvlc.xcframework"')
-metadata_report_removal = build.index('    "${MACHO_METADATA_REPORT}"')
+staged_output_setup = build.index(
+    'STAGED_OUTPUT_CHILD=".swiftvlc-native-output"'
+)
+staged_output_initialization = build.index(
+    '"${SCRIPT_DIR}/detach-managed-build-directory.py" initialize \\\n',
+    staged_output_setup,
+)
+staged_output_require_new = build.index(
+    '    --require-new; then', staged_output_initialization
+)
+staged_output_anchor = build.index(
+    'cd "${STAGED_OUTPUT_CHILD}"', staged_output_require_new
+)
 artifact_creation = build.index('\nxcodebuild -create-xcframework \\\n')
-if not metadata_report_removal < artifact_replacement < artifact_creation:
-    sys.exit("artifact replacement can retain a stale Mach-O metadata report")
+if not (
+    staged_output_setup
+    < staged_output_initialization
+    < staged_output_require_new
+    < staged_output_anchor
+    < artifact_creation
+):
+    sys.exit("native artifact is not assembled in a fresh bound staging directory")
+if 'rm -rf "${OUTPUT_DIR}/libvlc.xcframework"' in build:
+    sys.exit("native artifact replacement regressed to pathname-recursive deletion")
+stage_phase = build[staged_output_anchor:]
+if (
+    'retire_directory_binding \\\n'
+    '    "${STAGED_OUTPUT_BINDING_NAME}" "${STAGED_OUTPUT_BINDING_CONTENT}"'
+    in stage_phase
+):
+    sys.exit("native output stage retires its generation binding before cleanup")
+if stage_phase.count(
+    'verify_directory_binding \\\n'
+    '    "${STAGED_OUTPUT_BINDING_NAME}" "${STAGED_OUTPUT_BINDING_CONTENT}"'
+) != 2:
+    sys.exit("native output stage is not generation-verified at entry and publication")
 
 build_metadata_verification = build.index(
     'info "Verifying per-object Mach-O platform metadata and section alignment..."'
@@ -2202,21 +2233,199 @@ build_metadata_verification = build.index(
 provenance = build.index('python3 "${SCRIPT_DIR}/libvlc-provenance.py" create')
 if provenance < build_metadata_verification:
     sys.exit("provenance is written before per-object Mach-O verification")
-startup_evidence_invalidation = (
-    'rm -f "${OUTPUT_DIR}/libvlc-provenance-a.json" \\\n'
-    '    "${OUTPUT_DIR}/libvlc-provenance.json" \\\n'
-    '    "${OUTPUT_DIR}/libvlc-reproducibility.json" \\\n'
-    '    "${OUTPUT_DIR}/libvlc-macho-metadata.json"'
+evidence_invalidation = (
+    'rm -f ./libvlc-provenance-a.json \\\n'
+    '    ./libvlc-provenance.json \\\n'
+    '    ./libvlc-reproducibility.json \\\n'
+    '    ./libvlc-macho-metadata.json'
 )
-if build.count(startup_evidence_invalidation) != 1:
+if build.count(evidence_invalidation) != 2:
     sys.exit(
-        "native build startup does not invalidate A/B provenance, proof, and "
-        "Mach-O evidence as one exact set"
+        "native build does not invalidate A/B provenance, proof, and Mach-O "
+        "evidence as one exact set at startup and final publication"
     )
-if build.index(startup_evidence_invalidation) > build.index(
+startup_evidence_invalidation = build.index(evidence_invalidation)
+if startup_evidence_invalidation > build.index(
     'info "Setting up VLC source..."'
 ):
     sys.exit("native build invalidates stale two-build evidence after source setup")
+
+output_lock_call = build.index('\nacquire_output_lock\n')
+original_vendor_bind = build.index(
+    'if ! bind_directory_for_handoff \\\n'
+    '            . Vendor \\\n',
+    output_lock_call,
+)
+external_root_reanchor = build.index(
+    'configure_external_build_root "${BUILD_ROOT_OVERRIDE}"',
+    original_vendor_bind,
+)
+if not (
+    output_lock_call
+    < original_vendor_bind
+    < external_root_reanchor
+    < startup_evidence_invalidation
+):
+    sys.exit("checkout lock/Vendor continuity is established after external re-anchor")
+if (
+    'cd -P ..\n'
+    '        if [ "$(/bin/pwd -P)" != "${REPO_ROOT}" ]; then'
+    not in build[output_lock_call:original_vendor_bind]
+):
+    sys.exit("original Vendor bind is not rooted in the physical checkout parent")
+if '$(pwd -P)' in build:
+    sys.exit("native path identity relies on Bash 3.2's stale cached pwd builtin")
+
+output_lock_function_start = build.index('acquire_output_lock() {')
+output_lock_function_end = build.index(
+    '\n}\n\ninitialize_managed_build_directory()', output_lock_function_start
+)
+output_lock_function = build[output_lock_function_start:output_lock_function_end]
+for lock_marker in (
+    'lock-acquire',
+    '--root-fd "${OUTPUT_LOCK_PARENT_FD}"',
+    '--child "${OUTPUT_LOCK_NAME}"',
+    '--token-name "${LOCK_TOKEN_NAME}"',
+    '--token-content "${OUTPUT_LOCK_TOKEN_CONTENT}"',
+):
+    if output_lock_function.count(lock_marker) != 1:
+        sys.exit(f"checkout output lock is not descriptor-anchored: {lock_marker}")
+release_output_lock_start = build.index('release_output_lock() {')
+release_output_lock_end = build.index(
+    '\n}\n\nclose_output_lock_parent()', release_output_lock_start
+)
+release_output_lock_function = build[
+    release_output_lock_start:release_output_lock_end
+]
+for lock_marker in (
+    'lock-release',
+    '--root-fd "${OUTPUT_LOCK_PARENT_FD}"',
+    '--child "${OUTPUT_LOCK_NAME}"',
+    '--token-name "${LOCK_TOKEN_NAME}"',
+    '--token-content "${OUTPUT_LOCK_TOKEN_CONTENT}"',
+):
+    if release_output_lock_function.count(lock_marker) != 1:
+        sys.exit(f"checkout output lock release is not descriptor-safe: {lock_marker}")
+if 'rmdir "${OUTPUT_LOCK_DIR}"' in build:
+    sys.exit("checkout output lock release regressed to an absolute pathname")
+
+build_lock_function_start = build.index('acquire_build_root_lock() {')
+build_lock_function_end = build.index(
+    '\n}\n\nreject_stale_managed_build_state()', build_lock_function_start
+)
+build_lock_function = build[build_lock_function_start:build_lock_function_end]
+for lock_marker in (
+    'exec 8<.',
+    'lock-acquire',
+    '--root-fd "${BUILD_LOCK_PARENT_FD}"',
+    '--child "${BUILD_LOCK_DIR}"',
+    '--token-name "${LOCK_TOKEN_NAME}"',
+    '--token-content "${BUILD_LOCK_TOKEN_CONTENT}"',
+):
+    if build_lock_function.count(lock_marker) != 1:
+        sys.exit(f"external build-root lock is not generation-bound: {lock_marker}")
+release_build_lock_start = build.index('release_build_root_lock() {')
+release_build_lock_end = build.index(
+    '\n}\n\nclose_build_lock_parent()', release_build_lock_start
+)
+release_build_lock_function = build[
+    release_build_lock_start:release_build_lock_end
+]
+for lock_marker in (
+    'lock-release',
+    '--root-fd "${BUILD_LOCK_PARENT_FD}"',
+    '--child "${BUILD_LOCK_DIR}"',
+    '--token-name "${LOCK_TOKEN_NAME}"',
+    '--token-content "${BUILD_LOCK_TOKEN_CONTENT}"',
+):
+    if release_build_lock_function.count(lock_marker) != 1:
+        sys.exit(f"external build-root lock release is not generation-safe: {lock_marker}")
+if 'mkdir "${BUILD_LOCK_DIR}"' in build or 'rmdir "${BUILD_LOCK_DIR}"' in build:
+    sys.exit("external build-root lock regressed to pathname-only mkdir/rmdir")
+
+publication_binding = build.index(
+    '    "${PUBLISHING_BINDING_NAME}" "${PUBLISHING_BINDING_CONTENT}" \\\n'
+    '    --create; then'
+)
+publication_copy = build.index(
+    '    "${STAGED_OUTPUT_DIRECTORY}/libvlc.xcframework" \\\n'
+    '    ./libvlc.xcframework',
+    publication_binding,
+)
+published_tree_verification = build.index(
+    'module.verify_recorded_artifact(record, published_path, "published XCFramework")',
+    publication_copy,
+)
+old_artifact_cleanup = build.index(
+    '"${SCRIPT_DIR}/detach-managed-build-directory.py" clean \\\n'
+    '        --root . \\\n'
+    '        --child libvlc.xcframework',
+    published_tree_verification,
+)
+final_evidence_invalidation = build.index(
+    evidence_invalidation, old_artifact_cleanup
+)
+publication = build.index(
+    '"${SCRIPT_DIR}/detach-managed-build-directory.py" publish \\\n',
+    final_evidence_invalidation,
+)
+publication_command_end = build.index(
+    '; then', publication
+)
+publication_command = build[publication:publication_command_end]
+expected_publication_entries = (
+    '    --entry libvlc.xcframework \\\n'
+    '    --entry libvlc-macho-metadata.json \\\n'
+    '    --entry libvlc-provenance.json'
+)
+if publication_command.count(expected_publication_entries) != 1:
+    sys.exit("native publication does not move provenance last as its commit marker")
+if not (
+    provenance
+    < publication_binding
+    < publication_copy
+    < published_tree_verification
+    < old_artifact_cleanup
+    < final_evidence_invalidation
+    < publication
+):
+    sys.exit("native publication is not bound, verified, invalidated, and committed in order")
+for unsafe_publication in (
+    'mkdir "${PUBLISHING_CHILD}"',
+    'mv "${PUBLISHING_CHILD}/',
+    'rmdir "${PUBLISHING_CHILD}"',
+):
+    if unsafe_publication in build:
+        sys.exit(f"native publication bypasses the fd-safe helper: {unsafe_publication}")
+stage_cleanup = build.index(
+    '"${SCRIPT_DIR}/detach-managed-build-directory.py" clean \\\n'
+    '    --root . \\\n'
+    '    --child "${STAGED_OUTPUT_CHILD}"',
+    publication,
+)
+stage_cleanup_end = build.index('; then', stage_cleanup)
+stage_cleanup_command = build[stage_cleanup:stage_cleanup_end]
+for generation_marker in (
+    '--marker-name "${STAGED_OUTPUT_BINDING_NAME}"',
+    '--marker-content "${STAGED_OUTPUT_BINDING_CONTENT}"',
+):
+    if stage_cleanup_command.count(generation_marker) != 1:
+        sys.exit(
+            "native output cleanup is not authorized by its invocation binding: "
+            f"{generation_marker}"
+        )
+for preserved_state in (
+    'for preserved_checkout_state in \\\n'
+    '            ./.swiftvlc-managed-build.initializing-*',
+    './.swiftvlc-native-output-publishing-* \\\n'
+    '    ./.swiftvlc-published-artifact.removing-* \\\n'
+    '    ./.swiftvlc-managed-build.initializing-*',
+    './.swiftvlc-native-output \\\n'
+    '    ./.swiftvlc-native-output.removing-* \\\n'
+    '    ./.swiftvlc-managed-build.initializing-*',
+):
+    if build.count(preserved_state) != 1:
+        sys.exit(f"native build does not surface preserved helper state: {preserved_state}")
 
 build_validator_asset_verification = build.index(
     'if ! python3 "${SCRIPT_DIR}/verify-native-validator-assets.py"; then'
@@ -2504,6 +2713,10 @@ headless_runtime_gate = build.index(
 final_archive_mutation = build.index(
     'find "${OUTPUT_DIR}/libvlc.xcframework" -name \'*.a\' -exec xcrun ranlib -D {} \\;'
 )
+checkout_path_gate = build.index(
+    'if [ "${EXTERNAL_BUILD_ROOT}" = yes ]; then\n'
+    '    info "Verifying that the release artifact contains no checkout-local paths..."'
+)
 native_archive_contract_setup = build.index(
     'native_archive_contract_args=('
 )
@@ -2518,6 +2731,7 @@ if not (
     < headless_runtime_selection
     < headless_runtime_gate
     < final_archive_mutation
+    < checkout_path_gate
     < native_archive_contract_setup
     < native_archive_contract
     < archive_metadata_gate
@@ -2526,6 +2740,36 @@ if not (
         "exact linked native extension validation is not after the final "
         "archive mutation and before artifact metadata/provenance gates"
     )
+checkout_path_gate_region = build[
+    checkout_path_gate:native_archive_contract_setup
+]
+checkout_path_function_start = build.index(
+    'verify_checkout_path_not_embedded() {'
+)
+checkout_path_function = build[
+    checkout_path_function_start:build.index(
+        '\n}\n\ntrap release_build_locks EXIT', checkout_path_function_start
+    )
+]
+for marker in (
+    '"${SCRIPT_DIR}/verify-libvlc-build-paths.py"',
+    '--xcframework "${OUTPUT_DIR}/libvlc.xcframework"',
+    '--forbidden-path "${REPO_ROOT}"',
+):
+    if checkout_path_function.count(marker) != 1:
+        sys.exit(f"checkout-path verifier invocation is incomplete: {marker}")
+for marker in (
+    'if [ "${EXTERNAL_BUILD_ROOT}" = yes ]; then',
+    'verify_checkout_path_not_embedded',
+):
+    if checkout_path_gate_region.count(marker) != 1:
+        sys.exit(f"checkout-path gate is not ordered after archive normalization: {marker}")
+if (
+    'if [ "${CLEAN_BUILD}" = yes ] && [ "${BUILD_ROOT_OVERRIDE_SET}" != yes ]; then'
+    not in build
+    or '--clean-build requires a canonical external --build-root' not in build
+):
+    sys.exit("clean provenance builds do not require the canonical external root")
 headless_runtime_region = build[headless_runtime_selection:final_archive_mutation]
 for marker in (
     'if [ "$headless_vout_teardown_patch_listed" = yes ] && [ "$BUILD_MACOS" = "yes" ]; then',
@@ -2562,11 +2806,13 @@ if release_validator_asset_verification > release_provenance_verification:
 
 expected_configurations = {
     "build-libvlc.sh",
+    "detach-managed-build-directory.py",
     "fix-duplicate-symbols.sh",
     "native-validator-assets.sha256",
     "native-extension-version-probe.c",
     "pip_extension_version.py",
     "validate-libvlc-macho-metadata.py",
+    "verify-libvlc-build-paths.py",
     "validate-apple-assembly-metadata-patch.sh",
     "validate-aom-nasm3-detection.sh",
     "validate-headless-vout-teardown.sh",
@@ -5173,6 +5419,7 @@ release_flow_pushes_before=$(wc -l < "$release_flow_git_log" | tr -d ' ')
   fail "completed finalize repeated a candidate or cleanup ref write"
 cd "$ROOT_DIR"
 bash -n \
+  scripts/build-libvlc.sh \
   scripts/canonical-libvlc-artifact.sh \
   scripts/check-engine-coverage.sh \
   scripts/check-qualification.sh \

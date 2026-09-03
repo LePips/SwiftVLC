@@ -241,16 +241,50 @@ Needed only when bumping `VLC_HASH`, modifying build patches, or preparing a rel
 
 ```bash
 brew install autoconf automake libtool cmake pkg-config gettext
-./scripts/build-libvlc.sh --clean-build --all
+mkdir -p /Volumes/ExternalSSD/SwiftVLC-Native
+./scripts/build-libvlc.sh \
+  --build-root=/Volumes/ExternalSSD/SwiftVLC-Native \
+  --clean-build --all
 ```
 
-Expect a full `--all` build to take tens of minutes on Apple Silicon. The script clones VLC at a pinned commit into `scripts/.build-libvlc/`, applies the hash-locked patch manifest, builds every contrib (FFmpeg, dav1d, x264, libass, …) per slice, and assembles the result into `Vendor/libvlc.xcframework`.
+Expect a full `--all` build to take tens of minutes on Apple Silicon. By
+default, the script clones VLC at a pinned commit into
+`scripts/.build-libvlc/`. It applies the hash-locked patch manifest, builds
+every contrib (FFmpeg, dav1d, x264, libass, …) per slice, and assembles the
+result into `Vendor/libvlc.xcframework`.
 
 A clean all-platform build needs roughly 100 GiB of working space. The script
-checks the volume that contains the repository before compiling and fails early
-when it is too small. Keep the checkout on an external SSD when internal disk
-space is constrained: the VLC source, contrib trees, architecture builds, and
-assembled libraries all remain under `scripts/.build-libvlc/` on that volume.
+checks the volume that contains its working directory before compiling and
+fails early when it is too small. For an external SSD, create a dedicated root
+and pass its canonical physical path; the script owns and may remove only the
+`swiftvlc-libvlc-build` child beneath it:
+
+```bash
+mkdir -p /Volumes/ExternalSSD/SwiftVLC-Native
+./scripts/build-libvlc.sh \
+  --build-root=/Volumes/ExternalSSD/SwiftVLC-Native \
+  --clean-build --all
+```
+
+The managed child carries an ownership marker, and an atomic generation-bound
+lock prevents two builds from using the root concurrently. The script refuses
+to remove an unmarked directory and never automatically clears a stale lock;
+verify that no build is active before inspecting or removing that exact lock
+directory and its `.swiftvlc-lock-generation-v1` token.
+Cleanup detaches the marked child atomically and walks it through no-follow
+directory descriptors, refusing filesystem boundaries or replacement races.
+Any interrupted quarantine or publication staging is preserved and reported
+for inspection instead of being silently reused or recursively deleted.
+
+Source mutation, output assembly, and final `Vendor/` publication each use a
+one-use directory binding before entering an anchored working directory. The
+XCFramework is built and fully validated in the stable external path, copied
+to a private Vendor staging directory, and checked against its recorded tree
+identity before it replaces the previous artifact. Publication uses atomic
+no-replace moves and writes provenance last as the completion marker, so a
+partial handoff cannot masquerade as a releasable native artifact. These
+constraints are part of the release reproducibility and data-safety contract,
+not coverage-only tests.
 
 The inexpensive source-contract lane replays the complete ordered patch stack
 and exercises its mutation/behavior proofs without compiling VLC:
@@ -279,7 +313,8 @@ a bounded build failure instead of letting a release build hang indefinitely.
 | `--all` | iOS, tvOS, visionOS, macOS, Mac Catalyst (eight slices) |
 | `--ios-only` / `--tvos-only` / `--visionos-only` / `--macos-only` / `--catalyst-only` | Replaces `Vendor/` with that single platform |
 | `--tvos` / `--visionos` / `--macos` / `--catalyst` | Adds a platform to the default set |
-| `--clean` / `--clean-build` | Wipe `scripts/.build-libvlc/` (the latter rebuilds afterwards) |
+| `--clean` / `--clean-build` | Wipe the managed build directory (the latter rebuilds afterwards) |
+| `--build-root=<absolute-dir>` | Use `<absolute-dir>/swiftvlc-libvlc-build`; the root must already exist outside the checkout |
 | `--hash=<sha>` | Override the pinned VLC commit |
 
 > `*-only` flags **replace** the xcframework; any slices already in `Vendor/` are lost.
@@ -288,9 +323,22 @@ a bounded build failure instead of letting a release build hang indefinitely.
 
 A release needs two complete `--clean-build --all` invocations from the same
 committed SwiftVLC revision, on the same unchanged host toolchain and with the
-same `MAKEFLAGS`. Use separate checkouts on the external SSD: each build keeps
-its VLC source under that checkout, and a second build in the first checkout
-would replace both `Vendor/libvlc.xcframework` and its provenance.
+same `MAKEFLAGS`. Use separate checkouts, but pass both sequential invocations
+the exact same canonical external `--build-root`. VLC and some contribs retain
+configure/source paths in live string data, so different working roots are
+different build inputs even after debug symbols are stripped. The shared root
+is locked against concurrent use; each `--clean-build` still removes the entire
+managed child before cloning and compiling from scratch.
+
+For example, prepare the shared root once, then use the identical option in
+both checkouts:
+
+```bash
+mkdir -p /Volumes/ExternalSSD/SwiftVLC-Repro
+./scripts/build-libvlc.sh \
+  --build-root=/Volumes/ExternalSSD/SwiftVLC-Repro \
+  --clean-build --all
+```
 
 After build A completes, preserve and validate its actual artifact rather than
 copying only its JSON record:
@@ -305,9 +353,10 @@ cp Vendor/libvlc-provenance.json \
   /absolute/path/to/repro/run-a/libvlc-provenance.json
 ```
 
-Run build B in a different clean checkout at the same commit. From build B's
-checkout, compare both retained artifacts and records, then retain A's record
-beside B's selected artifact:
+Run build B in a different clean checkout at the same commit, with the same
+`--build-root` command shown above. From build B's checkout, compare both
+retained artifacts and records, then retain A's record beside B's selected
+artifact:
 
 ```bash
 python3 scripts/libvlc-provenance.py compare \
@@ -376,7 +425,9 @@ eligible candidate; the published beta.8 archive remains usable through the
 fail-closed weak compatibility path but cannot pass the current release gate.
 
 ```bash
-./scripts/build-libvlc.sh --clean-build --all  # run twice; retain proof above
+./scripts/build-libvlc.sh \
+  --build-root=/absolute/path/to/shared-native-root \
+  --clean-build --all                    # run twice; retain proof above
 ./scripts/release.sh X.Y.Z --dry-run     # strip + zip + checksum, no push
 ./scripts/release.sh X.Y.Z --prepare /absolute/path/to/candidate
 ./scripts/check-qualification.sh X.Y.Z /absolute/path/to/candidate/libvlc.xcframework
