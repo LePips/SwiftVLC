@@ -110,7 +110,10 @@ jobs:
       # report assembly, feature/risk mapping, and device parsing are pure
       # Python and cheap enough to verify on every pull request.
       - name: Test physical-qualification policy
-        timeout-minutes: 2
+        # Cold macOS runners currently take about two minutes (118-121s).
+        # Leave a bounded margin so scheduler noise cannot turn a green suite
+        # into a retry that costs more than simply allowing it to finish.
+        timeout-minutes: 4
         run: python3 -B -m unittest discover -s scripts/qualification/tests -p 'test_*.py'
 
   # Showcase apps build gate. Catches API breakage that the SwiftVLC
