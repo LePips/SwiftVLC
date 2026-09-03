@@ -210,10 +210,9 @@ if [[ "$ALLOW_DRAFT" == "1" || -n "${GH_TOKEN:-}" ]]; then
     --json url,tagName,targetCommitish,isDraft,isImmutable,isPrerelease,assets \
     > "$temp_dir/release.json"
 else
-  # Public release metadata does not need a repository token. Keeping ordinary
-  # PRs anonymous means their checked-out scripts never receive the candidate
-  # job's write-capable token. Normalize REST names to the gh JSON contract so
-  # the verifier below has one fail-closed implementation.
+  # Local public release resolution can work without a repository token.
+  # Normalize REST names to the gh JSON contract so authenticated CI and
+  # anonymous local callers share one fail-closed verifier.
   curl --disable --fail --location --retry 3 --retry-all-errors \
     --silent --show-error \
     -H 'Accept: application/vnd.github+json' \
