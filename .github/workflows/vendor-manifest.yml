@@ -78,7 +78,7 @@ jobs:
       - name: Set up Vendor + local Swift package
         timeout-minutes: 12
         env:
-          GH_TOKEN: ${{ ((github.event_name == 'push' && startsWith(github.ref, 'refs/heads/release-candidates/')) || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && startsWith(github.head_ref, 'release-candidates/'))) && secrets.GITHUB_TOKEN || '' }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SWIFTVLC_ALLOW_DRAFT_RELEASE: ${{ ((github.event_name == 'push' && startsWith(github.ref, 'refs/heads/release-candidates/')) || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && startsWith(github.head_ref, 'release-candidates/'))) && '1' || '' }}
         run: ./scripts/setup-dev.sh
 

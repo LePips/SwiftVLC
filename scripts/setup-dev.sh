@@ -260,13 +260,15 @@ PYEOF
 
     echo "Downloading $ZIP_NAME from $RESOLVED_DOWNLOAD_TAG..."
     rm -f "Vendor/$ZIP_NAME"
-    if [[ "$RESOLVED_IS_DRAFT" == true ]]; then
+    if [[ "$RESOLVED_IS_DRAFT" == true || -n "${GH_TOKEN:-}" ]]; then
+      # Authenticated gh downloads avoid the shared anonymous runner quota and
+      # refresh GitHub's short-lived signed asset URL. The checksum below still
+      # authenticates the exact bytes declared by Package.swift.
       require_gh
       gh release download "$RESOLVED_DOWNLOAD_TAG" \
         --repo "$REPO" --pattern "$ZIP_NAME" --dir Vendor/
     else
-      # Published assets are public and checksum-bound by Package.swift. Avoid
-      # passing any repository token through ordinary PR-controlled scripts.
+      # Local public installs remain usable without GitHub authentication.
       curl --disable --fail --location --retry 3 --retry-all-errors \
         --output "Vendor/$ZIP_NAME" "$RESOLVED_URL"
     fi

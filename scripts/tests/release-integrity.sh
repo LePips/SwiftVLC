@@ -182,36 +182,29 @@ draft_authorization = (
     "github.event.pull_request.head.repo.full_name == github.repository && "
     "startsWith(github.head_ref, 'release-candidates/'))) && '1' || '' }}\n"
 )
-candidate_token = (
-    "          GH_TOKEN: "
-    "${{ ((github.event_name == 'push' && "
-    "startsWith(github.ref, 'refs/heads/release-candidates/')) || "
-    "(github.event_name == 'pull_request' && "
-    "github.event.pull_request.head.repo.full_name == github.repository && "
-    "startsWith(github.head_ref, 'release-candidates/'))) && "
-    "secrets.GITHUB_TOKEN || '' }}\n"
-)
-expected_counts = (2, 1, 1, 1, 0)
-if len(sys.argv[1:]) != len(expected_counts):
+workflow_token = "          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}\n"
+expected_draft_counts = (2, 1, 1, 1, 0)
+expected_token_counts = (3, 1, 1, 1, 0)
+if len(sys.argv[1:]) != len(expected_draft_counts):
     sys.exit("release workflow integrity invocation is incomplete")
-for path, expected_count in zip(sys.argv[1:], expected_counts):
+for path, expected_draft_count, expected_token_count in zip(
+    sys.argv[1:], expected_draft_counts, expected_token_counts
+):
     source = open(path).read()
     count = source.count(draft_authorization)
-    if count != expected_count:
+    if count != expected_draft_count:
         sys.exit(
             f"{path} must scope draft authorization to each of its "
-            f"{expected_count} release-asset steps; found {count}"
+            f"{expected_draft_count} release-asset steps; found {count}"
         )
-    token_count = source.count(candidate_token)
-    if token_count != expected_count:
+    token_count = source.count(workflow_token)
+    if token_count != expected_token_count:
         sys.exit(
-            f"{path} must expose the ephemeral token only to its "
-            f"{expected_count} candidate steps; found {token_count}"
+            f"{path} must expose the ephemeral token to exactly "
+            f"{expected_token_count} release-asset steps; found {token_count}"
         )
-    if source.count(candidate_token + draft_authorization) != expected_count:
+    if source.count(workflow_token + draft_authorization) != expected_draft_count:
         sys.exit(f"{path} candidate token and authorization are not inseparable")
-    if "GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}" in source:
-        sys.exit(f"{path} exposes a repository token outside candidate CI")
     if "  pull_request:\n    branches: [main]\n" not in source:
         sys.exit(f"{path} does not run protected release-candidate PR CI")
     if "  push:\n    branches: [main]\n" not in source:
@@ -222,7 +215,7 @@ for path, expected_count in zip(sys.argv[1:], expected_counts):
         re.MULTILINE,
     ):
         sys.exit(f"{path} grants unconditional draft release access")
-    if expected_count and (
+    if expected_draft_count and (
         "github.event.pull_request.head.repo.full_name == github.repository"
         not in source
         or "startsWith(github.head_ref, 'release-candidates/')" not in source
@@ -697,6 +690,25 @@ chmod +x "$resolver_bin/gh" "$resolver_bin/curl"
     ./scripts/resolve-release-artifact.sh >/dev/null
 )
 
+# GitHub-hosted runners must use their ephemeral token instead of the shared
+# anonymous API quota, without broadening which releases may be drafts.
+(
+  cd "$resolver_repo"
+  GH_TOKEN=fixture-token \
+    PATH="$resolver_bin:$PATH" \
+    RESOLVER_RELEASE_DRAFT=0 \
+    ./scripts/resolve-release-artifact.sh >/dev/null
+)
+if (
+  cd "$resolver_repo"
+  GH_TOKEN=fixture-token \
+    PATH="$resolver_bin:$PATH" \
+    RESOLVER_RELEASE_DRAFT=1 \
+    ./scripts/resolve-release-artifact.sh >/dev/null 2>&1
+); then
+  fail "public authenticated resolution accepted a draft without candidate authorization"
+fi
+
 # Candidate staging removes the final SemVer tag from the equation entirely.
 # Install only the deterministic candidate tag and exact candidate branch.
 git -C "$resolver_repo" tag -d v1.1.0-beta.1 >/dev/null
@@ -1067,6 +1079,24 @@ grep -q '^trusted release bytes$' \
 )
 [[ $(wc -l < "$cache_downloads" | tr -d ' ') == 1 ]] || \
   fail "verified public Vendor cache lost its non-candidate fast path"
+
+rm -rf "$cache_repo/Vendor/libvlc.xcframework"
+rm -f "$cache_repo/Vendor/.swiftvlc-release.json"
+(
+  cd "$cache_repo"
+  GH_TOKEN=fixture-token \
+    PATH="$cache_bin:$PATH" \
+    CACHE_IS_DRAFT=0 \
+    CACHE_ZIP_CHECKSUM="$cache_zip_checksum" \
+    CACHE_ASSET="$cache_zip" \
+    CACHE_DOWNLOADS="$cache_downloads" \
+    ./scripts/setup-dev.sh --artifact-only >/dev/null
+)
+[[ $(wc -l < "$cache_downloads" | tr -d ' ') == 2 ]] || \
+  fail "authenticated public setup did not use the reliable gh download path"
+grep -q '^trusted release bytes$' \
+  "$cache_repo/Vendor/libvlc.xcframework/payload.txt" || \
+  fail "authenticated public setup installed unexpected Vendor bytes"
 
 mkdir -p "$temp_dir/tree-a/Headers" "$temp_dir/tree-b/Headers"
 printf 'binary' > "$temp_dir/tree-a/libvlc.a"

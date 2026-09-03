@@ -194,7 +194,18 @@ git show "$RELEASE_REF:Package.swift" > "$temp_dir/Package.swift"
 python3 "$SCRIPT_DIR/release-artifact-info.py" \
   "$temp_dir/Package.swift" --expect-tag "$TAG" > "$temp_dir/manifest.json"
 
-if [[ "$ALLOW_DRAFT" == "1" ]]; then
+if [[ "$ALLOW_DRAFT" == "1" || -n "${GH_TOKEN:-}" ]]; then
+  # GitHub-hosted runners share a small anonymous API quota. Use the job's
+  # ephemeral token for public metadata when available; draft acceptance stays
+  # independently gated by the exact candidate identity checks above.
+  if ! command -v gh >/dev/null 2>&1; then
+    echo "Error: GitHub CLI (gh) is required for authenticated release metadata." >&2
+    exit 1
+  fi
+  if ! gh auth status >/dev/null 2>&1; then
+    echo "Error: GitHub CLI authentication is required for release metadata." >&2
+    exit 1
+  fi
   gh release view "$RELEASE_TAG" --repo "$REPO" \
     --json url,tagName,targetCommitish,isDraft,isImmutable,isPrerelease,assets \
     > "$temp_dir/release.json"
