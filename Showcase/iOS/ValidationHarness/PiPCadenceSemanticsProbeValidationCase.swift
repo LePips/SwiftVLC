@@ -91,13 +91,20 @@ struct PiPCadenceSemanticsProbeValidationCase: View {
     defer { isRunning = false }
 
     do {
+      let runDeadline = ContinuousClock().now.advanced(
+        by: .seconds(PiPCadenceSemanticsProbeTiming.applicationRunBudgetSeconds)
+      )
       let startedSystemUptime = ProcessInfo.processInfo.systemUptime
       var windows: [ProbeWindow] = []
       for (index, scenario) in ProbeScenario.all.enumerated() {
         activeProfile = scenario.name
         progress = "\(index) / \(ProbeScenario.all.count)"
         try play(scenario.profile, from: baseURL)
-        try await waitUntil("\(scenario.profile.rawValue) did not start", timeout: .seconds(20)) {
+        try await waitUntil(
+          "\(scenario.profile.rawValue) did not start",
+          timeout: .seconds(20),
+          runDeadline: runDeadline
+        ) {
           player.state == .playing && scenario.profile.matches(player.videoTracks)
         }
 
@@ -105,33 +112,64 @@ struct PiPCadenceSemanticsProbeValidationCase: View {
           guard controller.requestStart() == .accepted else {
             throw ProbeFailure("Direct PiP start was not accepted")
           }
-          try await waitUntil("Direct PiP did not become active", timeout: .seconds(30)) {
+          try await waitUntil(
+            "Direct PiP did not become active",
+            timeout: .seconds(30),
+            runDeadline: runDeadline
+          ) {
             controller.isActive
           }
           // Gives the XCTest process time to enter SpringBoard and establish
           // its fixed PiP crop before the first retained boundary.
-          try await Task.sleep(for: .seconds(5))
+          try await sleepWithinRunBudget(
+            for: .seconds(5),
+            runDeadline: runDeadline
+          )
         } else {
-          try await waitUntil("PiP did not survive media replacement", timeout: .seconds(20)) {
+          try await waitUntil(
+            "PiP did not survive media replacement",
+            timeout: .seconds(20),
+            runDeadline: runDeadline
+          ) {
             controller.isActive
           }
         }
 
         try player.setPlaybackRate(PlaybackRate(scenario.requestedRate))
-        try await waitUntil("\(scenario.name) rate did not apply", timeout: .seconds(10)) {
+        try await waitUntil(
+          "\(scenario.name) rate did not apply",
+          timeout: .seconds(10),
+          runDeadline: runDeadline
+        ) {
           player.isActive && abs(player.rate - scenario.requestedRate) < 0.001
         }
-        try await waitUntil("\(scenario.name) v6 output PTS was unavailable", timeout: .seconds(10)) {
+        try await waitUntil(
+          "\(scenario.name) v6 output PTS was unavailable",
+          timeout: .seconds(10),
+          runDeadline: runDeadline
+        ) {
           let snapshot = controller.timebaseDiagnosticSnapshot()
           return snapshot.vmemOutputTimestampProvenance == ProbeWindow.provenance
             && (snapshot.vmemOutputCallbackCount ?? 0) >= 2
         }
 
         // Exclude media/rate/vout transients from the retained window.
-        try await Task.sleep(for: .seconds(2))
-        let before = try await settledBoundary(controller: controller)
-        try await Task.sleep(for: .seconds(5))
-        let after = try await settledBoundary(controller: controller)
+        try await sleepWithinRunBudget(
+          for: .seconds(2),
+          runDeadline: runDeadline
+        )
+        let before = try await settledBoundary(
+          controller: controller,
+          runDeadline: runDeadline
+        )
+        try await sleepWithinRunBudget(
+          for: .seconds(5),
+          runDeadline: runDeadline
+        )
+        let after = try await settledBoundary(
+          controller: controller,
+          runDeadline: runDeadline
+        )
         try windows.append(
           ProbeWindow(
             scenario: scenario,
@@ -139,9 +177,11 @@ struct PiPCadenceSemanticsProbeValidationCase: View {
             after: after
           )
         )
+        try requireRemainingRunBudget(runDeadline)
         progress = "\(index + 1) / \(ProbeScenario.all.count)"
       }
 
+      try requireRemainingRunBudget(runDeadline)
       let endedSystemUptime = ProcessInfo.processInfo.systemUptime
       let report = ProbeReport(
         startedSystemUptime: startedSystemUptime,
@@ -150,7 +190,9 @@ struct PiPCadenceSemanticsProbeValidationCase: View {
       )
       let encoder = JSONEncoder()
       encoder.outputFormatting = [.sortedKeys]
-      result = try "report:\(encoder.encode(report).base64EncodedString())"
+      let encodedResult = try encoder.encode(report).base64EncodedString()
+      try requireRemainingRunBudget(runDeadline)
+      result = "report:\(encodedResult)"
       activeProfile = "complete"
     } catch is CancellationError {
       result = "cancelled"
@@ -162,12 +204,14 @@ struct PiPCadenceSemanticsProbeValidationCase: View {
   }
 
   private func settledBoundary(
-    controller: PiPController
+    controller: PiPController,
+    runDeadline: ContinuousClock.Instant
   )
     async throws -> PiPTimebaseDiagnosticSnapshot {
     let clock = ContinuousClock()
     let deadline = clock.now.advanced(by: .seconds(2))
     while true {
+      try requireRemainingRunBudget(runDeadline)
       let snapshot = controller.timebaseDiagnosticSnapshot()
       if snapshot.vmemOutputInFlightCount == 0 {
         return snapshot
@@ -175,7 +219,10 @@ struct PiPCadenceSemanticsProbeValidationCase: View {
       guard clock.now < deadline else {
         throw ProbeFailure("Could not capture a callback-conserved boundary")
       }
-      try await Task.sleep(for: .milliseconds(5))
+      try await sleepWithinRunBudget(
+        for: .milliseconds(5),
+        runDeadline: runDeadline
+      )
     }
   }
 
@@ -187,17 +234,50 @@ struct PiPCadenceSemanticsProbeValidationCase: View {
   private func waitUntil(
     _ failure: String,
     timeout: Duration,
+    runDeadline: ContinuousClock.Instant,
     condition: @escaping @MainActor () -> Bool
   )
     async throws {
     let clock = ContinuousClock()
     let deadline = clock.now.advanced(by: timeout)
     while !condition() {
-      try Task.checkCancellation()
+      try requireRemainingRunBudget(runDeadline)
       guard clock.now < deadline else { throw ProbeFailure(failure) }
-      try await Task.sleep(for: .milliseconds(100))
+      try await sleepWithinRunBudget(
+        for: .milliseconds(100),
+        runDeadline: runDeadline
+      )
+    }
+    try requireRemainingRunBudget(runDeadline)
+  }
+
+  private func sleepWithinRunBudget(
+    for duration: Duration,
+    runDeadline: ContinuousClock.Instant
+  )
+    async throws {
+    try requireRemainingRunBudget(runDeadline)
+    let clock = ContinuousClock()
+    let requestedEnd = clock.now.advanced(by: duration)
+    guard requestedEnd < runDeadline else {
+      throw ProbeFailure(Self.runBudgetFailure)
+    }
+    try await clock.sleep(until: requestedEnd)
+    try requireRemainingRunBudget(runDeadline)
+  }
+
+  private func requireRemainingRunBudget(
+    _ runDeadline: ContinuousClock.Instant
+  )
+    throws {
+    try Task.checkCancellation()
+    guard ContinuousClock().now < runDeadline else {
+      throw ProbeFailure(Self.runBudgetFailure)
     }
   }
+
+  private static let runBudgetFailure =
+    "Cadence semantics probe exceeded its app-side global run deadline"
 
   private func valueRow(
     _ title: String,

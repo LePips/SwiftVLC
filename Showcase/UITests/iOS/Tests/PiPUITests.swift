@@ -36,6 +36,28 @@ final class PiPUITests: ShowcaseIOSTestCase {
     }
   }
 
+  private func assertEnabledPiPToggle() {
+    XCTAssertTrue(
+      toggleButton.waitForExistence(timeout: 3),
+      "Toggle PiP button is missing while isPossible is 'yes'"
+    )
+    XCTAssertTrue(
+      toggleButton.isEnabled,
+      "Toggle PiP button is disabled while isPossible is 'yes'"
+    )
+  }
+
+  private func assertUnavailablePiPToggle() {
+    // SwiftUI Form may strip disabled Buttons from the accessibility tree
+    // entirely. Hidden and present-but-disabled both prevent a no-op tap.
+    if toggleButton.exists {
+      XCTAssertFalse(
+        toggleButton.isEnabled,
+        "Toggle PiP button is enabled while isPossible is 'no'"
+      )
+    }
+  }
+
   // MARK: - Smoke
 
   /// Page loads, reaches playing, and the PiP controller becomes
@@ -58,32 +80,38 @@ final class PiPUITests: ShowcaseIOSTestCase {
 
   // MARK: - Deep
 
-  /// Critical UX invariant: when PiP isn't possible, the toggle button
-  /// must be disabled (not simply hidden). In simulator, isPossible is
-  /// typically `false`, so this is the common-case UX path.
-  func test_deep_toggleButtonDisabledWhenNotPossible() throws {
+  /// Critical UX invariant: the toggle follows PiP capability. A real device
+  /// normally exercises the enabled path, while Simulator normally exercises
+  /// the disabled-or-hidden path.
+  func test_deep_toggleButtonAvailabilityMatchesPiPPossibility() {
     launch(route: .pip)
 
     waitForLabel(playPauseButton, equals: "Pause", timeout: 10)
     scrollToPiPSection()
 
     XCTAssertTrue(possibleLabel.waitForExistence(timeout: 10))
-    guard possibleLabel.label == "no" else {
-      throw XCTSkip("This device supports PiP; the unavailable-state contract is not reachable")
+    #if targetEnvironment(simulator)
+    // Simulator normally remains incapable, but give an asynchronously
+    // converging controller a bounded chance to publish `yes` before accepting
+    // a stable disabled state.
+    let convergenceDeadline = ProcessInfo.processInfo.systemUptime + 3
+    while
+      possibleLabel.label == "no",
+      ProcessInfo.processInfo.systemUptime < convergenceDeadline {
+      RunLoop.current.run(until: Date().addingTimeInterval(0.1))
     }
-
-    // SwiftUI Form may strip disabled Buttons from the accessibility
-    // tree entirely — treat either "button doesn't exist" or "button
-    // exists but not enabled" as passing the contract. Both mean the
-    // user cannot trigger a no-op toggle.
-    if toggleButton.exists {
-      XCTAssertFalse(
-        toggleButton.isEnabled,
-        "Toggle PiP button is enabled while isPossible is 'no'"
-      )
+    switch possibleLabel.label {
+    case "yes": assertEnabledPiPToggle()
+    case "no": assertUnavailablePiPToggle()
+    default: XCTFail("Unexpected PiP possibility value: \(possibleLabel.label)")
     }
-    // If !toggleButton.exists, SwiftUI hid the disabled button — still
-    // correct UX (can't be tapped).
+    #else
+    // Physical qualification must exercise the enabled path. Accepting the
+    // controller's transient initial `no` would let this test pass without
+    // proving the capability/button invariant users rely on.
+    waitForLabel(possibleLabel, equals: "yes", timeout: 30)
+    assertEnabledPiPToggle()
+    #endif
 
     assertNoLibraryErrors()
   }
@@ -97,7 +125,7 @@ final class PiPUITests: ShowcaseIOSTestCase {
     measure(metrics: [XCTMemoryMetric()]) {
       for _ in 0..<3 {
         app.terminate()
-        app.launch()
+        launchDirectlyHandlingQualificationPermissions()
         _ = playPauseButton.waitForExistence(timeout: 5)
       }
     }

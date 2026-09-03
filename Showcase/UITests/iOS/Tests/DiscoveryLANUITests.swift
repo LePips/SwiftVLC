@@ -31,7 +31,7 @@ final class DiscoveryLANUITests: ShowcaseIOSTestCase {
     measure(metrics: [XCTMemoryMetric()]) {
       for _ in 0..<3 {
         app.terminate()
-        app.launch()
+        launchDirectlyHandlingQualificationPermissions()
         Thread.sleep(forTimeInterval: 2)
       }
     }

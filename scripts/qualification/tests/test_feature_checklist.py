@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import date, datetime, timedelta, timezone
 import hashlib
 import importlib.util
+import io
 import json
 import os
 import subprocess
@@ -10,20 +11,200 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 QUALIFICATION = Path(__file__).resolve().parents[1]
 
 
-def load_script():
-    path = QUALIFICATION / "feature-checklist.py"
-    spec = importlib.util.spec_from_file_location("feature_checklist", path)
+def load_script(name: str):
+    path = QUALIFICATION / name
+    spec = importlib.util.spec_from_file_location(name.replace("-", "_"), path)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     spec.loader.exec_module(module)
     return module
 
 
-feature_checklist = load_script()
+feature_checklist = load_script("feature-checklist.py")
+report_validation = load_script("report_validation.py")
+validation_plan = load_script("validation-plan.py")
+
+
+def fixture_candidate_build_attestation_fields(
+    policy,
+    *,
+    version: str,
+    source_commit: str,
+    release_source_digest: str,
+    artifact_digest: str,
+    catalog: list[str],
+    candidate_app_digest: str = "d" * 64,
+    test_runner_digest: str = "1" * 64,
+    test_bundle_digest: str = "2" * 64,
+    base_xctestrun_digest: str = "3" * 64,
+) -> dict:
+    swift_source_files = [
+        {
+            "relativePath": "Fixture.swift",
+            "mode": 0o644,
+            "digestAlgorithm": "sha256",
+            "digest": "6" * 64,
+        }
+    ]
+    showcase_source_files = [
+        {
+            "relativePath": "Shared/ValidationFixture.swift",
+            "mode": 0o644,
+            "digestAlgorithm": "sha256",
+            "digest": "7" * 64,
+        }
+    ]
+    swift_sources = [record["relativePath"] for record in swift_source_files]
+    showcase_sources = [
+        record["relativePath"] for record in showcase_source_files
+    ]
+    authority_build_inputs = [
+        {
+            "relativePath": "Package.swift",
+            "mode": 0o644,
+            "digestAlgorithm": "sha256",
+            "digest": "a" * 64,
+        }
+    ]
+    effective_build_inputs = [dict(authority_build_inputs[0])]
+    effective_build_settings = [
+        {
+            "target": target,
+            "settings": {
+                "ARCHS": "arm64",
+                "CONFIGURATION": "Release",
+                "OTHER_LDFLAGS": "",
+                "OTHER_SWIFT_FLAGS": "",
+                "SWIFT_ACTIVE_COMPILATION_CONDITIONS": "",
+                "SWIFT_OPTIMIZATION_LEVEL": "-O",
+                "SWIFT_VERSION": "6.0",
+            },
+        }
+        for target in ("iOS", "iOSUITests")
+    ]
+    attestation = {
+        "formatVersion": 1,
+        "authority": "swiftvlc-candidate-build-binding-v1",
+        "version": version,
+        "candidateRuntimeBinding": "e" * 64,
+        "sourceCommit": source_commit,
+        "releaseSourceDigestAlgorithm": "swiftvlc-git-tree-v1",
+        "releaseSourceDigest": release_source_digest,
+        "artifactRelativePath": "Vendor/libvlc.xcframework",
+        "artifactBindingMode": "direct",
+        "artifactDigestAlgorithm": "swiftvlc-tree-v1",
+        "artifactDigest": artifact_digest,
+        "workspaceStateRelativePath": "SourcePackages/workspace-state.json",
+        "workspaceStateDigestAlgorithm": "sha256",
+        "workspaceStateDigest": "4" * 64,
+        "workspaceBinding": policy.CANDIDATE_WORKSPACE_BINDING,
+        "buildConfiguration": "Release",
+        "buildPlatform": "iphoneos",
+        "swiftSourceRoot": "Sources/SwiftVLC",
+        "swiftSourceSetDigestAlgorithm": "swiftvlc-compiled-source-set-v2",
+        "swiftSourceSetDigest": policy.compiled_source_set_digest(
+            swift_source_files
+        ),
+        "swiftSourceCount": len(swift_sources),
+        "swiftSourceRelativePaths": swift_sources,
+        "swiftSourceFiles": swift_source_files,
+        "showcaseSourceRoot": "Showcase",
+        "showcaseSourceSetDigestAlgorithm": "swiftvlc-compiled-source-set-v2",
+        "showcaseSourceSetDigest": policy.compiled_source_set_digest(
+            showcase_source_files
+        ),
+        "showcaseSourceCount": len(showcase_sources),
+        "showcaseSourceRelativePaths": showcase_sources,
+        "showcaseSourceFiles": showcase_source_files,
+        "sourceAuthorityBuildInputSetDigestAlgorithm": (
+            "swiftvlc-build-input-set-v1"
+        ),
+        "sourceAuthorityBuildInputSetDigest": policy.build_input_set_digest(
+            authority_build_inputs
+        ),
+        "sourceAuthorityBuildInputCount": len(authority_build_inputs),
+        "sourceAuthorityBuildInputFiles": authority_build_inputs,
+        "effectiveBuildInputSetDigestAlgorithm": "swiftvlc-build-input-set-v1",
+        "effectiveBuildInputSetDigest": policy.build_input_set_digest(
+            effective_build_inputs
+        ),
+        "effectiveBuildInputCount": len(effective_build_inputs),
+        "effectiveBuildInputFiles": effective_build_inputs,
+        "authorizedBuildInputTransforms": [],
+        "developmentTeam": "ABCDEFGHIJ",
+        "bundlePrefix": "com.swiftvlc.validation.fixture",
+        "effectiveBuildSettingsDigestAlgorithm": (
+            "swiftvlc-effective-build-settings-v1"
+        ),
+        "effectiveBuildSettingsDigest": policy.effective_build_settings_digest(
+            effective_build_settings
+        ),
+        "effectiveBuildSettings": effective_build_settings,
+        "swiftFileLists": [
+            {
+                "architecture": "arm64",
+                "digestAlgorithm": "sha256",
+                "digest": "5" * 64,
+                "relativePath": (
+                    "Build/Intermediates.noindex/SwiftVLC.build/Release-iphoneos/"
+                    "SwiftVLC.build/Objects-normal/arm64/SwiftVLC.SwiftFileList"
+                ),
+                "sourceCount": len(swift_sources),
+            }
+        ],
+        "showcaseTargetFileLists": [
+            {
+                "target": target,
+                "architecture": "arm64",
+                "digestAlgorithm": "sha256",
+                "digest": digest * 64,
+                "relativePath": (
+                    "Build/Intermediates.noindex/SwiftVLCShowcase.build/"
+                    f"Release-iphoneos/{target}.build/Objects-normal/arm64/"
+                    f"{target}.SwiftFileList"
+                ),
+                "sourceCount": 1,
+                "generatedSourceCount": 1,
+                "generatedSourceDigestAlgorithm": "sha256",
+                "generatedSourceDigest": generated_digest * 64,
+            }
+            for target, digest, generated_digest in (
+                ("iOS", "a", "b"),
+                ("iOSUITests", "c", "d"),
+            )
+        ],
+        "candidateAppRelativePath": "Release-iphoneos/iOS.app",
+        "candidateAppDigestAlgorithm": "swiftvlc-tree-v1",
+        "candidateAppDigest": candidate_app_digest,
+        "testRunnerRelativePath": "Release-iphoneos/iOSUITests-Runner.app",
+        "testRunnerDigestAlgorithm": "swiftvlc-tree-v1",
+        "testRunnerDigest": test_runner_digest,
+        "testBundleRelativePath": "PlugIns/iOSUITests.xctest",
+        "testBundleDigestAlgorithm": "swiftvlc-tree-v1",
+        "testBundleDigest": test_bundle_digest,
+        "baseXCTestRunName": "fixture.xctestrun",
+        "baseXCTestRunDigestAlgorithm": "sha256",
+        "baseXCTestRunDigest": base_xctestrun_digest,
+        "testCatalogDigestAlgorithm": "swiftvlc-test-catalog-v1",
+        "testCatalogDigest": policy.catalog_digest(catalog),
+        "testCatalogCount": len(catalog),
+        "testCatalog": catalog,
+    }
+    return {
+        "candidateRuntimeBinding": attestation["candidateRuntimeBinding"],
+        "candidateBuildAttestation": attestation,
+        "candidateBuildAttestationDigestAlgorithm": "sha256",
+        "candidateBuildAttestationDigest": hashlib.sha256(
+            policy.canonical_json_bytes(attestation)
+        ).hexdigest(),
+        "testCatalogAuthorityDigestAlgorithm": "sha256",
+        "testCatalogAuthorityDigest": "0" * 64,
+    }
 
 
 class FeatureChecklistTests(unittest.TestCase):
@@ -53,6 +234,28 @@ class FeatureChecklistTests(unittest.TestCase):
                     "id": "vod",
                     "summary": "Playback",
                     "hardware": ["iphone"],
+                },
+            ],
+            "runnerContracts": [
+                {
+                    "id": "seek-runner",
+                    "outputs": [
+                        {
+                            "scenario": "seek",
+                            "attachmentName": "qualification-seek.json",
+                            "testIdentifiers": ["iOSUITests/FixtureTests/testSeek"],
+                        }
+                    ],
+                },
+                {
+                    "id": "vod",
+                    "outputs": [
+                        {
+                            "scenario": "vod",
+                            "attachmentName": "qualification-vod.json",
+                            "testIdentifiers": ["iOSUITests/FixtureTests/testVOD"],
+                        }
+                    ],
                 },
             ],
         }
@@ -145,12 +348,45 @@ class FeatureChecklistTests(unittest.TestCase):
         }
 
     def build(self, source: dict) -> dict:
+        exploratory_durations = None
+        if (
+            source.get("mode") == "exploratory"
+            and source.get("qualificationEligibleEnvironment") is False
+        ):
+            matching = source.get("device", {}).get("matchingHardwareRows", [])
+            evidence_hardware = (
+                matching[0]
+                if len(matching) == 1
+                else feature_checklist.policy.EXPLORATORY_FUTURE_IOS_HARDWARE_ID
+            )
+            producer_by_scenario = {
+                output["scenario"]: contract["id"]
+                for contract in self.matrix.get("runnerContracts", [])
+                for output in contract.get("outputs", [])
+            }
+            runners = {
+                row.get("scenario"): row
+                for row in source.get("scenarios", [])
+                if isinstance(row, dict)
+            }
+            exploratory_durations = {
+                (scenario, evidence_hardware): runner["durationSeconds"]
+                for scenario, producer in producer_by_scenario.items()
+                if isinstance((runner := runners.get(producer)), dict)
+                and runner.get("result") == "pass"
+                and runner.get("qualificationEvidence") == "captured"
+            }
         return feature_checklist.build_checklist(
             source,
             self.manifest,
             self.matrix,
             manifest_checksum=self.manifest_checksum,
             matrix_checksum=self.matrix_checksum,
+            exploratory_evidence_durations=exploratory_durations,
+            release_scope_valid=(
+                source.get("mode") == "qualification"
+                and source.get("qualificationEligibleEnvironment") is True
+            ),
         )
 
     def passing_release_runner_scenarios(self) -> list[dict]:
@@ -292,9 +528,7 @@ class FeatureChecklistTests(unittest.TestCase):
             controls["headless-vout-teardown-contract"],
             {
                 "id": "headless-vout-teardown-contract",
-                "title": (
-                    "Stopped video-output teardown and natural-EOF contract"
-                ),
+                "title": ("Stopped video-output teardown and natural-EOF contract"),
                 "description": (
                     "Patch 0040 applies VLC's established started-vout "
                     "admission rule to SwiftVLC's Hold-backed emptiness query. "
@@ -377,13 +611,26 @@ class FeatureChecklistTests(unittest.TestCase):
     def test_manifest_rejects_unknown_and_unclassified_scenarios(self):
         unknown = json.loads(json.dumps(self.manifest))
         unknown["features"][0]["scenarioIds"] = ["not-a-scenario"]
-        with self.assertRaises(feature_checklist.ChecklistError):
+        with self.assertRaisesRegex(
+            feature_checklist.ChecklistError, "names unknown scenarios"
+        ):
             feature_checklist.validate_manifest(unknown, self.matrix)
 
         uncovered = json.loads(json.dumps(self.manifest))
         uncovered["features"][1]["scenarioIds"] = ["seek"]
-        with self.assertRaises(feature_checklist.ChecklistError):
+        uncovered["features"][1]["runnerScenarioIds"] = ["seek-runner"]
+        with self.assertRaisesRegex(
+            feature_checklist.ChecklistError,
+            "leaves matrix scenarios unclassified: vod",
+        ):
             feature_checklist.validate_manifest(uncovered, self.matrix)
+
+        wrong_producer = json.loads(json.dumps(self.manifest))
+        wrong_producer["features"][0]["runnerScenarioIds"] = ["vod"]
+        with self.assertRaisesRegex(
+            feature_checklist.ChecklistError, "matrix-owned producers"
+        ):
+            feature_checklist.validate_manifest(wrong_producer, self.matrix)
 
     def test_duplicate_json_keys_are_rejected_instead_of_last_wins(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -546,6 +793,45 @@ class FeatureChecklistTests(unittest.TestCase):
         self.assertFalse(checklist["summary"]["releaseReady"])
         self.assertEqual(checklist["runnerFailures"][0]["scenario"], "vod")
 
+    def test_stable_partial_device_report_never_receives_release_credit(self):
+        source = {
+            **self.identity(),
+            **self.fresh_timing(),
+            "mode": "qualification",
+            "qualificationEligibleEnvironment": True,
+            "device": {
+                "name": "Fixture Phone",
+                "productType": "iPhone99,1",
+                "osVersion": "26.0",
+                "osBuild": "23A1",
+                "osReleaseType": "stable",
+                "matchingHardwareRows": ["iphone"],
+            },
+            "qualificationRows": [
+                self.row("seek", "iphone"),
+                self.row("vod", "iphone"),
+            ],
+            "scenarios": [
+                {
+                    **row,
+                    "qualificationEvidence": "captured",
+                    "durationSeconds": 12,
+                }
+                for row in self.passing_release_runner_scenarios()
+                if row["hardware"] == "iphone"
+            ],
+        }
+        checklist = feature_checklist.build_checklist(
+            source,
+            self.manifest,
+            self.matrix,
+            manifest_checksum=self.manifest_checksum,
+            matrix_checksum=self.matrix_checksum,
+            release_scope_valid=False,
+        )
+        self.assertFalse(checklist["scope"]["releaseCreditEligible"])
+        self.assertFalse(checklist["summary"]["requiredFeaturesSatisfied"])
+
     def test_stale_qualifying_device_report_cannot_render_a_green_checklist(self):
         completed = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(
             seconds=feature_checklist.policy.MAXIMUM_STABLE_REPORT_AGE_SECONDS + 1
@@ -602,12 +888,16 @@ class FeatureChecklistTests(unittest.TestCase):
                     "result": "pass",
                     "xcodebuildExitCode": 0,
                     "libraryErrorCount": 0,
+                    "qualificationEvidence": "captured",
+                    "durationSeconds": 12,
                 },
                 {
                     "scenario": "vod",
                     "result": "pass",
                     "xcodebuildExitCode": 0,
                     "libraryErrorCount": 0,
+                    "qualificationEvidence": "captured",
+                    "durationSeconds": 12,
                 },
             ],
         }
@@ -617,10 +907,43 @@ class FeatureChecklistTests(unittest.TestCase):
     ):
         checklist = self.build(self.exploratory_future_device_report())
         results = {feature["id"]: feature for feature in checklist["features"]}
-        self.assertEqual(results["seek-landing"]["status"], "notRun")
-        self.assertEqual(results["vod-output"]["status"], "notRun")
+        self.assertEqual(results["seek-landing"]["status"], "observedPass")
+        self.assertEqual(results["vod-output"]["status"], "observedPass")
         self.assertEqual(results["receiver-output"]["status"], "blocked")
         self.assertEqual(checklist["summary"]["counts"]["pass"], 0)
+        self.assertEqual(checklist["summary"]["counts"]["observedPass"], 2)
+        self.assertEqual(
+            list(checklist["summary"]["counts"]),
+            list(feature_checklist.RESULT_ORDER),
+        )
+        self.assertEqual(
+            list(checklist["categories"][0]["counts"]),
+            list(feature_checklist.RESULT_ORDER),
+        )
+        self.assertFalse(checklist["summary"]["requiredFeaturesSatisfied"])
+        self.assertFalse(checklist["summary"]["releaseReady"])
+        self.assertEqual(checklist["formatVersion"], 2)
+        self.assertEqual(
+            results["seek-landing"]["evidence"],
+            [
+                {
+                    "scenario": "seek",
+                    "hardware": "iphone",
+                    "evidenceHardware": "exploratory-future-ios",
+                    "runnerScenario": "seek-runner",
+                    "result": "observedPass",
+                    "evidence": "evidence/seek-exploratory-future-ios.json",
+                    "durationSeconds": 12,
+                    "releaseQualifying": False,
+                }
+            ],
+        )
+        markdown = feature_checklist.render_markdown(checklist, self.manifest)
+        self.assertIn(
+            "[seek on iphone (captured as exploratory-future-ios)]"
+            "(evidence/seek-exploratory-future-ios.json)",
+            markdown,
+        )
         self.assertTrue(checklist["runnerFailures"])
         self.assertTrue(
             all(row["result"] == "notRun" for row in checklist["runnerFailures"])
@@ -684,12 +1007,16 @@ class FeatureChecklistTests(unittest.TestCase):
                     "result": "pass",
                     "xcodebuildExitCode": 0,
                     "libraryErrorCount": 0,
+                    "qualificationEvidence": "captured",
+                    "durationSeconds": 12,
                 },
                 {
                     "scenario": "vod",
                     "result": "pass",
                     "xcodebuildExitCode": 0,
                     "libraryErrorCount": 0,
+                    "qualificationEvidence": "captured",
+                    "durationSeconds": 12,
                 },
             ],
         }
@@ -702,14 +1029,27 @@ class FeatureChecklistTests(unittest.TestCase):
             if feature["execution"] == "automated"
         ]
         self.assertTrue(automated)
-        self.assertTrue(all(feature["status"] == "notRun" for feature in automated))
-        self.assertEqual(checklist["summary"]["counts"]["pass"], 0)
-        self.assertFalse(checklist["summary"]["requiredFeaturesSatisfied"])
-        self.assertFalse(checklist["scope"]["releaseCreditEligible"])
-        self.assertIn(
-            "EXPLORATORY — NOT RELEASE-QUALIFYING",
-            feature_checklist.render_markdown(checklist, self.manifest),
+        self.assertTrue(
+            all(feature["status"] == "observedPass" for feature in automated)
         )
+        self.assertEqual(checklist["summary"]["counts"]["pass"], 0)
+        self.assertEqual(checklist["summary"]["counts"]["observedPass"], 2)
+        self.assertFalse(checklist["summary"]["requiredFeaturesSatisfied"])
+        self.assertFalse(checklist["summary"]["releaseReady"])
+        self.assertFalse(checklist["scope"]["releaseCreditEligible"])
+        markdown = feature_checklist.render_markdown(checklist, self.manifest)
+        html = feature_checklist.render_html(checklist, self.manifest)
+        self.assertIn("EXPLORATORY — NOT RELEASE-QUALIFYING", markdown)
+        self.assertIn("EXPLORATORY OBSERVATIONS ONLY", markdown)
+        self.assertIn("OBSERVED PASS", markdown)
+        self.assertIn("Observed pass", html)
+        self.assertIn("EXPLORATORY OBSERVATIONS ONLY", html)
+        self.assertIn("evidence/seek-iphone.json", markdown)
+        self.assertIn("| OBSERVED PASS | required | Seek <lands>", markdown)
+        self.assertIn('class="status status-observedPass">OBSERVED PASS</td>', html)
+        cli_summary = feature_checklist._cli_summary(checklist["summary"])
+        self.assertIn("0 passed", cli_summary)
+        self.assertIn("2 observed passed (non-release)", cli_summary)
 
         source["qualificationRows"].append(self.row("seek", "iphone"))
         with self.assertRaisesRegex(
@@ -717,6 +1057,162 @@ class FeatureChecklistTests(unittest.TestCase):
             "cannot contain qualification rows",
         ):
             self.build(source)
+
+    def test_exploratory_checklist_uses_device_evidence_not_host_duration(self):
+        source = self.exploratory_future_device_report()
+        source["scenarios"][0]["durationSeconds"] = 300
+        checklist = feature_checklist.build_checklist(
+            source,
+            self.manifest,
+            self.matrix,
+            manifest_checksum=self.manifest_checksum,
+            matrix_checksum=self.matrix_checksum,
+            exploratory_evidence_durations={
+                ("seek", "exploratory-future-ios"): 12,
+                ("vod", "exploratory-future-ios"): 12,
+            },
+        )
+        seek = next(
+            feature
+            for feature in checklist["features"]
+            if feature["id"] == "seek-landing"
+        )
+        self.assertEqual(seek["evidence"][0]["durationSeconds"], 12)
+
+    def test_exploratory_duration_loader_skips_inapplicable_mixed_runner_output(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            report = root / "report.json"
+            evidence = root / "evidence" / "replacement-ipad.json"
+            evidence.parent.mkdir()
+            evidence.write_text(json.dumps({"durationSeconds": 17}))
+            source = {
+                **self.identity(),
+                "mode": "exploratory",
+                "qualificationEligibleEnvironment": False,
+                "device": {
+                    "matchingHardwareRows": ["ipad"],
+                    "deviceFamily": "iPad",
+                    "osMajor": 26,
+                },
+                "qualificationRows": [],
+                "scenarios": [
+                    {
+                        "scenario": "continuity",
+                        "result": "pass",
+                        "qualificationEvidence": "captured",
+                    }
+                ],
+            }
+            report.write_text(json.dumps(source))
+            validated = {
+                "scenarioById": {
+                    "replacement": {"id": "replacement"},
+                    "replacement-continuity": {
+                        "id": "replacement-continuity",
+                        "hardware": ["iphone"],
+                    },
+                },
+                "hardwareById": {
+                    "iphone": {
+                        "id": "iphone",
+                        "deviceFamily": "iPhone",
+                        "osMajor": 26,
+                    },
+                    "ipad": {
+                        "id": "ipad",
+                        "deviceFamily": "iPad",
+                        "osMajor": 26,
+                    },
+                },
+                "scenarioProducerById": {
+                    "replacement": "continuity",
+                    "replacement-continuity": "continuity",
+                },
+            }
+
+            durations = feature_checklist.load_exploratory_evidence_durations(
+                source, report, validated
+            )
+
+            self.assertEqual(durations, {("replacement", "ipad"): 17})
+            self.assertFalse(
+                (root / "evidence" / "replacement-continuity-ipad.json").exists()
+            )
+
+    def test_exploratory_observation_is_bound_to_owner_pass_and_capture(self):
+        mutations = {
+            "missing capture marker": lambda rows: rows[0].pop("qualificationEvidence"),
+            "non-captured evidence": lambda rows: rows[0].update(
+                qualificationEvidence="missing"
+            ),
+            "failed owner": lambda rows: rows[0].update(result="fail"),
+            "captured non-owner": lambda rows: (
+                rows[0].pop("qualificationEvidence"),
+                rows.append(
+                    {
+                        "scenario": "untrusted-runner",
+                        "result": "pass",
+                        "qualificationEvidence": "captured",
+                        "durationSeconds": 12,
+                    }
+                ),
+            ),
+        }
+        for description, mutate in mutations.items():
+            with self.subTest(description):
+                source = self.exploratory_future_device_report()
+                mutate(source["scenarios"])
+                checklist = self.build(source)
+                seek = next(
+                    feature
+                    for feature in checklist["features"]
+                    if feature["id"] == "seek-landing"
+                )
+                expected = "fail" if description == "failed owner" else "notRun"
+                self.assertEqual(seek["status"], expected)
+                self.assertNotEqual(seek["status"], "observedPass")
+                self.assertEqual(
+                    seek["evidence"][0]["result"],
+                    "fail" if description == "failed owner" else "notRun",
+                )
+                self.assertIsNone(seek["evidence"][0]["evidence"])
+                self.assertEqual(checklist["summary"]["counts"]["pass"], 0)
+                self.assertFalse(checklist["summary"]["requiredFeaturesSatisfied"])
+                self.assertFalse(checklist["summary"]["releaseReady"])
+
+    def test_exploratory_partial_keeps_missing_output_not_run(self):
+        self.manifest["features"][0]["scenarioIds"] = ["seek", "vod"]
+        self.manifest["features"][0]["runnerScenarioIds"] = ["seek-runner", "vod"]
+        source = self.exploratory_future_device_report()
+        source["scenarios"][1]["qualificationEvidence"] = "missing"
+
+        checklist = self.build(source)
+        seek = next(
+            feature
+            for feature in checklist["features"]
+            if feature["id"] == "seek-landing"
+        )
+
+        self.assertEqual(seek["status"], "observedPartial")
+        self.assertEqual(
+            [record["result"] for record in seek["evidence"]],
+            ["observedPass", "notRun"],
+        )
+        self.assertEqual(checklist["summary"]["counts"]["pass"], 0)
+        self.assertEqual(checklist["summary"]["counts"]["observedPartial"], 1)
+        self.assertFalse(checklist["summary"]["requiredFeaturesSatisfied"])
+        self.assertFalse(checklist["summary"]["releaseReady"])
+        markdown = feature_checklist.render_markdown(checklist, self.manifest)
+        html = feature_checklist.render_html(checklist, self.manifest)
+        self.assertIn("| OBSERVED PARTIAL | required | Seek <lands>", markdown)
+        self.assertIn(
+            'class="status status-observedPartial">OBSERVED PARTIAL</td>', html
+        )
+        self.assertIn(
+            "1 observed partial (non-release)",
+            feature_checklist._cli_summary(checklist["summary"]),
+        )
 
     def test_release_record_is_ready_only_when_every_required_row_passes(self):
         self.manifest["features"] = self.manifest["features"][:2]
@@ -853,6 +1349,16 @@ class FeatureChecklistTests(unittest.TestCase):
                     "qualificationPolicyDigestAlgorithm": "swiftvlc-qualification-policy-v1",
                     "qualificationPolicyDigest": policy.policy_digest(),
                 }
+                identity.update(
+                    fixture_candidate_build_attestation_fields(
+                        policy,
+                        version=identity["version"],
+                        source_commit=identity["sourceCommit"],
+                        release_source_digest=identity["releaseSourceDigest"],
+                        artifact_digest=identity["artifactDigest"],
+                        catalog=catalog,
+                    )
+                )
                 source_directory = (
                     root / f"source-{identity['featureManifestChecksum'][:12]}"
                 )
@@ -939,6 +1445,10 @@ class FeatureChecklistTests(unittest.TestCase):
                             payload = {
                                 "scenario": output["scenario"],
                                 "durationSeconds": 12,
+                                "qualificationSessionBinding": "9" * 64,
+                                "candidateRuntimeBinding": identity[
+                                    "candidateRuntimeBinding"
+                                ],
                             }
                             payload_path.write_text(json.dumps(payload, sort_keys=True))
                             payloads[output["scenario"]] = payload_path
@@ -980,7 +1490,7 @@ class FeatureChecklistTests(unittest.TestCase):
                             "attemptArtifactRoot": attempt_root.name,
                             "durationSeconds": 12,
                             "qualificationEvidence": (
-                                "captured" if outputs else "notCaptured"
+                                "captured" if outputs else "not-applicable"
                             ),
                         }
                     )
@@ -1069,17 +1579,57 @@ class FeatureChecklistTests(unittest.TestCase):
                             "result": "pass",
                         }
                     )
+                selected_device = {
+                    "id": "fixture-coredevice",
+                    "udid": "fixture-device",
+                    "ecid": 42,
+                    "ecidHex": "0x2A",
+                    "name": "Fixture iphone",
+                    "marketingName": "Fixture iphone",
+                    "deviceFamily": "iPhone",
+                    "productType": "Fixture1,1",
+                    "osVersion": "26.0",
+                    "osMajor": 26,
+                    "osBuild": "23A1",
+                    "osReleaseType": "stable",
+                    "transport": "wired",
+                    "tunnelIPAddress": "fd00::1",
+                    "connected": True,
+                    "matchingHardwareRows": ["iphone"],
+                    "qualificationEligible": True,
+                }
+                (source_directory / policy.DEVICE_SNAPSHOT_RELATIVE_PATH).write_text(
+                    json.dumps(
+                        {
+                            "selected": selected_device,
+                            "connected": [selected_device],
+                            "allPhysicalIOSDevices": [selected_device],
+                            "mode": "qualification",
+                        },
+                        sort_keys=True,
+                    )
+                )
                 source_report = source_directory / "report.json"
                 source_report.write_text(
                     json.dumps(
                         {
                             **identity,
-                            "device": {"udid": "fixture-device"},
+                            "device": selected_device,
+                            "deviceSnapshot": policy.device_snapshot_binding(
+                                source_directory
+                            ),
                             "qualificationEligibleEnvironment": True,
                             "mode": "qualification",
-                            "startedAtUTC": started_at.strftime(
+                            "reportOnly": False,
+                            "orchestratorSessionBinding": "9" * 64,
+                            "orchestratorStartedAtUTC": started_at.strftime(
                                 "%Y-%m-%dT%H:%M:%SZ"
                             ),
+                            "releaseGateSatisfied": False,
+                            "releaseGateReason": (
+                                policy.ORDINARY_RELEASE_GATE_REASON
+                            ),
+                            "startedAtUTC": started_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
                             "completedAtUTC": completed_at.strftime(
                                 "%Y-%m-%dT%H:%M:%SZ"
                             ),
@@ -1090,6 +1640,34 @@ class FeatureChecklistTests(unittest.TestCase):
                         },
                         sort_keys=True,
                     )
+                )
+                plan = validation_plan.build_plan(
+                    {
+                        "mode": "qualification",
+                        "selected": selected_device,
+                    },
+                    self.matrix,
+                    runners,
+                    runners,
+                    started_at_utc=started_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    orchestrator_session_binding="9" * 64,
+                    orchestrator_started_at_utc=started_at.strftime(
+                        "%Y-%m-%dT%H:%M:%SZ"
+                    ),
+                    selection_scope="partial",
+                )
+                report_validation.atomic_write_json(
+                    source_directory / report_validation.PLAN_FILENAME,
+                    plan,
+                )
+                report_validation.write_marker_for_bytes(
+                    source_directory,
+                    source_report.read_bytes(),
+                    (source_directory / report_validation.PLAN_FILENAME).read_bytes(),
+                    report_validation.QUALIFICATION_AUTHORITY,
+                    validated_evidence_manifest=(
+                        report_validation.evidence_tree_manifest(source_directory)
+                    ),
                 )
                 source_digest = policy.tree_digest(source_directory)
                 source_binding = {
@@ -1237,6 +1815,173 @@ class FeatureChecklistTests(unittest.TestCase):
             self.assertNotIn(
                 "generatedAt", (Path(first) / "feature-checklist.json").read_text()
             )
+
+    def test_cli_classifies_render_io_failure_as_validation_error(self):
+        checklist = {
+            "summary": {
+                "counts": {result: 0 for result in feature_checklist.RESULT_ORDER},
+                "requiredFeaturesSatisfied": False,
+            }
+        }
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(
+                sys,
+                "argv",
+                [
+                    "feature-checklist.py",
+                    "--input",
+                    "/tmp/report.json",
+                    "--output-dir",
+                    "/tmp",
+                ],
+            ),
+            mock.patch.object(
+                feature_checklist,
+                "load_json",
+                side_effect=[self.manifest, self.matrix, {"qualificationRows": []}],
+            ),
+            mock.patch.object(
+                feature_checklist.report_validation,
+                "regular_file_bytes",
+                return_value=b'{"qualificationRows":[]}',
+            ),
+            mock.patch.object(
+                feature_checklist.report_validation,
+                "is_valid",
+                return_value=True,
+            ),
+            mock.patch.object(feature_checklist, "validate_manifest"),
+            mock.patch.object(feature_checklist.policy, "validate_report"),
+            mock.patch.object(
+                feature_checklist, "build_checklist", return_value=checklist
+            ),
+            mock.patch.object(
+                feature_checklist,
+                "write_outputs",
+                side_effect=OSError("fixture disk full"),
+            ),
+            mock.patch.object(sys, "stderr", stderr),
+        ):
+            status = feature_checklist.main()
+
+        self.assertEqual(status, 2)
+        self.assertIn("fixture disk full", stderr.getvalue())
+
+    def test_cli_rechecks_receipt_after_semantic_reads_before_success(self):
+        checklist = {
+            "summary": {
+                "counts": {result: 0 for result in feature_checklist.RESULT_ORDER},
+                "requiredFeaturesSatisfied": False,
+            }
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            report = root / "report.json"
+            report.write_text(json.dumps({"qualificationRows": []}))
+            stderr = io.StringIO()
+            with (
+                mock.patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "feature-checklist.py",
+                        "--input",
+                        str(report),
+                        "--output-dir",
+                        str(root),
+                    ],
+                ),
+                mock.patch.object(
+                    feature_checklist,
+                    "load_json",
+                    side_effect=[self.manifest, self.matrix],
+                ),
+                mock.patch.object(feature_checklist, "validate_manifest"),
+                mock.patch.object(feature_checklist.policy, "validate_report"),
+                mock.patch.object(
+                    feature_checklist,
+                    "build_checklist",
+                    return_value=checklist,
+                ),
+                mock.patch.object(
+                    feature_checklist.report_validation,
+                    "is_valid",
+                    side_effect=[True, False],
+                ),
+                mock.patch.object(feature_checklist, "write_outputs") as write_outputs,
+                mock.patch.object(sys, "stderr", stderr),
+            ):
+                status = feature_checklist.main()
+
+            self.assertEqual(status, 2)
+            self.assertIn("changed while", stderr.getvalue())
+            write_outputs.assert_not_called()
+
+    def test_cli_rejects_direct_device_report_without_validation_receipt(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            report = Path(temporary) / "report.json"
+            report.write_text(json.dumps({"qualificationRows": []}))
+            stderr = io.StringIO()
+            with (
+                mock.patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "feature-checklist.py",
+                        "--input",
+                        str(report),
+                        "--check-only",
+                    ],
+                ),
+                mock.patch.object(
+                    feature_checklist,
+                    "load_json",
+                    side_effect=[self.manifest, self.matrix],
+                ),
+                mock.patch.object(feature_checklist, "validate_manifest"),
+                mock.patch.object(
+                    feature_checklist.report_validation,
+                    "is_valid",
+                    return_value=False,
+                ),
+                mock.patch.object(
+                    feature_checklist.policy, "validate_report"
+                ) as validate_report,
+                mock.patch.object(sys, "stderr", stderr),
+            ):
+                status = feature_checklist.main()
+
+            self.assertEqual(status, 2)
+            self.assertIn("successful-validation receipt", stderr.getvalue())
+            validate_report.assert_not_called()
+
+    def test_cli_rejects_output_directory_that_breaks_evidence_links(self):
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(
+                sys,
+                "argv",
+                [
+                    "feature-checklist.py",
+                    "--input",
+                    "/tmp/report.json",
+                    "--output-dir",
+                    "/tmp/separate-checklist",
+                ],
+            ),
+            mock.patch.object(
+                feature_checklist,
+                "load_json",
+                side_effect=[self.manifest, self.matrix],
+            ),
+            mock.patch.object(feature_checklist, "validate_manifest"),
+            mock.patch.object(sys, "stderr", stderr),
+        ):
+            status = feature_checklist.main()
+
+        self.assertEqual(status, 2)
+        self.assertIn("evidence links remain valid", stderr.getvalue())
 
 
 if __name__ == "__main__":

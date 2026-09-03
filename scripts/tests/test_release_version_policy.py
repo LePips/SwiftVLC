@@ -62,6 +62,30 @@ class ReleaseVersionPolicyTests(unittest.TestCase):
                 with self.assertRaises(release_version_policy.VersionPolicyError):
                     release_version_policy.classify(version)
 
+    def test_release_series_binding_accepts_only_the_exact_core_version(self):
+        for version in ("1.1.0", "1.1.0-beta.1", "1.1.0-rc.0"):
+            with self.subTest(version=version):
+                self.assertEqual(
+                    release_version_policy.require_series(version, "1.1.0")[
+                        "version"
+                    ],
+                    version,
+                )
+        for version in ("1.0.9", "1.2.0-beta.1", "2.0.0"):
+            with self.subTest(version=version):
+                with self.assertRaisesRegex(
+                    release_version_policy.VersionPolicyError,
+                    "not in release series",
+                ):
+                    release_version_policy.require_series(version, "1.1.0")
+
+    def test_release_series_prefix_must_itself_be_stable_semver(self):
+        with self.assertRaisesRegex(
+            release_version_policy.VersionPolicyError,
+            "prefix must be a stable strict SemVer",
+        ):
+            release_version_policy.require_series("1.1.0-beta.2", "1.1.0-beta.1")
+
 
 if __name__ == "__main__":
     unittest.main()

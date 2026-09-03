@@ -12,12 +12,6 @@ final class PiPCadenceDeviceUITests: ShowcaseIOSTestCase {
     else {
       throw XCTSkip("Set SWIFTVLC_PIP_CADENCE_DEVICE=YES for candidate-bound hardware runs")
     }
-    addUIInterruptionMonitor(withDescription: "Local network permission") { alert in
-      let allow = alert.buttons["Allow"]
-      guard allow.exists else { return false }
-      allow.tap()
-      return true
-    }
     let duration = max(
       1,
       Int(ProcessInfo.processInfo.environment["SWIFTVLC_CADENCE_SECONDS"] ?? "600")
@@ -31,8 +25,7 @@ final class PiPCadenceDeviceUITests: ShowcaseIOSTestCase {
       LaunchArguments.pipCadenceBaseURLBase64, encodedBaseURL,
       LaunchArguments.pipCadenceDuration, String(duration)
     ]
-    app.launch()
-    app.tap()
+    launchDirectlyHandlingQualificationPermissions()
 
     let possible = element(AccessibilityID.PiPCadenceValidation.possibleLabel)
     let active = element(AccessibilityID.PiPCadenceValidation.activeLabel)

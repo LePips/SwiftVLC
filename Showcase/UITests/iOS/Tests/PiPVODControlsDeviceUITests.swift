@@ -49,15 +49,8 @@ final class PiPVODControlsDeviceUITests: ShowcaseIOSTestCase {
   }
 
   private func runControls(renderingPath: String) throws -> [String: Any] {
-    addUIInterruptionMonitor(withDescription: "Local network permission") { alert in
-      let allow = alert.buttons["Allow"]
-      guard allow.exists else { return false }
-      allow.tap()
-      return true
-    }
     replaceLaunchArgument(LaunchArguments.pipRenderingPath, with: renderingPath)
     launch(route: .pipVODControlsValidation)
-    app.tap()
 
     let state = element(AccessibilityID.PiPVODControlsValidation.stateLabel)
     let possible = element(AccessibilityID.PiPVODControlsValidation.possibleLabel)

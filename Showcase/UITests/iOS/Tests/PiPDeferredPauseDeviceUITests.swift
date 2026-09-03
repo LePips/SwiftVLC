@@ -11,14 +11,7 @@ final class PiPDeferredPauseDeviceUITests: ShowcaseIOSTestCase {
       throw XCTSkip("Set SWIFTVLC_PIP_DEFERRED_PAUSE_DEVICE=YES for candidate-bound hardware runs")
     }
 
-    addUIInterruptionMonitor(withDescription: "Local network permission") { alert in
-      let allow = alert.buttons["Allow"]
-      guard allow.exists else { return false }
-      allow.tap()
-      return true
-    }
     launch(route: .pipDeferredPauseValidation)
-    app.tap()
 
     let state = element(AccessibilityID.PiPDeferredPauseValidation.stateLabel)
     let possible = element(AccessibilityID.PiPDeferredPauseValidation.possibleLabel)

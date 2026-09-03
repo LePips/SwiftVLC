@@ -65,16 +65,8 @@ final class PiPCapabilityDeviceUITests: ShowcaseIOSTestCase {
   }
 
   private func runCapabilityTransitions(renderingPath: String) throws -> BackendEvidence {
-    addUIInterruptionMonitor(withDescription: "Local network permission") { alert in
-      let allow = alert.buttons["Allow"]
-      guard allow.exists else { return false }
-      allow.tap()
-      return true
-    }
-
     replaceLaunchArgument(LaunchArguments.pipRenderingPath, with: renderingPath)
     launch(route: .pipCapabilityValidation)
-    app.tap()
 
     let state = element(AccessibilityID.PiPCapabilityValidation.stateLabel)
     let generation = element(AccessibilityID.PiPCapabilityValidation.generationLabel)

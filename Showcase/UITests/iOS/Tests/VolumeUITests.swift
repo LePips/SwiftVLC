@@ -167,7 +167,7 @@ final class VolumeUITests: ShowcaseIOSTestCase {
     measure(metrics: [XCTMemoryMetric()]) {
       for _ in 0..<3 {
         app.terminate()
-        app.launch()
+        launchDirectlyHandlingQualificationPermissions()
         _ = playPauseButton.waitForExistence(timeout: 5)
       }
     }

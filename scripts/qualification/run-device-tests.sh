@@ -7,7 +7,7 @@ export PYTHONDONTWRITEBYTECODE=1
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
-VERSION="1.1.0"
+VERSION=""
 DEVICE_SELECTOR=""
 DEVELOPMENT_TEAM="${SWIFTVLC_DEVELOPMENT_TEAM:-}"
 CANDIDATE_APP=""
@@ -22,12 +22,17 @@ EXPLORATORY_CURRENT_ONLY=false
 EXPLORATORY_HARDWARE_ID=""
 SKIP_BUILD=false
 FULL_SUITE_SELECTION=false
+ORCHESTRATOR_SESSION_BINDING=""
+ORCHESTRATOR_STARTED_AT_UTC=""
 ONLY_SCENARIOS=()
 ADAPTIVE_SOAK_SECONDS="${SWIFTVLC_ADAPTIVE_SOAK_SECONDS:-7200}"
 PIP_PERFORMANCE_SECONDS="${SWIFTVLC_PIP_PERFORMANCE_SECONDS:-900}"
 CADENCE_SECONDS="${SWIFTVLC_CADENCE_SECONDS:-600}"
 NATIVE_SUBTITLE_SECONDS="${SWIFTVLC_NATIVE_SUBTITLE_SECONDS:-900}"
 TIMEBASE_SOAK_SECONDS="${SWIFTVLC_TIMEBASE_SOAK_SECONDS:-7200}"
+CADENCE_SEMANTICS_PROBE_XCTEST_ALLOWANCE_SECONDS=420
+CADENCE_SEMANTICS_PROBE_IDLE_WATCHDOG_SECONDS=480
+CADENCE_SEMANTICS_PROBE_WALL_WATCHDOG_SECONDS=780
 
 usage() {
   cat <<'EOF'
@@ -37,7 +42,7 @@ Runs automated candidate-bound physical iOS smoke tests and captures xcresult,
 app-log, fixture-server, device, source, and binary identity evidence.
 
 Options:
-  --version VERSION       Candidate version (default: 1.1.0)
+  --version VERSION       Exact candidate version (required)
   --device IDENTIFIER     CoreDevice id, UDID, ECID, or exact device name
   --development-team ID  Required for a new build: signs the disposable export
                           with team-scoped bundle IDs (or set the matching env)
@@ -50,6 +55,10 @@ Options:
   --fixtures PATH         Generated fixture directory
   --output PATH           Evidence output root
   --work-root PATH        Temporary source/work root (default: beside the repo)
+  --orchestrator-session-binding SHA256
+                          Exact 64-hex handoff binding from qualify.py
+  --orchestrator-started-at-utc TIMESTAMP
+                          Canonical UTC start of the qualifying orchestrator
   --only SCENARIO         Repeat to select: analyzer, ui-suite, native-live,
                           direct-live, live-media, background-audio,
                           continuity, capability-convergence,
@@ -151,6 +160,8 @@ while [[ $# -gt 0 ]]; do
     --fixtures) FIXTURES="$2"; shift 2 ;;
     --output) OUTPUT_ROOT="$2"; shift 2 ;;
     --work-root) WORK_ROOT="$2"; shift 2 ;;
+    --orchestrator-session-binding) ORCHESTRATOR_SESSION_BINDING="$2"; shift 2 ;;
+    --orchestrator-started-at-utc) ORCHESTRATOR_STARTED_AT_UTC="$2"; shift 2 ;;
     --only) ONLY_SCENARIOS+=("$2"); shift 2 ;;
     --full-suite-selection) FULL_SUITE_SELECTION=true; shift ;;
     --require-stable) REQUIRE_STABLE=true; shift ;;
@@ -161,6 +172,34 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+if [[ -z "$VERSION" ]]; then
+  echo "Error: --version is required; qualification must name the exact candidate." >&2
+  exit 2
+fi
+if ! RELEASE_VERSION_PREFIX=$(python3 - "$SCRIPT_DIR/feature-manifest-v1.json" \
+    "$SCRIPT_DIR" <<'PY'
+import sys
+from pathlib import Path
+
+manifest_path, qualification_path = sys.argv[1:]
+sys.path.insert(0, qualification_path)
+import qualification_policy as policy
+
+manifest = policy.load_json(Path(manifest_path), "feature manifest")
+prefix = manifest.get("releaseVersionPrefix")
+if not isinstance(prefix, str) or not prefix:
+    raise SystemExit("feature manifest has no releaseVersionPrefix")
+print(prefix)
+PY
+); then
+  echo "Error: cannot resolve the feature manifest release series." >&2
+  exit 2
+fi
+if ! python3 "$ROOT_DIR/scripts/release-version-policy.py" "$VERSION" \
+    --series-prefix "$RELEASE_VERSION_PREFIX" > /dev/null; then
+  echo "Error: --version must be strict SemVer in release series $RELEASE_VERSION_PREFIX." >&2
+  exit 2
+fi
 if [[ -n "$DEVELOPMENT_TEAM" && ! "$DEVELOPMENT_TEAM" =~ ^[A-Z0-9]{10}$ ]]; then
   echo "Error: --development-team must be a 10-character Apple team identifier." >&2
   exit 2
@@ -209,10 +248,25 @@ if [[ "$REQUIRE_STABLE" == true ]]; then
   done
 fi
 
-for command in curl ffmpeg ffprobe git jq plutil python3 shasum tar xcodebuild xcrun; do
+for command in chflags curl ffmpeg ffprobe git jq plutil python3 shasum tar xcodebuild xcrun; do
   if ! command -v "$command" >/dev/null 2>&1; then
     echo "Error: required command is unavailable: $command" >&2
     exit 1
+  fi
+done
+
+# Do not let an inherited shell build-setting override select different
+# compiler inputs, conditions, link flags, metadata, or tools than the settings
+# captured in the candidate build attestation.
+for override in \
+  CC CXX LD LDPLUSPLUS LIBTOOL SWIFT_EXEC XCODE_XCCONFIG_FILE \
+  OTHER_CFLAGS OTHER_CPLUSPLUSFLAGS OTHER_LDFLAGS OTHER_SWIFT_FLAGS \
+  GCC_PREPROCESSOR_DEFINITIONS SWIFT_ACTIVE_COMPILATION_CONDITIONS \
+  EXCLUDED_SOURCE_FILE_NAMES INCLUDED_SOURCE_FILE_NAMES \
+  INFOPLIST_FILE CODE_SIGN_ENTITLEMENTS; do
+  if [[ ${!override+x} == x ]]; then
+    echo "Error: inherited Xcode build override is forbidden: $override" >&2
+    exit 2
   fi
 done
 
@@ -233,12 +287,54 @@ run_with_watchdog() {
 }
 
 RUN_STARTED_AT_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+if [[ -z "$ORCHESTRATOR_SESSION_BINDING" \
+  && -z "$ORCHESTRATOR_STARTED_AT_UTC" ]]; then
+  ORCHESTRATOR_SESSION_BINDING=$(python3 -c \
+    'import secrets; print(secrets.token_hex(32))')
+  ORCHESTRATOR_STARTED_AT_UTC="$RUN_STARTED_AT_UTC"
+elif [[ -z "$ORCHESTRATOR_SESSION_BINDING" \
+  || -z "$ORCHESTRATOR_STARTED_AT_UTC" ]]; then
+  echo "Error: orchestrator binding and start timestamp must be supplied together." >&2
+  exit 2
+fi
+python3 - \
+  "$ORCHESTRATOR_SESSION_BINDING" \
+  "$ORCHESTRATOR_STARTED_AT_UTC" \
+  "$RUN_STARTED_AT_UTC" <<'PY'
+import re
+import sys
+from datetime import datetime, timezone
+
+binding, orchestrator_raw, runner_raw = sys.argv[1:]
+if re.fullmatch(r"[0-9a-f]{64}", binding) is None:
+    raise SystemExit("orchestrator session binding must be 64 lowercase hex characters")
+
+def timestamp(value: str) -> datetime:
+    try:
+        parsed = datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=timezone.utc
+        )
+    except ValueError as error:
+        raise SystemExit("orchestrator timestamps must be canonical UTC") from error
+    if parsed.strftime("%Y-%m-%dT%H:%M:%SZ") != value:
+        raise SystemExit("orchestrator timestamps must be canonical UTC")
+    return parsed
+
+orchestrator = timestamp(orchestrator_raw)
+runner = timestamp(runner_raw)
+age = (runner - orchestrator).total_seconds()
+if age < 0 or age > 300:
+    raise SystemExit(
+        "orchestrator start must be no later than runner start and at most 5 minutes old"
+    )
+PY
 run_id="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 OUTPUT_DIR="$OUTPUT_ROOT/$run_id"
 mkdir -p "$OUTPUT_DIR" "$WORK_ROOT"
 WORK_DIR=$(mktemp -d "$WORK_ROOT/swiftvlc-device-tests.XXXXXX")
 export TMPDIR="$WORK_DIR"
 SERVER_PID=""
+DEVICE_LOCK_PID=""
 ACTIVE_XCODEBUILD_PID=""
 ACTIVE_XCTRACE_PID=""
 
@@ -279,12 +375,96 @@ cleanup() {
     kill -TERM "$ACTIVE_XCODEBUILD_PID" 2>/dev/null || true
     wait "$ACTIVE_XCODEBUILD_PID" 2>/dev/null || true
   fi
+  if [[ -n "$DEVICE_LOCK_PID" ]] && kill -0 "$DEVICE_LOCK_PID" 2>/dev/null; then
+    kill -TERM "$DEVICE_LOCK_PID" 2>/dev/null || true
+    wait "$DEVICE_LOCK_PID" 2>/dev/null || true
+  fi
   stop_fixture_server
+  if [[ -n "${BUILD_SOURCE_ROOT:-}" && -e "$BUILD_SOURCE_ROOT" ]]; then
+    chflags -R nouchg "$BUILD_SOURCE_ROOT" 2>/dev/null || true
+  fi
+  if [[ -n "${SOURCE_AUTHORITY_ROOT:-}" && -e "$SOURCE_AUTHORITY_ROOT" ]]; then
+    chflags -R nouchg "$SOURCE_AUTHORITY_ROOT" 2>/dev/null || true
+  fi
+  if [[ -n "${STAGED_VENDOR_ROOT:-}" && -e "$STAGED_VENDOR_ROOT" ]]; then
+    chflags -R nouchg "$STAGED_VENDOR_ROOT" 2>/dev/null || true
+  fi
+  if [[ -n "${STAGED_PRODUCTS:-}" && -e "$STAGED_PRODUCTS" ]]; then
+    chflags -R nouchg "$STAGED_PRODUCTS" 2>/dev/null || true
+  fi
   rm -rf "$WORK_DIR"
 }
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+
+stage_tree() {
+  local source="$1"
+  local destination="$2"
+  if ! /bin/cp -cR "$source" "$destination" 2>/dev/null; then
+    /bin/cp -R "$source" "$destination"
+  fi
+}
+
+# Pin every subsequently invoked qualification helper and policy input to the
+# committed source snapshot. The running shell remains part of the trusted host
+# boundary, while mutable checkout helpers cannot be swapped during a long run.
+AUTHORITY_SCRIPT_DIR="$SCRIPT_DIR"
+SOURCE_AUTHORITY_IDENTITY_START=$(python3 \
+  "$AUTHORITY_SCRIPT_DIR/candidate-metadata.py" source \
+  --source-root "$ROOT_DIR" \
+  --version "$VERSION")
+SOURCE_AUTHORITY_COMMIT_START=$(jq -er '.sourceCommit' \
+  <<< "$SOURCE_AUTHORITY_IDENTITY_START")
+SOURCE_AUTHORITY_DIGEST_START=$(jq -er '.releaseSourceDigest' \
+  <<< "$SOURCE_AUTHORITY_IDENTITY_START")
+
+# Create a private Git checkout of the exact observed commit. Merely archiving
+# HEAD again would reopen a race where a same-host ref move could select a
+# different tree between identity capture and staging. The private checkout is
+# also the Git-backed source authority used by candidate-build-binding.
+SOURCE_AUTHORITY_ROOT="$WORK_DIR/source-authority"
+git clone --quiet --no-checkout --no-local "$ROOT_DIR" "$SOURCE_AUTHORITY_ROOT"
+git -C "$SOURCE_AUTHORITY_ROOT" checkout --quiet --detach \
+  "$SOURCE_AUTHORITY_COMMIT_START"
+PINNED_SOURCE_AUTHORITY_IDENTITY=$(python3 \
+  "$SOURCE_AUTHORITY_ROOT/scripts/qualification/candidate-metadata.py" source \
+  --source-root "$SOURCE_AUTHORITY_ROOT" \
+  --version "$VERSION")
+if [[ $(jq -er '.sourceCommit' <<< "$PINNED_SOURCE_AUTHORITY_IDENTITY") \
+    != "$SOURCE_AUTHORITY_COMMIT_START" \
+  || $(jq -er '.releaseSourceDigest' <<< "$PINNED_SOURCE_AUTHORITY_IDENTITY") \
+    != "$SOURCE_AUTHORITY_DIGEST_START" ]]; then
+  echo "Error: exact-commit source authority differs from captured identity." >&2
+  exit 1
+fi
+chflags -R uchg "$SOURCE_AUTHORITY_ROOT"
+TOOL_SOURCE_ROOT="$SOURCE_AUTHORITY_ROOT"
+SCRIPT_DIR="$SOURCE_AUTHORITY_ROOT/scripts/qualification"
+
+assert_source_authority_unchanged() {
+  local current_identity current_commit current_digest pinned_identity
+  current_identity=$(python3 "$SCRIPT_DIR/candidate-metadata.py" source \
+    --source-root "$ROOT_DIR" \
+    --version "$VERSION")
+  current_commit=$(jq -er '.sourceCommit' <<< "$current_identity")
+  current_digest=$(jq -er '.releaseSourceDigest' <<< "$current_identity")
+  if [[ "$current_commit" != "$SOURCE_AUTHORITY_COMMIT_START" \
+    || "$current_digest" != "$SOURCE_AUTHORITY_DIGEST_START" ]]; then
+    echo "Error: source authority identity changed during qualification." >&2
+    exit 1
+  fi
+  pinned_identity=$(python3 "$SCRIPT_DIR/candidate-metadata.py" source \
+    --source-root "$SOURCE_AUTHORITY_ROOT" \
+    --version "$VERSION")
+  if [[ $(jq -er '.sourceCommit' <<< "$pinned_identity") \
+      != "$SOURCE_AUTHORITY_COMMIT_START" \
+    || $(jq -er '.releaseSourceDigest' <<< "$pinned_identity") \
+      != "$SOURCE_AUTHORITY_DIGEST_START" ]]; then
+    echo "Error: private exact-commit source authority changed during qualification." >&2
+    exit 1
+  fi
+}
 
 device_args=(--matrix "$SCRIPT_DIR/matrix.json")
 if [[ -n "$DEVICE_SELECTOR" ]]; then
@@ -309,9 +489,44 @@ DEVICE_UDID=$(jq -r '.selected.udid' "$OUTPUT_DIR/device.json")
 DEVICE_ECID=$(jq -r '.selected.ecidHex' "$OUTPUT_DIR/device.json")
 DEVICE_TUNNEL_IP=$(jq -r '.selected.tunnelIPAddress // empty' "$OUTPUT_DIR/device.json")
 RUN_MODE=$(jq -r '.mode' "$OUTPUT_DIR/device.json")
+DEVICE_LOCK_READY="$WORK_DIR/device-lock.json"
+python3 "$SCRIPT_DIR/device-run-lock.py" \
+  --device-identifier "$DEVICE_UDID" \
+  --parent-pid "$$" \
+  --ready-file "$DEVICE_LOCK_READY" \
+  > "$OUTPUT_DIR/device-lock.log" 2>&1 &
+DEVICE_LOCK_PID=$!
+for _ in {1..100}; do
+  [[ -s "$DEVICE_LOCK_READY" ]] && break
+  if ! kill -0 "$DEVICE_LOCK_PID" 2>/dev/null; then
+    wait "$DEVICE_LOCK_PID" || lock_status=$?
+    echo "Error: could not reserve the selected physical device (status ${lock_status:-1})." >&2
+    exit "${lock_status:-1}"
+  fi
+  sleep 0.1
+done
+if [[ ! -s "$DEVICE_LOCK_READY" ]] || ! kill -0 "$DEVICE_LOCK_PID" 2>/dev/null; then
+  echo "Error: device reservation helper did not establish a live lock." >&2
+  exit 1
+fi
+cp "$DEVICE_LOCK_READY" "$OUTPUT_DIR/device-lock.json"
+
+assert_device_lock_held() {
+  if [[ -z "$DEVICE_LOCK_PID" ]]; then
+    echo "Error: selected physical device has no reservation helper." >&2
+    exit 1
+  fi
+  python3 "$SCRIPT_DIR/device-run-lock.py" \
+    --assert-held \
+    --device-identifier "$DEVICE_UDID" \
+    --parent-pid "$$" \
+    --owner-pid "$DEVICE_LOCK_PID"
+}
+
+assert_device_lock_held
 echo "Selected $(jq -r '.selected.marketingName' "$OUTPUT_DIR/device.json") on $(jq -r '.selected.osVersion' "$OUTPUT_DIR/device.json") ($RUN_MODE)."
 
-DEFAULT_SCENARIOS=(analyzer ui-suite harness-regressions live-media background-audio continuity capability-convergence vod-controls long-stall failed-start dismissal interruptions native-lifecycle playback-foreground-displaylayer-recovery terminal-outcomes adaptive-hls-soak deferred-pause-rejection hls-seek)
+DEFAULT_SCENARIOS=(analyzer ui-suite harness-regressions live-media background-audio continuity capability-convergence vod-controls long-stall failed-start dismissal interruptions audio-session-ownership native-lifecycle playback-foreground-displaylayer-recovery terminal-outcomes adaptive-hls-soak deferred-pause-rejection hls-seek)
 DEFAULT_SCENARIOS+=(seek-frame-oracles)
 DEFAULT_SCENARIOS+=(progressive-http-range-seek)
 DEFAULT_SCENARIOS+=(local-file-matrix audio-only-playback)
@@ -319,7 +534,7 @@ DEFAULT_SCENARIOS+=(pip-render-performance-1080p60 pip-render-performance-4k60)
 DEFAULT_SCENARIOS+=(cadence-matrix)
 DEFAULT_SCENARIOS+=(native-subtitle-matrix)
 DEFAULT_SCENARIOS+=(timebase-vod-soak timebase-live-soak)
-DEFAULT_SCENARIOS+=(audio-session-ownership audio-media-services-reset)
+DEFAULT_SCENARIOS+=(audio-media-services-reset)
 IPHONE_CURRENT_ONLY_SCENARIOS=(
   capability-convergence
   native-lifecycle
@@ -422,6 +637,10 @@ if [[ "$FULL_SUITE_SELECTION" == true ]]; then
     echo "Error: a report-only probe cannot claim full-suite selection." >&2
     exit 2
   fi
+  if [[ "${DEFAULT_SCENARIOS[${#DEFAULT_SCENARIOS[@]}-1]}" != "audio-media-services-reset" ]]; then
+    echo "Error: canonical suite must keep audio-media-services-reset last." >&2
+    exit 2
+  fi
   EXPECTED_FULL_SCENARIOS=()
   for scenario in "${DEFAULT_SCENARIOS[@]}"; do
     if device_matches_hardware_row "iphone-current" \
@@ -431,9 +650,9 @@ if [[ "$FULL_SUITE_SELECTION" == true ]]; then
     fi
   done
   if ! diff -u \
-      <(printf '%s\n' "${EXPECTED_FULL_SCENARIOS[@]}" | sort) \
-      <(printf '%s\n' "${ONLY_SCENARIOS[@]}" | sort) >/dev/null; then
-    echo "Error: --full-suite-selection does not match the canonical applicable suite." >&2
+      <(printf '%s\n' "${EXPECTED_FULL_SCENARIOS[@]}") \
+      <(printf '%s\n' "${ONLY_SCENARIOS[@]}") >/dev/null; then
+    echo "Error: --full-suite-selection does not match the canonical applicable suite in canonical order." >&2
     exit 2
   fi
   REQUESTED_SCENARIOS=("${DEFAULT_SCENARIOS[@]}")
@@ -451,6 +670,8 @@ validation_plan_args=(
   --selected "$selected_scenarios_file"
   --selection-scope "$VALIDATION_SELECTION_SCOPE"
   --started-at-utc "$RUN_STARTED_AT_UTC"
+  --orchestrator-session-binding "$ORCHESTRATOR_SESSION_BINDING"
+  --orchestrator-started-at-utc "$ORCHESTRATOR_STARTED_AT_UTC"
   --output "$OUTPUT_DIR/validation-plan.json"
 )
 if [[ -n "$EXPLORATORY_HARDWARE_ID" ]]; then
@@ -487,8 +708,34 @@ if [[ ! -f "$FIXTURES/manifest.json" \
   "$SCRIPT_DIR/generate-fixtures.sh" "$FIXTURES"
 fi
 python3 "$SCRIPT_DIR/verify-fixtures.py" "$FIXTURES" > /dev/null
+python3 "$SCRIPT_DIR/fixture-tree-binding.py" create \
+  --root "$FIXTURES" \
+  --output "$WORK_DIR/external-fixture-tree-binding.json" \
+  > /dev/null
+
+# The external fixture authority may be regenerated by another process during
+# a long qualification. Freeze a verified copy in this run's private work
+# directory and serve only that snapshot. APFS clone copies keep the large
+# media set cheap while still providing independent directory entries.
+EXTERNAL_FIXTURES="$FIXTURES"
+STAGED_FIXTURES="$WORK_DIR/qualification-fixtures"
+stage_tree "$EXTERNAL_FIXTURES" "$STAGED_FIXTURES"
+python3 "$SCRIPT_DIR/fixture-tree-binding.py" verify \
+  --root "$STAGED_FIXTURES" \
+  --receipt "$WORK_DIR/external-fixture-tree-binding.json" \
+  > /dev/null
+python3 "$SCRIPT_DIR/verify-fixtures.py" "$STAGED_FIXTURES" > /dev/null
+cp "$WORK_DIR/external-fixture-tree-binding.json" \
+  "$OUTPUT_DIR/fixture-tree-binding.json"
+FIXTURES="$STAGED_FIXTURES"
 cp "$FIXTURES/manifest.json" "$OUTPUT_DIR/fixture-manifest.json"
-FIXTURE_MANIFEST_CHECKSUM=$(shasum -a 256 "$FIXTURES/manifest.json" | cut -d' ' -f1)
+FIXTURE_MANIFEST_CHECKSUM=$(shasum -a 256 \
+  "$OUTPUT_DIR/fixture-manifest.json" | cut -d' ' -f1)
+if [[ "$FIXTURE_MANIFEST_CHECKSUM" != \
+    "$(jq -er '.manifestDigest' "$OUTPUT_DIR/fixture-tree-binding.json")" ]]; then
+  echo "Error: fixture manifest changed while establishing its preflight binding." >&2
+  exit 1
+fi
 
 READY_FILE="$WORK_DIR/server-ready.json"
 fixture_server_args=(
@@ -533,26 +780,47 @@ VOD_URL_BASE64=$(printf '%s' "$BASE_URL/files/vod.mp4" | base64 | tr -d '\r\n')
 LOCAL_PLAYBACK_BASE_URL_BASE64=$(printf '%s/' "$BASE_URL" | base64 | tr -d '\r\n')
 PROGRESSIVE_HTTP_RANGE_BASE_URL_BASE64=$(printf '%s/' "$BASE_URL" | base64 | tr -d '\r\n')
 PROGRESSIVE_HTTP_RANGE_FIXTURE_SHA256=$(jq -er \
-  '.files["oracles/progressive-range.mp4"].sha256' "$FIXTURES/manifest.json")
+  '.files["oracles/progressive-range.mp4"].sha256' "$OUTPUT_DIR/fixture-manifest.json")
 PROGRESSIVE_HTTP_RANGE_FIXTURE_BYTES=$(jq -er \
-  '.files["oracles/progressive-range.mp4"].bytes' "$FIXTURES/manifest.json")
+  '.files["oracles/progressive-range.mp4"].bytes' "$OUTPUT_DIR/fixture-manifest.json")
+
+# Freeze the large binary artifact into the run-owned work directory before
+# package resolution/build. On APFS this is a copy-on-write clone; the fallback
+# is an ordinary (and intentionally more expensive) independent copy.
+EXTERNAL_ARTIFACT="$ROOT_DIR/Vendor/libvlc.xcframework"
+if [[ ! -d "$EXTERNAL_ARTIFACT" ]]; then
+  echo "Error: local Vendor/libvlc.xcframework is required for candidate verification." >&2
+  exit 1
+fi
+EXTERNAL_ARTIFACT_DIGEST_BEFORE=$(python3 \
+  "$TOOL_SOURCE_ROOT/scripts/artifact-tree-digest.py" "$EXTERNAL_ARTIFACT")
+STAGED_VENDOR_ROOT="$WORK_DIR/vendor-authority"
+mkdir -p "$STAGED_VENDOR_ROOT"
+ARTIFACT_AUTHORITY="$STAGED_VENDOR_ROOT/libvlc.xcframework"
+stage_tree "$EXTERNAL_ARTIFACT" "$ARTIFACT_AUTHORITY"
+STAGED_ARTIFACT_DIGEST=$(python3 \
+  "$TOOL_SOURCE_ROOT/scripts/artifact-tree-digest.py" "$ARTIFACT_AUTHORITY")
+EXTERNAL_ARTIFACT_DIGEST_AFTER=$(python3 \
+  "$TOOL_SOURCE_ROOT/scripts/artifact-tree-digest.py" "$EXTERNAL_ARTIFACT")
+if [[ "$EXTERNAL_ARTIFACT_DIGEST_BEFORE" != "$STAGED_ARTIFACT_DIGEST" \
+  || "$EXTERNAL_ARTIFACT_DIGEST_AFTER" != "$STAGED_ARTIFACT_DIGEST" ]]; then
+  echo "Error: Vendor artifact changed while creating its run-owned snapshot." >&2
+  exit 1
+fi
+chflags -R uchg "$STAGED_VENDOR_ROOT"
 
 if [[ "$SKIP_BUILD" == false ]]; then
-  if [[ ! -d "$ROOT_DIR/Vendor/libvlc.xcframework" ]]; then
-    echo "Error: local Vendor/libvlc.xcframework is required to build the candidate." >&2
-    exit 1
-  fi
-  BUILD_SOURCE_IDENTITY=$(python3 "$SCRIPT_DIR/candidate-metadata.py" source \
-    --source-root "$ROOT_DIR" \
-    --version "$VERSION")
-  BUILD_SOURCE_COMMIT=$(jq -r '.sourceCommit' <<< "$BUILD_SOURCE_IDENTITY")
-  BUILD_SOURCE_DIGEST=$(jq -r '.releaseSourceDigest' <<< "$BUILD_SOURCE_IDENTITY")
-  BUILD_ARTIFACT_DIGEST=$(python3 "$ROOT_DIR/scripts/artifact-tree-digest.py" \
-    "$ROOT_DIR/Vendor/libvlc.xcframework")
+  CANDIDATE_RUNTIME_BINDING=$(python3 -c \
+    'import secrets; print(secrets.token_hex(32))')
+  BUILD_SOURCE_COMMIT="$SOURCE_AUTHORITY_COMMIT_START"
+  BUILD_SOURCE_DIGEST="$SOURCE_AUTHORITY_DIGEST_START"
+  BUILD_ARTIFACT_DIGEST=$(python3 "$TOOL_SOURCE_ROOT/scripts/artifact-tree-digest.py" \
+    "$ARTIFACT_AUTHORITY")
   BUILD_SOURCE_ROOT="$WORK_DIR/source"
   mkdir -p "$BUILD_SOURCE_ROOT"
-  git -C "$ROOT_DIR" archive HEAD | tar -x -C "$BUILD_SOURCE_ROOT"
-  ln -s "$ROOT_DIR/Vendor" "$BUILD_SOURCE_ROOT/Vendor"
+  git -C "$SOURCE_AUTHORITY_ROOT" archive "$SOURCE_AUTHORITY_COMMIT_START" \
+    | tar -x -C "$BUILD_SOURCE_ROOT"
+  ln -s "$STAGED_VENDOR_ROOT" "$BUILD_SOURCE_ROOT/Vendor"
   "$BUILD_SOURCE_ROOT/scripts/setup-dev.sh" --skip-download \
     > "$OUTPUT_DIR/setup-local-source.log"
   team_suffix=$(printf '%s' "$DEVELOPMENT_TEAM" | tr '[:upper:]' '[:lower:]')
@@ -561,6 +829,16 @@ if [[ "$SKIP_BUILD" == false ]]; then
     --team "$DEVELOPMENT_TEAM" \
     --bundle-prefix "com.swiftvlc.validation.$team_suffix" \
     > "$OUTPUT_DIR/configure-signing.log"
+  rm -f "$BUILD_SOURCE_ROOT/Showcase/SwiftVLCShowcase.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved"
+  if ! run_with_watchdog 1800 600 \
+      "$OUTPUT_DIR/resolve-package-dependencies.log" \
+      xcodebuild -resolvePackageDependencies \
+      -project "$BUILD_SOURCE_ROOT/Showcase/SwiftVLCShowcase.xcodeproj" \
+      -scheme iOS \
+      -derivedDataPath "$DERIVED_DATA"; then
+    echo "Error: explicit local package resolution failed." >&2
+    exit 1
+  fi
   build_args=(
     build-for-testing
     -project "$BUILD_SOURCE_ROOT/Showcase/SwiftVLCShowcase.xcodeproj"
@@ -573,11 +851,47 @@ if [[ "$SKIP_BUILD" == false ]]; then
     SWIFTVLC_SOURCE_COMMIT="$BUILD_SOURCE_COMMIT"
     SWIFTVLC_RELEASE_SOURCE_DIGEST="$BUILD_SOURCE_DIGEST"
     SWIFTVLC_ARTIFACT_DIGEST="$BUILD_ARTIFACT_DIGEST"
+    SWIFTVLC_CANDIDATE_VERSION="$VERSION"
+    SWIFTVLC_CANDIDATE_RUNTIME_BINDING="$CANDIDATE_RUNTIME_BINDING"
     CODE_SIGNING_ALLOWED=YES
     DEVELOPMENT_TEAM="$DEVELOPMENT_TEAM"
   )
+  EFFECTIVE_BUILD_SETTINGS="$WORK_DIR/effective-build-settings.json"
+  if ! run_with_watchdog 900 300 "$EFFECTIVE_BUILD_SETTINGS" \
+      python3 "$SCRIPT_DIR/capture-build-settings.py" \
+      --stderr "$OUTPUT_DIR/effective-build-settings-prebuild.log" -- \
+      xcodebuild "${build_args[@]}" -showBuildSettings -json; then
+    echo "Error: cannot capture authoritative effective build settings." >&2
+    exit 1
+  fi
+  BUILD_BINDING_RECEIPT="$WORK_DIR/candidate-build-resolution.json"
+  BUILD_ATTESTATION="$OUTPUT_DIR/candidate-build-attestation.json"
+  python3 "$SCRIPT_DIR/candidate-build-binding.py" prebuild \
+    --source-root "$BUILD_SOURCE_ROOT" \
+    --source-authority "$SOURCE_AUTHORITY_ROOT" \
+    --artifact-authority "$ARTIFACT_AUTHORITY" \
+    --derived-data "$DERIVED_DATA" \
+    --build-settings "$EFFECTIVE_BUILD_SETTINGS" \
+    --development-team "$DEVELOPMENT_TEAM" \
+    --bundle-prefix "com.swiftvlc.validation.$team_suffix" \
+    --version "$VERSION" \
+    --candidate-runtime-binding "$CANDIDATE_RUNTIME_BINDING" \
+    --source-commit "$BUILD_SOURCE_COMMIT" \
+    --release-source-digest "$BUILD_SOURCE_DIGEST" \
+    --configuration Release \
+    --platform iphoneos \
+    --output "$BUILD_BINDING_RECEIPT" \
+    > /dev/null
+  chflags -R uchg "$BUILD_SOURCE_ROOT"
   run_with_watchdog 7200 900 "$OUTPUT_DIR/build.log" \
     xcodebuild "${build_args[@]}"
+  if ! run_with_watchdog 900 300 "$EFFECTIVE_BUILD_SETTINGS" \
+      python3 "$SCRIPT_DIR/capture-build-settings.py" \
+      --stderr "$OUTPUT_DIR/effective-build-settings-postbuild.log" -- \
+      xcodebuild "${build_args[@]}" -showBuildSettings -json; then
+    echo "Error: cannot recheck effective build settings after build." >&2
+    exit 1
+  fi
 fi
 
 RUNNER_APP="$DERIVED_DATA/Build/Products/Release-iphoneos/iOSUITests-Runner.app"
@@ -615,6 +929,8 @@ TEST_RUNNER_BUNDLE_IDENTIFIER=$(read_app_bundle_identifier \
 
 prepare_xctestrun() {
   python3 "$SCRIPT_DIR/prepare-xctestrun.py" "$@" \
+    --environment SWIFTVLC_QUALIFICATION_SESSION_BINDING="$ORCHESTRATOR_SESSION_BINDING" \
+    --environment SWIFTVLC_CANDIDATE_RUNTIME_BINDING="$CANDIDATE_RUNTIME_BINDING" \
     --test-host-bundle-identifier "$TEST_RUNNER_BUNDLE_IDENTIFIER" \
     --ui-target-app-bundle-identifier "$CANDIDATE_BUNDLE_IDENTIFIER"
 }
@@ -650,10 +966,44 @@ else
   XCTESTRUN="${XCTESTRUN_CANDIDATES[0]}"
 fi
 
+# Freeze the exact signed products in the run-owned work directory before any
+# catalog enumeration, hashing, installation, or evidence collection. APFS
+# clone copies avoid duplicating the large linked application when available;
+# the ordinary recursive-copy fallback preserves portability.
+SOURCE_CANDIDATE_APP="$CANDIDATE_APP"
+SOURCE_RUNNER_APP="$RUNNER_APP"
+SOURCE_XCTESTRUN="$XCTESTRUN"
+STAGED_PRODUCTS="$WORK_DIR/candidate-products"
+STAGED_CONFIGURATION="$STAGED_PRODUCTS/Release-iphoneos"
+mkdir -p "$STAGED_CONFIGURATION"
+stage_tree "$SOURCE_CANDIDATE_APP" "$STAGED_CONFIGURATION/iOS.app"
+stage_tree "$SOURCE_RUNNER_APP" \
+  "$STAGED_CONFIGURATION/iOSUITests-Runner.app"
+/bin/cp "$SOURCE_XCTESTRUN" "$STAGED_PRODUCTS/$(basename "$SOURCE_XCTESTRUN")"
+CANDIDATE_APP="$STAGED_CONFIGURATION/iOS.app"
+RUNNER_APP="$STAGED_CONFIGURATION/iOSUITests-Runner.app"
+TEST_BUNDLE="$RUNNER_APP/PlugIns/iOSUITests.xctest"
+XCTESTRUN="$STAGED_PRODUCTS/$(basename "$SOURCE_XCTESTRUN")"
+for app in "$CANDIDATE_APP" "$RUNNER_APP"; do
+  codesign --verify --deep --strict "$app"
+done
+
+if [[ "$PREBUILT_CANDIDATE" == false ]]; then
+  python3 "$SCRIPT_DIR/candidate-build-binding.py" postbuild \
+    --receipt "$BUILD_BINDING_RECEIPT" \
+    --candidate-app "$CANDIDATE_APP" \
+    --test-runner "$RUNNER_APP" \
+    --test-bundle "$TEST_BUNDLE" \
+    --xctestrun "$XCTESTRUN" \
+    --output "$BUILD_ATTESTATION" \
+    > /dev/null
+fi
+
 FULL_CATALOG_RAW="$WORK_DIR/full-test-catalog-raw.json"
 FULL_TEST_CATALOG="$OUTPUT_DIR/full-test-catalog.json"
 if ! run_with_watchdog 600 180 "$OUTPUT_DIR/enumerate-full-test-catalog.log" \
     xcodebuild test-without-building \
+    -parallel-testing-enabled NO \
     -xctestrun "$XCTESTRUN" \
     -derivedDataPath "$DERIVED_DATA" \
     -destination "platform=iOS,id=$DEVICE_UDID" \
@@ -667,6 +1017,25 @@ fi
 python3 "$SCRIPT_DIR/qualification_policy.py" normalize-catalog \
   --input "$FULL_CATALOG_RAW" \
   --output "$FULL_TEST_CATALOG"
+TEST_CATALOG_AUTHORITY="$SCRIPT_DIR/ios-test-catalog-authority-v1.json"
+if [[ ! -f "$TEST_CATALOG_AUTHORITY" ]]; then
+  echo "Error: reviewed exact iOS XCTest catalog authority is missing." >&2
+  echo "  After a clean reviewed build, create it with:" >&2
+  echo "  python3 scripts/qualification/test-catalog-authority.py create --catalog '$FULL_TEST_CATALOG' --output scripts/qualification/ios-test-catalog-authority-v1.json" >&2
+  exit 1
+fi
+python3 "$SCRIPT_DIR/test-catalog-authority.py" verify \
+  --catalog "$FULL_TEST_CATALOG" \
+  --authority "$TEST_CATALOG_AUTHORITY" \
+  > /dev/null
+
+if [[ "$PREBUILT_CANDIDATE" == false ]]; then
+  python3 "$SCRIPT_DIR/candidate-build-binding.py" bind-catalog \
+    --attestation "$BUILD_ATTESTATION" \
+    --test-catalog "$FULL_TEST_CATALOG" \
+    --output "$BUILD_ATTESTATION" \
+    > /dev/null
+fi
 
 CANDIDATE_IDENTITY="$OUTPUT_DIR/candidate-metadata.json"
 if [[ "$PREBUILT_CANDIDATE" == true ]]; then
@@ -676,33 +1045,36 @@ if [[ "$PREBUILT_CANDIDATE" == true ]]; then
   fi
   python3 "$SCRIPT_DIR/candidate-metadata.py" verify \
     --candidate-app "$CANDIDATE_APP" \
-    --xcframework "$ROOT_DIR/Vendor/libvlc.xcframework" \
+    --xcframework "$ARTIFACT_AUTHORITY" \
     --metadata "$CANDIDATE_METADATA" \
     --version "$VERSION" \
-    --digest-script "$ROOT_DIR/scripts/artifact-tree-digest.py" \
+    --digest-script "$TOOL_SOURCE_ROOT/scripts/artifact-tree-digest.py" \
     --test-runner "$RUNNER_APP" \
     --test-bundle "$TEST_BUNDLE" \
     --xctestrun "$XCTESTRUN" \
     --test-catalog "$FULL_TEST_CATALOG" \
+    --test-catalog-authority "$TEST_CATALOG_AUTHORITY" \
     --matrix "$SCRIPT_DIR/matrix.json" \
     --feature-manifest "$SCRIPT_DIR/feature-manifest-v1.json" \
     --profiles "$SCRIPT_DIR/profiles-v1.json" \
-    --fixture-manifest "$FIXTURES/manifest.json" \
+    --fixture-manifest "$OUTPUT_DIR/fixture-manifest.json" \
     > "$CANDIDATE_IDENTITY"
 else
   python3 "$SCRIPT_DIR/candidate-metadata.py" create \
     --candidate-app "$CANDIDATE_APP" \
-    --xcframework "$ROOT_DIR/Vendor/libvlc.xcframework" \
+    --xcframework "$ARTIFACT_AUTHORITY" \
     --version "$VERSION" \
-    --digest-script "$ROOT_DIR/scripts/artifact-tree-digest.py" \
+    --digest-script "$TOOL_SOURCE_ROOT/scripts/artifact-tree-digest.py" \
+    --build-attestation "$BUILD_ATTESTATION" \
     --test-runner "$RUNNER_APP" \
     --test-bundle "$TEST_BUNDLE" \
     --xctestrun "$XCTESTRUN" \
     --test-catalog "$FULL_TEST_CATALOG" \
+    --test-catalog-authority "$TEST_CATALOG_AUTHORITY" \
     --matrix "$SCRIPT_DIR/matrix.json" \
     --feature-manifest "$SCRIPT_DIR/feature-manifest-v1.json" \
     --profiles "$SCRIPT_DIR/profiles-v1.json" \
-    --fixture-manifest "$FIXTURES/manifest.json" \
+    --fixture-manifest "$OUTPUT_DIR/fixture-manifest.json" \
     --output "$CANDIDATE_IDENTITY" \
     > /dev/null
 fi
@@ -710,6 +1082,46 @@ CANDIDATE_APP_DIGEST=$(jq -r '.candidateAppDigest' "$CANDIDATE_IDENTITY")
 ARTIFACT_DIGEST=$(jq -r '.artifactDigest' "$CANDIDATE_IDENTITY")
 SOURCE_COMMIT=$(jq -r '.sourceCommit' "$CANDIDATE_IDENTITY")
 SOURCE_DIGEST=$(jq -r '.releaseSourceDigest' "$CANDIDATE_IDENTITY")
+CANDIDATE_VERSION=$(jq -r '.version' "$CANDIDATE_IDENTITY")
+CANDIDATE_RUNTIME_BINDING=$(jq -r '.candidateRuntimeBinding' "$CANDIDATE_IDENTITY")
+
+assert_candidate_matches_source_authority() {
+  if [[ "$CANDIDATE_VERSION" != "$VERSION" \
+    || ! "$CANDIDATE_RUNTIME_BINDING" =~ ^[0-9a-f]{64}$ \
+    || "$SOURCE_COMMIT" != "$SOURCE_AUTHORITY_COMMIT_START" \
+    || "$SOURCE_DIGEST" != "$SOURCE_AUTHORITY_DIGEST_START" ]]; then
+    echo "Error: candidate identity does not match the current source authority/version." >&2
+    exit 1
+  fi
+}
+
+assert_candidate_matches_source_authority
+
+verify_staged_candidate_identity() {
+  codesign --verify --deep --strict "$CANDIDATE_APP"
+  codesign --verify --deep --strict "$RUNNER_APP"
+  python3 "$SCRIPT_DIR/candidate-metadata.py" verify \
+    --candidate-app "$CANDIDATE_APP" \
+    --xcframework "$ARTIFACT_AUTHORITY" \
+    --metadata "$CANDIDATE_IDENTITY" \
+    --version "$VERSION" \
+    --digest-script "$TOOL_SOURCE_ROOT/scripts/artifact-tree-digest.py" \
+    --test-runner "$RUNNER_APP" \
+    --test-bundle "$TEST_BUNDLE" \
+    --xctestrun "$XCTESTRUN" \
+    --test-catalog "$FULL_TEST_CATALOG" \
+    --test-catalog-authority "$TEST_CATALOG_AUTHORITY" \
+    --matrix "$SCRIPT_DIR/matrix.json" \
+    --feature-manifest "$SCRIPT_DIR/feature-manifest-v1.json" \
+    --profiles "$SCRIPT_DIR/profiles-v1.json" \
+    --fixture-manifest "$OUTPUT_DIR/fixture-manifest.json" \
+    > /dev/null
+  assert_source_authority_unchanged
+  assert_candidate_matches_source_authority
+}
+
+verify_staged_candidate_identity
+chflags -R uchg "$STAGED_PRODUCTS"
 
 DESTINATION_XCTESTRUN="$WORK_DIR/destination.xctestrun"
 prepare_xctestrun "$XCTESTRUN" "$DESTINATION_XCTESTRUN" \
@@ -746,6 +1158,7 @@ cp "$LAUNCH_XCTESTRUN" "$OUTPUT_DIR/destination-launch.xctestrun"
 install_app() {
   local app="$1"
   local configurator="/Applications/Apple Configurator.app/Contents/MacOS/cfgutil"
+  assert_device_lock_held
   if [[ -x "$configurator" ]]; then
     "$configurator" --ecid "$DEVICE_ECID" install-app "$app"
   else
@@ -753,7 +1166,33 @@ install_app() {
   fi
 }
 
-install_app "$CANDIDATE_APP" > "$OUTPUT_DIR/install-candidate.log"
+install_candidate_with_fresh_permission_state() {
+  if [[ "$CANDIDATE_BUNDLE_IDENTIFIER" == com.swiftvlc.validation.* ]]; then
+    # Installing first makes the exact verified candidate the known uninstall
+    # target even when no older copy exists. Removing and reinstalling this
+    # disposable namespace clears a previously denied Local Network decision.
+    install_app "$CANDIDATE_APP" > "$OUTPUT_DIR/install-candidate-bootstrap.log"
+    echo "Resetting Local Network permission state for disposable candidate $CANDIDATE_BUNDLE_IDENTIFIER." >&2
+    assert_device_lock_held
+    if ! xcrun devicectl device uninstall app \
+        --device "$DEVICE_UDID" "$CANDIDATE_BUNDLE_IDENTIFIER" \
+        > "$OUTPUT_DIR/reset-candidate-permissions.log" 2>&1; then
+      echo "Error: could not fresh-install the disposable candidate; permission state may be stale." >&2
+      echo "  See $OUTPUT_DIR/reset-candidate-permissions.log" >&2
+      exit 1
+    fi
+  else
+    {
+      echo "Warning: candidate $CANDIDATE_BUNDLE_IDENTIFIER is outside the disposable com.swiftvlc.validation.* namespace."
+      echo "It will not be uninstalled, so iOS Local Network permission state is preserved."
+      echo "Before qualifying it, enable Local Network access in Settings > Privacy & Security > Local Network."
+    } | tee "$OUTPUT_DIR/candidate-permission-state-warning.log" >&2
+  fi
+
+  install_app "$CANDIDATE_APP" > "$OUTPUT_DIR/install-candidate.log"
+}
+
+install_candidate_with_fresh_permission_state
 install_app "$RUNNER_APP" > "$OUTPUT_DIR/install-runner.log"
 
 # A freshly installed xctrunner has no data container until its first launch.
@@ -939,6 +1378,7 @@ capture_apple_audio_source_metrics() {
 
 run_scenario() {
   local scenario="$1"
+  assert_device_lock_held
   local route log_name selected_xctestrun
   local test_identifiers=()
   local skip_device_tests=false
@@ -1180,7 +1620,7 @@ run_scenario() {
     harness-regressions)
       test_identifiers=(
         "iOSUITests/MusicPlayerUITests/test_switchingTracksKeepsTransportStateAndDoesNotCrash"
-        "iOSUITests/PiPUITests/test_deep_toggleButtonDisabledWhenNotPossible"
+        "iOSUITests/PiPUITests/test_deep_toggleButtonAvailabilityMatchesPiPPossibility"
       )
       route=""
       selected_xctestrun="$LAUNCH_XCTESTRUN"
@@ -1318,6 +1758,7 @@ run_scenario() {
   if ! run_with_watchdog 600 180 \
       "$OUTPUT_DIR/$scenario-enumerate-tests.log" \
       xcodebuild test-without-building \
+      -parallel-testing-enabled NO \
       -xctestrun "$selected_xctestrun" \
       -derivedDataPath "$DERIVED_DATA" \
       -destination "platform=iOS,id=$DEVICE_UDID" \
@@ -1460,6 +1901,7 @@ run_scenario() {
       run_with_watchdog "$((ADAPTIVE_SOAK_SECONDS + 900))" \
         "$((ADAPTIVE_SOAK_SECONDS + 600))" "$attempt_log" \
         xcodebuild test-without-building \
+        -parallel-testing-enabled NO \
         -xctestrun "$attempt_xctestrun" \
         -derivedDataPath "$DERIVED_DATA" \
         -destination "platform=iOS,id=$DEVICE_UDID" \
@@ -1566,6 +2008,7 @@ PY
       run_with_watchdog "$((PIP_PERFORMANCE_SECONDS + 900))" \
         "$((PIP_PERFORMANCE_SECONDS + 600))" "$attempt_log" \
         xcodebuild test-without-building \
+        -parallel-testing-enabled NO \
         -xctestrun "$attempt_xctestrun" \
         -derivedDataPath "$DERIVED_DATA" \
         -destination "platform=iOS,id=$DEVICE_UDID" \
@@ -1629,6 +2072,7 @@ PY
       run_with_watchdog "$((CADENCE_SECONDS + 600))" \
         "$((CADENCE_SECONDS + 300))" "$attempt_log" \
         xcodebuild test-without-building \
+        -parallel-testing-enabled NO \
         -xctestrun "$attempt_xctestrun" \
         -derivedDataPath "$DERIVED_DATA" \
         -destination "platform=iOS,id=$DEVICE_UDID" \
@@ -1640,15 +2084,20 @@ PY
         -resultBundlePath "$attempt_bundle"
       test_status=$?
     elif [[ "$scenario" == "cadence-semantics-probe" ]]; then
-      run_with_watchdog 600 360 "$attempt_log" \
+      run_with_watchdog \
+        "$CADENCE_SEMANTICS_PROBE_WALL_WATCHDOG_SECONDS" \
+        "$CADENCE_SEMANTICS_PROBE_IDLE_WATCHDOG_SECONDS" "$attempt_log" \
         xcodebuild test-without-building \
+        -parallel-testing-enabled NO \
         -xctestrun "$attempt_xctestrun" \
         -derivedDataPath "$DERIVED_DATA" \
         -destination "platform=iOS,id=$DEVICE_UDID" \
         -collect-test-diagnostics never \
         -test-timeouts-enabled YES \
-        -default-test-execution-time-allowance 240 \
-        -maximum-test-execution-time-allowance 240 \
+        -default-test-execution-time-allowance \
+        "$CADENCE_SEMANTICS_PROBE_XCTEST_ALLOWANCE_SECONDS" \
+        -maximum-test-execution-time-allowance \
+        "$CADENCE_SEMANTICS_PROBE_XCTEST_ALLOWANCE_SECONDS" \
         "${test_selection_args[@]}" \
         -resultBundlePath "$attempt_bundle"
       test_status=$?
@@ -1656,6 +2105,7 @@ PY
       run_with_watchdog "$((NATIVE_SUBTITLE_SECONDS + 900))" \
         "$((NATIVE_SUBTITLE_SECONDS + 600))" "$attempt_log" \
         xcodebuild test-without-building \
+        -parallel-testing-enabled NO \
         -xctestrun "$attempt_xctestrun" \
         -derivedDataPath "$DERIVED_DATA" \
         -destination "platform=iOS,id=$DEVICE_UDID" \
@@ -1719,6 +2169,7 @@ PY
       run_with_watchdog "$((TIMEBASE_SOAK_SECONDS + 1200))" \
         "$((TIMEBASE_SOAK_SECONDS + 900))" "$attempt_log" \
         xcodebuild test-without-building \
+        -parallel-testing-enabled NO \
         -xctestrun "$attempt_xctestrun" \
         -derivedDataPath "$DERIVED_DATA" \
         -destination "platform=iOS,id=$DEVICE_UDID" \
@@ -1766,6 +2217,7 @@ PY
     elif [[ "$scenario" == "audio-session-ownership" ]]; then
       run_with_watchdog 900 660 "$attempt_log" \
         xcodebuild test-without-building \
+        -parallel-testing-enabled NO \
         -xctestrun "$attempt_xctestrun" \
         -derivedDataPath "$DERIVED_DATA" \
         -destination "platform=iOS,id=$DEVICE_UDID" \
@@ -1781,6 +2233,7 @@ PY
       local reset_ready=false
       run_with_watchdog 1200 660 "$attempt_log" \
         xcodebuild test-without-building \
+        -parallel-testing-enabled NO \
         -xctestrun "$attempt_xctestrun" \
         -derivedDataPath "$DERIVED_DATA" \
         -destination "platform=iOS,id=$DEVICE_UDID" \
@@ -1834,6 +2287,7 @@ EOF
     else
       run_with_watchdog 1800 900 "$attempt_log" \
         xcodebuild test-without-building \
+        -parallel-testing-enabled NO \
         -xctestrun "$attempt_xctestrun" \
         -derivedDataPath "$DERIVED_DATA" \
         -destination "platform=iOS,id=$DEVICE_UDID" \
@@ -1976,8 +2430,9 @@ EOF
   if [[ -d "$attempt_bundle" ]]; then
     cp -R "$attempt_bundle" "$result_bundle"
   fi
-  local test_execution="$OUTPUT_DIR/$scenario-test-execution.json"
+  local test_execution=""
   if [[ -n "$final_test_execution" && -f "$final_test_execution" ]]; then
+    test_execution="$OUTPUT_DIR/$scenario-test-execution.json"
     cp "$final_test_execution" "$test_execution"
   fi
   ended=$(date +%s)
@@ -2032,21 +2487,37 @@ EOF
   # unbounded recovery, or incorrect attribution. Other scenarios retain the
   # strict zero-error gate.
   local log_errors_acceptable=false
-  if [[ "$error_count" -eq 0 || "$scenario" == "terminal-outcomes" || "$scenario" == "adaptive-hls-soak" || "$scenario" == "cadence-semantics-probe" ]]; then
+  if [[ "$error_count" -eq 0 || "$scenario" == "terminal-outcomes" || "$scenario" == "adaptive-hls-soak" ]]; then
     log_errors_acceptable=true
   fi
 
   if [[ "$scenario" == "cadence-semantics-probe" ]]; then
     # Preserve the ordinary XCTest JSON attachment for human/engineering
-    # inspection. It never enters materialize-evidence.py, qualification rows,
+    # inspection. Mark it report-only only after the retained passing xcresult,
+    # exact XCTest owner/catalog, export, and raw cadence/motion semantics all
+    # reconcile. It never enters materialize-evidence.py, qualification rows,
     # or the release policy.
     evidence_status="missing"
-    if [[ "$test_status" -eq 0 ]] && [[ -d "$result_bundle" ]]; then
+    local probe_proof="$OUTPUT_DIR/$scenario-report-only-evidence.json"
+    rm -f "$probe_proof"
+    if [[ "$test_status" -eq 0 ]] \
+      && [[ "$log_status" == "captured" ]] \
+      && [[ "$error_count" -eq 0 ]] \
+      && [[ -d "$result_bundle" ]]; then
       local probe_attachments="$OUTPUT_DIR/$scenario-attachments"
       if xcrun xcresulttool export attachments \
           --path "$result_bundle" \
           --output-path "$probe_attachments" \
-          > "$OUTPUT_DIR/$scenario-export-attachments.log" 2>&1; then
+          > "$OUTPUT_DIR/$scenario-export-attachments.log" 2>&1 \
+        && python3 "$SCRIPT_DIR/qualification_policy.py" \
+          validate-cadence-semantics-probe \
+          --artifact-root "$OUTPUT_DIR" \
+          --expected-catalog "$scenario_expected_catalog" \
+          --test-execution "$test_execution" \
+          --attempts "$attempts_json" \
+          --version "$VERSION" \
+          --output "$probe_proof" \
+          > "$OUTPUT_DIR/$scenario-validate-report-only.log" 2>&1; then
         evidence_status="report-only"
       fi
     fi
@@ -2213,6 +2684,8 @@ EOF
             --scenario "$qualification_scenario" \
             --hardware "$hardware_id" \
             --device-identifier "$DEVICE_UDID" \
+            --qualification-session-binding "$ORCHESTRATOR_SESSION_BINDING" \
+            --candidate-runtime-binding "$CANDIDATE_RUNTIME_BINDING" \
             --artifact-digest "$ARTIFACT_DIGEST" \
             --source-digest "$SOURCE_DIGEST" \
             --candidate-metadata "$CANDIDATE_IDENTITY" \
@@ -2384,6 +2857,7 @@ PY
     "$scenario" "$result" "$test_status" "$error_count" "$log_status" "$evidence_status" "$((ended - started))" \
     "$scenario_expected_catalog" "$test_execution" "$attempts_json" "$error_inventory" \
     >> "$RESULTS_TSV"
+  assert_device_lock_held
   echo "$scenario: $result"
 }
 
@@ -2394,19 +2868,28 @@ done
 # Freeze the request transcript and server log before the evidence manifest is
 # calculated. No retained artifact producer may remain alive past this point.
 stop_fixture_server
+python3 "$SCRIPT_DIR/fixture-tree-binding.py" verify \
+  --root "$FIXTURES" \
+  --receipt "$OUTPUT_DIR/fixture-tree-binding.json" \
+  > /dev/null
+verify_staged_candidate_identity
+assert_source_authority_unchanged
 
 MATRIX_CHECKSUM=$(shasum -a 256 "$SCRIPT_DIR/matrix.json" | cut -d' ' -f1)
 
+assert_device_lock_held
 python3 - \
   "$RESULTS_TSV" "$OUTPUT_DIR/report.json" "$OUTPUT_DIR/device.json" \
   "$VERSION" "$SOURCE_COMMIT" "$SOURCE_DIGEST" "$MATRIX_CHECKSUM" \
   "$CANDIDATE_APP_DIGEST" "$ARTIFACT_DIGEST" "$RUN_MODE" "$QUALIFICATION_ROWS" \
-  "$CANDIDATE_IDENTITY" "$REPORT_ONLY_RUN" "$RUN_STARTED_AT_UTC" <<'PY'
+  "$CANDIDATE_IDENTITY" "$REPORT_ONLY_RUN" "$RUN_STARTED_AT_UTC" "$SCRIPT_DIR" \
+  "$ORCHESTRATOR_SESSION_BINDING" "$ORCHESTRATOR_STARTED_AT_UTC" <<'PY'
 import json
 import os
 import sys
 import tempfile
 from datetime import datetime, timezone
+from pathlib import Path
 
 (
     results_path,
@@ -2423,8 +2906,13 @@ from datetime import datetime, timezone
     candidate_path,
     report_only_raw,
     started_at_utc,
+    script_dir,
+    orchestrator_session_binding,
+    orchestrator_started_at_utc,
 ) = sys.argv[1:]
 report_only = report_only_raw == "true"
+sys.path.insert(0, script_dir)
+import qualification_policy as policy
 
 scenarios = []
 with open(results_path) as source:
@@ -2454,24 +2942,32 @@ with open(results_path) as source:
         if error_inventory_path:
             with open(error_inventory_path) as inventory_source:
                 error_inventory = json.load(inventory_source)
-        scenarios.append(
-            {
-                "scenario": scenario,
-                "result": result,
-                "xcodebuildExitCode": int(exit_code),
-                "libraryErrorCount": int(errors),
-                "appLog": log_status,
-                "qualificationEvidence": evidence_status,
-                "durationSeconds": int(duration),
-                "expectedTestCatalog": expected_catalog,
-                "testExecution": test_execution,
-                "attempts": attempts,
-                "attemptArtifactRoot": f"{scenario}-attempt-artifacts",
-                "hostErrorInventory": error_inventory,
-            }
-        )
+        row = {
+            "scenario": scenario,
+            "result": result,
+            "xcodebuildExitCode": int(exit_code),
+            "libraryErrorCount": int(errors),
+            "appLog": log_status,
+            "qualificationEvidence": evidence_status,
+            "durationSeconds": int(duration),
+            "expectedTestCatalog": expected_catalog,
+            "testExecution": test_execution,
+            "attempts": attempts,
+            "attemptArtifactRoot": f"{scenario}-attempt-artifacts",
+            "hostErrorInventory": error_inventory,
+        }
+        if scenario == policy.CADENCE_SEMANTICS_PROBE_SCENARIO:
+            if evidence_status == "report-only":
+                proof_path = (
+                    Path(output_path).parent
+                    / f"{scenario}-report-only-evidence.json"
+                )
+                with proof_path.open(encoding="utf-8") as proof_source:
+                    row["reportOnlyEvidence"] = json.load(proof_source)
+        scenarios.append(row)
 
 device = json.load(open(device_path))["selected"]
+device_snapshot = policy.device_snapshot_binding(Path(output_path).parent)
 with open(qualification_rows_path) as source:
     qualification_rows = [json.loads(line) for line in source if line.strip()]
 with open(candidate_path) as source:
@@ -2484,6 +2980,8 @@ report = {
     **candidate,
     "formatVersion": 2,
     "startedAtUTC": started_at_utc,
+    "orchestratorSessionBinding": orchestrator_session_binding,
+    "orchestratorStartedAtUTC": orchestrator_started_at_utc,
     "completedAtUTC": completed_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
     "wallDurationSeconds": int((completed_at - started_at).total_seconds()),
     "mode": mode,
@@ -2496,6 +2994,7 @@ report = {
     ),
     "reportOnly": report_only,
     "device": device,
+    "deviceSnapshot": device_snapshot,
     "scenarios": scenarios,
     "qualificationRows": qualification_rows,
     "result": "pass" if scenarios and all(row["result"] == "pass" for row in scenarios) else "fail",
@@ -2520,13 +3019,13 @@ PY
 report_validation_args=(
   validate-and-mark
   --run-dir "$OUTPUT_DIR"
+  --candidate "$CANDIDATE_IDENTITY"
 )
 if [[ "$REPORT_ONLY_RUN" == true ]]; then
   report_validation_args+=(--report-only)
 else
   report_validation_args+=(
     --matrix "$SCRIPT_DIR/matrix.json"
-    --candidate "$CANDIDATE_IDENTITY"
   )
   if [[ "$REQUIRE_STABLE" == true ]]; then
     report_validation_args+=(--stable-required)
@@ -2536,6 +3035,8 @@ fi
 # Validate one immutable snapshot and bind its exact report and selected plan.
 # A validated FAIL remains complete; a killed, changed, or mismatched run has
 # no matching marker and the volunteer package labels it incomplete.
+assert_source_authority_unchanged
+assert_device_lock_held
 python3 "$SCRIPT_DIR/report_validation.py" "${report_validation_args[@]}" > /dev/null
 
 jq '{result, mode, qualificationEligibleEnvironment, releaseGateSatisfied, scenarios}' "$OUTPUT_DIR/report.json"

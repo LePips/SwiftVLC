@@ -48,11 +48,32 @@ def classify(version: str) -> dict[str, object]:
     }
 
 
+def require_series(version: str, release_prefix: str) -> dict[str, object]:
+    """Validate a candidate and bind it to one stable release series."""
+
+    candidate = classify(version)
+    prefix = classify(release_prefix)
+    if prefix["isPrerelease"]:
+        raise VersionPolicyError(
+            "release series prefix must be a stable strict SemVer, for example 1.1.0"
+        )
+    candidate_core = version.split("-", 1)[0]
+    if candidate_core != release_prefix:
+        raise VersionPolicyError(
+            f"version {version!r} is not in release series {release_prefix!r}"
+        )
+    return candidate
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Validate SemVer and classify stable versus prerelease routing."
     )
     parser.add_argument("version")
+    parser.add_argument(
+        "--series-prefix",
+        help="Require VERSION to be the stable version or a prerelease in this series",
+    )
     parser.add_argument(
         "--field",
         choices=("version", "tag", "kind", "isPrerelease", "requiresQualification"),
@@ -60,7 +81,11 @@ def main() -> int:
     args = parser.parse_args()
 
     try:
-        policy = classify(args.version)
+        policy = (
+            require_series(args.version, args.series_prefix)
+            if args.series_prefix is not None
+            else classify(args.version)
+        )
     except VersionPolicyError as error:
         parser.error(str(error))
 

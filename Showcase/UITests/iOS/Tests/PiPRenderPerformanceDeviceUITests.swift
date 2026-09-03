@@ -12,12 +12,6 @@ final class PiPRenderPerformanceDeviceUITests: ShowcaseIOSTestCase {
     else {
       throw XCTSkip("Set SWIFTVLC_PIP_PERFORMANCE_DEVICE=YES for candidate-bound hardware runs")
     }
-    addUIInterruptionMonitor(withDescription: "Local network permission") { alert in
-      let allow = alert.buttons["Allow"]
-      guard allow.exists else { return false }
-      allow.tap()
-      return true
-    }
     let profile = ProcessInfo.processInfo.environment["SWIFTVLC_PIP_PERFORMANCE_PROFILE"]
       ?? "1080p60"
     let duration = max(
@@ -34,8 +28,7 @@ final class PiPRenderPerformanceDeviceUITests: ShowcaseIOSTestCase {
       LaunchArguments.pipPerformanceURLBase64, encodedURL,
       LaunchArguments.pipPerformanceDuration, String(duration)
     ]
-    app.launch()
-    app.tap()
+    launchDirectlyHandlingQualificationPermissions()
 
     let possible = element(AccessibilityID.PiPRenderPerformanceValidation.possibleLabel)
     let active = element(AccessibilityID.PiPRenderPerformanceValidation.activeLabel)

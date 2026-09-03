@@ -28,18 +28,11 @@ final class MediaServicesResetDeviceUITests: ShowcaseIOSTestCase {
       )
     }
 
-    addUIInterruptionMonitor(withDescription: "Local network permission") { alert in
-      let allow = alert.buttons["Allow"]
-      guard allow.exists else { return false }
-      allow.tap()
-      return true
-    }
     replaceLaunchArgument(
       LaunchArguments.audioMediaServicesResetURLBase64,
       with: encodedResetURL
     )
     launch(route: .mediaServicesResetValidation)
-    app.tap()
     let phase = element(AccessibilityID.MediaServicesResetValidation.phaseLabel)
     let startPictureInPicture = app.buttons[
       AccessibilityID.MediaServicesResetValidation.startPictureInPictureButton

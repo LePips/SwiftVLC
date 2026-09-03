@@ -28,18 +28,11 @@ final class AudioSessionOwnershipDeviceUITests: ShowcaseIOSTestCase {
       )
     }
 
-    addUIInterruptionMonitor(withDescription: "Local network permission") { alert in
-      let allow = alert.buttons["Allow"]
-      guard allow.exists else { return false }
-      allow.tap()
-      return true
-    }
     replaceLaunchArgument(
       LaunchArguments.audioSessionOwnershipURLBase64,
       with: encodedOwnershipURL
     )
     launch(route: .audioSessionOwnershipValidation)
-    app.tap()
 
     let phase = element(AccessibilityID.AudioSessionOwnershipValidation.phaseLabel)
     let interruptions = element(

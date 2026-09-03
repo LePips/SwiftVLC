@@ -43,6 +43,7 @@
           "iOSUITests/PiPDeferredPauseDeviceUITests/",
           "iOSUITests/PiPDelayedStartFailureDeviceUITests/",
           "iOSUITests/PiPOverlayDeviceUITests/",
+          "iOSUITests/PiPCadenceSemanticsProbeDeviceUITests/",
           "iOSUITests/SeekFrameOracleDeviceUITests/",
           "iOSUITests/ProgressiveHTTPRangeSeekDeviceUITests/",
           "iOSUITests/LocalPlaybackMatrixDeviceUITests/",
@@ -60,7 +61,7 @@
     },
     {
       "id": "harness-regressions",
-      "selection": {"kind": "exact", "testIdentifiers": ["iOSUITests/MusicPlayerUITests/test_switchingTracksKeepsTransportStateAndDoesNotCrash", "iOSUITests/PiPUITests/test_deep_toggleButtonDisabledWhenNotPossible"]},
+      "selection": {"kind": "exact", "testIdentifiers": ["iOSUITests/MusicPlayerUITests/test_switchingTracksKeepsTransportStateAndDoesNotCrash", "iOSUITests/PiPUITests/test_deep_toggleButtonAvailabilityMatchesPiPPossibility"]},
       "outputs": []
     },
     {

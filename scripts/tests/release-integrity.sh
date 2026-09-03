@@ -3242,6 +3242,35 @@ fixture_feature_checksum=$(shasum -a 256 \
   "$temp_dir/feature-manifest.json" | cut -d' ' -f1)
 qualification_profiles_checksum=$(shasum -a 256 \
   "$SCRIPT_DIR/qualification/profiles-v1.json" | cut -d' ' -f1)
+
+mkdir -p "$temp_dir/fake-bin"
+cat > "$temp_dir/fake-bin/xcrun" <<'EOF'
+#!/bin/sh
+if [ "${1:-}" = "xcresulttool" ]; then
+  if [ "${2:-}" = "export" ] && [ "${3:-}" = "attachments" ]; then
+    output=""
+    while [ "$#" -gt 0 ]; do
+      if [ "$1" = "--output-path" ]; then
+        shift
+        output="${1:-}"
+        break
+      fi
+      shift
+    done
+    [ -n "$output" ] || exit 2
+    mkdir -p "$output"
+    cp -R "$SWIFTVLC_RELEASE_TEST_ATTACHMENT_EXPORT/." "$output/"
+    exit 0
+  fi
+  printf '%s\n' '{"testNodes":[{"nodeType":"Test Case","nodeIdentifier":"iOSUITests/FixtureTests/test_releaseIntegrity","result":"Passed"}]}'
+  exit 0
+fi
+exec /usr/bin/xcrun "$@"
+EOF
+chmod +x "$temp_dir/fake-bin/xcrun"
+export SWIFTVLC_RELEASE_TEST_ATTACHMENT_EXPORT="$temp_dir/retained-report/vod-attachments"
+export PATH="$temp_dir/fake-bin:$PATH"
+
 python3 - "$temp_dir/record.json" "$temp_dir/evidence.json" \
   "$qualification_source_commit" "$qualification_source_digest" \
   "$qualification_matrix_checksum" "$digest_a" "$fixture_feature_checksum" \
@@ -3265,6 +3294,12 @@ from pathlib import Path
 ) = sys.argv[1:]
 sys.path.insert(0, qualification_directory)
 import qualification_policy as policy
+sys.path.insert(0, str(Path(qualification_directory) / "tests"))
+from test_qualification_harness import (
+    fixture_candidate_build_attestation_fields,
+    report_validation,
+    validation_plan,
+)
 
 record_path = Path(record_path_value)
 evidence_path = Path(evidence_path_value)
@@ -3307,6 +3342,20 @@ identity = {
     "qualificationPolicyDigestAlgorithm": "swiftvlc-qualification-policy-v1",
     "qualificationPolicyDigest": policy.policy_digest(),
 }
+identity.update(
+    fixture_candidate_build_attestation_fields(
+        source_commit=commit,
+        release_source_digest=source_digest,
+        artifact_digest=artifact_digest,
+        version=identity["version"],
+        catalog=catalog,
+        candidate_app_digest=identity["candidateAppDigest"],
+        test_runner_digest=identity["testRunnerDigest"],
+        test_bundle_digest=identity["testBundleDigest"],
+        base_xctestrun_digest=identity["baseXCTestRunDigest"],
+        base_xctestrun_name=identity["baseXCTestRunName"],
+    )
+)
 execution = {
     "expected": catalog_record,
     "executed": catalog_record,
@@ -3412,7 +3461,16 @@ raw_evidence = {
     "outcome": "stable",
     "retryCount": 0,
 }
-attachment_payload.write_text(json.dumps(raw_evidence, sort_keys=True))
+attachment_payload.write_text(
+    json.dumps(
+        {
+            **raw_evidence,
+            "qualificationSessionBinding": "9" * 64,
+            "candidateRuntimeBinding": identity["candidateRuntimeBinding"],
+        },
+        sort_keys=True,
+    )
+)
 attachment_manifest = attachment_root / "manifest.json"
 attachment_manifest.write_text(
     json.dumps(
@@ -3481,25 +3539,85 @@ row = {
     "result": "pass",
 }
 (retained_root / "evidence.json").write_text(json.dumps(evidence, sort_keys=True))
+selected_device = {
+    "id": "fixture-coredevice",
+    "udid": "fixture-device",
+    "ecid": 42,
+    "ecidHex": "0x2A",
+    "name": "Test phone",
+    "marketingName": "Test phone",
+    "productType": "iPhone16,1",
+    "deviceFamily": "iPhone",
+    "osVersion": "26.6",
+    "osMajor": 26,
+    "osBuild": "23G80",
+    "osReleaseType": "stable",
+    "transport": "wired",
+    "tunnelIPAddress": "fd00::1",
+    "connected": True,
+    "qualificationEligible": True,
+    "matchingHardwareRows": ["iphone-current"],
+}
+(retained_root / policy.DEVICE_SNAPSHOT_RELATIVE_PATH).write_text(
+    json.dumps(
+        {
+            "selected": selected_device,
+            "connected": [selected_device],
+            "allPhysicalIOSDevices": [selected_device],
+            "mode": "qualification",
+        },
+        sort_keys=True,
+    )
+)
 report_path = retained_root / "report.json"
 completed_at = datetime.now(timezone.utc).replace(microsecond=0)
 started_at = completed_at - timedelta(seconds=120)
+session_binding = "9" * 64
 report_path.write_text(
     json.dumps(
         {
             **identity,
             "startedAtUTC": started_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "orchestratorSessionBinding": session_binding,
+            "orchestratorStartedAtUTC": started_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
             "completedAtUTC": completed_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
             "wallDurationSeconds": 120,
             "mode": "qualification",
             "qualificationEligibleEnvironment": True,
-            "device": {"udid": "fixture-device"},
+            "reportOnly": False,
+            "releaseGateSatisfied": False,
+            "releaseGateReason": policy.ORDINARY_RELEASE_GATE_REASON,
+            "device": selected_device,
+            "deviceSnapshot": policy.device_snapshot_binding(retained_root),
             "result": "pass",
             "scenarios": runner_rows,
             "qualificationRows": [row],
         },
         sort_keys=True,
     )
+)
+candidate_path = retained_root / "candidate-metadata.json"
+candidate_path.write_text(json.dumps(identity, sort_keys=True))
+runner_scenario_ids = [runner["scenario"] for runner in runner_rows]
+plan = validation_plan.build_plan(
+    {"mode": "qualification", "selected": selected_device},
+    json.loads((root / "matrix.json").read_text()),
+    runner_scenario_ids,
+    runner_scenario_ids,
+    started_at_utc=started_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
+    orchestrator_session_binding=session_binding,
+    orchestrator_started_at_utc=started_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
+    selection_scope="partial",
+)
+report_validation.atomic_write_json(
+    retained_root / report_validation.PLAN_FILENAME,
+    plan,
+)
+report_validation.validate_and_mark(
+    retained_root,
+    matrix_path=root / "matrix.json",
+    candidate_path=candidate_path,
+    stable_required=True,
 )
 source_binding = {
     "path": retained_root.relative_to(root).as_posix(),
@@ -3532,34 +3650,6 @@ record_path.write_text(
     )
 )
 PY
-
-mkdir -p "$temp_dir/fake-bin"
-cat > "$temp_dir/fake-bin/xcrun" <<'EOF'
-#!/bin/sh
-if [ "${1:-}" = "xcresulttool" ]; then
-  if [ "${2:-}" = "export" ] && [ "${3:-}" = "attachments" ]; then
-    output=""
-    while [ "$#" -gt 0 ]; do
-      if [ "$1" = "--output-path" ]; then
-        shift
-        output="${1:-}"
-        break
-      fi
-      shift
-    done
-    [ -n "$output" ] || exit 2
-    mkdir -p "$output"
-    cp -R "$SWIFTVLC_RELEASE_TEST_ATTACHMENT_EXPORT/." "$output/"
-    exit 0
-  fi
-  printf '%s\n' '{"testNodes":[{"nodeType":"Test Case","nodeIdentifier":"iOSUITests/FixtureTests/test_releaseIntegrity","result":"Passed"}]}'
-  exit 0
-fi
-exec /usr/bin/xcrun "$@"
-EOF
-chmod +x "$temp_dir/fake-bin/xcrun"
-export SWIFTVLC_RELEASE_TEST_ATTACHMENT_EXPORT="$temp_dir/retained-report/vod-attachments"
-export PATH="$temp_dir/fake-bin:$PATH"
 
 SWIFTVLC_QUALIFICATION_MATRIX="$temp_dir/matrix.json" \
   SWIFTVLC_QUALIFICATION_RECORD="$temp_dir/record.json" \

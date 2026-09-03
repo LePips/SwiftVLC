@@ -27,6 +27,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import qualification_policy as policy
+import report_validation
 
 
 class ChecklistError(ValueError):
@@ -45,7 +46,16 @@ EVIDENCE_LEVELS = {
     "receiver-output",
     "operator-observed",
 }
-RESULT_ORDER = ("pass", "fail", "partial", "notRun", "blocked", "notApplicable")
+RESULT_ORDER = (
+    "pass",
+    "observedPass",
+    "fail",
+    "partial",
+    "observedPartial",
+    "notRun",
+    "blocked",
+    "notApplicable",
+)
 UPSTREAM_PROJECT_URLS = {
     "VLC": "https://code.videolan.org/videolan/vlc/-/work_items/",
     "VLCKit": "https://code.videolan.org/videolan/VLCKit/-/work_items/",
@@ -139,10 +149,65 @@ def validate_matrix(matrix: dict) -> tuple[dict[str, dict], dict[str, dict]]:
     return scenario_by_id, hardware_by_id
 
 
+def _matrix_scenario_producers(
+    matrix: dict, scenario_by_id: dict[str, dict]
+) -> dict[str, str]:
+    """Return the matrix-owned runner for every qualification output.
+
+    The release policy performs the complete runner-contract validation before
+    the CLI renders a report.  The checklist also needs this small, explicit
+    authority map so a report cannot award an observation to an arbitrary
+    passing runner, including when build_checklist is exercised directly.
+    """
+
+    contracts = matrix.get("runnerContracts")
+    if not isinstance(contracts, list) or not contracts:
+        raise ChecklistError(
+            "qualification matrix needs a non-empty runnerContracts authority map"
+        )
+    runner_ids: set[str] = set()
+    producers: dict[str, str] = {}
+    for index, contract in enumerate(contracts):
+        if not isinstance(contract, dict):
+            raise ChecklistError(f"runner contract {index} must be an object")
+        runner_id = _identifier(contract.get("id"), f"runner contract {index}")
+        if runner_id in runner_ids:
+            raise ChecklistError(f"duplicate runner contract {runner_id!r}")
+        runner_ids.add(runner_id)
+        outputs = contract.get("outputs")
+        if not isinstance(outputs, list):
+            raise ChecklistError(
+                f"runner contract {runner_id} outputs must be an array"
+            )
+        for output_index, output in enumerate(outputs):
+            if not isinstance(output, dict):
+                raise ChecklistError(
+                    f"runner contract {runner_id} output {output_index} must be an object"
+                )
+            scenario_id = output.get("scenario")
+            if scenario_id not in scenario_by_id:
+                raise ChecklistError(
+                    f"runner contract {runner_id} names unknown output {scenario_id!r}"
+                )
+            if scenario_id in producers:
+                raise ChecklistError(
+                    f"qualification scenario {scenario_id!r} has multiple producers"
+                )
+            producers[str(scenario_id)] = runner_id
+    missing = sorted(set(scenario_by_id) - set(producers))
+    if missing:
+        raise ChecklistError(
+            "qualification scenarios have no matrix-owned producer: "
+            + ", ".join(missing)
+        )
+    return producers
+
+
 def validate_manifest(
     manifest: dict, matrix: dict, *, enforce_canonical_required_ids: bool = False
 ) -> dict:
     scenario_by_id, hardware_by_id = validate_matrix(matrix)
+    scenario_producer_by_id = _matrix_scenario_producers(matrix, scenario_by_id)
     if manifest.get("formatVersion") != 1:
         raise ChecklistError("feature manifest formatVersion must be 1")
     manifest_id = _identifier(manifest.get("id"), "feature manifest")
@@ -231,6 +296,14 @@ def validate_manifest(
             if not runner_ids:
                 raise ChecklistError(
                     f"evidence-backed feature {feature_id} needs a runnerScenarioId"
+                )
+            authorized_runners = {
+                scenario_producer_by_id[scenario_id] for scenario_id in scenario_ids
+            }
+            if set(runner_ids) != authorized_runners:
+                raise ChecklistError(
+                    f"feature {feature_id} runnerScenarioIds do not match its "
+                    "matrix-owned producers"
                 )
             if "blocker" in feature:
                 raise ChecklistError(
@@ -425,6 +498,7 @@ def validate_manifest(
         "manifestVersion": manifest_version,
         "releaseVersionPrefix": release_prefix,
         "scenarioById": scenario_by_id,
+        "scenarioProducerById": scenario_producer_by_id,
         "hardwareById": hardware_by_id,
         "categoryById": category_by_id,
         "staticControlById": control_by_id,
@@ -585,7 +659,8 @@ def _scope_hardware(
     # A future OS has no exact stable-matrix row.  The runner's explicit
     # exploratory-current-only mode can still exercise those scenarios, but it
     # intentionally materializes no qualification rows.  Project that report
-    # onto the latest same-family row solely to render an honest NOT RUN list.
+    # onto the latest same-family row solely to render an honest exploratory
+    # observation/not-run list.
     # Requiring every condition below prevents a malformed, current, or
     # qualifying report from borrowing a different hardware scope.
     if indexed_rows:
@@ -674,6 +749,139 @@ def _evidence_records(
     return records
 
 
+def _exploratory_evidence_hardware(
+    scope_hardware: list[str], exploratory_projection: dict | None
+) -> str | None:
+    if exploratory_projection is not None:
+        # This is the fixed hardware identity used by run-device-tests.sh and
+        # exploratory-device-policy.py when a future iPhone has no matrix row.
+        return policy.EXPLORATORY_FUTURE_IOS_HARDWARE_ID
+    if len(scope_hardware) == 1:
+        return scope_hardware[0]
+    # The harness cannot materialize an exploratory artifact when a device's
+    # hardware identity is ambiguous, so a runner marker alone is insufficient.
+    return None
+
+
+def load_exploratory_evidence_durations(
+    source: dict,
+    report_path: Path,
+    validated_manifest: dict,
+) -> dict[tuple[str, str], int]:
+    """Read device-observed durations from already policy-validated evidence."""
+
+    if not (
+        _source_kind(source) == "deviceReport"
+        and source.get("mode") == "exploratory"
+        and source.get("qualificationEligibleEnvironment") is False
+    ):
+        return {}
+    indexed_rows = _index_rows(
+        _source_rows(source, "deviceReport"),
+        validated_manifest["scenarioById"],
+        validated_manifest["hardwareById"],
+    )
+    scope_hardware, projection = _scope_hardware(
+        source,
+        "deviceReport",
+        indexed_rows,
+        validated_manifest["hardwareById"],
+    )
+    evidence_hardware = _exploratory_evidence_hardware(
+        scope_hardware, projection
+    )
+    if evidence_hardware is None:
+        return {}
+    runner_results = _runner_results(source)
+    durations: dict[tuple[str, str], int] = {}
+    applicable_scenarios = {
+        scenario
+        for scenario, _ in _expected_rows(
+            list(validated_manifest["scenarioById"]),
+            scope_hardware,
+            validated_manifest["scenarioById"],
+            validated_manifest["hardwareById"],
+        )
+    }
+    for scenario, producer in validated_manifest["scenarioProducerById"].items():
+        if scenario not in applicable_scenarios:
+            continue
+        runner = runner_results.get(producer)
+        if not (
+            isinstance(runner, dict)
+            and runner.get("result") == "pass"
+            and runner.get("qualificationEvidence") == "captured"
+        ):
+            continue
+        relative = f"evidence/{scenario}-{evidence_hardware}.json"
+        try:
+            evidence_path = policy.safe_relative_file(
+                report_path.parent,
+                relative,
+                f"exploratory {scenario!r} evidence",
+            )
+        except policy.QualificationPolicyError as error:
+            raise ChecklistError(str(error)) from error
+        evidence = load_json(evidence_path, f"exploratory {scenario!r} evidence")
+        duration = evidence.get("durationSeconds")
+        if isinstance(duration, bool) or not isinstance(duration, int) or duration <= 0:
+            raise ChecklistError(
+                f"exploratory {scenario!r} evidence has invalid durationSeconds"
+            )
+        durations[(scenario, evidence_hardware)] = duration
+    return durations
+
+
+def _exploratory_evidence_records(
+    expected: list[tuple[str, str]],
+    runner_results: dict[str, dict],
+    scenario_producer_by_id: dict[str, str],
+    evidence_hardware: str | None,
+    evidence_durations: dict[tuple[str, str], int],
+) -> list[dict]:
+    records = []
+    for scenario, hardware in expected:
+        runner_scenario = scenario_producer_by_id[scenario]
+        runner = runner_results.get(runner_scenario)
+        runner_failed = runner is not None and runner.get("result") != "pass"
+        captured = (
+            evidence_hardware is not None
+            and runner is not None
+            and runner.get("result") == "pass"
+            and runner.get("qualificationEvidence") == "captured"
+        )
+        if runner_failed:
+            evidence_result = "fail"
+        elif captured:
+            evidence_result = "observedPass"
+        else:
+            evidence_result = "notRun"
+        duration = None
+        if captured:
+            duration = evidence_durations.get((scenario, evidence_hardware))
+            if duration is None:
+                raise ChecklistError(
+                    f"captured exploratory {scenario!r} evidence has no bound duration"
+                )
+        records.append(
+            {
+                "scenario": scenario,
+                "hardware": hardware,
+                "evidenceHardware": evidence_hardware,
+                "runnerScenario": runner_scenario,
+                "result": evidence_result,
+                "evidence": (
+                    f"evidence/{scenario}-{evidence_hardware}.json"
+                    if captured
+                    else None
+                ),
+                "durationSeconds": duration,
+                "releaseQualifying": False,
+            }
+        )
+    return records
+
+
 def build_checklist(
     source: dict,
     manifest: dict,
@@ -681,6 +889,8 @@ def build_checklist(
     *,
     manifest_checksum: str,
     matrix_checksum: str,
+    exploratory_evidence_durations: dict[tuple[str, str], int] | None = None,
+    release_scope_valid: bool = False,
 ) -> dict:
     validated = validate_manifest(manifest, matrix)
     if (
@@ -694,6 +904,11 @@ def build_checklist(
         source, validated["releaseVersionPrefix"], matrix_checksum
     )
     source_kind = _source_kind(source)
+    release_credit_eligible = source_kind == "releaseRecord" or (
+        release_scope_valid
+        and source.get("mode") == "qualification"
+        and source.get("qualificationEligibleEnvironment") is True
+    )
     indexed_rows = _index_rows(
         _source_rows(source, source_kind),
         validated["scenarioById"],
@@ -706,6 +921,21 @@ def build_checklist(
         indexed_rows,
         validated["hardwareById"],
     )
+    exploratory_observation_eligible = (
+        source_kind == "deviceReport"
+        and source.get("mode") == "exploratory"
+        and source.get("qualificationEligibleEnvironment") is False
+        and not release_credit_eligible
+    )
+    exploratory_evidence_hardware = (
+        _exploratory_evidence_hardware(scope_hardware, exploratory_projection)
+        if exploratory_observation_eligible
+        else None
+    )
+    if exploratory_observation_eligible and exploratory_evidence_durations is None:
+        raise ChecklistError(
+            "exploratory checklist evaluation requires evidence-bound durations"
+        )
 
     feature_results = []
     for feature in manifest["features"]:
@@ -717,16 +947,36 @@ def build_checklist(
             validated["scenarioById"],
             validated["hardwareById"],
         )
-        evidence = _evidence_records(expected, indexed_rows)
+        evidence = (
+            _exploratory_evidence_records(
+                expected,
+                runner_results,
+                validated["scenarioProducerById"],
+                exploratory_evidence_hardware,
+                exploratory_evidence_durations or {},
+            )
+            if exploratory_observation_eligible
+            else _evidence_records(expected, indexed_rows)
+        )
+        applicable_runner_ids = (
+            sorted(
+                {
+                    validated["scenarioProducerById"][scenario]
+                    for scenario, _ in expected
+                }
+            )
+            if exploratory_observation_eligible
+            else feature.get("runnerScenarioIds", [])
+        )
         runner_failures = [
             scenario
-            for scenario in feature.get("runnerScenarioIds", [])
+            for scenario in applicable_runner_ids
             if scenario in runner_results
             and runner_results[scenario].get("result") != "pass"
         ]
         missing_runners = [
             scenario
-            for scenario in feature.get("runnerScenarioIds", [])
+            for scenario in applicable_runner_ids
             if scenario not in runner_results
         ]
 
@@ -739,6 +989,29 @@ def build_checklist(
         elif runner_failures:
             status = "fail"
             detail = "Runner failure: " + ", ".join(runner_failures)
+        elif exploratory_observation_eligible:
+            observed_count = sum(
+                record["result"] == "observedPass" for record in evidence
+            )
+            if observed_count == len(expected):
+                status = "observedPass"
+                detail = (
+                    "Every applicable output was captured by its matrix-owned "
+                    "runner. Exploratory observations never grant release credit."
+                )
+            elif observed_count:
+                status = "observedPartial"
+                detail = (
+                    f"{observed_count} of {len(expected)} applicable outputs were "
+                    "captured by their matrix-owned runners; this is not "
+                    "release-qualifying."
+                )
+            elif missing_runners:
+                status = "notRun"
+                detail = "Runner not run: " + ", ".join(missing_runners)
+            else:
+                status = "notRun"
+                detail = "No policy-validated exploratory evidence was captured."
         elif missing_runners:
             status = "notRun"
             detail = "Runner not run: " + ", ".join(missing_runners)
@@ -811,13 +1084,6 @@ def build_checklist(
             (runner, scope_hardware[0] if len(scope_hardware) == 1 else "device")
             for runner in sorted(required_runner_ids - set(runner_results))
         ]
-    release_credit_eligible = (
-        source_kind == "releaseRecord"
-        or (
-            source.get("mode") == "qualification"
-            and source.get("qualificationEligibleEnvironment") is True
-        )
-    )
     required_satisfied = (
         bool(required)
         and release_credit_eligible
@@ -856,6 +1122,15 @@ def build_checklist(
             "qualificationEligibleEnvironment"
         )
         scope["releaseCreditEligible"] = release_credit_eligible
+        scope["evidenceClass"] = (
+            "releaseQualifying"
+            if release_credit_eligible
+            else (
+                "exploratoryObservation"
+                if exploratory_observation_eligible
+                else "nonQualifying"
+            )
+        )
         scope["runTiming"] = {
             key: source.get(key)
             for key in (
@@ -895,7 +1170,7 @@ def build_checklist(
     ]
 
     return {
-        "formatVersion": 1,
+        "formatVersion": 2,
         "manifestId": validated["manifestId"],
         "manifestVersion": validated["manifestVersion"],
         "featureManifestChecksum": manifest_checksum,
@@ -946,18 +1221,28 @@ def _short_digest(value: object) -> str:
 def _status_label(status: str) -> str:
     return {
         "pass": "PASS",
+        "observedPass": "OBSERVED PASS",
         "fail": "FAIL",
         "partial": "PARTIAL",
+        "observedPartial": "OBSERVED PARTIAL",
         "notRun": "NOT RUN",
         "blocked": "BLOCKED",
         "notApplicable": "N/A",
     }[status]
 
 
+def _evidence_label(record: dict) -> str:
+    label = f"{record['scenario']} on {record['hardware']}"
+    evidence_hardware = record.get("evidenceHardware")
+    if evidence_hardware and evidence_hardware != record["hardware"]:
+        label += f" (captured as {evidence_hardware})"
+    return label
+
+
 def _evidence_markdown(records: list[dict]) -> str:
     links = []
     for record in records:
-        label = f"{record['scenario']} on {record['hardware']}"
+        label = _evidence_label(record)
         path = record.get("evidence")
         if path:
             links.append(f"[{_markdown_escape(label)}]({_markdown_escape(path)})")
@@ -983,6 +1268,15 @@ def render_markdown(checklist: dict, manifest: dict) -> str:
         f"# {manifest['title']}",
         "",
         f"**Scope result:** {'PASS' if summary['requiredFeaturesSatisfied'] else 'INCOMPLETE'}",
+        *(
+            [
+                "",
+                "**EXPLORATORY OBSERVATIONS ONLY — NOT RELEASE-QUALIFYING. "
+                "OBSERVED PASS/PARTIAL never counts as qualification PASS.**",
+            ]
+            if scope.get("evidenceClass") == "exploratoryObservation"
+            else []
+        ),
         "",
         "## Candidate",
         "",
@@ -1031,16 +1325,17 @@ def render_markdown(checklist: dict, manifest: dict) -> str:
             "",
             "## Summary",
             "",
-            "| Category | Pass | Fail | Partial | Not run | Blocked | N/A |",
-            "|---|---:|---:|---:|---:|---:|---:|",
+            "| Category | Pass | Observed pass | Fail | Partial | Observed partial | Not run | Blocked | N/A |",
+            "|---|---:|---:|---:|---:|---:|---:|---:|---:|",
         ]
     )
     for category in checklist["categories"]:
         counts = category["counts"]
         lines.append(
-            f"| {_markdown_escape(category['title'])} | {counts['pass']} | {counts['fail']} | "
-            f"{counts['partial']} | {counts['notRun']} | {counts['blocked']} | "
-            f"{counts['notApplicable']} |"
+            f"| {_markdown_escape(category['title'])} | {counts['pass']} | "
+            f"{counts['observedPass']} | {counts['fail']} | {counts['partial']} | "
+            f"{counts['observedPartial']} | {counts['notRun']} | "
+            f"{counts['blocked']} | {counts['notApplicable']} |"
         )
 
     static_controls = checklist.get("staticControls", [])
@@ -1121,7 +1416,7 @@ def render_html(checklist: dict, manifest: dict) -> str:
     def evidence(records: list[dict]) -> str:
         values = []
         for record in records:
-            label = escaped(f"{record['scenario']} on {record['hardware']}")
+            label = escaped(_evidence_label(record))
             path = record.get("evidence")
             if path:
                 values.append(f'<a href="{escaped(path)}">{label}</a>')
@@ -1147,13 +1442,23 @@ def render_html(checklist: dict, manifest: dict) -> str:
         "<style>",
         "body{font:15px -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;margin:2rem;max-width:1200px;color:#202124}",
         "table{border-collapse:collapse;width:100%;margin:1rem 0 2rem}th,td{border:1px solid #d8dce1;padding:.5rem;text-align:left;vertical-align:top}th{background:#f5f6f7}",
-        ".status{font-weight:700}.status-pass{color:#157f3b}.status-fail,.status-blocked{color:#b42318}.status-partial,.status-notRun{color:#9a6700}.status-notApplicable{color:#667085}",
+        ".status{font-weight:700}.status-pass{color:#157f3b}.status-observedPass,.status-observedPartial{color:#175cd3}.status-fail,.status-blocked{color:#b42318}.status-partial,.status-notRun{color:#9a6700}.status-notApplicable{color:#667085}",
         ".outcome{padding:.75rem 1rem;border-radius:.4rem;font-weight:700}.outcome.pass{background:#e8f7ee;color:#157f3b}.outcome.incomplete{background:#fff1f0;color:#b42318}",
+        ".exploratory{padding:.75rem 1rem;border:2px solid #175cd3;background:#eff8ff;color:#1849a9;font-weight:700}",
         "code{overflow-wrap:anywhere}small{color:#667085}",
         "</style></head><body>",
         f"<h1>{escaped(manifest['title'])}</h1>",
         f'<p class="outcome {outcome_class}">Scope result: '
         f"{'PASS' if summary['requiredFeaturesSatisfied'] else 'INCOMPLETE'}</p>",
+        *(
+            [
+                '<p class="exploratory">EXPLORATORY OBSERVATIONS ONLY — NOT '
+                "RELEASE-QUALIFYING. OBSERVED PASS/PARTIAL never counts as "
+                "qualification PASS.</p>"
+            ]
+            if checklist["scope"].get("evidenceClass") == "exploratoryObservation"
+            else []
+        ),
         "<h2>Candidate</h2><table><tbody>",
     ]
     identity = (
@@ -1211,6 +1516,26 @@ def render_html(checklist: dict, manifest: dict) -> str:
         body.append(
             f"<tr><th>Upstream risk review</th><td>{escaped(risk_review['reviewedOn'])}; "
             f"{risk_review['riskCount']} mapped risks</td></tr>"
+        )
+    body.append("</tbody></table>")
+
+    body.extend(
+        [
+            "<h2>Summary</h2>",
+            "<table><thead><tr><th>Category</th><th>Pass</th>"
+            "<th>Observed pass</th><th>Fail</th><th>Partial</th>"
+            "<th>Observed partial</th><th>Not run</th><th>Blocked</th>"
+            "<th>N/A</th></tr></thead><tbody>",
+        ]
+    )
+    for category in checklist["categories"]:
+        counts = category["counts"]
+        body.append(
+            f"<tr><td>{escaped(category['title'])}</td>"
+            f"<td>{counts['pass']}</td><td>{counts['observedPass']}</td>"
+            f"<td>{counts['fail']}</td><td>{counts['partial']}</td>"
+            f"<td>{counts['observedPartial']}</td><td>{counts['notRun']}</td>"
+            f"<td>{counts['blocked']}</td><td>{counts['notApplicable']}</td></tr>"
         )
     body.append("</tbody></table>")
 
@@ -1284,6 +1609,17 @@ def write_outputs(output_dir: Path, checklist: dict, manifest: dict) -> None:
     )
 
 
+def _cli_summary(summary: dict) -> str:
+    counts = summary["counts"]
+    return (
+        f"Feature checklist: {counts['pass']} passed, "
+        f"{counts['observedPass']} observed passed (non-release), "
+        f"{counts['fail']} failed, {counts['partial']} partial, "
+        f"{counts['observedPartial']} observed partial (non-release), "
+        f"{counts['notRun']} not run, {counts['blocked']} blocked."
+    )
+
+
 def main() -> int:
     script_directory = Path(__file__).resolve().parent
     parser = argparse.ArgumentParser(
@@ -1353,9 +1689,34 @@ def main() -> int:
             raise ChecklistError("--check-only cannot be combined with --output-dir")
         if not args.check_only and args.output_dir is None:
             raise ChecklistError("--output-dir is required when rendering")
-        source = load_json(args.input, "qualification input")
+        if (
+            not args.check_only
+            and args.output_dir.resolve() != args.input.resolve().parent
+        ):
+            raise ChecklistError(
+                "--output-dir must be the input report/record directory so retained "
+                "evidence links remain valid"
+            )
+        try:
+            source_bytes = report_validation.regular_file_bytes(
+                args.input, "qualification input"
+            )
+            source = report_validation.json_object(
+                source_bytes, "qualification input"
+            )
+        except report_validation.ReportValidationError as error:
+            raise ChecklistError(str(error)) from error
         try:
             if isinstance(source.get("qualificationRows"), list):
+                if (
+                    args.input.name != report_validation.REPORT_FILENAME
+                    or not report_validation.is_valid(
+                        args.input.parent, report_bytes=source_bytes
+                    )
+                ):
+                    raise policy.QualificationPolicyError(
+                        "device report has no matching successful-validation receipt"
+                    )
                 policy.validate_report(
                     args.input,
                     matrix,
@@ -1374,25 +1735,62 @@ def main() -> int:
                 )
         except policy.QualificationPolicyError as error:
             raise ChecklistError(str(error)) from error
+        validated_manifest = validate_manifest(
+            manifest,
+            matrix,
+            enforce_canonical_required_ids=(
+                args.enforce_canonical_policy
+                or manifest.get("id") == "swiftvlc-release-features"
+            ),
+        )
+        exploratory_durations = (
+            load_exploratory_evidence_durations(
+                source, args.input, validated_manifest
+            )
+            if isinstance(source.get("qualificationRows"), list)
+            else {}
+        )
+        release_scope_valid = (
+            report_validation.is_release_scope_valid(
+                args.input.parent, report_bytes=source_bytes
+            )
+            if isinstance(source.get("qualificationRows"), list)
+            else True
+        )
         checklist = build_checklist(
             source,
             manifest,
             matrix,
             manifest_checksum=file_checksum(args.manifest),
             matrix_checksum=file_checksum(args.matrix),
+            exploratory_evidence_durations=exploratory_durations,
+            release_scope_valid=release_scope_valid,
         )
+        if isinstance(source.get("qualificationRows"), list):
+            try:
+                source_unchanged = (
+                    report_validation.regular_file_bytes(
+                        args.input, "qualification input"
+                    )
+                    == source_bytes
+                )
+            except report_validation.ReportValidationError as error:
+                raise ChecklistError(str(error)) from error
+            if not source_unchanged or not report_validation.is_valid(
+                args.input.parent, report_bytes=source_bytes
+            ):
+                raise ChecklistError(
+                    "device report or retained evidence changed while the "
+                    "validation receipt was consumed"
+                )
         if not args.check_only:
             write_outputs(args.output_dir, checklist, manifest)
-    except ChecklistError as error:
+    except (ChecklistError, OSError, UnicodeError) as error:
         print(f"Error: {error}", file=sys.stderr)
         return 2
 
     summary = checklist["summary"]
-    print(
-        f"Feature checklist: {summary['counts']['pass']} passed, "
-        f"{summary['counts']['fail']} failed, {summary['counts']['notRun']} not run, "
-        f"{summary['counts']['blocked']} blocked."
-    )
+    print(_cli_summary(summary))
     if args.require_complete and not summary["requiredFeaturesSatisfied"]:
         return 1
     return 0

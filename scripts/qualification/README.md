@@ -17,11 +17,17 @@ feature checklists beside the raw report:
 ```bash
 ./scripts/qualification/qualify.sh --list-profiles
 export SWIFTVLC_DEVELOPMENT_TEAM=ABCDE12345  # team shown in Xcode Settings
-./scripts/qualification/qualify.sh smoke --device "My iPhone"
-./scripts/qualification/qualify.sh full --device "My beta iPhone" --exploratory-current-only
-./scripts/qualification/qualify.sh full --device "My iPhone" --require-stable
-./scripts/qualification/qualify.sh release --device "My iPhone"
+./scripts/qualification/qualify.sh smoke --version 1.1.0-beta.9 --device "My iPhone"
+./scripts/qualification/qualify.sh full --version 1.1.0-beta.9 \
+  --device "My beta iPhone" --exploratory-current-only
+./scripts/qualification/qualify.sh full --version 1.1.0 \
+  --device "My iPhone" --require-stable
+./scripts/qualification/qualify.sh release --version 1.1.0 --device "My iPhone"
 ```
+
+`--version` is mandatory and is bound into the candidate, evidence, report,
+and checklist. There is deliberately no default: omitting it must not label a
+beta build as the stable `1.1.0` candidate.
 
 The profiles make different claims rather than treating every green command as
 a release qualification:
@@ -54,10 +60,12 @@ profile always requires a stable OS that matches `matrix.json`; it rejects an
 exploratory device before building. A future iPhone OS can exercise current-only
 lanes with `--exploratory-current-only`, but the resulting report remains
 ineligible for release. The same is true for a beta build of the current matrix
-OS major: runner diagnostics are retained, but no qualification rows are
-materialized and the checklist cannot display an automated feature as passed.
+OS major: no qualification rows are materialized. Policy-validated evidence is
+shown separately as `OBSERVED PASS` or `OBSERVED PARTIAL`, with an explicit
+non-release banner; those states never count as qualification `PASS` or release
+credit.
 
-### Ninety-second cadence semantics probe
+### Progress-driven cadence semantics probe
 
 Before spending ten minutes on the candidate-bound cadence row, run the
 isolated physical probe against the connected iPhone. First choose a writable
@@ -67,6 +75,7 @@ root on your external SSD:
 export SWIFTVLC_QUALIFICATION_ROOT="/absolute/path/on/your/external-ssd/SwiftVLC-Qualification"
 
 ./scripts/qualification/run-device-tests.sh \
+  --version 1.1.0-beta.9 \
   --only cadence-semantics-probe \
   --development-team ABCDE12345 \
   --device "My beta iPhone" \
@@ -77,7 +86,11 @@ export SWIFTVLC_QUALIFICATION_ROOT="/absolute/path/on/your/external-ssd/SwiftVLC
   --output "$SWIFTVLC_QUALIFICATION_ROOT/Cadence-Probe-Results"
 ```
 
-This is a report-only engineering probe. It samples exact five-second windows
+This is a report-only engineering probe. It usually completes in about ninety
+seconds. A shared timing contract makes the app fail explicitly at its 4.5-minute
+global deadline, before SpringBoard capture's five-minute ceiling, and XCTest
+retains a separate 30-second collection reserve plus runner margin. It samples
+exact five-second windows
 for 24@0.5x, 60@1x, 30/50/59.94/60@2x, and VFR@0.5/1/2x after settling. The
 retained JSON contains exact monotonic boundaries, effective player and
 control-timebase rates, the lossless native PTS-delta histogram, callback
@@ -85,15 +98,37 @@ submission/rejection conservation, renderer and libVLC counters, and three
 uptime-bound SpringBoard frames per window. The runner requires this scenario
 to execute alone, refuses `--require-stable`, never materializes a qualification
 row, and marks both its attachment and top-level report as non-release-credit.
+It emits the `report-only` evidence state only after the retained final
+`.xcresult` proves the one exact XCTest leaf passed, its attempt-history copy
+matches byte-for-byte, and the exported manifest contains exactly one probe
+attachment with the exact name and XCTest owner. Policy then re-exports that
+attachment from the retained `.xcresult`, requires an identical payload, and
+recomputes all nine window identities, native PTS histograms/classification,
+rate clocks, callback conservation, renderer/libVLC deltas, and RGB8
+SpringBoard hashes and adjacent-frame motion. VFR windows must retain material
+24fps and 60fps rational interval/multiple coverage for the exact absolute PTS
+span; a CFR-only histogram cannot impersonate the alternating fixture. Final
+receipt validation also requires the strict sibling `candidate-metadata.json`
+and exact report/candidate identity, policy, and input-checksum bindings. Any
+skip, extra/missing test,
+failed test, manifest/owner/payload drift, missing raw field, or non-moving
+window remains a failed/missing report-only run and receives no validation
+receipt.
 
 Each session contains `session.json` plus the device runner's `report.json`,
 `feature-checklist.json`, `feature-checklist.md`, and
-`feature-checklist.html`. `PASS` means the requested candidate-bound evidence
-was observed; `FAIL` means an executed requirement failed; `NOT RUN` means the
-profile did not execute it; and `BLOCKED` means trustworthy automation or an
-external prerequisite such as a real receiver is not yet available. These
-states are intentionally distinct so a skipped or unimplemented feature can
-never become a false pass.
+`feature-checklist.html`. `PASS` means release-qualifying candidate-bound
+evidence was observed. `OBSERVED PASS` and `OBSERVED PARTIAL` are validated
+beta/future-OS observations with no release credit. `FAIL` means an executed
+requirement failed; `NOT RUN` means the profile did not execute it; and
+`BLOCKED` means trustworthy automation or an external prerequisite such as a
+real receiver is not yet available. These states are intentionally distinct so
+a skipped, exploratory, or unimplemented feature can never become a false
+pass. If the runner is interrupted, cannot produce exactly one report, or the
+report/checklist handoff is rejected, the session instead retains
+`incomplete-execution-summary.json` and Markdown. That summary labels every
+recovered lane outcome as unvalidated diagnostics and can never grant release
+credit.
 
 Two high-value physical observations remain explicit required blockers instead
 of being inferred from sender state. The system-PiP row requires an operator to
@@ -111,12 +146,14 @@ again without rerunning hardware:
 ```bash
 python3 scripts/qualification/feature-checklist.py \
   --input /absolute/path/to/report.json \
-  --output-dir /absolute/path/to/checklist
+  --output-dir /absolute/path/to
 ```
 
 Add `--require-complete` only when checking whether every applicable required
 feature passed; the renderer still writes all three reports before returning a
-non-zero status. `matrix.json` is the fail-closed scenario and evidence policy;
+non-zero status. Rendered checklists stay beside their input so their retained
+evidence links cannot silently point at the wrong directory. `matrix.json` is
+the fail-closed scenario and evidence policy;
 `feature-manifest-v1.json` is the higher-level product promise policy.
 `check-qualification.sh` enforces both for a stable release. The canonical set
 of required feature IDs is also immutable in the shared release policy (for
@@ -196,6 +233,7 @@ device evidence can be accepted.
 
 ```bash
 ./scripts/qualification/run-device-tests.sh \
+  --version 1.1.0-beta.9 \
   --development-team ABCDE12345 \
   --derived-data /absolute/path/to/device-build \
   --work-root /absolute/path/to/temporary-work \
@@ -208,6 +246,7 @@ The profile wrapper forwards the same storage controls:
 export SWIFTVLC_QUALIFICATION_ROOT="/absolute/path/on/your/external-ssd/SwiftVLC-Qualification"
 
 ./scripts/qualification/qualify.sh full \
+  --version 1.1.0-beta.9 \
   --development-team ABCDE12345 \
   --derived-data "$SWIFTVLC_QUALIFICATION_ROOT/DerivedData" \
   --work-root "$SWIFTVLC_QUALIFICATION_ROOT/Tmp" \
@@ -238,18 +277,37 @@ An ordinary invocation is `FULL APPLICABLE DEVICE SUITE`; any explicit
 Here, full means the complete suite applicable to this one device—not a
 complete multi-device release record.
 
-After execution, `report_validation.py` validates an immutable snapshot with
-the applicable qualification or report-only policy. The plan and report bind a
-canonical UTC start, the report adds canonical completion and exact wall-clock
-duration, and stable evidence expires after 30 days. Only then does validation
-write a deterministic manifest of every retained directory and file (path,
-mode, size, and SHA-256), plus a receipt binding that manifest and the exact
-`report.json` and selected plan bytes. Generated checklist files and the
+After execution, `report_validation.py` inventories the retained evidence tree,
+validates that immutable snapshot with the applicable qualification or
+report-only policy, then requires the complete inventory to remain byte-for-byte
+unchanged before writing its receipt. The plan and report bind a canonical UTC
+start, the report adds canonical completion and exact wall-clock duration, and
+stable evidence expires after 30 days. Validation retains that deterministic
+manifest of every directory and file (path, mode, size, and SHA-256), plus a
+receipt binding the manifest and exact `report.json` and selected plan bytes.
+Generated checklist files and the
 privacy-only host summary are the only named post-validation exclusions; they
 cannot satisfy evidence rows. A changed, deleted, or added evidence artifact,
 changed report or plan, mismatched scenario list, missing receipt, stale stable
 run, or interruption therefore cannot be packaged or rendered as a qualifying
 `COMPLETE`/`PASS`.
+
+Every strict report also carries the relative path, SHA-256, and byte size of
+its sibling `device.json`. Policy reopens that exact retained file, requires the
+canonical normalized selected-device shape, and exact-matches its mode and
+selected device to the report. This closes accidental or partial relabelling;
+it is not independent hardware attestation. Someone able to synthesize or
+replace the complete offline evidence tree can also recompute these unkeyed
+bindings, so release review still depends on running the trusted scripts on a
+trusted Mac/device and preserving custody of the resulting tree.
+
+The cadence semantics receipt has the same offline trust boundary. Its artifact
+digests and semantic replay prevent accidental, partial, and internally
+inconsistent claims; they are not a cryptographic device attestation against an
+actor who can replace the entire tree and run modified host tooling. The probe
+is permanently report-only: even a fully validated pass has
+`releaseGateSatisfied: false`, an empty `qualificationRows` array, and cannot be
+aggregated into release credit.
 
 `volunteer-validation.sh` always attempts to produce a privacy-scrubbed ZIP,
 including after a failed or interrupted run. Its summary prominently labels
@@ -264,19 +322,42 @@ review.
 
 That default path builds the app and runner from a clean checkout, embeds the
 source commit and release-source digest in the signed app, and creates its
-candidate metadata automatically. It builds a disposable `HEAD` export against
-the exact local `Vendor/libvlc.xcframework`, so remote package resolution cannot
-silently substitute an older wrapper or engine. A reused `--candidate-app` or `--skip-build`
-requires `--candidate-metadata`; metadata creation succeeds only for an app
-that was built with the `SwiftVLCSourceCommit` and
-`SwiftVLCReleaseSourceDigest` Info.plist keys. The signed app also embeds
-`SwiftVLCArtifactDigest`, and metadata creation rejects it unless that value
-matches the complete XCFramework tree supplied to the runner. Use
-`candidate-metadata.py source` before an external build to obtain those values,
-then `candidate-metadata.py create` after signing to bind them to the app-tree
-digest. Candidate metadata also records and verifies the complete XCFramework
-tree digest; a signed app cannot be paired with evidence naming a different
-engine artifact.
+candidate metadata automatically. It captures the clean checkout identity once,
+clones a private source authority detached at that exact commit, verifies its
+release-source digest, and makes the private authority immutable for the run.
+The mutable build tree is exported from that captured commit rather than from a
+later `HEAD`. Before compiling, the runner explicitly resolves Swift packages
+and rejects the workspace unless it contains exactly one file-system SwiftVLC
+dependency at the disposable source root and one local `libvlc` XCFramework at
+its logical `Vendor` path.
+
+The local `Vendor/libvlc.xcframework` is hashed before and after it is cloned
+into the run-owned work directory. The disposable build's `Vendor` symlink may
+resolve only to that immutable private clone, whose full tree is rehashed at
+candidate-verification boundaries. The original checkout, binary artifact,
+build source, and signed products therefore cannot silently exchange identities
+during a long device run.
+
+The same pre/post receipt recomputes the claimed commit and release-source
+digest from the clean authority checkout, then mode/path/content-hashes both the
+SwiftVLC package sources and every Showcase app/UI-test Swift source. After a
+successful build, every Release-iphoneos `SwiftVLC.SwiftFileList` must have been
+refreshed and must name exactly the attested package source set under the
+disposable root. Remote beta checkouts, wrong or mixed roots, source overlays,
+artifact symlink escapes, and missing/extra/stale file lists therefore fail
+before candidate metadata is created.
+
+A reused `--candidate-app` or `--skip-build` requires
+`--candidate-metadata`. It does not manufacture a new attestation from old
+DerivedData; it strictly revalidates the embedded build attestation and
+recomputes the app, runner, test bundle, XCFramework, XCTest catalog, and policy
+bindings. Format-version 2 metadata cannot be created from the app's
+`SwiftVLCSourceCommit`, `SwiftVLCReleaseSourceDigest`, and
+`SwiftVLCArtifactDigest` plist stamps alone: `candidate-metadata.py create`
+also requires the exact postbuild `--build-attestation`. These unkeyed hashes
+prevent accidental or internally inconsistent substitutions, but remain local
+operator evidence rather than a hardware-backed proof against an actor who can
+replace the checkout, host tools, and entire evidence tree together.
 
 Format-version 2 candidate metadata also binds the actual signed candidate and
 UI-test-runner bundle identifiers, the complete signed UI-test runner tree, the
@@ -286,6 +367,25 @@ the build produces more than one `.xctestrun`, the runner fails unless
 `--xctestrun` selects one explicitly. Reused/prebuilt candidates are not trusted
 from their metadata: all of these trees, files, catalogs, and policy manifests
 are recomputed before testing.
+
+The enumerated leaf catalog must exactly equal the reviewed
+`ios-test-catalog-authority-v1.json`. Bootstrap or update that authority only
+from a clean, committed source snapshot: build the iOS Showcase and UI-test
+runner into DerivedData on the external SSD, use `xcodebuild
+test-without-building -enumerate-tests` on its single `.xctestrun`, normalize
+the output with `qualification_policy.py normalize-catalog`, and inspect the
+complete added/removed leaf list. After review, create the tracked authority:
+
+```bash
+python3 scripts/qualification/test-catalog-authority.py create \
+  --catalog /absolute/path/to/full-test-catalog.json \
+  --output scripts/qualification/ios-test-catalog-authority-v1.json
+```
+
+Then rebuild from the commit containing that authority and run the `verify`
+subcommand against the newly enumerated catalog. Never copy a catalog from old
+DerivedData or edit the digest/count by hand. Until this file exists and matches
+the current signed runner exactly, physical qualification fails closed.
 
 `matrix.json` owns the immutable runner contracts that map each runner lane to
 its exact XCTest selection, qualification scenarios, and attachment names.
@@ -314,7 +414,14 @@ a small allowlist of structured Xcode/device-launch infrastructure failures.
 Every scenario, including the analyzer, has a preflight-selected leaf catalog;
 after execution its xcresult must contain exactly that same non-empty catalog
 and count, with every test passed. Every run reinstalls both exact signed apps;
-retry requires a readable structured xcresult that proves no intended Test
+before testing a candidate in the runner-owned
+`com.swiftvlc.validation.*` namespace, the runner installs, uninstalls, and
+fresh-installs that disposable app so a previously denied Local Network choice
+cannot silently poison later runs. No other bundle identifier is ever
+uninstalled. A prebuilt candidate outside that namespace retains its existing
+permission state and emits a retained warning; enable its Local Network access
+under **Settings > Privacy & Security > Local Network** before qualification.
+Retry requires a readable structured xcresult that proves no intended Test
 Case began. A missing/unreadable result, assertion, fatal/crash/sanitizer or
 test-process/product signal remains terminal even when its log also contains
 an allowlisted word such as `Busy`. A passing xcresult never overrides a fatal,

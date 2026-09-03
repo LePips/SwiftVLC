@@ -68,10 +68,17 @@ enum ShowcaseScrollDirection {
 class ShowcaseIOSTestCase: XCTestCase {
   private static let attachToRunningAppEnvironment = "SWIFTVLC_ATTACH_TO_RUNNING_APP"
   private static let deviceFixtureEnvironment = "SWIFTVLC_DEVICE_FIXTURE_URL_BASE64"
-  private static let deviceLogPrefixEnvironment = "SWIFTVLC_DEVICE_LOG_PREFIX"
+  static let deviceLogPrefixEnvironment = "SWIFTVLC_DEVICE_LOG_PREFIX"
+  static let qualificationSessionBindingEnvironment =
+    "SWIFTVLC_QUALIFICATION_SESSION_BINDING"
+  static let candidateRuntimeBindingEnvironment =
+    "SWIFTVLC_CANDIDATE_RUNTIME_BINDING"
 
   private(set) var app: XCUIApplication!
   private(set) var logURL: URL!
+  var qualificationSessionBinding: String?
+  var expectedCandidateRuntimeBinding: String?
+  var observedCandidateRuntimeBinding: String?
 
   /// HTTP fixture staged by the physical-device runner. Simulator tests use
   /// bundle files, but those runner-bundle paths do not exist inside an app on
@@ -88,6 +95,18 @@ class ShowcaseIOSTestCase: XCTestCase {
     continueAfterFailure = false
 
     app = XCUIApplication()
+
+    if ProcessInfo.processInfo.environment[Self.deviceLogPrefixEnvironment] != nil {
+      qualificationSessionBinding = try Self.requiredQualificationBinding(
+        environment: Self.qualificationSessionBindingEnvironment,
+        description: "qualification session"
+      )
+      expectedCandidateRuntimeBinding = try Self.requiredQualificationBinding(
+        environment: Self.candidateRuntimeBindingEnvironment,
+        description: "signed candidate runtime"
+      )
+      installLocalNetworkPermissionInterruptionMonitor()
+    }
 
     // One log file per test, in the simulator's tmp dir. Both processes
     // (test runner and app) share the simulator filesystem, so an absolute
@@ -158,6 +177,9 @@ class ShowcaseIOSTestCase: XCTestCase {
     } else {
       app.launch()
     }
+
+    handleQualificationLocalNetworkPermissionIfPresent()
+    observeQualificationCandidateRuntimeBindingIfRequired()
   }
 
   // MARK: - Log assertions
@@ -227,54 +249,6 @@ class ShowcaseIOSTestCase: XCTestCase {
         .joined(separator: "\n")
       XCTFail(
         "Library emitted \(errors.count) error(s):\n\(summary)",
-        file: file,
-        line: line
-      )
-    }
-  }
-
-  /// Adds a machine-readable payload that the physical-device runner turns
-  /// into candidate-bound qualification evidence. Identity fields are added
-  /// by the host after exporting the xcresult attachment; a test process must
-  /// never guess which source tree or signed app bundle launched it.
-  func attachQualificationEvidence(
-    _ suppliedPayload: [String: Any],
-    scenario: String,
-    file: StaticString = #filePath,
-    line: UInt = #line
-  ) {
-    if
-      let embeddedScenario = suppliedPayload["scenario"],
-      embeddedScenario as? String != scenario {
-      XCTFail(
-        "Qualification evidence scenario does not match \(scenario)",
-        file: file,
-        line: line
-      )
-      return
-    }
-    var payload = suppliedPayload
-    payload["formatVersion"] = payload["formatVersion"] ?? 1
-    payload["scenario"] = scenario
-    guard JSONSerialization.isValidJSONObject(payload) else {
-      XCTFail("Qualification evidence is not valid JSON", file: file, line: line)
-      return
-    }
-    do {
-      let data = try JSONSerialization.data(
-        withJSONObject: payload,
-        options: [.prettyPrinted, .sortedKeys]
-      )
-      let attachment = XCTAttachment(
-        data: data,
-        uniformTypeIdentifier: "public.json"
-      )
-      attachment.name = "qualification-\(scenario).json"
-      attachment.lifetime = .keepAlways
-      add(attachment)
-    } catch {
-      XCTFail(
-        "Could not encode qualification evidence: \(error)",
         file: file,
         line: line
       )
