@@ -231,12 +231,12 @@ extension Integration {
     @Test(.timeLimit(.minutes(2)))
     func `A smaller render size converts into a smaller pool`() async throws {
       let player = Player(instance: TestInstance.makeVideoDecoding())
-      let harness = Harness(attachedTo: player)
+      let harness = CapturingHarness(attachedTo: player)
       defer { player.stop() }
 
       try player.play(url: TestMedia.testMP4URL)
       try #require(
-        await poll(timeout: .seconds(30), until: { harness.drained > 0 }),
+        await poll(timeout: .seconds(30), until: { harness.frameCount > 0 }),
         "no frame was delivered before the resize"
       )
 
@@ -271,7 +271,8 @@ extension Integration {
     /// stopped there, PiP would freeze on the pre-seek picture — on a device
     /// that looks like a stuck window rather than an error.
     ///
-    /// Asserts on `drainedSampleCount`, which advances per delivered frame.
+    /// Asserts on the capture sink's frame count, which advances only after a
+    /// converted sample reaches the deterministic headless display boundary.
     /// The first version of this test compared `formatDescriptionCreationCount`
     /// against a baseline, which is monotonic and settles at one for a steady
     /// stream — so `>= baseline` held whether or not a single frame arrived
@@ -279,12 +280,12 @@ extension Integration {
     @Test(.timeLimit(.minutes(2)))
     func `Frames continue to arrive after a seek`() async throws {
       let player = Player(instance: TestInstance.makeVideoDecoding())
-      let harness = Harness(attachedTo: player)
+      let harness = CapturingHarness(attachedTo: player)
       defer { player.stop() }
 
       try player.play(url: TestMedia.testMP4URL)
       try #require(
-        await poll(timeout: .seconds(30), until: { harness.drained > 0 }),
+        await poll(timeout: .seconds(30), until: { harness.frameCount > 0 }),
         "no frame was delivered before the seek"
       )
       try #require(
@@ -296,9 +297,9 @@ extension Integration {
 
       // Baseline taken *after* the seek is issued, so nothing counted here can
       // predate it.
-      let baseline = harness.drained
+      let baseline = harness.frameCount
       try #require(
-        await poll(timeout: .seconds(20), until: { harness.drained > baseline }),
+        await poll(timeout: .seconds(20), until: { harness.frameCount > baseline }),
         "no frame was delivered after the seek; conversion stopped at the pipeline refill"
       )
     }
