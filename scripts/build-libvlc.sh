@@ -506,7 +506,7 @@ verify_checkout_path_not_embedded() {
     fi
     PYTHONDONTWRITEBYTECODE=1 python3 \
         "${SCRIPT_DIR}/verify-libvlc-build-paths.py" \
-        --xcframework "${OUTPUT_DIR}/libvlc.xcframework" \
+        --xcframework "${STAGED_OUTPUT_DIRECTORY}/libvlc.xcframework" \
         --forbidden-path "${REPO_ROOT}"
 }
 

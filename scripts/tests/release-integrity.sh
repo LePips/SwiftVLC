@@ -2753,7 +2753,7 @@ checkout_path_function = build[
 ]
 for marker in (
     '"${SCRIPT_DIR}/verify-libvlc-build-paths.py"',
-    '--xcframework "${OUTPUT_DIR}/libvlc.xcframework"',
+    '--xcframework "${STAGED_OUTPUT_DIRECTORY}/libvlc.xcframework"',
     '--forbidden-path "${REPO_ROOT}"',
 ):
     if checkout_path_function.count(marker) != 1:
