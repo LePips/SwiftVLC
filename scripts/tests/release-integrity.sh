@@ -172,6 +172,7 @@ python3 - \
   "$ROOT_DIR/.github/workflows/native-source-contracts.yml" <<'PY'
 import re
 import sys
+from pathlib import Path
 
 workflow = open(sys.argv[1]).read()
 draft_authorization = (
@@ -184,7 +185,7 @@ draft_authorization = (
 )
 workflow_token = "          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}\n"
 expected_draft_counts = (2, 1, 1, 1, 0)
-expected_token_counts = (3, 1, 1, 1, 0)
+expected_token_counts = (5, 1, 1, 1, 0)
 if len(sys.argv[1:]) != len(expected_draft_counts):
     sys.exit("release workflow integrity invocation is incomplete")
 for path, expected_draft_count, expected_token_count in zip(
@@ -224,6 +225,18 @@ for path, expected_draft_count, expected_token_count in zip(
     for action in re.findall(r"(?m)^\s*-?\s*uses:\s*([^\s#]+)", source):
         if not re.fullmatch(r"[^@]+@[0-9a-f]{40}", action):
             sys.exit(f"{path} contains an unpinned authorizing action: {action}")
+
+# Audit consumers, not only the candidate jobs: main-only Showcase/tvOS lanes
+# also call GitHub's API and can exhaust the shared anonymous runner quota.
+for path in Path(sys.argv[1]).parent.glob("*.yml"):
+    source = path.read_text()
+    for step in re.split(r"(?m)^      - ", source)[1:]:
+        if re.search(
+            r"(?m)^\s+run: \./scripts/(?:setup-dev|ci-use-released-xcframework)\.sh\s*$",
+            step,
+        ) and workflow_token not in step:
+            sys.exit(f"{path} has an unauthenticated release-artifact consumer")
+
 candidate_lint_marker = (
     "          SWIFTVLC_RELEASE_CANDIDATE_LINT: "
     "${{ (github.event_name == 'pull_request' && "

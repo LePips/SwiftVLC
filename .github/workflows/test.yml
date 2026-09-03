@@ -197,6 +197,8 @@ jobs:
       # the local SwiftVLC checkout so we compile against in-PR code.
       - name: Set up Vendor + local Swift package
         timeout-minutes: 12
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: ./scripts/setup-dev.sh
 
       - name: Build Showcase (${{ matrix.scheme }})
@@ -386,6 +388,8 @@ jobs:
 
       - name: Set up Vendor + local Swift package
         timeout-minutes: 12
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: ./scripts/setup-dev.sh
 
       # TEST_RUNNER_CI=true is load-bearing: xcodebuild strips the
