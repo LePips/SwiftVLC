@@ -698,7 +698,8 @@ chmod +x "$resolver_bin/gh" "$resolver_bin/curl"
 
 (
   cd "$resolver_repo"
-  PATH="$resolver_bin:$PATH" \
+  GH_TOKEN= GITHUB_TOKEN= \
+    PATH="$resolver_bin:$PATH" \
     RESOLVER_RELEASE_DRAFT=0 \
     ./scripts/resolve-release-artifact.sh >/dev/null
 )
