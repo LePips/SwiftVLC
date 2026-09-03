@@ -1,5 +1,18 @@
 import Foundation
 
+/// One reviewed wall-clock contract shared by the probe app and its physical
+/// UI test. The app must reach either a report or an explicit failure before
+/// SpringBoard capture ends; XCTest then retains a separate collection reserve.
+enum PiPCadenceSemanticsProbeTiming {
+  static let applicationRunBudgetSeconds: TimeInterval = 270
+  static let springBoardCaptureBudgetSeconds: TimeInterval = 300
+  static let reportCollectionBudgetSeconds: TimeInterval = 30
+  static let captureBoundaryGuardSeconds: TimeInterval = 0.1
+  static let xctestExecutionAllowanceSeconds = 420
+  static let runnerIdleWatchdogSeconds = 480
+  static let runnerWallWatchdogSeconds = 780
+}
+
 /// Fixture profile understood by the direct-vmem cadence evidence producers.
 /// The names match `generate-fixtures.sh`; no inferred/average track rate is
 /// used to classify native PTS deltas.

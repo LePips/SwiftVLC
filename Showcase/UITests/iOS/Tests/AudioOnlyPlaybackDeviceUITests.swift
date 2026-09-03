@@ -20,7 +20,7 @@ final class AudioOnlyPlaybackDeviceUITests: ShowcaseIOSTestCase {
     var fixtureResults: [[String: Any]] = []
     for fixture in LocalPlaybackFixtureContract.audioFixtures {
       configureLaunch(fixture: fixture, encodedBaseURL: encodedBaseURL)
-      app.launch()
+      launchDirectlyHandlingQualificationPermissions()
 
       let state = element(AccessibilityID.AudioOnlyPlaybackValidation.stateLabel)
       let result = element(AccessibilityID.AudioOnlyPlaybackValidation.resultLabel)

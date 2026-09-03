@@ -24,7 +24,7 @@ final class LocalPlaybackMatrixDeviceUITests: ShowcaseIOSTestCase {
         fixture: fixture,
         encodedBaseURL: encodedBaseURL
       )
-      app.launch()
+      launchDirectlyHandlingQualificationPermissions()
 
       let state = element(AccessibilityID.LocalFileMatrixValidation.stateLabel)
       let result = element(AccessibilityID.LocalFileMatrixValidation.resultLabel)

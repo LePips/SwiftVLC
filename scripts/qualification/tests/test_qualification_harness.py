@@ -23,6 +23,12 @@ from unittest import mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
+RELEASE_SCENARIO_ORDER = tuple(
+    json.loads((ROOT / "qualification" / "profiles-v1.json").read_text())["profiles"][
+        "release"
+    ]["scenarios"]
+)
+FIXTURE_SESSION_BINDING = "9" * 64
 
 
 def load_script(name: str):
@@ -36,6 +42,7 @@ def load_script(name: str):
 
 qualification_policy = load_script("qualification_policy.py")
 device_info = load_script("device-info.py")
+device_run_lock = load_script("device-run-lock.py")
 exploratory_device_policy = load_script("exploratory-device-policy.py")
 fixture_server = load_script("fixture-server.py")
 prepare_xctestrun = load_script("prepare-xctestrun.py")
@@ -67,11 +74,316 @@ def load_repository_script(name: str):
 release_source_digest = load_repository_script("release-source-digest.py")
 
 
+def fixture_candidate_build_attestation_fields(
+    *,
+    source_commit: str,
+    release_source_digest: str,
+    artifact_digest: str,
+    version: str = "1.1.0",
+    catalog: list[str] | None = None,
+    candidate_app_digest: str = "a" * 64,
+    test_runner_digest: str = "e" * 64,
+    test_bundle_digest: str = "f" * 64,
+    base_xctestrun_digest: str = "1" * 64,
+    base_xctestrun_name: str = "iOS_iphoneos.xctestrun",
+) -> dict:
+    catalog = catalog or ["iOSUITests/AnalyzerTests/test_pixels"]
+    swift_source_files = [
+        {
+            "relativePath": "Fixture.swift",
+            "mode": 0o644,
+            "digestAlgorithm": "sha256",
+            "digest": "6" * 64,
+        }
+    ]
+    showcase_source_files = sorted([
+        {
+            "relativePath": "Shared/ValidationFixture.swift",
+            "mode": 0o644,
+            "digestAlgorithm": "sha256",
+            "digest": "7" * 64,
+        },
+        {
+            "relativePath": "iOS/AppFixture.swift",
+            "mode": 0o644,
+            "digestAlgorithm": "sha256",
+            "digest": "8" * 64,
+        },
+        {
+            "relativePath": "UITests/iOS/TestFixture.swift",
+            "mode": 0o644,
+            "digestAlgorithm": "sha256",
+            "digest": "9" * 64,
+        },
+    ], key=lambda record: record["relativePath"])
+    swift_sources = [record["relativePath"] for record in swift_source_files]
+    showcase_sources = [
+        record["relativePath"] for record in showcase_source_files
+    ]
+    authority_build_inputs = [
+        {
+            "relativePath": "Package.swift",
+            "mode": 0o644,
+            "digestAlgorithm": "sha256",
+            "digest": "a" * 64,
+        }
+    ]
+    effective_build_inputs = [dict(authority_build_inputs[0])]
+    effective_build_settings = [
+        {
+            "target": target,
+            "settings": {
+                "ARCHS": "arm64",
+                "CONFIGURATION": "Release",
+                "OTHER_LDFLAGS": "",
+                "OTHER_SWIFT_FLAGS": "",
+                "SWIFT_ACTIVE_COMPILATION_CONDITIONS": "",
+                "SWIFT_OPTIMIZATION_LEVEL": "-O",
+                "SWIFT_VERSION": "6.0",
+            },
+        }
+        for target in ("iOS", "iOSUITests")
+    ]
+    attestation = {
+        "formatVersion": 1,
+        "authority": "swiftvlc-candidate-build-binding-v1",
+        "version": version,
+        "candidateRuntimeBinding": "e" * 64,
+        "sourceCommit": source_commit,
+        "releaseSourceDigestAlgorithm": "swiftvlc-git-tree-v1",
+        "releaseSourceDigest": release_source_digest,
+        "artifactRelativePath": "Vendor/libvlc.xcframework",
+        "artifactBindingMode": "direct",
+        "artifactDigestAlgorithm": "swiftvlc-tree-v1",
+        "artifactDigest": artifact_digest,
+        "workspaceStateRelativePath": "SourcePackages/workspace-state.json",
+        "workspaceStateDigestAlgorithm": "sha256",
+        "workspaceStateDigest": "4" * 64,
+        "workspaceBinding": qualification_policy.CANDIDATE_WORKSPACE_BINDING,
+        "buildConfiguration": "Release",
+        "buildPlatform": "iphoneos",
+        "swiftSourceRoot": "Sources/SwiftVLC",
+        "swiftSourceSetDigestAlgorithm": "swiftvlc-compiled-source-set-v2",
+        "swiftSourceSetDigest": qualification_policy.compiled_source_set_digest(
+            swift_source_files
+        ),
+        "swiftSourceCount": len(swift_sources),
+        "swiftSourceRelativePaths": swift_sources,
+        "swiftSourceFiles": swift_source_files,
+        "showcaseSourceRoot": "Showcase",
+        "showcaseSourceSetDigestAlgorithm": "swiftvlc-compiled-source-set-v2",
+        "showcaseSourceSetDigest": qualification_policy.compiled_source_set_digest(
+            showcase_source_files
+        ),
+        "showcaseSourceCount": len(showcase_sources),
+        "showcaseSourceRelativePaths": showcase_sources,
+        "showcaseSourceFiles": showcase_source_files,
+        "sourceAuthorityBuildInputSetDigestAlgorithm": (
+            "swiftvlc-build-input-set-v1"
+        ),
+        "sourceAuthorityBuildInputSetDigest": (
+            qualification_policy.build_input_set_digest(authority_build_inputs)
+        ),
+        "sourceAuthorityBuildInputCount": len(authority_build_inputs),
+        "sourceAuthorityBuildInputFiles": authority_build_inputs,
+        "effectiveBuildInputSetDigestAlgorithm": "swiftvlc-build-input-set-v1",
+        "effectiveBuildInputSetDigest": qualification_policy.build_input_set_digest(
+            effective_build_inputs
+        ),
+        "effectiveBuildInputCount": len(effective_build_inputs),
+        "effectiveBuildInputFiles": effective_build_inputs,
+        "authorizedBuildInputTransforms": [],
+        "developmentTeam": "ABCDEFGHIJ",
+        "bundlePrefix": "com.swiftvlc.validation.fixture",
+        "effectiveBuildSettingsDigestAlgorithm": (
+            "swiftvlc-effective-build-settings-v1"
+        ),
+        "effectiveBuildSettingsDigest": (
+            qualification_policy.effective_build_settings_digest(
+                effective_build_settings
+            )
+        ),
+        "effectiveBuildSettings": effective_build_settings,
+        "swiftFileLists": [
+            {
+                "architecture": "arm64",
+                "digestAlgorithm": "sha256",
+                "digest": "5" * 64,
+                "relativePath": (
+                    "Build/Intermediates.noindex/SwiftVLC.build/Release-iphoneos/"
+                    "SwiftVLC.build/Objects-normal/arm64/SwiftVLC.SwiftFileList"
+                ),
+                "sourceCount": len(swift_sources),
+            }
+        ],
+        "showcaseTargetFileLists": [
+            {
+                "target": target,
+                "architecture": "arm64",
+                "digestAlgorithm": "sha256",
+                "digest": digest * 64,
+                "relativePath": (
+                    "Build/Intermediates.noindex/SwiftVLCShowcase.build/"
+                    f"Release-iphoneos/{target}.build/Objects-normal/arm64/"
+                    f"{target}.SwiftFileList"
+                ),
+                "sourceCount": 2,
+                "generatedSourceCount": 1,
+                "generatedSourceDigestAlgorithm": "sha256",
+                "generatedSourceDigest": generated_digest * 64,
+            }
+            for target, digest, generated_digest in (
+                ("iOS", "a", "b"),
+                ("iOSUITests", "c", "d"),
+            )
+        ],
+        "candidateAppRelativePath": "Release-iphoneos/iOS.app",
+        "candidateAppDigestAlgorithm": "swiftvlc-tree-v1",
+        "candidateAppDigest": candidate_app_digest,
+        "testRunnerRelativePath": "Release-iphoneos/iOSUITests-Runner.app",
+        "testRunnerDigestAlgorithm": "swiftvlc-tree-v1",
+        "testRunnerDigest": test_runner_digest,
+        "testBundleRelativePath": "PlugIns/iOSUITests.xctest",
+        "testBundleDigestAlgorithm": "swiftvlc-tree-v1",
+        "testBundleDigest": test_bundle_digest,
+        "baseXCTestRunName": base_xctestrun_name,
+        "baseXCTestRunDigestAlgorithm": "sha256",
+        "baseXCTestRunDigest": base_xctestrun_digest,
+        "testCatalogDigestAlgorithm": "swiftvlc-test-catalog-v1",
+        "testCatalogDigest": qualification_policy.catalog_digest(catalog),
+        "testCatalogCount": len(catalog),
+        "testCatalog": catalog,
+    }
+    return {
+        "candidateRuntimeBinding": attestation["candidateRuntimeBinding"],
+        "candidateBuildAttestation": attestation,
+        "candidateBuildAttestationDigestAlgorithm": "sha256",
+        "candidateBuildAttestationDigest": hashlib.sha256(
+            qualification_policy.canonical_json_bytes(attestation)
+        ).hexdigest(),
+        "testCatalogAuthorityDigestAlgorithm": "sha256",
+        "testCatalogAuthorityDigest": "0" * 64,
+    }
+
+
+def cadence_report_only_scenario() -> dict:
+    expected_catalog = qualification_policy.catalog_record(
+        [qualification_policy.CADENCE_SEMANTICS_PROBE_TEST_IDENTIFIER]
+    )
+    execution = {
+        "expected": expected_catalog,
+        "executed": expected_catalog,
+        "identityAndCountMatch": True,
+        "allPassed": True,
+    }
+    return {
+        "scenario": qualification_policy.CADENCE_SEMANTICS_PROBE_SCENARIO,
+        "result": "pass",
+        "xcodebuildExitCode": 0,
+        "libraryErrorCount": 0,
+        "appLog": "captured",
+        "qualificationEvidence": "report-only",
+        "durationSeconds": 90,
+        "expectedTestCatalog": expected_catalog,
+        "testExecution": execution,
+        "attempts": [{"attempt": 1}],
+        "attemptArtifactRoot": "cadence-semantics-probe-attempt-artifacts",
+        "hostErrorInventory": {
+            "scenario": "cadence-semantics-probe",
+            "errorCount": 0,
+        },
+        "reportOnlyEvidence": {
+            "formatVersion": 1,
+            "authority": "report-only-cadence-semantics-v1",
+            "version": "1.1.0-beta.9",
+            "releaseCreditEligible": False,
+            "sourceAttempt": 1,
+            "sourceXcresultArtifact": (
+                "cadence-semantics-probe-attempt-artifacts/attempt-1.xcresult"
+            ),
+            "sourceXcresultDigestAlgorithm": "swiftvlc-tree-v1",
+            "sourceXcresultDigest": "a" * 64,
+            "sourceXcresultSizeBytes": 1,
+            "retainedFinalXcresultArtifact": "cadence-semantics-probe.xcresult",
+            "retainedFinalXcresultDigestAlgorithm": "swiftvlc-tree-v1",
+            "retainedFinalXcresultDigest": "a" * 64,
+            "retainedFinalXcresultSizeBytes": 1,
+            "attachmentName": "exploratory-pip-cadence-semantics-probe.json",
+            "attachmentTestIdentifier": (
+                qualification_policy.CADENCE_SEMANTICS_PROBE_TEST_IDENTIFIER
+            ),
+            "retainedAttachmentRoot": "cadence-semantics-probe-attachments",
+            "manifestRelativePath": (
+                "cadence-semantics-probe-attachments/manifest.json"
+            ),
+            "manifestDigestAlgorithm": "sha256",
+            "manifestDigest": "b" * 64,
+            "manifestSizeBytes": 1,
+            "attachmentRelativePath": (
+                "cadence-semantics-probe-attachments/probe.json"
+            ),
+            "attachmentDigestAlgorithm": "sha256",
+            "attachmentDigest": "c" * 64,
+            "attachmentSizeBytes": 1,
+        },
+    }
+
+
+def cadence_report_only_candidate(fixture_checksum: str) -> dict:
+    catalog = [qualification_policy.CADENCE_SEMANTICS_PROBE_TEST_IDENTIFIER]
+    source_commit = "a" * 40
+    release_source_digest = "a" * 64
+    artifact_digest = "b" * 64
+    return {
+        "formatVersion": 2,
+        "version": "1.1.0-beta.9",
+        "sourceCommit": source_commit,
+        "releaseSourceDigestAlgorithm": "swiftvlc-git-tree-v1",
+        "releaseSourceDigest": release_source_digest,
+        "artifactDigestAlgorithm": "swiftvlc-tree-v1",
+        "artifactDigest": artifact_digest,
+        **fixture_candidate_build_attestation_fields(
+            source_commit=source_commit,
+            release_source_digest=release_source_digest,
+            artifact_digest=artifact_digest,
+            version="1.1.0-beta.9",
+            catalog=catalog,
+            candidate_app_digest="c" * 64,
+            test_runner_digest="d" * 64,
+            test_bundle_digest="e" * 64,
+            base_xctestrun_digest="f" * 64,
+            base_xctestrun_name="fixture.xctestrun",
+        ),
+        "candidateAppBundleIdentifier": "com.swiftvlc.fixture.app",
+        "candidateAppDigestAlgorithm": "swiftvlc-tree-v1",
+        "candidateAppDigest": "c" * 64,
+        "testRunnerBundleIdentifier": "com.swiftvlc.fixture.uitests.xctrunner",
+        "testRunnerDigestAlgorithm": "swiftvlc-tree-v1",
+        "testRunnerDigest": "d" * 64,
+        "testBundleRelativePath": "PlugIns/iOSUITests.xctest",
+        "testBundleDigestAlgorithm": "swiftvlc-tree-v1",
+        "testBundleDigest": "e" * 64,
+        "baseXCTestRunDigestAlgorithm": "sha256",
+        "baseXCTestRunDigest": "f" * 64,
+        "baseXCTestRunName": "fixture.xctestrun",
+        "testCatalogDigestAlgorithm": "swiftvlc-test-catalog-v1",
+        "testCatalogDigest": qualification_policy.catalog_digest(catalog),
+        "testCatalogCount": len(catalog),
+        "testCatalog": catalog,
+        "qualificationMatrixChecksum": "1" * 64,
+        "featureManifestChecksum": "2" * 64,
+        "qualificationProfilesChecksum": "3" * 64,
+        "fixtureManifestChecksum": fixture_checksum,
+        "qualificationPolicyDigestAlgorithm": "swiftvlc-qualification-policy-v1",
+        "qualificationPolicyDigest": qualification_policy.policy_digest(),
+    }
+
+
 def write_validated_report(
     run_dir: Path,
     value: dict,
     *,
-    selection_scope: str = "full",
+    selection_scope: str = "partial",
     mode: str = "qualification",
     qualification_eligible: bool = True,
     report_only: bool = False,
@@ -79,31 +391,60 @@ def write_validated_report(
 ) -> None:
     device_path = run_dir / "device.json"
     if not device_path.exists():
+        selected_device = {
+            "id": "fixture-coredevice",
+            "udid": "fixture-device",
+            "ecid": 42,
+            "ecidHex": "0x2A",
+            "name": "Fixture iPhone",
+            "marketingName": "iPhone",
+            "productType": "iPhone17,1",
+            "deviceFamily": "iPhone",
+            "osVersion": "26.0",
+            "osMajor": 26,
+            "osBuild": "23A1" if qualification_eligible else "23A1a",
+            "osReleaseType": "stable" if qualification_eligible else "beta",
+            "transport": "wired",
+            "tunnelIPAddress": "fd00::1",
+            "connected": True,
+            "matchingHardwareRows": ["iphone-current"],
+            "qualificationEligible": qualification_eligible,
+        }
         report_validation.atomic_write_json(
             device_path,
             {
-                "selected": {
-                    "marketingName": "iPhone",
-                    "productType": "iPhone17,1",
-                    "deviceFamily": "iPhone",
-                    "osVersion": "26.0",
-                    "osBuild": "23A1",
-                    "osReleaseType": "stable",
-                    "matchingHardwareRows": ["iphone-current"],
-                }
+                "selected": selected_device,
+                "connected": [selected_device],
+                "allPhysicalIOSDevices": [selected_device],
+                "mode": mode,
             },
         )
-    candidate_path = run_dir / "candidate-metadata.json"
-    if not candidate_path.exists():
-        report_validation.atomic_write_json(candidate_path, {"formatVersion": 2})
     fixture_path = run_dir / "fixture-manifest.json"
     if not fixture_path.exists():
         report_validation.atomic_write_json(fixture_path, {"formatVersion": 1})
     selected_device = json.loads(device_path.read_text())["selected"]
     fixture_digest = hashlib.sha256(fixture_path.read_bytes()).hexdigest()
+    candidate_path = run_dir / "candidate-metadata.json"
+    if not candidate_path.exists():
+        candidate = (
+            cadence_report_only_candidate(fixture_digest)
+            if report_only
+            else {"formatVersion": 2}
+        )
+        report_validation.atomic_write_json(candidate_path, candidate)
+    candidate = json.loads(candidate_path.read_text())
+    candidate_identity = (
+        {
+            field: candidate[field]
+            for field in qualification_policy.CORE_IDENTITY_FIELDS
+        }
+        if report_only
+        else {}
+    )
     completed_at = datetime.now(timezone.utc).replace(microsecond=0)
     started_at = completed_at - timedelta(seconds=1)
     report = {
+        **candidate_identity,
         "formatVersion": 2,
         "startedAtUTC": started_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "completedAtUTC": completed_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -111,9 +452,17 @@ def write_validated_report(
         "mode": mode,
         "qualificationEligibleEnvironment": qualification_eligible,
         "reportOnly": report_only,
+        "orchestratorSessionBinding": FIXTURE_SESSION_BINDING,
+        "orchestratorStartedAtUTC": started_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "releaseGateSatisfied": False,
+        "releaseGateReason": (
+            "exploratory cadence semantics probe cannot produce release credit"
+            if report_only
+            else qualification_policy.ORDINARY_RELEASE_GATE_REASON
+        ),
         "qualificationRows": [],
         "device": selected_device,
+        "deviceSnapshot": qualification_policy.device_snapshot_binding(run_dir),
         "fixtureManifestChecksum": fixture_digest,
         **value,
     }
@@ -127,6 +476,8 @@ def write_validated_report(
         ],
         "reportOnly": report["reportOnly"],
         "selectionScope": selection_scope,
+        "orchestratorSessionBinding": FIXTURE_SESSION_BINDING,
+        "orchestratorStartedAtUTC": report["startedAtUTC"],
         "requestedScenarioDrivers": scenario_ids,
         "selectedScenarioDrivers": scenario_ids,
         "skippedScenarioDrivers": [],
@@ -148,7 +499,13 @@ def write_validated_report(
         else report_validation.QUALIFICATION_AUTHORITY
     )
     report_validation.write_marker_for_bytes(
-        run_dir, report_bytes, plan_bytes, authority
+        run_dir,
+        report_bytes,
+        plan_bytes,
+        authority,
+        validated_evidence_manifest=report_validation.evidence_tree_manifest(
+            run_dir
+        ),
     )
 
 
@@ -313,6 +670,227 @@ class DeviceInfoTests(unittest.TestCase):
             [details],
         )
 
+    def test_explicit_device_selector_must_resolve_uniquely(self):
+        devices = [
+            {
+                "id": "core-id-a",
+                "udid": "fixture-udid-a",
+                "ecidHex": "0x2A",
+                "name": "Fixture iPhone",
+                "marketingName": "iPhone Fixture",
+                "productType": "iPhone99,1",
+            },
+            {
+                "id": "core-id-b",
+                "udid": "fixture-udid-b",
+                "ecidHex": "0x2B",
+                "name": "Fixture iPhone",
+                "marketingName": "iPhone Fixture",
+                "productType": "iPhone99,2",
+            },
+        ]
+
+        with self.assertRaisesRegex(
+            device_info.DeviceSelectionError,
+            r"matched 2 connected physical iOS devices.*core-id-a.*core-id-b",
+        ):
+            device_info.select_explicit_device(devices, "Fixture iPhone")
+        self.assertIs(
+            device_info.select_explicit_device(devices, "fixture-udid-b"),
+            devices[1],
+        )
+
+
+class DeviceRunLockTests(unittest.TestCase):
+    def _wait_for_ready(self, process: subprocess.Popen, ready: Path) -> dict:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if ready.is_file():
+                return json.loads(ready.read_text())
+            if process.poll() is not None:
+                _, stderr = process.communicate()
+                self.fail(
+                    f"device lock exited before readiness ({process.returncode}): {stderr}"
+                )
+            time.sleep(0.02)
+        process.terminate()
+        process.wait(timeout=5)
+        self.fail("device lock did not report readiness")
+
+    def _start_lock(
+        self,
+        root: Path | None,
+        ready: Path,
+        device: str,
+        *,
+        environment: dict[str, str] | None = None,
+    ) -> subprocess.Popen:
+        arguments = [
+                sys.executable,
+                str(ROOT / "qualification" / "device-run-lock.py"),
+                "--device-identifier",
+                device,
+                "--parent-pid",
+                str(os.getpid()),
+                "--ready-file",
+                str(ready),
+        ]
+        if root is not None:
+            arguments.extend(["--lock-root", str(root)])
+        return subprocess.Popen(
+            arguments,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=environment,
+        )
+
+    def _assert_lock(
+        self,
+        root: Path,
+        device: str,
+        owner_pid: int,
+    ) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "qualification" / "device-run-lock.py"),
+                "--assert-held",
+                "--device-identifier",
+                device,
+                "--parent-pid",
+                str(os.getpid()),
+                "--owner-pid",
+                str(owner_pid),
+                "--lock-root",
+                str(root),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+
+    def test_same_device_is_exclusive_and_released_with_owner(self):
+        device = "00008110-001A2B3C4D5E601E"
+        with tempfile.TemporaryDirectory() as directory:
+            temporary = Path(directory)
+            lock_root = temporary / "locks"
+            first = self._start_lock(lock_root, temporary / "first.json", device)
+            try:
+                owner = self._wait_for_ready(first, temporary / "first.json")
+                self.assertEqual(owner["authority"], device_run_lock.LOCK_AUTHORITY)
+                self.assertEqual(owner["ownerPID"], first.pid)
+                self.assertEqual(owner["deviceIdentifierSuffix"], device[-6:])
+                self.assertNotIn(device, (temporary / "first.json").read_text())
+                self.assertNotIn(device, owner["deviceIdentifierDigest"])
+                assertion = self._assert_lock(lock_root, device, first.pid)
+                self.assertEqual(assertion.returncode, 0, assertion.stderr)
+
+                wrong_owner = self._assert_lock(lock_root, device, first.pid + 1)
+                self.assertEqual(wrong_owner.returncode, 75)
+                self.assertIn("ownerPID mismatch", wrong_owner.stderr)
+
+                contender = subprocess.run(
+                    [
+                        sys.executable,
+                        str(ROOT / "qualification" / "device-run-lock.py"),
+                        "--device-identifier",
+                        device,
+                        "--parent-pid",
+                        str(os.getpid()),
+                        "--ready-file",
+                        str(temporary / "contender.json"),
+                        "--lock-root",
+                        str(lock_root),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                self.assertEqual(contender.returncode, 75)
+                self.assertIn(str(first.pid), contender.stderr)
+                self.assertIn(device[-6:], contender.stderr)
+                self.assertFalse((temporary / "contender.json").exists())
+            finally:
+                first.terminate()
+                first.communicate(timeout=5)
+
+            released_assertion = self._assert_lock(lock_root, device, first.pid)
+            self.assertEqual(released_assertion.returncode, 75)
+            self.assertIn("no longer reserved", released_assertion.stderr)
+
+            replacement = self._start_lock(
+                lock_root, temporary / "replacement.json", device
+            )
+            try:
+                replacement_owner = self._wait_for_ready(
+                    replacement, temporary / "replacement.json"
+                )
+                self.assertEqual(replacement_owner["ownerPID"], replacement.pid)
+            finally:
+                replacement.terminate()
+                replacement.communicate(timeout=5)
+
+    def test_different_inherited_tmpdirs_still_contend(self):
+        device = f"test-device-{os.getpid()}-{time.time_ns()}"
+        with tempfile.TemporaryDirectory() as directory:
+            temporary = Path(directory)
+            first_tmp = temporary / "first-tmp"
+            second_tmp = temporary / "second-tmp"
+            first_tmp.mkdir()
+            second_tmp.mkdir()
+            first_environment = dict(os.environ, TMPDIR=str(first_tmp))
+            second_environment = dict(os.environ, TMPDIR=str(second_tmp))
+            first = self._start_lock(
+                None,
+                temporary / "first-default.json",
+                device,
+                environment=first_environment,
+            )
+            try:
+                self._wait_for_ready(first, temporary / "first-default.json")
+                contender = subprocess.run(
+                    [
+                        sys.executable,
+                        str(ROOT / "qualification" / "device-run-lock.py"),
+                        "--device-identifier",
+                        device,
+                        "--parent-pid",
+                        str(os.getpid()),
+                        "--ready-file",
+                        str(temporary / "second-default.json"),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                    env=second_environment,
+                )
+                self.assertEqual(contender.returncode, 75)
+                self.assertFalse((temporary / "second-default.json").exists())
+            finally:
+                first.terminate()
+                first.communicate(timeout=5)
+                device_run_lock.device_lock_path(
+                    device_run_lock.default_lock_root(), device
+                ).unlink(missing_ok=True)
+
+    def test_lock_path_is_an_identifier_digest_and_roots_reject_symlinks(self):
+        device = "00008110-001A2B3C4D5E601E"
+        with tempfile.TemporaryDirectory() as directory:
+            temporary = Path(directory)
+            lock_path = device_run_lock.device_lock_path(temporary, device)
+            self.assertEqual(lock_path.stem, hashlib.sha256(device.encode()).hexdigest())
+            self.assertNotIn(device, str(lock_path))
+
+            real_root = temporary / "real"
+            real_root.mkdir()
+            linked_root = temporary / "linked"
+            linked_root.symlink_to(real_root, target_is_directory=True)
+            with self.assertRaisesRegex(
+                device_run_lock.DeviceRunLockError, "must be a real directory"
+            ):
+                device_run_lock._prepare_lock_root(linked_root)
+
 
 class TunnelHostTests(unittest.TestCase):
     def test_finds_the_mac_peer_in_the_device_tunnel_prefix(self):
@@ -417,23 +995,43 @@ class ValidationPlanTests(unittest.TestCase):
         selected,
         hardware,
         *,
+        requested=None,
         projected=None,
         report_only=False,
         selection_scope="partial",
     ):
+        hardware_by_id = {row["id"]: row for row in self.matrix["hardware"]}
+        if hardware:
+            row = hardware_by_id[hardware[0]]
+            family = row["deviceFamily"]
+            os_major = row["osMajor"]
+            mode = "qualification"
+            qualification_eligible = True
+            release_type = "stable"
+        else:
+            family = "iPhone"
+            os_major = hardware_by_id["iphone-current"]["osMajor"] + 1
+            mode = "exploratory"
+            qualification_eligible = False
+            release_type = "beta"
         device_info_value = {
-            "mode": "qualification",
+            "mode": mode,
             "selected": {
-                "qualificationEligible": True,
+                "deviceFamily": family,
+                "osMajor": os_major,
+                "osReleaseType": release_type,
+                "qualificationEligible": qualification_eligible,
                 "matchingHardwareRows": hardware,
             },
         }
         return validation_plan.build_plan(
             device_info_value,
             self.matrix,
-            list(selected),
+            list(selected if requested is None else requested),
             list(selected),
             started_at_utc="2026-09-02T00:00:00Z",
+            orchestrator_session_binding=FIXTURE_SESSION_BINDING,
+            orchestrator_started_at_utc="2026-09-02T00:00:00Z",
             projected_hardware_row=projected,
             report_only=report_only,
             selection_scope=selection_scope,
@@ -506,6 +1104,95 @@ class ValidationPlanTests(unittest.TestCase):
                 selection_scope="full",
             )
 
+    def test_full_plan_requires_the_complete_immutable_release_runner_set(self):
+        with self.assertRaisesRegex(ValueError, "immutable release coverage"):
+            self.build(
+                ["analyzer"],
+                ["iphone-current"],
+                selection_scope="full",
+            )
+
+        plan = self.build(
+            RELEASE_SCENARIO_ORDER,
+            ["iphone-current"],
+            selection_scope="full",
+        )
+        self.assertEqual(
+            set(plan["requestedScenarioDrivers"]),
+            qualification_policy.REQUIRED_RELEASE_RUNNER_SCENARIOS,
+        )
+        self.assertEqual(
+            set(plan["selectedScenarioDrivers"]),
+            qualification_policy.REQUIRED_RELEASE_RUNNER_SCENARIOS,
+        )
+
+    def test_full_plan_rejects_reordered_complete_release_runner_set(self):
+        reordered = list(RELEASE_SCENARIO_ORDER)
+        reordered[0], reordered[1] = reordered[1], reordered[0]
+        with self.assertRaisesRegex(ValueError, "coverage or order"):
+            self.build(
+                reordered,
+                ["iphone-current"],
+                requested=reordered,
+                selection_scope="full",
+            )
+
+        reset_early = list(RELEASE_SCENARIO_ORDER)
+        reset_early.insert(0, reset_early.pop())
+        with self.assertRaisesRegex(ValueError, "coverage or order"):
+            self.build(
+                reset_early,
+                ["iphone-current"],
+                requested=reset_early,
+                selection_scope="full",
+            )
+
+    def test_full_plan_selects_exactly_the_device_applicable_release_set(self):
+        selected = [
+            scenario
+            for scenario in RELEASE_SCENARIO_ORDER
+            if scenario
+            not in qualification_policy.IPHONE_CURRENT_ONLY_RUNNER_SCENARIOS
+        ]
+        plan = self.build(
+            selected,
+            ["ipad-minimum"],
+            requested=RELEASE_SCENARIO_ORDER,
+            selection_scope="full",
+        )
+        self.assertEqual(plan["selectedScenarioDrivers"], selected)
+        self.assertEqual(
+            {row["scenario"] for row in plan["skippedScenarioDrivers"]},
+            qualification_policy.IPHONE_CURRENT_ONLY_RUNNER_SCENARIOS,
+        )
+
+        with self.assertRaisesRegex(ValueError, "device-applicable release coverage"):
+            self.build(
+                [*selected, "capability-convergence"],
+                ["ipad-minimum"],
+                requested=RELEASE_SCENARIO_ORDER,
+                selection_scope="full",
+            )
+
+    def test_future_iphone_projection_controls_full_plan_applicability(self):
+        projected = self.build(
+            RELEASE_SCENARIO_ORDER,
+            [],
+            requested=RELEASE_SCENARIO_ORDER,
+            projected="iphone-current",
+            selection_scope="full",
+        )
+        self.assertEqual(projected["matrixHardwareRows"], [])
+        self.assertEqual(projected["projectedHardwareRow"], "iphone-current")
+
+        with self.assertRaisesRegex(ValueError, "projected hardware row"):
+            self.build(
+                RELEASE_SCENARIO_ORDER,
+                ["iphone-current"],
+                projected="iphone-current",
+                selection_scope="full",
+            )
+
     def test_duplicate_driver_plan_is_rejected_before_device_work(self):
         with self.assertRaisesRegex(ValueError, "non-empty unique"):
             self.build(["analyzer", "analyzer"], ["iphone-current"])
@@ -529,7 +1216,7 @@ class ReportValidationReceiptTests(unittest.TestCase):
             )
 
             plan = json.loads(plan_bytes)
-            plan["selectionScope"] = "partial"
+            plan["selectionScope"] = "full"
             report_validation.atomic_write_json(run / "validation-plan.json", plan)
 
             self.assertFalse(report_validation.is_valid(run))
@@ -583,6 +1270,9 @@ class ReportValidationReceiptTests(unittest.TestCase):
                 report_bytes,
                 plan_bytes,
                 report_validation.QUALIFICATION_AUTHORITY,
+                validated_evidence_manifest=(
+                    report_validation.evidence_tree_manifest(run)
+                ),
             )
 
             self.assertEqual(
@@ -594,6 +1284,93 @@ class ReportValidationReceiptTests(unittest.TestCase):
             self.assertTrue(report_validation.is_valid(run))
             (run / "unexpected-post-validation.txt").write_text("unbound\n")
             self.assertFalse(report_validation.is_valid(run))
+
+    def test_snapshot_prefix_collision_is_inventoried_and_cannot_be_replayed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run = Path(directory)
+            collision_name = (
+                report_validation.VALIDATION_SNAPSHOT_PREFIX + "release-evidence.json"
+            )
+            write_validated_report(
+                run,
+                {
+                    "result": "pass",
+                    "scenarios": [{"scenario": "analyzer", "result": "pass"}],
+                },
+                retained_files={collision_name: '{"value":1}\n'},
+            )
+            manifest = json.loads(
+                (run / report_validation.EVIDENCE_MANIFEST_FILENAME).read_text()
+            )
+            self.assertIn(
+                collision_name,
+                {entry["path"] for entry in manifest["files"]},
+            )
+
+            (run / collision_name).write_text('{"value":2}\n')
+
+            self.assertFalse(report_validation.is_valid(run))
+
+    def test_semantic_validation_rejects_preexisting_snapshot_prefix_collision(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run = Path(directory)
+            write_validated_report(
+                run,
+                {
+                    "result": "pass",
+                    "scenarios": [{"scenario": "analyzer", "result": "pass"}],
+                },
+            )
+            collision = run / (
+                report_validation.VALIDATION_SNAPSHOT_PREFIX + "preexisting.json"
+            )
+            collision.write_text("{}\n")
+
+            with self.assertRaisesRegex(
+                report_validation.ReportValidationError,
+                "reserved validation snapshot paths",
+            ):
+                report_validation.validate_and_mark(
+                    run,
+                    matrix_path=None,
+                    candidate_path=None,
+                )
+
+            self.assertFalse((run / report_validation.MARKER_FILENAME).exists())
+            self.assertFalse(
+                (run / report_validation.EVIDENCE_MANIFEST_FILENAME).exists()
+            )
+
+    def test_only_the_validator_owned_snapshot_inode_is_excluded(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run = Path(directory)
+            write_validated_report(
+                run,
+                {
+                    "result": "pass",
+                    "scenarios": [{"scenario": "analyzer", "result": "pass"}],
+                },
+            )
+            snapshot = run / (
+                report_validation.VALIDATION_SNAPSHOT_PREFIX + "owned.json"
+            )
+            snapshot.write_text("{}\n")
+            metadata = snapshot.stat()
+            identity = (snapshot, metadata.st_dev, metadata.st_ino)
+            report_validation.evidence_tree_manifest(
+                run, validation_snapshot=identity
+            )
+            replacement = run / "replacement.json"
+            replacement.write_text("{}\n")
+            os.replace(replacement, snapshot)
+
+            with self.assertRaisesRegex(
+                report_validation.ReportValidationError,
+                "snapshot was replaced",
+            ):
+                report_validation.evidence_tree_manifest(
+                    run, validation_snapshot=identity
+                )
 
     def test_failed_revalidation_removes_the_previous_success_receipt(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -693,6 +1470,294 @@ class ReportValidationReceiptTests(unittest.TestCase):
                     report_validation.QUALIFICATION_AUTHORITY,
                 )
 
+    def test_arbitrary_one_driver_report_cannot_forge_full_scope(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run = Path(directory)
+            write_validated_report(
+                run,
+                {
+                    "result": "pass",
+                    "scenarios": [{"scenario": "analyzer", "result": "pass"}],
+                },
+            )
+            plan = json.loads((run / "validation-plan.json").read_text())
+            plan["selectionScope"] = "full"
+
+            with self.assertRaisesRegex(
+                report_validation.ReportValidationError,
+                "requested drivers differ from immutable release coverage",
+            ):
+                report_validation.marker_payload(
+                    (run / "report.json").read_bytes(),
+                    json.dumps(plan).encode(),
+                    report_validation.QUALIFICATION_AUTHORITY,
+                )
+
+    def test_canonical_full_report_is_accepted_and_omission_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run = Path(directory)
+            write_validated_report(
+                run,
+                {
+                    "result": "pass",
+                    "scenarios": [
+                        {"scenario": scenario, "result": "pass"}
+                        for scenario in RELEASE_SCENARIO_ORDER
+                    ],
+                },
+                selection_scope="full",
+            )
+            self.assertTrue(report_validation.is_valid(run))
+            self.assertTrue(report_validation.is_release_scope_valid(run))
+
+            report = json.loads((run / "report.json").read_text())
+            plan = json.loads((run / "validation-plan.json").read_text())
+            omitted = plan["selectedScenarioDrivers"].pop(0)
+            report["scenarios"].pop(0)
+            plan["skippedScenarioDrivers"] = [
+                {"scenario": omitted, "reason": "forged omission"}
+            ]
+
+            with self.assertRaisesRegex(
+                report_validation.ReportValidationError,
+                "selected drivers differ from immutable device-applicable release coverage",
+            ):
+                report_validation.marker_payload(
+                    json.dumps(report).encode(),
+                    json.dumps(plan).encode(),
+                    report_validation.QUALIFICATION_AUTHORITY,
+                )
+
+    def test_reordered_complete_full_report_cannot_receive_a_receipt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run = Path(directory)
+            write_validated_report(
+                run,
+                {
+                    "result": "pass",
+                    "scenarios": [
+                        {"scenario": scenario, "result": "pass"}
+                        for scenario in RELEASE_SCENARIO_ORDER
+                    ],
+                },
+                selection_scope="full",
+            )
+            report = json.loads((run / "report.json").read_text())
+            plan = json.loads((run / "validation-plan.json").read_text())
+            report["scenarios"][0], report["scenarios"][1] = (
+                report["scenarios"][1],
+                report["scenarios"][0],
+            )
+            plan["requestedScenarioDrivers"][0], plan["requestedScenarioDrivers"][1] = (
+                plan["requestedScenarioDrivers"][1],
+                plan["requestedScenarioDrivers"][0],
+            )
+            plan["selectedScenarioDrivers"][0], plan["selectedScenarioDrivers"][1] = (
+                plan["selectedScenarioDrivers"][1],
+                plan["selectedScenarioDrivers"][0],
+            )
+            with self.assertRaisesRegex(
+                report_validation.ReportValidationError, "coverage or order"
+            ):
+                report_validation.marker_payload(
+                    json.dumps(report).encode(),
+                    json.dumps(plan).encode(),
+                    report_validation.QUALIFICATION_AUTHORITY,
+                )
+
+    def test_partial_receipt_never_grants_release_scope(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run = Path(directory)
+            write_validated_report(
+                run,
+                {
+                    "result": "pass",
+                    "scenarios": [{"scenario": "analyzer", "result": "pass"}],
+                },
+            )
+            self.assertTrue(report_validation.is_valid(run))
+            self.assertFalse(report_validation.is_release_scope_valid(run))
+
+    def test_receipt_rejects_cross_session_report_replay(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run = Path(directory)
+            write_validated_report(
+                run,
+                {
+                    "result": "pass",
+                    "scenarios": [{"scenario": "analyzer", "result": "pass"}],
+                },
+            )
+            report = json.loads((run / "report.json").read_text())
+            plan = json.loads((run / "validation-plan.json").read_text())
+            plan["orchestratorSessionBinding"] = "8" * 64
+            with self.assertRaisesRegex(
+                report_validation.ReportValidationError, "orchestrator session"
+            ):
+                report_validation.marker_payload(
+                    json.dumps(report).encode(),
+                    json.dumps(plan).encode(),
+                    report_validation.QUALIFICATION_AUTHORITY,
+                )
+
+    def test_receipt_rejects_report_started_outside_orchestrator_handoff(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run = Path(directory)
+            write_validated_report(
+                run,
+                {
+                    "result": "pass",
+                    "scenarios": [{"scenario": "analyzer", "result": "pass"}],
+                },
+            )
+            report = json.loads((run / "report.json").read_text())
+            plan = json.loads((run / "validation-plan.json").read_text())
+            plan["orchestratorStartedAtUTC"] = "2020-01-01T00:00:00Z"
+            report["orchestratorStartedAtUTC"] = "2020-01-01T00:00:00Z"
+            with self.assertRaisesRegex(
+                report_validation.ReportValidationError, "handoff window"
+            ):
+                report_validation.marker_payload(
+                    json.dumps(report).encode(),
+                    json.dumps(plan).encode(),
+                    report_validation.QUALIFICATION_AUTHORITY,
+                )
+
+    def test_full_report_recomputes_device_applicable_and_projected_sets(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run = Path(directory)
+            write_validated_report(
+                run,
+                {
+                    "result": "pass",
+                    "scenarios": [
+                        {"scenario": scenario, "result": "pass"}
+                        for scenario in RELEASE_SCENARIO_ORDER
+                    ],
+                },
+                selection_scope="full",
+            )
+            current_report = json.loads((run / "report.json").read_text())
+            current_plan = json.loads((run / "validation-plan.json").read_text())
+
+            minimum_report = json.loads(json.dumps(current_report))
+            minimum_plan = json.loads(json.dumps(current_plan))
+            applicable_order = [
+                scenario
+                for scenario in RELEASE_SCENARIO_ORDER
+                if scenario
+                not in qualification_policy.IPHONE_CURRENT_ONLY_RUNNER_SCENARIOS
+            ]
+            minimum_report["device"].update(
+                {
+                    "deviceFamily": "iPad",
+                    "osVersion": "18.0",
+                    "osMajor": 18,
+                    "matchingHardwareRows": ["ipad-minimum"],
+                }
+            )
+            minimum_report["scenarios"] = [
+                {"scenario": scenario, "result": "pass"}
+                for scenario in applicable_order
+            ]
+            minimum_plan["matrixHardwareRows"] = ["ipad-minimum"]
+            minimum_plan["selectedScenarioDrivers"] = applicable_order
+            minimum_plan["skippedScenarioDrivers"] = [
+                {
+                    "scenario": scenario,
+                    "reason": "not applicable to the selected hardware row",
+                }
+                for scenario in RELEASE_SCENARIO_ORDER
+                if scenario
+                in qualification_policy.IPHONE_CURRENT_ONLY_RUNNER_SCENARIOS
+            ]
+            report_validation.marker_payload(
+                json.dumps(minimum_report).encode(),
+                json.dumps(minimum_plan).encode(),
+                report_validation.QUALIFICATION_AUTHORITY,
+            )
+
+            projected_report = json.loads(json.dumps(current_report))
+            projected_plan = json.loads(json.dumps(current_plan))
+            projected_report["device"].update(
+                {
+                    "osVersion": "27.0",
+                    "osMajor": 27,
+                    "osBuild": "24A1a",
+                    "osReleaseType": "beta",
+                    "matchingHardwareRows": [],
+                    "qualificationEligible": False,
+                }
+            )
+            projected_report.update(
+                mode="exploratory", qualificationEligibleEnvironment=False
+            )
+            projected_plan.update(
+                mode="exploratory",
+                qualificationEligibleEnvironment=False,
+                matrixHardwareRows=[],
+                projectedHardwareRow="iphone-current",
+            )
+            report_validation.marker_payload(
+                json.dumps(projected_report).encode(),
+                json.dumps(projected_plan).encode(),
+                report_validation.QUALIFICATION_AUTHORITY,
+            )
+
+    def test_plan_hardware_context_cannot_drift_from_report_device(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run = Path(directory)
+            write_validated_report(
+                run,
+                {
+                    "result": "pass",
+                    "scenarios": [{"scenario": "analyzer", "result": "pass"}],
+                },
+            )
+            report = json.loads((run / "report.json").read_text())
+            baseline = json.loads((run / "validation-plan.json").read_text())
+            mutations = {
+                "plan-row-drift": lambda plan: plan.update(
+                    matrixHardwareRows=["ipad-current"]
+                ),
+                "forged-projection": lambda plan: plan.update(
+                    projectedHardwareRow="iphone-current"
+                ),
+                "missing-projection-field": lambda plan: plan.pop(
+                    "projectedHardwareRow"
+                ),
+            }
+            for name, mutate in mutations.items():
+                with self.subTest(name=name):
+                    plan = json.loads(json.dumps(baseline))
+                    mutate(plan)
+                    with self.assertRaisesRegex(
+                        report_validation.ReportValidationError,
+                        "do not match the report device|"
+                        "does not reconcile with the report device|"
+                        "projectedHardwareRow is missing",
+                    ):
+                        report_validation.marker_payload(
+                            json.dumps(report).encode(),
+                            json.dumps(plan).encode(),
+                            report_validation.QUALIFICATION_AUTHORITY,
+                        )
+
+            forged_report = json.loads(json.dumps(report))
+            forged_report["device"]["matchingHardwareRows"] = ["ipad-current"]
+            forged_plan = json.loads(json.dumps(baseline))
+            forged_plan["matrixHardwareRows"] = ["ipad-current"]
+            forged_plan["selectionScope"] = "full"
+            with self.assertRaisesRegex(
+                report_validation.ReportValidationError,
+                "do not reconcile with device identity",
+            ):
+                report_validation.marker_payload(
+                    json.dumps(forged_report).encode(),
+                    json.dumps(forged_plan).encode(),
+                    report_validation.QUALIFICATION_AUTHORITY,
+                )
+
     def test_marker_write_refuses_a_changed_retained_plan(self):
         with tempfile.TemporaryDirectory() as directory:
             run = Path(directory)
@@ -707,7 +1772,7 @@ class ReportValidationReceiptTests(unittest.TestCase):
             plan_bytes = (run / "validation-plan.json").read_bytes()
             (run / report_validation.MARKER_FILENAME).unlink()
             plan = json.loads(plan_bytes)
-            plan["selectionScope"] = "partial"
+            plan["selectionScope"] = "full"
             report_validation.atomic_write_json(run / "validation-plan.json", plan)
 
             with self.assertRaisesRegex(
@@ -719,8 +1784,56 @@ class ReportValidationReceiptTests(unittest.TestCase):
                     report_bytes,
                     plan_bytes,
                     report_validation.QUALIFICATION_AUTHORITY,
+                    validated_evidence_manifest=(
+                        report_validation.evidence_tree_manifest(run)
+                    ),
                 )
             self.assertFalse((run / report_validation.MARKER_FILENAME).exists())
+
+    def test_marker_write_failure_removes_partial_receipt_outputs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run = Path(directory)
+            write_validated_report(
+                run,
+                {
+                    "result": "pass",
+                    "scenarios": [{"scenario": "analyzer", "result": "pass"}],
+                },
+            )
+            report_bytes = (run / "report.json").read_bytes()
+            plan_bytes = (run / "validation-plan.json").read_bytes()
+            (run / report_validation.MARKER_FILENAME).unlink()
+            (run / report_validation.EVIDENCE_MANIFEST_FILENAME).unlink()
+            evidence_manifest = report_validation.evidence_tree_manifest(run)
+            atomic_write_json = report_validation.atomic_write_json
+
+            def fail_marker_write(path: Path, value: object) -> None:
+                if path.name == report_validation.MARKER_FILENAME:
+                    raise OSError("simulated receipt interruption")
+                atomic_write_json(path, value)
+
+            with mock.patch.object(
+                report_validation,
+                "atomic_write_json",
+                side_effect=fail_marker_write,
+            ):
+                with self.assertRaisesRegex(
+                    OSError, "simulated receipt interruption"
+                ):
+                    report_validation.write_marker_for_bytes(
+                        run,
+                        report_bytes,
+                        plan_bytes,
+                        report_validation.QUALIFICATION_AUTHORITY,
+                        validated_evidence_manifest=evidence_manifest,
+                    )
+
+            self.assertFalse(
+                (run / report_validation.MARKER_FILENAME).exists()
+            )
+            self.assertFalse(
+                (run / report_validation.EVIDENCE_MANIFEST_FILENAME).exists()
+            )
 
     def test_atomic_json_writer_preserves_the_previous_file_on_replace_failure(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -744,27 +1857,353 @@ class ReportValidationReceiptTests(unittest.TestCase):
                 run,
                 {
                     "result": "pass",
-                    "scenarios": [
-                        {
-                            "scenario": "cadence-semantics-probe",
-                            "result": "pass",
-                            "qualificationEvidence": "report-only",
-                        }
-                    ],
+                    "releaseGateReason": (
+                        "exploratory cadence semantics probe cannot produce "
+                        "release credit"
+                    ),
+                    "scenarios": [cadence_report_only_scenario()],
                 },
                 selection_scope="partial",
                 report_only=True,
             )
             (run / report_validation.MARKER_FILENAME).unlink()
 
-            report_validation.validate_and_mark(
+            runtime_policy = sys.modules["qualification_policy"]
+            with mock.patch.object(
+                runtime_policy, "validate_report_only_cadence_report"
+            ) as validate_probe:
+                report_validation.validate_and_mark(
+                    run,
+                    matrix_path=None,
+                    candidate_path=run / "candidate-metadata.json",
+                    report_only=True,
+                )
+            validate_probe.assert_called_once()
+
+            self.assertTrue(report_validation.is_valid(run))
+
+    def test_report_only_validation_rejects_device_snapshot_drift(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run = Path(directory)
+            write_validated_report(
                 run,
-                matrix_path=None,
-                candidate_path=None,
+                {
+                    "result": "pass",
+                    "releaseGateReason": (
+                        "exploratory cadence semantics probe cannot produce "
+                        "release credit"
+                    ),
+                    "scenarios": [cadence_report_only_scenario()],
+                },
+                selection_scope="partial",
+                report_only=True,
+            )
+            (run / report_validation.MARKER_FILENAME).unlink()
+            (run / "device.json").write_bytes(
+                (run / "device.json").read_bytes() + b" "
+            )
+
+            with self.assertRaisesRegex(
+                report_validation.ReportValidationError,
+                "snapshot binding mismatch",
+            ):
+                report_validation.validate_and_mark(
+                    run,
+                    matrix_path=None,
+                    candidate_path=run / "candidate-metadata.json",
+                    report_only=True,
+                )
+
+            self.assertFalse(
+                (run / report_validation.MARKER_FILENAME).exists()
+            )
+
+    def test_report_only_validation_rejects_mode_eligibility_tampering(self):
+        for mode, eligible, forged_eligible in (
+            ("qualification", True, False),
+            ("exploratory", False, True),
+        ):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                run = Path(directory)
+                write_validated_report(
+                    run,
+                    {
+                        "result": "pass",
+                        "releaseGateReason": (
+                            "exploratory cadence semantics probe cannot produce "
+                            "release credit"
+                        ),
+                        "scenarios": [cadence_report_only_scenario()],
+                    },
+                    selection_scope="partial",
+                    mode=mode,
+                    qualification_eligible=eligible,
+                    report_only=True,
+                )
+                for name in ("report.json", "validation-plan.json"):
+                    value = json.loads((run / name).read_text())
+                    value["qualificationEligibleEnvironment"] = forged_eligible
+                    report_validation.atomic_write_json(run / name, value)
+
+                runtime_policy = sys.modules["qualification_policy"]
+                with mock.patch.object(
+                    runtime_policy, "validate_report_only_cadence_report"
+                ):
+                    with self.assertRaisesRegex(
+                        report_validation.ReportValidationError,
+                        "mode/eligibility differs from retained selected device",
+                    ):
+                        report_validation.validate_and_mark(
+                            run,
+                            matrix_path=None,
+                            candidate_path=run / "candidate-metadata.json",
+                            report_only=True,
+                        )
+
+                self.assertFalse(
+                    (run / report_validation.MARKER_FILENAME).exists()
+                )
+                self.assertFalse(
+                    (run / report_validation.EVIDENCE_MANIFEST_FILENAME).exists()
+                )
+
+    def test_report_only_validation_rejects_evidence_changed_after_semantic_read(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run = Path(directory)
+            write_validated_report(
+                run,
+                {
+                    "result": "pass",
+                    "releaseGateReason": (
+                        "exploratory cadence semantics probe cannot produce "
+                        "release credit"
+                    ),
+                    "scenarios": [cadence_report_only_scenario()],
+                },
+                selection_scope="partial",
                 report_only=True,
             )
 
-            self.assertTrue(report_validation.is_valid(run))
+            runtime_policy = sys.modules["qualification_policy"]
+
+            def mutate_after_snapshot_read(_snapshot: Path, _report: dict) -> None:
+                device_path = run / "device.json"
+                device_path.write_bytes(device_path.read_bytes() + b" ")
+
+            with mock.patch.object(
+                runtime_policy,
+                "validate_report_only_cadence_report",
+                side_effect=mutate_after_snapshot_read,
+            ):
+                with self.assertRaisesRegex(
+                    report_validation.ReportValidationError,
+                    "evidence tree changed during validation",
+                ):
+                    report_validation.validate_and_mark(
+                        run,
+                        matrix_path=None,
+                        candidate_path=run / "candidate-metadata.json",
+                        report_only=True,
+                    )
+
+            self.assertFalse(
+                (run / report_validation.MARKER_FILENAME).exists()
+            )
+            self.assertFalse(
+                (run / report_validation.EVIDENCE_MANIFEST_FILENAME).exists()
+            )
+
+    def test_report_only_validation_requires_strict_sibling_candidate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run = Path(directory)
+            write_validated_report(
+                run,
+                {
+                    "result": "pass",
+                    "releaseGateReason": (
+                        "exploratory cadence semantics probe cannot produce "
+                        "release credit"
+                    ),
+                    "scenarios": [cadence_report_only_scenario()],
+                },
+                selection_scope="partial",
+                report_only=True,
+            )
+            (run / report_validation.MARKER_FILENAME).unlink()
+
+            for label, candidate_path, expected in (
+                ("missing", None, "requires sibling candidate-metadata.json"),
+                (
+                    "not-sibling",
+                    run.parent / "candidate-metadata.json",
+                    "must be sibling candidate-metadata.json",
+                ),
+            ):
+                with self.subTest(label=label):
+                    with self.assertRaisesRegex(
+                        report_validation.ReportValidationError, expected
+                    ):
+                        report_validation.validate_and_mark(
+                            run,
+                            matrix_path=None,
+                            candidate_path=candidate_path,
+                            report_only=True,
+                        )
+
+    def test_report_only_validation_rejects_malformed_candidate_metadata(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run = Path(directory)
+            write_validated_report(
+                run,
+                {
+                    "result": "pass",
+                    "releaseGateReason": (
+                        "exploratory cadence semantics probe cannot produce "
+                        "release credit"
+                    ),
+                    "scenarios": [cadence_report_only_scenario()],
+                },
+                selection_scope="partial",
+                report_only=True,
+            )
+            (run / report_validation.MARKER_FILENAME).unlink()
+            candidate_path = run / "candidate-metadata.json"
+            baseline = json.loads(candidate_path.read_text())
+
+            runtime_policy = sys.modules["qualification_policy"]
+            mutations = {
+                "missing-runner-digest": (
+                    lambda value: value.pop("testRunnerDigest"),
+                    "no valid testRunnerDigest",
+                ),
+                "wrong-policy-digest": (
+                    lambda value: value.update(qualificationPolicyDigest="9" * 64),
+                    "qualification policy digest mismatch",
+                ),
+            }
+            for label, (mutate, expected) in mutations.items():
+                with self.subTest(label=label):
+                    candidate = json.loads(json.dumps(baseline))
+                    mutate(candidate)
+                    report_validation.atomic_write_json(candidate_path, candidate)
+                    with mock.patch.object(
+                        runtime_policy, "validate_report_only_cadence_report"
+                    ):
+                        with self.assertRaisesRegex(
+                            report_validation.ReportValidationError, expected
+                        ):
+                            report_validation.validate_and_mark(
+                                run,
+                                matrix_path=None,
+                                candidate_path=candidate_path,
+                                report_only=True,
+                            )
+
+    def test_report_only_validation_rejects_candidate_identity_drift(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run = Path(directory)
+            write_validated_report(
+                run,
+                {
+                    "result": "pass",
+                    "releaseGateReason": (
+                        "exploratory cadence semantics probe cannot produce "
+                        "release credit"
+                    ),
+                    "scenarios": [cadence_report_only_scenario()],
+                },
+                selection_scope="partial",
+                report_only=True,
+            )
+            (run / report_validation.MARKER_FILENAME).unlink()
+            candidate_path = run / "candidate-metadata.json"
+            baseline = json.loads(candidate_path.read_text())
+
+            runtime_policy = sys.modules["qualification_policy"]
+            for field in (
+                "candidateAppDigest",
+                "qualificationMatrixChecksum",
+                "fixtureManifestChecksum",
+            ):
+                with self.subTest(field=field):
+                    candidate = json.loads(json.dumps(baseline))
+                    candidate[field] = "9" * 64
+                    report_validation.atomic_write_json(candidate_path, candidate)
+                    with mock.patch.object(
+                        runtime_policy, "validate_report_only_cadence_report"
+                    ):
+                        expected = (
+                            "candidate build attestation candidateAppDigest does not "
+                            "match candidate metadata"
+                            if field == "candidateAppDigest"
+                            else (
+                                "report-only report/candidate identity "
+                                f"{field} mismatch"
+                            )
+                        )
+                        with self.assertRaisesRegex(
+                            report_validation.ReportValidationError,
+                            expected,
+                        ):
+                            report_validation.validate_and_mark(
+                                run,
+                                matrix_path=None,
+                                candidate_path=candidate_path,
+                                report_only=True,
+                            )
+
+    def test_report_only_receipt_rejects_fabricated_failed_report(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run = Path(directory)
+            write_validated_report(
+                run,
+                {
+                    "result": "pass",
+                    "releaseGateReason": (
+                        "exploratory cadence semantics probe cannot produce "
+                        "release credit"
+                    ),
+                    "scenarios": [cadence_report_only_scenario()],
+                },
+                selection_scope="partial",
+                report_only=True,
+            )
+            baseline = json.loads((run / "report.json").read_text())
+            plan_bytes = (run / "validation-plan.json").read_bytes()
+            mutations = {
+                "top-level-fail": lambda value: value.update(result="fail"),
+                "runner-fail": lambda value: value["scenarios"][0].update(
+                    result="fail", xcodebuildExitCode=65
+                ),
+                "skipped-test": lambda value: value["scenarios"][0][
+                    "testExecution"
+                ].update(allPassed=False),
+                "release-gate": lambda value: value.update(
+                    releaseGateSatisfied=True
+                ),
+                "qualification-row": lambda value: value.update(
+                    qualificationRows=[{"scenario": "cadence-matrix"}]
+                ),
+                "payload-release-credit": lambda value: value["scenarios"][0][
+                    "reportOnlyEvidence"
+                ].update(releaseCreditEligible=True),
+                "beta-to-stable-relabel": lambda value: value.update(
+                    version="1.1.0"
+                ),
+            }
+            for label, mutate in mutations.items():
+                with self.subTest(label=label):
+                    forged = json.loads(json.dumps(baseline))
+                    mutate(forged)
+                    with self.assertRaisesRegex(
+                        report_validation.ReportValidationError,
+                        "report-only contract failed",
+                    ):
+                        report_validation.marker_payload(
+                            json.dumps(forged).encode(),
+                            plan_bytes,
+                            report_validation.REPORT_ONLY_AUTHORITY,
+                        )
 
     def test_duplicate_keys_cannot_forge_a_validation_receipt(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1014,6 +2453,181 @@ class ReleaseSourceDigestQualificationOutputTests(unittest.TestCase):
 
 
 class QualificationRunnerStorageTests(unittest.TestCase):
+    def test_runner_uses_one_private_exact_commit_source_authority(self):
+        script = (ROOT / "qualification" / "run-device-tests.sh").read_text()
+
+        capture_index = script.index("SOURCE_AUTHORITY_COMMIT_START=$(jq")
+        clone_index = script.index(
+            'git clone --quiet --no-checkout --no-local "$ROOT_DIR" '
+            '"$SOURCE_AUTHORITY_ROOT"'
+        )
+        checkout_index = script.index(
+            'git -C "$SOURCE_AUTHORITY_ROOT" checkout --quiet --detach'
+        )
+        pinned_check_index = script.index("PINNED_SOURCE_AUTHORITY_IDENTITY=$(")
+        self.assertLess(capture_index, clone_index)
+        self.assertLess(clone_index, checkout_index)
+        self.assertLess(checkout_index, pinned_check_index)
+        self.assertNotIn("archive HEAD", script)
+        self.assertEqual(
+            script.count(
+                'git -C "$SOURCE_AUTHORITY_ROOT" archive '
+                '"$SOURCE_AUTHORITY_COMMIT_START"'
+            ),
+            1,
+        )
+        self.assertIn(
+            '--source-authority "$SOURCE_AUTHORITY_ROOT"',
+            script,
+        )
+        self.assertNotIn('--source-authority "$ROOT_DIR"', script)
+        self.assertIn('chflags -R uchg "$SOURCE_AUTHORITY_ROOT"', script)
+
+    def test_exact_commit_checkout_recipe_does_not_follow_a_moved_head(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            authority = root / "authority"
+            subprocess.run(["git", "init", "-q", str(source)], check=True)
+            subprocess.run(
+                ["git", "-C", str(source), "config", "user.email", "fixture@example.com"],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(source), "config", "user.name", "Fixture"],
+                check=True,
+            )
+            tracked = source / "tracked.txt"
+            tracked.write_text("captured\n")
+            subprocess.run(["git", "-C", str(source), "add", "tracked.txt"], check=True)
+            subprocess.run(["git", "-C", str(source), "commit", "-qm", "captured"], check=True)
+            captured = subprocess.run(
+                ["git", "-C", str(source), "rev-parse", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+
+            tracked.write_text("moved head\n")
+            subprocess.run(["git", "-C", str(source), "commit", "-qam", "moved"], check=True)
+            subprocess.run(
+                [
+                    "git",
+                    "clone",
+                    "--quiet",
+                    "--no-checkout",
+                    "--no-local",
+                    str(source),
+                    str(authority),
+                ],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(authority), "checkout", "--quiet", "--detach", captured],
+                check=True,
+            )
+
+            self.assertEqual((authority / "tracked.txt").read_text(), "captured\n")
+            self.assertEqual(
+                subprocess.run(
+                    ["git", "-C", str(authority), "rev-parse", "HEAD"],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout.strip(),
+                captured,
+            )
+
+    def test_runner_proves_device_lock_ownership_at_mutation_and_seal_boundaries(self):
+        script = (ROOT / "qualification" / "run-device-tests.sh").read_text()
+        assertion = script[
+            script.index("assert_device_lock_held() {") : script.index(
+                "assert_device_lock_held\n", script.index("assert_device_lock_held() {")
+            )
+        ]
+        for argument in (
+            "--assert-held",
+            '--device-identifier "$DEVICE_UDID"',
+            '--parent-pid "$$"',
+            '--owner-pid "$DEVICE_LOCK_PID"',
+        ):
+            self.assertIn(argument, assertion)
+
+        install_start = script.index("install_app() {")
+        install_end = script.index("install_candidate_with_fresh_permission_state()")
+        install_body = script[install_start:install_end]
+        self.assertLess(
+            install_body.index("assert_device_lock_held"),
+            min(
+                install_body.index('"$configurator" --ecid'),
+                install_body.index("xcrun devicectl device install app"),
+            ),
+        )
+        uninstall_index = script.index("xcrun devicectl device uninstall app")
+        self.assertEqual(
+            script.rfind("assert_device_lock_held", 0, uninstall_index),
+            script.rfind("assert_device_lock_held", install_end, uninstall_index),
+        )
+
+        scenario_start = script.index("run_scenario() {")
+        scenario_end = script.index(
+            'for scenario in "${ONLY_SCENARIOS[@]}"; do\n  run_scenario "$scenario"',
+            scenario_start,
+        )
+        scenario_body = script[scenario_start:scenario_end]
+        self.assertLess(
+            scenario_body.index("assert_device_lock_held"),
+            scenario_body.index('case "$scenario" in'),
+        )
+        self.assertLess(
+            scenario_body.rindex("assert_device_lock_held"),
+            scenario_body.rindex('echo "$scenario: $result"'),
+        )
+
+        report_index = script.index(
+            'python3 - \\\n  "$RESULTS_TSV" "$OUTPUT_DIR/report.json"'
+        )
+        validation_index = script.index(
+            'python3 "$SCRIPT_DIR/report_validation.py"'
+        )
+        self.assertEqual(
+            script[script.rfind("\n", 0, report_index - 1) + 1 : report_index],
+            "assert_device_lock_held\n",
+        )
+        self.assertEqual(
+            script[script.rfind("\n", 0, validation_index - 1) + 1 : validation_index],
+            "assert_device_lock_held\n",
+        )
+
+    def test_runner_default_and_full_selection_use_canonical_release_order(self):
+        script = (ROOT / "qualification" / "run-device-tests.sh").read_text()
+        assignments = re.findall(
+            r"(?m)^DEFAULT_SCENARIOS(?:\+)?=\((?P<body>[^)]*)\)$",
+            script,
+        )
+        runner_order = tuple(
+            token.strip('"\'')
+            for assignment in assignments
+            for token in assignment.split()
+        )
+        self.assertEqual(runner_order, RELEASE_SCENARIO_ORDER)
+        self.assertEqual(runner_order[-1], "audio-media-services-reset")
+
+        full_selection = script[
+            script.index('if [[ "$FULL_SUITE_SELECTION" == true ]]') : script.index(
+                'requested_scenarios_file="$WORK_DIR/requested-scenarios.txt"'
+            )
+        ]
+        self.assertNotIn("| sort", full_selection)
+        self.assertIn(
+            '<(printf \'%s\\n\' "${EXPECTED_FULL_SCENARIOS[@]}")',
+            full_selection,
+        )
+        self.assertIn(
+            '<(printf \'%s\\n\' "${ONLY_SCENARIOS[@]}")',
+            full_selection,
+        )
+
     def test_runner_current_only_filter_matches_release_policy(self):
         script = (ROOT / "qualification" / "run-device-tests.sh").read_text()
         match = re.search(
@@ -1041,7 +2655,7 @@ class QualificationRunnerStorageTests(unittest.TestCase):
     def test_runner_requires_the_release_oracle_decoder_tools(self):
         script = (ROOT / "qualification" / "run-device-tests.sh").read_text()
         self.assertIn(
-            "for command in curl ffmpeg ffprobe git jq plutil python3 shasum tar xcodebuild xcrun",
+            "for command in chflags curl ffmpeg ffprobe git jq plutil python3 shasum tar xcodebuild xcrun",
             script,
         )
 
@@ -1071,6 +2685,7 @@ class QualificationRunnerStorageTests(unittest.TestCase):
             'report_validation_args=(\n  validate-and-mark\n  --run-dir "$OUTPUT_DIR"',
             script,
         )
+        self.assertIn('--candidate "$CANDIDATE_IDENTITY"', script)
         self.assertNotIn('report_validation.py" mark', script)
         self.assertIn(
             'RESULTS_TSV="$OUTPUT_DIR/scenario-results.tsv"',
@@ -1106,6 +2721,15 @@ class QualificationRunnerStorageTests(unittest.TestCase):
         self.assertLess(stop_index, report_index)
         self.assertLess(stop_index, receipt_index)
 
+    def test_runner_report_binds_the_retained_normalized_device_snapshot(self):
+        script = (ROOT / "qualification" / "run-device-tests.sh").read_text()
+
+        self.assertIn(
+            "device_snapshot = policy.device_snapshot_binding(Path(output_path).parent)",
+            script,
+        )
+        self.assertIn('"deviceSnapshot": device_snapshot', script)
+
     def test_runner_primes_the_exact_installed_xctrunner_before_tests(self):
         script = (ROOT / "qualification" / "run-device-tests.sh").read_text()
         install_index = script.index('install_app "$RUNNER_APP"')
@@ -1139,6 +2763,160 @@ class QualificationRunnerStorageTests(unittest.TestCase):
         for command in commands:
             self.assertIn('-derivedDataPath "$DERIVED_DATA"', command)
 
+    def test_every_xcode_test_invocation_disables_parallel_testing(self):
+        script = (ROOT / "qualification" / "run-device-tests.sh").read_text()
+        lines = script.splitlines()
+        commands = []
+        for index, line in enumerate(lines):
+            if "xcodebuild test-without-building" not in line:
+                continue
+            command = [line]
+            while command[-1].rstrip().endswith("\\"):
+                index += 1
+                command.append(lines[index])
+            commands.append("\n".join(command))
+
+        self.assertGreater(len(commands), 0)
+        for command in commands:
+            self.assertEqual(command.count("-parallel-testing-enabled NO"), 1)
+            self.assertNotIn("-parallel-testing-enabled YES", command)
+
+    def test_physical_ui_tests_fail_closed_on_unrecognized_permission_alerts(self):
+        support_path = (
+            ROOT.parent
+            / "Showcase"
+            / "UITests"
+            / "iOS"
+            / "Support"
+            / "ShowcaseIOSTestCase.swift"
+        )
+        support = support_path.read_text()
+        permission_support = support_path.with_name(
+            "QualificationLocalNetworkPermission.swift"
+        ).read_text()
+        permission_sources = support + permission_support
+        info = plistlib.loads(
+            (ROOT.parent / "Showcase" / "iOS" / "Info.plist").read_bytes()
+        )
+        purpose = info["NSLocalNetworkUsageDescription"]
+        tests_root = ROOT.parent / "Showcase" / "UITests" / "iOS" / "Tests"
+        test_sources = "\n".join(
+            path.read_text() for path in tests_root.glob("*.swift")
+        )
+
+        self.assertEqual(permission_sources.count("addUIInterruptionMonitor"), 1)
+        self.assertIn(f'"{purpose}"', permission_support)
+        self.assertIn(
+            "environment[Self.deviceLogPrefixEnvironment] != nil",
+            permission_support,
+        )
+        for contract in (
+            "alert.elementType == .alert",
+            'format: "label == %@"',
+            'affirmativeButtonLabel = "Allow"',
+            "alert.buttons[affirmativeButtonLabel]",
+            "grant.label == affirmativeButtonLabel",
+            "grant.isHittable",
+            "bundleIdentifier: contract.springBoardBundleIdentifier",
+            "Refusing to interact with an unrecognized or unready SpringBoard alert",
+            "initialAppearanceTimeout: TimeInterval = 10",
+            "repeatedAppearanceTimeout: TimeInterval = 0.5",
+            "controlReadinessTimeout: TimeInterval = 5",
+            "while alert.exists",
+            "ProcessInfo.processInfo.systemUptime",
+        ):
+            self.assertIn(contract, permission_support)
+        launch_helper = support[
+            support.index("private func launchOrAttach()") : support.index(
+                "// MARK: - Log assertions"
+            )
+        ]
+        self.assertIn("handleQualificationLocalNetworkPermissionIfPresent()", launch_helper)
+        self.assertNotIn("app.tap()", permission_sources)
+        self.assertNotIn("buttons.element(boundBy:", permission_sources)
+        self.assertNotIn("addUIInterruptionMonitor", test_sources)
+
+    def test_every_direct_ui_test_launch_uses_the_permission_safe_wrapper(self):
+        tests_root = ROOT.parent / "Showcase" / "UITests" / "iOS" / "Tests"
+        ui_test_sources = {
+            path.name: path.read_text()
+            for path in tests_root.glob("*.swift")
+        }
+
+        self.assertGreater(len(ui_test_sources), 0)
+        wrapper_uses = 0
+        for name, source in ui_test_sources.items():
+            self.assertNotIn(
+                "app.launch()",
+                source,
+                f"{name} bypasses the fail-closed permission-safe launch wrapper",
+            )
+            self.assertNotIn(
+                "app.tap()",
+                source,
+                f"{name} contains a blind candidate tap",
+            )
+            wrapper_uses += source.count(
+                "launchDirectlyHandlingQualificationPermissions()"
+            )
+        self.assertGreaterEqual(wrapper_uses, 55)
+
+    def test_physical_pip_capability_waits_for_the_enabled_path(self):
+        source = (
+            ROOT.parent
+            / "Showcase"
+            / "UITests"
+            / "iOS"
+            / "Tests"
+            / "PiPUITests.swift"
+        ).read_text()
+        test_start = source.index(
+            "func test_deep_toggleButtonAvailabilityMatchesPiPPossibility()"
+        )
+        test_end = source.index("\n  // MARK: - Stress", test_start)
+        body = source[test_start:test_end]
+        physical = body[body.index("#else") : body.index("#endif")]
+
+        self.assertIn("#if targetEnvironment(simulator)", body)
+        self.assertIn(
+            'waitForLabel(possibleLabel, equals: "yes", timeout: 30)',
+            physical,
+        )
+        self.assertIn("assertEnabledPiPToggle()", physical)
+        self.assertNotIn('case "no"', physical)
+
+    def test_runner_resets_permission_state_only_for_disposable_candidate(self):
+        script = (ROOT / "qualification" / "run-device-tests.sh").read_text()
+        reset_start = script.index(
+            "install_candidate_with_fresh_permission_state()"
+        )
+        reset_end = script.index(
+            "install_candidate_with_fresh_permission_state\n", reset_start
+        )
+        reset = script[reset_start:reset_end]
+
+        self.assertIn(
+            'if [[ "$CANDIDATE_BUNDLE_IDENTIFIER" == '
+            "com.swiftvlc.validation.* ]]; then",
+            reset,
+        )
+        self.assertEqual(reset.count("device uninstall app"), 1)
+        self.assertIn('--device "$DEVICE_UDID" "$CANDIDATE_BUNDLE_IDENTIFIER"', reset)
+        bootstrap = reset.index('install_app "$CANDIDATE_APP"')
+        uninstall = reset.index("device uninstall app", bootstrap)
+        final_install = reset.index('install_app "$CANDIDATE_APP"', uninstall)
+        self.assertLess(bootstrap, uninstall)
+        self.assertLess(uninstall, final_install)
+        self.assertIn(
+            "outside the disposable com.swiftvlc.validation.* namespace",
+            reset,
+        )
+        self.assertIn(
+            "enable Local Network access in Settings > Privacy & Security > Local Network",
+            reset,
+        )
+        self.assertEqual(script.count("device uninstall app"), 1)
+
     def test_every_xcodebuild_invocation_has_wall_and_idle_watchdogs(self):
         script = (ROOT / "qualification" / "run-device-tests.sh").read_text()
         command_count = len(
@@ -1151,6 +2929,140 @@ class QualificationRunnerStorageTests(unittest.TestCase):
         self.assertGreater(command_count, 0)
         self.assertEqual(watchdog_call_count, command_count)
         self.assertIn('python3 "$SCRIPT_DIR/run-with-watchdog.py"', script)
+
+    def test_cadence_probe_shared_timing_contract_bounds_every_success_path(self):
+        ui_test = (
+            ROOT.parent
+            / "Showcase"
+            / "UITests"
+            / "iOS"
+            / "Tests"
+            / "PiPCadenceSemanticsProbeDeviceUITests.swift"
+        ).read_text()
+        app_probe = (
+            ROOT.parent
+            / "Showcase"
+            / "iOS"
+            / "ValidationHarness"
+            / "PiPCadenceSemanticsProbeValidationCase.swift"
+        ).read_text()
+        timing_contract = (
+            ROOT.parent
+            / "Showcase"
+            / "Shared"
+            / "PiPCadenceSemanticsProbeEvidence.swift"
+        ).read_text()
+        runner = (ROOT / "qualification" / "run-device-tests.sh").read_text()
+
+        def swift_seconds(name: str) -> int:
+            match = re.search(rf"static let {name}(?:: [^=]+)? = (\d+)", timing_contract)
+            self.assertIsNotNone(match, name)
+            return int(match.group(1))
+
+        def shell_seconds(name: str) -> int:
+            match = re.search(rf"(?m)^{name}=(\d+)$", runner)
+            self.assertIsNotNone(match, name)
+            return int(match.group(1))
+
+        application = swift_seconds("applicationRunBudgetSeconds")
+        capture = swift_seconds("springBoardCaptureBudgetSeconds")
+        collection = swift_seconds("reportCollectionBudgetSeconds")
+        xctest_allowance = swift_seconds("xctestExecutionAllowanceSeconds")
+        idle_watchdog = swift_seconds("runnerIdleWatchdogSeconds")
+        wall_watchdog = swift_seconds("runnerWallWatchdogSeconds")
+        probe_command = re.search(
+            r'elif \[\[ "\$scenario" == "cadence-semantics-probe" \]\]; then'
+            r'(.*?)elif \[\[ "\$scenario" == "native-subtitle-matrix" \]\]; then',
+            runner,
+            re.DOTALL,
+        ).group(1)
+
+        self.assertLess(application, capture)
+        self.assertGreaterEqual(capture - application, 15)
+        self.assertGreaterEqual(capture, 240)
+        self.assertGreaterEqual(xctest_allowance, capture + collection + 60)
+        self.assertGreater(idle_watchdog, xctest_allowance)
+        self.assertGreater(wall_watchdog, idle_watchdog)
+        self.assertEqual(
+            shell_seconds("CADENCE_SEMANTICS_PROBE_XCTEST_ALLOWANCE_SECONDS"),
+            xctest_allowance,
+        )
+        self.assertEqual(
+            shell_seconds("CADENCE_SEMANTICS_PROBE_IDLE_WATCHDOG_SECONDS"),
+            idle_watchdog,
+        )
+        self.assertEqual(
+            shell_seconds("CADENCE_SEMANTICS_PROBE_WALL_WATCHDOG_SECONDS"),
+            wall_watchdog,
+        )
+        for token in (
+            '"$CADENCE_SEMANTICS_PROBE_WALL_WATCHDOG_SECONDS"',
+            '"$CADENCE_SEMANTICS_PROBE_IDLE_WATCHDOG_SECONDS"',
+            "-default-test-execution-time-allowance",
+            "-maximum-test-execution-time-allowance",
+        ):
+            self.assertIn(token, probe_command)
+        self.assertEqual(
+            probe_command.count(
+                '"$CADENCE_SEMANTICS_PROBE_XCTEST_ALLOWANCE_SECONDS"'
+            ),
+            2,
+        )
+
+        self.assertIn(
+            "PiPCadenceSemanticsProbeTiming.applicationRunBudgetSeconds",
+            app_probe,
+        )
+        self.assertIn(
+            "PiPCadenceSemanticsProbeTiming.springBoardCaptureBudgetSeconds",
+            ui_test,
+        )
+        self.assertIn(
+            "PiPCadenceSemanticsProbeTiming.reportCollectionBudgetSeconds",
+            ui_test,
+        )
+        self.assertNotIn("Task.sleep", app_probe)
+        wait_calls = re.findall(
+            r"try await waitUntil\((.*?)\) \{", app_probe, re.DOTALL
+        )
+        self.assertEqual(len(wait_calls), 5)
+        self.assertTrue(
+            all("runDeadline: runDeadline" in call for call in wait_calls)
+        )
+        boundary_calls = re.findall(
+            r"try await settledBoundary\((.*?)\)", app_probe, re.DOTALL
+        )
+        self.assertEqual(len(boundary_calls), 2)
+        self.assertTrue(
+            all("runDeadline: runDeadline" in call for call in boundary_calls)
+        )
+        self.assertIn("try requireRemainingRunBudget(runDeadline)", app_probe)
+        self.assertIn("requestedEnd < runDeadline", app_probe)
+        self.assertIn("app-side global run deadline", app_probe)
+        background_capture = ui_test[
+            ui_test.index("XCUIDevice.shared.press(.home)") : ui_test.index(
+                "app.activate()"
+            )
+        ]
+        for background_query in (
+            "progress.label",
+            "result.label",
+            "error.exists",
+        ):
+            self.assertNotIn(background_query, background_capture)
+        self.assertEqual(ui_test.count("app.activate()"), 1)
+        self.assertIn(
+            "$0.captureStartedSystemUptime >= start + guardSeconds",
+            ui_test,
+        )
+        self.assertIn(
+            "$0.captureEndedSystemUptime <= end - guardSeconds",
+            ui_test,
+        )
+        self.assertIn('"captureStartSystemUptimes"', ui_test)
+        self.assertIn('"captureEndSystemUptimes"', ui_test)
+        self.assertIn('"captureBoundaryGuardSeconds"', ui_test)
+        self.assertNotIn("runStartedSystemUptime + 95", ui_test)
 
     def test_volunteer_runner_pins_the_exact_preflight_device_identifier(self):
         volunteer = (ROOT / "qualification" / "volunteer-validation.sh").read_text()
@@ -1743,6 +3655,51 @@ class QualificationRunnerStorageTests(unittest.TestCase):
         ):
             self.assertIn(contract, visual_source)
 
+    def test_ui_suite_excludes_every_skip_gated_test_class(self):
+        matrix = json.loads((ROOT / "qualification" / "matrix.json").read_text())
+        contracts = {item["id"]: item for item in matrix["runnerContracts"]}
+        excluded = set(contracts["ui-suite"]["selection"]["prefixes"])
+        tests_root = ROOT.parent / "Showcase" / "UITests" / "iOS" / "Tests"
+        skip_gated = {
+            f"iOSUITests/{source.stem}/"
+            for source in tests_root.glob("*.swift")
+            if "XCTSkip" in source.read_text()
+        }
+
+        self.assertTrue(skip_gated)
+        self.assertEqual(skip_gated - excluded, set())
+        probe = (
+            "iOSUITests/PiPCadenceSemanticsProbeDeviceUITests/"
+            "test_reportOnlyVmemCadenceSemanticsProbe"
+        )
+        self.assertIn(
+            "iOSUITests/PiPCadenceSemanticsProbeDeviceUITests/", excluded
+        )
+        self.assertIn(probe, qualification_policy.RELEASE_CATALOG_EXCEPTIONS)
+
+    def test_physical_harness_regression_has_no_capability_skip(self):
+        matrix = json.loads((ROOT / "qualification" / "matrix.json").read_text())
+        contracts = {item["id"]: item for item in matrix["runnerContracts"]}
+        expected = (
+            "iOSUITests/PiPUITests/"
+            "test_deep_toggleButtonAvailabilityMatchesPiPPossibility"
+        )
+        selected = contracts["harness-regressions"]["selection"][
+            "testIdentifiers"
+        ]
+        self.assertIn(expected, selected)
+        self.assertNotIn(
+            "iOSUITests/PiPUITests/test_deep_toggleButtonDisabledWhenNotPossible",
+            selected,
+        )
+        runner = (ROOT / "qualification" / "run-device-tests.sh").read_text()
+        self.assertIn(f'"{expected}"', runner)
+        source = (
+            ROOT.parent / "Showcase" / "UITests" / "iOS" / "Tests" / "PiPUITests.swift"
+        ).read_text()
+        self.assertIn("func test_deep_toggleButtonAvailabilityMatchesPiPPossibility()", source)
+        self.assertNotIn("XCTSkip", source)
+
     def test_require_stable_rejects_shortened_duration_before_device_discovery(self):
         script = ROOT / "qualification" / "run-device-tests.sh"
         environment = os.environ.copy()
@@ -1751,6 +3708,8 @@ class QualificationRunnerStorageTests(unittest.TestCase):
             [
                 "bash",
                 str(script),
+                "--version",
+                "1.1.0",
                 "--require-stable",
                 "--development-team",
                 "ABCDE12345",
@@ -1762,6 +3721,18 @@ class QualificationRunnerStorageTests(unittest.TestCase):
         )
         self.assertEqual(completed.returncode, 2)
         self.assertIn("immutable minimum is 7200s", completed.stderr)
+
+    def test_device_runner_requires_exact_candidate_version(self):
+        script = ROOT / "qualification" / "run-device-tests.sh"
+        completed = subprocess.run(
+            ["bash", str(script), "--development-team", "ABCDE12345"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(completed.returncode, 2)
+        self.assertIn("--version is required", completed.stderr)
 
     def test_temporary_work_defaults_beside_the_repository(self):
         script = (ROOT / "qualification" / "run-device-tests.sh").read_text()
@@ -2301,15 +4272,11 @@ class VolunteerReportPrivacyTests(unittest.TestCase):
                 {
                     "result": "pass",
                     "scenarios": [
-                        {
-                            "scenario": "analyzer",
-                            "result": "pass",
-                            "durationSeconds": 1,
-                            "libraryErrorCount": 0,
-                            "qualificationEvidence": "not-applicable",
-                        }
+                        {"scenario": scenario, "result": "pass"}
+                        for scenario in RELEASE_SCENARIO_ORDER
                     ],
                 },
+                selection_scope="full",
             )
             output = root / "share.zip"
             package_volunteer_report.package(run, output)
@@ -2335,7 +4302,7 @@ class VolunteerReportPrivacyTests(unittest.TestCase):
             (
                 "exploratory",
                 {
-                    "selection_scope": "full",
+                    "selection_scope": "partial",
                     "mode": "exploratory",
                     "qualification_eligible": False,
                 },
@@ -2404,7 +4371,7 @@ class VolunteerReportPrivacyTests(unittest.TestCase):
                 )
             self.assertIn("Timed out while enabling automation mode", summary)
             self.assertIn("Report state: **COMPLETE**", summary)
-            self.assertIn("Result: **FAIL**", summary)
+            self.assertIn("Result: **FAIL — PARTIAL SCOPE**", summary)
             self.assertEqual(reasons[0]["scenario"], "analyzer")
 
     def test_unvalidated_or_changed_report_is_never_labelled_complete(self):
@@ -2894,17 +4861,25 @@ class CandidateMetadataTests(unittest.TestCase):
 
     def test_format_two_metadata_accepts_the_complete_runner_binding(self):
         catalog = ["iOSUITests/AnalyzerTests/test_pixels"]
+        source_commit = "b" * 40
+        release_source_digest = "c" * 64
+        artifact_digest = "d" * 64
         metadata = {
             "formatVersion": 2,
             "version": "1.1.0",
             "candidateAppBundleIdentifier": "com.swiftvlc.validation.team.app",
-            "sourceCommit": "b" * 40,
+            "sourceCommit": source_commit,
             "releaseSourceDigestAlgorithm": "swiftvlc-git-tree-v1",
-            "releaseSourceDigest": "c" * 64,
+            "releaseSourceDigest": release_source_digest,
             "candidateAppDigestAlgorithm": "swiftvlc-tree-v1",
             "candidateAppDigest": "a" * 64,
             "artifactDigestAlgorithm": "swiftvlc-tree-v1",
-            "artifactDigest": "d" * 64,
+            "artifactDigest": artifact_digest,
+            **fixture_candidate_build_attestation_fields(
+                source_commit=source_commit,
+                release_source_digest=release_source_digest,
+                artifact_digest=artifact_digest,
+            ),
             "testRunnerBundleIdentifier": (
                 "com.swiftvlc.validation.team.uitests.xctrunner"
             ),
@@ -2957,23 +4932,70 @@ class CandidateMetadataTests(unittest.TestCase):
             test_bundle = runner / "PlugIns" / "iOSUITests.xctest"
             test_bundle.mkdir(parents=True)
             runner_identifier = "com.swiftvlc.validation.team.uitests.xctrunner"
+            candidate_app = root / "iOS.app"
+            candidate_app.mkdir()
+            with (candidate_app / "Info.plist").open("wb") as output:
+                plistlib.dump(
+                    {"CFBundleIdentifier": "com.swiftvlc.validation.team.app"},
+                    output,
+                )
             with (runner / "Info.plist").open("wb") as output:
                 plistlib.dump({"CFBundleIdentifier": runner_identifier}, output)
             (test_bundle / "fixture").write_text("signed test fixture")
             xctestrun = root / "fixture.xctestrun"
-            xctestrun.write_text("fixture")
+            with xctestrun.open("wb") as output:
+                plistlib.dump(
+                    {
+                        "TestConfigurations": [
+                            {
+                                "TestTargets": [
+                                    {
+                                        "IsUITestBundle": True,
+                                        "CommandLineArguments": [],
+                                        "UITargetAppCommandLineArguments": [],
+                                        "TestHostPath": str(runner),
+                                        "TestBundlePath": str(test_bundle),
+                                        "UITargetAppPath": str(candidate_app),
+                                        "DependentProductPaths": [
+                                            str(candidate_app),
+                                            str(runner),
+                                            str(test_bundle),
+                                        ],
+                                        "TestHostBundleIdentifier": runner_identifier,
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    output,
+                )
             catalog = qualification_policy.catalog_record(
                 ["iOSUITests/AnalyzerTests/test_pixels"]
             )
             catalog_path = root / "catalog.json"
             catalog_path.write_text(json.dumps(catalog))
+            catalog_authority = root / "catalog-authority.json"
+            catalog_authority.write_text(
+                json.dumps(
+                    {
+                        "formatVersion": 1,
+                        "authority": "swiftvlc-reviewed-ios-test-catalog-v1",
+                        "testCatalogDigestAlgorithm": "swiftvlc-test-catalog-v1",
+                        "testCatalogDigest": catalog["digest"],
+                        "testCatalogCount": catalog["testCount"],
+                        "testIdentifiers": catalog["testIdentifiers"],
+                    }
+                )
+            )
             fixture_manifest = root / "fixture-manifest.json"
             fixture_manifest.write_text("{}")
             bindings = candidate_metadata.qualification_bindings(
+                candidate_app=candidate_app,
                 test_runner=runner,
                 test_bundle=test_bundle,
                 xctestrun=xctestrun,
                 test_catalog=catalog_path,
+                test_catalog_authority=catalog_authority,
                 matrix=ROOT / "qualification" / "matrix.json",
                 feature_manifest=(ROOT / "qualification" / "feature-manifest-v1.json"),
                 profiles=ROOT / "qualification" / "profiles-v1.json",
@@ -2993,6 +5015,8 @@ class CandidateMetadataTests(unittest.TestCase):
                 plistlib.dump(
                     {
                         "CFBundleIdentifier": "com.swiftvlc.validation.team.app",
+                        "SwiftVLCCandidateVersion": "1.1.0",
+                        "SwiftVLCCandidateRuntimeBinding": "e" * 64,
                         "SwiftVLCSourceCommit": "b" * 40,
                         "SwiftVLCReleaseSourceDigest": "c" * 64,
                         "SwiftVLCArtifactDigest": "a" * 64,
@@ -3047,6 +5071,8 @@ class CandidateMetadataTests(unittest.TestCase):
                 plistlib.dump(
                     {
                         "CFBundleIdentifier": "com.swiftvlc.validation.team.app",
+                        "SwiftVLCCandidateVersion": "1.1.0",
+                        "SwiftVLCCandidateRuntimeBinding": "e" * 64,
                         "SwiftVLCSourceCommit": "b" * 40,
                         "SwiftVLCReleaseSourceDigest": "c" * 64,
                         "SwiftVLCArtifactDigest": "a" * 64,
@@ -3072,6 +5098,8 @@ class CandidateMetadataTests(unittest.TestCase):
                 "testCatalogDigest": qualification_policy.catalog_digest(catalog),
                 "testCatalogCount": 1,
                 "testCatalog": catalog,
+                "testCatalogAuthorityDigestAlgorithm": "sha256",
+                "testCatalogAuthorityDigest": "0" * 64,
                 "qualificationMatrixChecksum": "2" * 64,
                 "featureManifestChecksum": "3" * 64,
                 "qualificationProfilesChecksum": "4" * 64,
@@ -3081,12 +5109,18 @@ class CandidateMetadataTests(unittest.TestCase):
                 ),
                 "qualificationPolicyDigest": qualification_policy.policy_digest(),
             }
+            build_attestation = fixture_candidate_build_attestation_fields(
+                source_commit="b" * 40,
+                release_source_digest="c" * 64,
+                artifact_digest="a" * 64,
+            )["candidateBuildAttestation"]
             metadata = candidate_metadata.create(
                 app,
                 xcframework,
                 "1.1.0",
                 digest_script,
                 bindings,
+                build_attestation,
             )
             for field, replacement in (
                 (
@@ -3271,6 +5305,83 @@ class FixtureManifestTests(unittest.TestCase):
 
 
 class QualificationEvidenceTests(unittest.TestCase):
+    qualification_session_binding = "d" * 64
+    candidate_runtime_binding = "e" * 64
+
+    def materialize(self, *args, **kwargs):
+        kwargs.setdefault(
+            "expected_qualification_session_binding",
+            self.qualification_session_binding,
+        )
+        kwargs.setdefault(
+            "expected_candidate_runtime_binding",
+            self.candidate_runtime_binding,
+        )
+        return materialize_evidence.materialize(*args, **kwargs)
+
+    def test_runtime_bindings_are_independently_required_matched_and_stripped(self):
+        payload = {
+            "scenario": "fixture",
+            "qualificationSessionBinding": self.qualification_session_binding,
+            "candidateRuntimeBinding": self.candidate_runtime_binding,
+        }
+        self.assertEqual(
+            qualification_policy.validate_and_strip_qualification_runtime_bindings(
+                payload,
+                expected_session_binding=self.qualification_session_binding,
+                expected_candidate_binding=self.candidate_runtime_binding,
+            ),
+            {"scenario": "fixture"},
+        )
+        mutations = (
+            ({"qualificationSessionBinding": None}, "qualification session"),
+            ({"qualificationSessionBinding": "D" * 64}, "qualification session"),
+            ({"qualificationSessionBinding": "c" * 64}, "qualification session"),
+            ({"candidateRuntimeBinding": None}, "candidate runtime"),
+            ({"candidateRuntimeBinding": "E" * 64}, "candidate runtime"),
+            ({"candidateRuntimeBinding": "f" * 64}, "candidate runtime"),
+        )
+        for mutation, description in mutations:
+            with self.subTest(mutation=mutation):
+                with self.assertRaisesRegex(
+                    qualification_policy.QualificationPolicyError,
+                    description,
+                ):
+                    qualification_policy.validate_and_strip_qualification_runtime_bindings(
+                        {**payload, **mutation},
+                        expected_session_binding=self.qualification_session_binding,
+                        expected_candidate_binding=self.candidate_runtime_binding,
+                    )
+
+    def test_materializer_cannot_self_authenticate_raw_runtime_bindings(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.make_export(
+                root,
+                {
+                    "formatVersion": 1,
+                    "scenario": "vod-controls",
+                    "controls": "pass",
+                },
+                attachment_name="qualification-vod-controls.json",
+                test_identifier=(
+                    "PiPVODControlsDeviceUITests/"
+                    "test_vodControlsAcrossNativeAndDirectBackends"
+                ),
+            )
+            with self.assertRaisesRegex(
+                materialize_evidence.EvidenceError,
+                "expected qualification session binding",
+            ):
+                materialize_evidence.materialize(
+                    root,
+                    "qualification-vod-controls.json",
+                    "vod-controls",
+                    "iphone-current",
+                    "a" * 64,
+                    "b" * 64,
+                )
+
     @staticmethod
     def artifact_producer(runner: str, attempt: int = 1) -> dict:
         return {
@@ -3344,6 +5455,11 @@ class QualificationEvidenceTests(unittest.TestCase):
         attachment_name: str = "qualification-native-hls-seek-continuity.json",
         test_identifier: str = "iOSUITests/PiPOverlayDeviceUITests/test_nativePiPHLSSeeksRemainActive",
     ):
+        payload = {
+            **payload,
+            "qualificationSessionBinding": self.qualification_session_binding,
+            "candidateRuntimeBinding": self.candidate_runtime_binding,
+        }
         exported = root / "attachment.json"
         exported.write_text(json.dumps(payload))
         attachment = {
@@ -3404,6 +5520,11 @@ class QualificationEvidenceTests(unittest.TestCase):
         }
         attachments = []
         for index, (name, payload) in enumerate(payloads.items()):
+            payload = {
+                **payload,
+                "qualificationSessionBinding": self.qualification_session_binding,
+                "candidateRuntimeBinding": self.candidate_runtime_binding,
+            }
             exported = root / f"delayed-start-{index}.json"
             exported.write_text(json.dumps(payload))
             attachments.append(
@@ -3456,7 +5577,7 @@ class QualificationEvidenceTests(unittest.TestCase):
                     },
                 },
             )
-            evidence = materialize_evidence.materialize(
+            evidence = self.materialize(
                 root,
                 "qualification-native-hls-seek-continuity.json",
                 "native-hls-seek-continuity",
@@ -3494,7 +5615,7 @@ class QualificationEvidenceTests(unittest.TestCase):
                     "test_vodControlsAcrossNativeAndDirectBackends"
                 ),
             )
-            evidence = materialize_evidence.materialize(
+            evidence = self.materialize(
                 root,
                 "qualification-vod-controls.json",
                 "vod-controls",
@@ -3526,7 +5647,7 @@ class QualificationEvidenceTests(unittest.TestCase):
                         materialize_evidence.EvidenceError,
                         "unauthorized qualification attachment",
                     ):
-                        materialize_evidence.materialize(
+                        self.materialize(
                             root,
                             "qualification-vod-controls.json",
                             "vod-controls",
@@ -3562,7 +5683,7 @@ class QualificationEvidenceTests(unittest.TestCase):
                 materialize_evidence.EvidenceError,
                 "attachment counts mismatch",
             ):
-                materialize_evidence.materialize(
+                        self.materialize(
                     root,
                     "qualification-vod-controls.json",
                     "vod-controls",
@@ -3591,7 +5712,7 @@ class QualificationEvidenceTests(unittest.TestCase):
                 attachment_name="qualification-live-media.json",
                 test_identifier="PiPLiveDeviceUITests/test_liveMediaQualificationAcrossNativeAndDirectBackends",
             )
-            evidence = materialize_evidence.materialize(
+            evidence = self.materialize(
                 root,
                 "qualification-live-media.json",
                 "live-media",
@@ -3629,7 +5750,7 @@ class QualificationEvidenceTests(unittest.TestCase):
                 attachment_name="qualification-background-audio.json",
                 test_identifier="PiPLiveDeviceUITests/test_backgroundAudioQualificationWhileAppIsBackgrounded",
             )
-            evidence = materialize_evidence.materialize(
+            evidence = self.materialize(
                 root,
                 "qualification-background-audio.json",
                 "background-audio",
@@ -3674,7 +5795,7 @@ class QualificationEvidenceTests(unittest.TestCase):
                 attachment_name="qualification-replacement-continuity.json",
                 test_identifier="PiPContinuityDeviceUITests/test_nativePiPReplacementContinuityAcrossVODAndLive",
             )
-            evidence = materialize_evidence.materialize(
+            evidence = self.materialize(
                 root,
                 "qualification-replacement-continuity.json",
                 "replacement-continuity",
@@ -3719,7 +5840,7 @@ class QualificationEvidenceTests(unittest.TestCase):
                 attachment_name="qualification-capability-convergence.json",
                 test_identifier="PiPCapabilityDeviceUITests/test_capabilityConvergenceAcrossNativeAndDirectBackends",
             )
-            evidence = materialize_evidence.materialize(
+            evidence = self.materialize(
                 root,
                 "qualification-capability-convergence.json",
                 "capability-convergence",
@@ -3780,7 +5901,7 @@ class QualificationEvidenceTests(unittest.TestCase):
                 attachment_name="qualification-deferred-pause-rejection.json",
                 test_identifier="PiPDeferredPauseDeviceUITests/test_deferredPauseRejectionAndCancellationStayTruthful",
             )
-            evidence = materialize_evidence.materialize(
+            evidence = self.materialize(
                 root,
                 "qualification-deferred-pause-rejection.json",
                 "deferred-pause-rejection",
@@ -3821,7 +5942,7 @@ class QualificationEvidenceTests(unittest.TestCase):
                 attachment_name="qualification-vod-controls.json",
                 test_identifier="PiPVODControlsDeviceUITests/test_vodControlsAcrossNativeAndDirectBackends",
             )
-            evidence = materialize_evidence.materialize(
+            evidence = self.materialize(
                 root,
                 "qualification-vod-controls.json",
                 "vod-controls",
@@ -3861,7 +5982,7 @@ class QualificationEvidenceTests(unittest.TestCase):
                 attachment_name="qualification-long-stall.json",
                 test_identifier="PiPLongStallDeviceUITests/test_longStallRecoversAcrossNativeAndDirectBackends",
             )
-            evidence = materialize_evidence.materialize(
+            evidence = self.materialize(
                 root,
                 "qualification-long-stall.json",
                 "long-stall",
@@ -3919,7 +6040,7 @@ class QualificationEvidenceTests(unittest.TestCase):
                     attachment_name=f"qualification-{scenario}.json",
                     test_identifier="PiPDismissalDeviceUITests/test_systemRestoreAndCloseAcrossNativeAndDirectBackends",
                 )
-                evidence = materialize_evidence.materialize(
+                evidence = self.materialize(
                     root,
                     f"qualification-{scenario}.json",
                     scenario,
@@ -3974,7 +6095,7 @@ class QualificationEvidenceTests(unittest.TestCase):
                 attachment_name="qualification-interruptions.json",
                 test_identifier="PiPInterruptionDeviceUITests/test_audioInterruptionAndRouteLossAcrossNativeAndDirectBackends",
             )
-            evidence = materialize_evidence.materialize(
+            evidence = self.materialize(
                 root,
                 "qualification-interruptions.json",
                 "interruptions",
@@ -4074,7 +6195,7 @@ class QualificationEvidenceTests(unittest.TestCase):
                 attachment_name="qualification-native-lifecycle.json",
                 test_identifier="PiPNativeLifecycleDeviceUITests/test_nativeLifecyclePublishesAuthoritativeOrderedEvents",
             )
-            evidence = materialize_evidence.materialize(
+            evidence = self.materialize(
                 root,
                 "qualification-native-lifecycle.json",
                 "native-lifecycle",
@@ -4144,7 +6265,7 @@ class QualificationEvidenceTests(unittest.TestCase):
                 attachment_name="qualification-terminal-outcomes.json",
                 test_identifier="TerminalOutcomesDeviceUITests/test_terminalOutcomeMatrixIsGenerationScopedAndPreReset",
             )
-            evidence = materialize_evidence.materialize(
+            evidence = self.materialize(
                 root,
                 "qualification-terminal-outcomes.json",
                 "terminal-outcomes",
@@ -4202,7 +6323,7 @@ class QualificationEvidenceTests(unittest.TestCase):
                 attachment_name="qualification-adaptive-hls-soak.json",
                 test_identifier="AdaptiveHLSSoakDeviceUITests/test_adaptiveHLSMatrixSoakRemainsBounded",
             )
-            evidence = materialize_evidence.materialize(
+            evidence = self.materialize(
                 root,
                 "qualification-adaptive-hls-soak.json",
                 "adaptive-hls-soak",
@@ -4301,7 +6422,7 @@ class QualificationEvidenceTests(unittest.TestCase):
                 attachment_name="qualification-cadence-matrix.json",
                 test_identifier="PiPCadenceDeviceUITests/test_directPiPCadenceMatrix",
             )
-            evidence = materialize_evidence.materialize(
+            evidence = self.materialize(
                 root,
                 "qualification-cadence-matrix.json",
                 "cadence-matrix",
@@ -4424,7 +6545,7 @@ class QualificationEvidenceTests(unittest.TestCase):
                 attachment_name="qualification-native-subtitle-matrix.json",
                 test_identifier="NativeSubtitleMatrixDeviceUITests/test_nativeSubtitleMatrixIsVisibleAndBounded",
             )
-            evidence = materialize_evidence.materialize(
+            evidence = self.materialize(
                 root,
                 "qualification-native-subtitle-matrix.json",
                 "native-subtitle-matrix",
@@ -4654,7 +6775,7 @@ class QualificationEvidenceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             self.make_delayed_start_export(root)
-            evidence = materialize_evidence.materialize(
+            evidence = self.materialize(
                 root,
                 "qualification-accepted-start-delayed-failure.json",
                 "accepted-start-delayed-failure",
@@ -4672,7 +6793,7 @@ class QualificationEvidenceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             self.make_delayed_start_export(root)
-            evidence = materialize_evidence.materialize(
+            evidence = self.materialize(
                 root,
                 "qualification-failed-start.json",
                 "failed-start",
@@ -4706,7 +6827,7 @@ class QualificationEvidenceTests(unittest.TestCase):
                     mutation(candidate)
                     manifest_path.write_text(json.dumps(candidate))
                     with self.assertRaises(materialize_evidence.EvidenceError):
-                        materialize_evidence.materialize(
+                        self.materialize(
                             root,
                             "qualification-failed-start.json",
                             "failed-start",
@@ -4735,7 +6856,7 @@ class QualificationEvidenceTests(unittest.TestCase):
                 attachment_name="qualification-replacement.json",
                 test_identifier="PiPContinuityDeviceUITests/test_nativePiPSurvivesSamePlayerReplacement",
             )
-            evidence = materialize_evidence.materialize(
+            evidence = self.materialize(
                 root,
                 "qualification-replacement.json",
                 "replacement",
@@ -4759,7 +6880,7 @@ class QualificationEvidenceTests(unittest.TestCase):
                 attachment_count=2,
             )
             with self.assertRaises(materialize_evidence.EvidenceError):
-                materialize_evidence.materialize(
+                self.materialize(
                     root,
                     "qualification-native-hls-seek-continuity.json",
                     "native-hls-seek-continuity",
@@ -4776,7 +6897,7 @@ class QualificationEvidenceTests(unittest.TestCase):
                 },
             )
             with self.assertRaises(materialize_evidence.EvidenceError):
-                materialize_evidence.materialize(
+                self.materialize(
                     root,
                     "qualification-native-hls-seek-continuity.json",
                     "native-hls-seek-continuity",
@@ -4804,7 +6925,7 @@ class QualificationEvidenceTests(unittest.TestCase):
                 materialize_evidence.EvidenceError,
                 "test attachment may not supply host identity fields: sourceRequestProof",
             ):
-                materialize_evidence.materialize(
+                self.materialize(
                     root,
                     "qualification-audio-media-services-reset.json",
                     "audio-media-services-reset",
@@ -4869,7 +6990,7 @@ class QualificationEvidenceTests(unittest.TestCase):
                     "xcresultSizeBytes": 123,
                 }
             ]
-            evidence = materialize_evidence.materialize(
+            evidence = self.materialize(
                 root,
                 "qualification-audio-media-services-reset.json",
                 "audio-media-services-reset",
@@ -5037,6 +7158,9 @@ class QualificationRecordAssemblyTests(unittest.TestCase):
         assemble_record.policy.inspect_xcresult_qualification_attachments = (
             inspect_fixture_attachments
         )
+        source_commit = "b" * 40
+        release_source_digest = "c" * 64
+        artifact_digest = "a" * 64
         self.candidate.write_text(
             json.dumps(
                 {
@@ -5046,10 +7170,21 @@ class QualificationRecordAssemblyTests(unittest.TestCase):
                         "com.swiftvlc.validation.team.app"
                     ),
                     "artifactDigestAlgorithm": "swiftvlc-tree-v1",
-                    "artifactDigest": "a" * 64,
-                    "sourceCommit": "b" * 40,
+                    "artifactDigest": artifact_digest,
+                    "sourceCommit": source_commit,
                     "releaseSourceDigestAlgorithm": "swiftvlc-git-tree-v1",
-                    "releaseSourceDigest": "c" * 64,
+                    "releaseSourceDigest": release_source_digest,
+                    **fixture_candidate_build_attestation_fields(
+                        source_commit=source_commit,
+                        release_source_digest=release_source_digest,
+                        artifact_digest=artifact_digest,
+                        catalog=catalog,
+                        candidate_app_digest="d" * 64,
+                        test_runner_digest="e" * 64,
+                        test_bundle_digest="f" * 64,
+                        base_xctestrun_digest="1" * 64,
+                        base_xctestrun_name="fixture.xctestrun",
+                    ),
                     "candidateAppDigestAlgorithm": "swiftvlc-tree-v1",
                     "candidateAppDigest": "d" * 64,
                     "testRunnerBundleIdentifier": (
@@ -5084,7 +7219,14 @@ class QualificationRecordAssemblyTests(unittest.TestCase):
         )
         self.temporary.cleanup()
 
-    def make_report(self, hardware: str, release_type: str = "stable") -> Path:
+    def make_report(
+        self,
+        hardware: str,
+        release_type: str = "stable",
+        *,
+        validate_receipt: bool = True,
+    ) -> Path:
+        stable = release_type == "stable"
         matrix = json.loads(self.matrix.read_text())
         scenario = matrix["scenarios"][0]["id"]
         output_contract = {
@@ -5109,6 +7251,17 @@ class QualificationRecordAssemblyTests(unittest.TestCase):
         self.matrix_checksum = hashlib.sha256(self.matrix.read_bytes()).hexdigest()
         candidate = json.loads(self.candidate.read_text())
         candidate["qualificationMatrixChecksum"] = self.matrix_checksum
+        catalog_record = qualification_policy.catalog_record(self.catalog)
+        candidate["testCatalog"] = self.catalog
+        candidate["testCatalogCount"] = catalog_record["testCount"]
+        candidate["testCatalogDigest"] = catalog_record["digest"]
+        attestation = candidate["candidateBuildAttestation"]
+        attestation["testCatalog"] = self.catalog
+        attestation["testCatalogCount"] = catalog_record["testCount"]
+        attestation["testCatalogDigest"] = catalog_record["digest"]
+        candidate["candidateBuildAttestationDigest"] = hashlib.sha256(
+            qualification_policy.canonical_json_bytes(attestation)
+        ).hexdigest()
         self.candidate.write_text(json.dumps(candidate))
         catalog = qualification_policy.catalog_record(candidate["testCatalog"])
         execution = {
@@ -5159,6 +7312,8 @@ class QualificationRecordAssemblyTests(unittest.TestCase):
             "scenario": scenario,
             "outcome": "pass",
             "durationSeconds": duration,
+            "qualificationSessionBinding": FIXTURE_SESSION_BINDING,
+            "candidateRuntimeBinding": candidate["candidateRuntimeBinding"],
         }
         if scenario in qualification_policy.RAW_HOST_TRACE_REQUIREMENTS:
             raw_attachment["hostTraceRequirements"] = (
@@ -5213,7 +7368,8 @@ class QualificationRecordAssemblyTests(unittest.TestCase):
             ],
             directory,
         )
-        evidence = evidence_directory / "seek.json"
+        evidence_name = "seek.json" if stable else f"seek-{hardware}.json"
+        evidence = evidence_directory / evidence_name
         evidence.write_text(
             json.dumps(
                 {
@@ -5266,6 +7422,35 @@ class QualificationRecordAssemblyTests(unittest.TestCase):
         )
         completed_at = datetime.now(timezone.utc).replace(microsecond=0)
         started_at = completed_at - timedelta(seconds=duration)
+        selected_device = {
+            "id": f"coredevice-{hardware}",
+            "udid": f"fixture-{hardware}",
+            "ecid": 42,
+            "ecidHex": "0x2A",
+            "name": f"Fixture {hardware}",
+            "marketingName": f"Fixture {hardware}",
+            "productType": "Fixture1,1",
+            "deviceFamily": "iPhone" if hardware == "iphone" else "iPad",
+            "osVersion": "26.0",
+            "osMajor": 26,
+            "osBuild": "23A1",
+            "osReleaseType": release_type,
+            "transport": "wired",
+            "tunnelIPAddress": "fd00::1",
+            "connected": True,
+            "matchingHardwareRows": [hardware],
+            "qualificationEligible": stable,
+        }
+        mode = "qualification" if stable else "exploratory"
+        report_validation.atomic_write_json(
+            directory / qualification_policy.DEVICE_SNAPSHOT_RELATIVE_PATH,
+            {
+                "selected": selected_device,
+                "connected": [selected_device],
+                "allPhysicalIOSDevices": [selected_device],
+                "mode": mode,
+            },
+        )
         report = directory / "report.json"
         report.write_text(
             json.dumps(
@@ -5274,10 +7459,16 @@ class QualificationRecordAssemblyTests(unittest.TestCase):
                     "startedAtUTC": started_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
                     "completedAtUTC": completed_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
                     "wallDurationSeconds": duration,
-                    "qualificationEligibleEnvironment": release_type == "stable",
-                    "device": {"udid": f"fixture-{hardware}"},
-                    "mode": (
-                        "qualification" if release_type == "stable" else "exploratory"
+                    "qualificationEligibleEnvironment": stable,
+                    "device": selected_device,
+                    "deviceSnapshot": qualification_policy.device_snapshot_binding(
+                        directory
+                    ),
+                    "mode": mode,
+                    "reportOnly": False,
+                    "releaseGateSatisfied": False,
+                    "releaseGateReason": (
+                        qualification_policy.ORDINARY_RELEASE_GATE_REASON
                     ),
                     "result": "pass",
                     "scenarios": [
@@ -5296,30 +7487,70 @@ class QualificationRecordAssemblyTests(unittest.TestCase):
                             "qualificationEvidence": "captured",
                         }
                     ],
-                    "qualificationRows": [
-                        {
-                            "scenario": scenario,
-                            "runnerScenario": scenario,
-                            "hardware": hardware,
-                            "device": f"Fixture {hardware}",
-                            "deviceFamily": (
-                                "iPhone" if hardware == "iphone" else "iPad"
-                            ),
-                            "productType": "Fixture1,1",
-                            "osVersion": "26.0",
-                            "osBuild": "23A1",
-                            "osReleaseType": release_type,
-                            "fixture": "qualification-fixtures:" + "4" * 64,
-                            "duration": f"{duration}s",
-                            "durationSeconds": duration,
-                            "evidence": "evidence/seek.json",
-                            "result": "pass",
-                        }
-                    ],
+                    "qualificationRows": (
+                        [
+                            {
+                                "scenario": scenario,
+                                "runnerScenario": scenario,
+                                "hardware": hardware,
+                                "device": f"Fixture {hardware}",
+                                "deviceFamily": (
+                                    "iPhone" if hardware == "iphone" else "iPad"
+                                ),
+                                "productType": "Fixture1,1",
+                                "osVersion": "26.0",
+                                "osBuild": "23A1",
+                                "osReleaseType": release_type,
+                                "fixture": "qualification-fixtures:" + "4" * 64,
+                                "duration": f"{duration}s",
+                                "durationSeconds": duration,
+                                "evidence": "evidence/seek.json",
+                                "result": "pass",
+                            }
+                        ]
+                        if stable
+                        else []
+                    ),
                 }
             )
         )
+        if validate_receipt:
+            self.validate_report_receipt(report, stable_required=stable)
         return report
+
+    def validate_report_receipt(
+        self,
+        report: Path,
+        *,
+        projected_hardware_row: str | None = None,
+        stable_required: bool = False,
+    ) -> Path:
+        payload = json.loads(report.read_text())
+        payload["orchestratorSessionBinding"] = FIXTURE_SESSION_BINDING
+        payload["orchestratorStartedAtUTC"] = payload["startedAtUTC"]
+        report_validation.atomic_write_json(report, payload)
+        scenario_ids = [row["scenario"] for row in payload["scenarios"]]
+        plan = validation_plan.build_plan(
+            {"mode": payload["mode"], "selected": payload["device"]},
+            json.loads(self.matrix.read_text()),
+            scenario_ids,
+            scenario_ids,
+            started_at_utc=payload["startedAtUTC"],
+            orchestrator_session_binding=FIXTURE_SESSION_BINDING,
+            orchestrator_started_at_utc=payload["startedAtUTC"],
+            projected_hardware_row=projected_hardware_row,
+            selection_scope="partial",
+        )
+        report_validation.atomic_write_json(
+            report.parent / report_validation.PLAN_FILENAME,
+            plan,
+        )
+        return report_validation.validate_and_mark(
+            report.parent,
+            matrix_path=self.matrix,
+            candidate_path=self.candidate,
+            stable_required=stable_required,
+        )
 
     def add_support_runner(
         self, report_path: Path, runner: str, *, capture_log: bool = True
@@ -5426,6 +7657,492 @@ class QualificationRecordAssemblyTests(unittest.TestCase):
         self.assertEqual(record["artifactDigest"], "a" * 64)
         for row in record["rows"]:
             self.assertTrue((output.parent / row["evidence"]).is_file())
+
+    def test_assembler_rejects_a_semantic_pass_without_validation_receipt(self):
+        report = self.make_report("iphone")
+        (report.parent / report_validation.MARKER_FILENAME).unlink()
+
+        with self.assertRaisesRegex(
+            assemble_record.AssemblyError,
+            "no matching successful-validation receipt",
+        ):
+            assemble_record.assemble(
+                "1.1.0",
+                self.candidate,
+                self.matrix,
+                [report],
+                self.root / "qualification" / "receiptless.json",
+            )
+
+    def test_record_reopens_validation_receipt_for_every_retained_source(self):
+        report = self.make_report("iphone")
+        output = self.root / "qualification" / "receipt-record.json"
+        record = assemble_record.assemble(
+            "1.1.0", self.candidate, self.matrix, [report], output
+        )
+        binding = record["sourceReports"][0]
+        retained_root = output.parent / binding["path"]
+        (retained_root / report_validation.MARKER_FILENAME).unlink()
+        binding["treeDigest"] = qualification_policy.tree_digest(retained_root)
+        binding["treeSizeBytes"] = qualification_policy.tree_size_bytes(retained_root)
+        output.write_text(json.dumps(record))
+
+        with self.assertRaisesRegex(
+            assemble_record.policy.QualificationPolicyError,
+            "no matching successful-validation receipt",
+        ):
+            assemble_record.policy.validate_record(
+                output,
+                json.loads(self.matrix.read_text()),
+                expected_identity=json.loads(self.candidate.read_text()),
+                strict_provenance=True,
+                require_complete=False,
+            )
+
+    def test_current_os_beta_report_validates_evidence_without_release_rows(self):
+        report = self.make_report("iphone", release_type="beta")
+        matrix = json.loads(self.matrix.read_text())
+        candidate = json.loads(self.candidate.read_text())
+
+        validated = assemble_record.policy.validate_report(
+            report,
+            matrix,
+            candidate=candidate,
+            stable_required=False,
+            strict_provenance=True,
+        )
+
+        self.assertEqual(validated["mode"], "exploratory")
+        self.assertEqual(validated["qualificationRows"], [])
+        self.assertEqual(
+            validated["scenarios"][0]["qualificationEvidence"], "captured"
+        )
+        self.assertTrue((report.parent / "evidence" / "seek-iphone.json").is_file())
+        self.validate_report_receipt(report)
+        self.assertTrue(report_validation.is_valid(report.parent))
+        (report.parent / "evidence" / "seek-iphone.json").unlink()
+        with self.assertRaises(assemble_record.policy.QualificationPolicyError):
+            assemble_record.policy.validate_report(
+                report,
+                matrix,
+                candidate=candidate,
+                stable_required=False,
+                strict_provenance=True,
+            )
+        self.assertFalse(report_validation.is_valid(report.parent))
+
+    def test_runner_assembles_and_validates_a_forced_product_failure_without_execution(self):
+        report = self.make_report("iphone", validate_receipt=False)
+        payload = json.loads(report.read_text())
+        runner = payload["scenarios"][0]
+        attempt_root = report.parent / runner["attemptArtifactRoot"]
+        attempt_log = attempt_root / "attempt-1.log"
+        attempt_bundle = attempt_root / "attempt-1.xcresult"
+        attempt_log.write_text(
+            "** TEST EXECUTE FAILED **\n"
+            "Test Case '-[iOSUITests.FixtureQualificationTests test_fixture]' failed.\n"
+        )
+
+        passing_reader = assemble_record.policy.xcresult_test_document
+        assemble_record.policy.xcresult_test_document = lambda _path: {
+            "testNodes": [
+                {
+                    "nodeType": "Test Case",
+                    "nodeIdentifier": self.catalog[0],
+                    "result": "Failed",
+                },
+                {
+                    "nodeType": "Failure Message",
+                    "name": "XCTAssertTrue failed",
+                },
+            ]
+        }
+        try:
+            classification = assemble_record.policy.classify_retry(
+                attempt_bundle,
+                attempt_log.read_text(),
+                runner["expectedTestCatalog"],
+            )
+            attempts = assemble_record.policy.bind_attempt_artifacts(
+                [
+                    {
+                        **classification,
+                        "attempt": 1,
+                        "xcodebuildExitCode": 65,
+                        "terminalReason": "XCTest failed",
+                        "logArtifact": attempt_log.relative_to(
+                            report.parent
+                        ).as_posix(),
+                        "xcresultArtifact": attempt_bundle.relative_to(
+                            report.parent
+                        ).as_posix(),
+                    }
+                ],
+                report.parent,
+            )
+
+            expected_catalog_path = report.parent / "seek-expected-test-catalog.json"
+            expected_catalog_path.write_text(json.dumps(runner["expectedTestCatalog"]))
+            attempts_path = report.parent / "seek-attempts.json"
+            attempts_path.write_text(json.dumps(attempts))
+            inventory_path = report.parent / "seek-error-inventory.json"
+            inventory_path.write_text(json.dumps(runner["hostErrorInventory"]))
+            qualification_rows_path = report.parent / "qualification-rows.jsonl"
+            qualification_rows_path.write_text("")
+            results_path = report.parent / "scenario-results.tsv"
+            results_path.write_text(
+                "\t".join(
+                    [
+                        runner["scenario"],
+                        "fail",
+                        "65",
+                        "0",
+                        runner["appLog"],
+                        "missing",
+                        str(runner["durationSeconds"]),
+                        str(expected_catalog_path),
+                        "",
+                        str(attempts_path),
+                        str(inventory_path),
+                    ]
+                )
+                + "\n"
+            )
+
+            runner_script = (
+                ROOT / "qualification" / "run-device-tests.sh"
+            ).read_text()
+            self.assertIn(
+                'local test_execution=""\n'
+                '  if [[ -n "$final_test_execution" && -f "$final_test_execution" ]]; then\n'
+                '    test_execution="$OUTPUT_DIR/$scenario-test-execution.json"',
+                runner_script,
+            )
+            assembly_invocation = (
+                '"$ORCHESTRATOR_SESSION_BINDING" '
+                '"$ORCHESTRATOR_STARTED_AT_UTC" <<\'PY\'\n'
+            )
+            assembly_start = runner_script.index(assembly_invocation) + len(
+                assembly_invocation
+            )
+            assembly_end = runner_script.index(
+                "\nPY\n\nreport_validation_args=", assembly_start
+            )
+            assembly_source = runner_script[assembly_start:assembly_end]
+            candidate = json.loads(self.candidate.read_text())
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-",
+                    str(results_path),
+                    str(report),
+                    str(report.parent / qualification_policy.DEVICE_SNAPSHOT_RELATIVE_PATH),
+                    candidate["version"],
+                    candidate["sourceCommit"],
+                    candidate["releaseSourceDigest"],
+                    candidate["qualificationMatrixChecksum"],
+                    candidate["candidateAppDigest"],
+                    candidate["artifactDigest"],
+                    payload["mode"],
+                    str(qualification_rows_path),
+                    str(self.candidate),
+                    "false",
+                    payload["startedAtUTC"],
+                    str(ROOT / "qualification"),
+                    FIXTURE_SESSION_BINDING,
+                    payload["startedAtUTC"],
+                ],
+                input=assembly_source,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+
+            assembled = json.loads(report.read_text())
+            self.assertEqual(assembled["result"], "fail")
+            self.assertIsNone(assembled["scenarios"][0]["testExecution"])
+            self.validate_report_receipt(report, stable_required=True)
+            self.assertTrue(report_validation.is_valid(report.parent))
+        finally:
+            assemble_record.policy.xcresult_test_document = passing_reader
+
+    def test_future_os_beta_report_projects_tests_without_release_credit(self):
+        report = self.make_report("iphone", release_type="beta")
+        payload = json.loads(report.read_text())
+        payload["device"].update(
+            {
+                "matchingHardwareRows": [],
+                "osMajor": 27,
+                "osVersion": "27.0",
+                "osBuild": "24A1",
+            }
+        )
+        device_snapshot = {
+            "selected": payload["device"],
+            "connected": [payload["device"]],
+            "allPhysicalIOSDevices": [payload["device"]],
+            "mode": payload["mode"],
+        }
+        report_validation.atomic_write_json(
+            report.parent / qualification_policy.DEVICE_SNAPSHOT_RELATIVE_PATH,
+            device_snapshot,
+        )
+        payload["deviceSnapshot"] = qualification_policy.device_snapshot_binding(
+            report.parent
+        )
+        report.write_text(json.dumps(payload))
+        old_evidence = report.parent / "evidence" / "seek-iphone.json"
+        evidence = json.loads(old_evidence.read_text())
+        evidence["hardware"] = (
+            qualification_policy.EXPLORATORY_FUTURE_IOS_HARDWARE_ID
+        )
+        future_evidence = old_evidence.with_name(
+            "seek-exploratory-future-ios.json"
+        )
+        future_evidence.write_text(json.dumps(evidence))
+        old_evidence.unlink()
+
+        validated = assemble_record.policy.validate_report(
+            report,
+            json.loads(self.matrix.read_text()),
+            candidate=json.loads(self.candidate.read_text()),
+            stable_required=False,
+            strict_provenance=True,
+        )
+
+        self.assertEqual(validated["qualificationRows"], [])
+        self.assertEqual(validated["device"]["matchingHardwareRows"], [])
+        self.validate_report_receipt(
+            report,
+            projected_hardware_row="iphone",
+        )
+        self.assertTrue(report_validation.is_valid(report.parent))
+
+    def test_strict_report_requires_exact_bound_device_snapshot(self):
+        report = self.make_report("iphone")
+        matrix = json.loads(self.matrix.read_text())
+        candidate = json.loads(self.candidate.read_text())
+        snapshot_path = (
+            report.parent / qualification_policy.DEVICE_SNAPSHOT_RELATIVE_PATH
+        )
+        original_report = json.loads(report.read_text())
+        original_snapshot = json.loads(snapshot_path.read_text())
+
+        def raw_binding() -> dict:
+            return {
+                "relativePath": qualification_policy.DEVICE_SNAPSHOT_RELATIVE_PATH,
+                "digestAlgorithm": "sha256",
+                "digest": qualification_policy.sha256_file(snapshot_path),
+                "sizeBytes": snapshot_path.stat().st_size,
+            }
+
+        def assert_rejected(
+            expected_message: str, mutated_report: dict, mutated_snapshot: dict
+        ) -> None:
+            report_validation.atomic_write_json(snapshot_path, mutated_snapshot)
+            report.write_text(json.dumps(mutated_report))
+            with self.assertRaisesRegex(
+                assemble_record.policy.QualificationPolicyError,
+                expected_message,
+            ):
+                assemble_record.policy.validate_report(
+                    report,
+                    matrix,
+                    candidate=candidate,
+                    stable_required=True,
+                    strict_provenance=True,
+                )
+
+        changed_bytes = json.loads(json.dumps(original_snapshot))
+        changed_bytes["selected"]["name"] = "Relabelled phone"
+        changed_bytes["connected"] = [changed_bytes["selected"]]
+        changed_bytes["allPhysicalIOSDevices"] = [changed_bytes["selected"]]
+        assert_rejected(
+            "snapshot binding mismatch",
+            json.loads(json.dumps(original_report)),
+            changed_bytes,
+        )
+
+        changed_device = json.loads(json.dumps(original_snapshot))
+        changed_device["selected"]["name"] = "Self-consistent relabel"
+        changed_device["connected"] = [changed_device["selected"]]
+        changed_device["allPhysicalIOSDevices"] = [changed_device["selected"]]
+        report_validation.atomic_write_json(snapshot_path, changed_device)
+        rebound_report = json.loads(json.dumps(original_report))
+        rebound_report["deviceSnapshot"] = raw_binding()
+        assert_rejected(
+            "device differs from retained selected device",
+            rebound_report,
+            changed_device,
+        )
+
+        changed_mode = json.loads(json.dumps(original_snapshot))
+        changed_mode["selected"]["osReleaseType"] = "beta"
+        changed_mode["selected"]["qualificationEligible"] = False
+        changed_mode["connected"] = [changed_mode["selected"]]
+        changed_mode["allPhysicalIOSDevices"] = [changed_mode["selected"]]
+        changed_mode["mode"] = "exploratory"
+        report_validation.atomic_write_json(snapshot_path, changed_mode)
+        rebound_report = json.loads(json.dumps(original_report))
+        rebound_report["deviceSnapshot"] = raw_binding()
+        assert_rejected(
+            "mode differs from retained device snapshot",
+            rebound_report,
+            changed_mode,
+        )
+
+        noncanonical = json.loads(json.dumps(original_snapshot))
+        noncanonical["selected"]["fabricatedField"] = "accepted-by-default"
+        noncanonical["connected"] = [noncanonical["selected"]]
+        noncanonical["allPhysicalIOSDevices"] = [noncanonical["selected"]]
+        report_validation.atomic_write_json(snapshot_path, noncanonical)
+        rebound_report = json.loads(json.dumps(original_report))
+        rebound_report["device"] = noncanonical["selected"]
+        rebound_report["deviceSnapshot"] = raw_binding()
+        assert_rejected(
+            "selected device fields are not canonical",
+            rebound_report,
+            noncanonical,
+        )
+
+    def test_exploratory_report_cannot_fabricate_a_qualification_row(self):
+        report = self.make_report("iphone", release_type="beta")
+        payload = json.loads(report.read_text())
+        payload["qualificationRows"] = [
+            {
+                "scenario": "seek",
+                "runnerScenario": "seek",
+                "hardware": "iphone",
+                "result": "pass",
+            }
+        ]
+        report.write_text(json.dumps(payload))
+
+        with self.assertRaises(assemble_record.policy.QualificationPolicyError):
+            assemble_record.policy.validate_report(
+                report,
+                json.loads(self.matrix.read_text()),
+                candidate=json.loads(self.candidate.read_text()),
+                stable_required=False,
+                strict_provenance=True,
+            )
+
+    def test_failed_output_runner_validates_without_a_qualification_row(self):
+        report = self.make_report("iphone")
+        payload = json.loads(report.read_text())
+        runner = payload["scenarios"][0]
+        attempt_root = report.parent / runner["attemptArtifactRoot"]
+        attempt_log = attempt_root / "attempt-1.log"
+        attempt_bundle = attempt_root / "attempt-1.xcresult"
+        attempt_log.write_text(
+            "** TEST EXECUTE FAILED **\n"
+            "Test Case '-[iOSUITests.FixtureQualificationTests test_fixture]' failed.\n"
+        )
+        passing_reader = assemble_record.policy.xcresult_test_document
+        assemble_record.policy.xcresult_test_document = lambda _path: {
+            "testNodes": [
+                {
+                    "nodeType": "Test Case",
+                    "nodeIdentifier": self.catalog[0],
+                    "result": "Failed",
+                },
+                {
+                    "nodeType": "Failure Message",
+                    "name": "XCTAssertTrue failed",
+                },
+            ]
+        }
+        try:
+            classification = assemble_record.policy.classify_retry(
+                attempt_bundle,
+                attempt_log.read_text(),
+                runner["expectedTestCatalog"],
+            )
+            attempts = assemble_record.policy.bind_attempt_artifacts(
+                [
+                    {
+                        **classification,
+                        "attempt": 1,
+                        "xcodebuildExitCode": 65,
+                        "terminalReason": "XCTest failed",
+                        "logArtifact": attempt_log.relative_to(
+                            report.parent
+                        ).as_posix(),
+                        "xcresultArtifact": attempt_bundle.relative_to(
+                            report.parent
+                        ).as_posix(),
+                    }
+                ],
+                report.parent,
+            )
+            runner.update(
+                {
+                    "result": "fail",
+                    "xcodebuildExitCode": 65,
+                    "qualificationEvidence": "missing",
+                    "testExecution": None,
+                    "attempts": attempts,
+                }
+            )
+            payload["result"] = "fail"
+            payload["qualificationRows"] = []
+            report.write_text(json.dumps(payload))
+
+            validated = assemble_record.policy.validate_report(
+                report,
+                json.loads(self.matrix.read_text()),
+                candidate=json.loads(self.candidate.read_text()),
+                stable_required=True,
+                strict_provenance=True,
+            )
+            self.validate_report_receipt(report, stable_required=True)
+            self.assertTrue(report_validation.is_valid(report.parent))
+        finally:
+            assemble_record.policy.xcresult_test_document = passing_reader
+
+        self.assertEqual(validated["result"], "fail")
+        self.assertEqual(validated["qualificationRows"], [])
+        self.assertEqual(
+            validated["scenarios"][0]["expectedTestCatalog"]["testIdentifiers"],
+            self.catalog,
+        )
+
+    def test_report_result_must_reconcile_with_runner_results(self):
+        report = self.make_report("iphone")
+        payload = json.loads(report.read_text())
+        payload["result"] = "fail"
+        report.write_text(json.dumps(payload))
+
+        with self.assertRaisesRegex(
+            assemble_record.policy.QualificationPolicyError,
+            "does not reconcile",
+        ):
+            assemble_record.policy.validate_report(
+                report,
+                json.loads(self.matrix.read_text()),
+                candidate=json.loads(self.candidate.read_text()),
+                stable_required=False,
+                strict_provenance=True,
+            )
+
+    def test_qualification_row_must_belong_to_the_report_device(self):
+        report = self.make_report("iphone")
+        payload = json.loads(report.read_text())
+        payload["qualificationRows"][0]["hardware"] = "ipad"
+        report.write_text(json.dumps(payload))
+
+        with self.assertRaisesRegex(
+            assemble_record.policy.QualificationPolicyError,
+            "does not belong to the report device",
+        ):
+            assemble_record.policy.validate_report(
+                report,
+                json.loads(self.matrix.read_text()),
+                candidate=json.loads(self.candidate.read_text()),
+                stable_required=True,
+                strict_provenance=True,
+            )
 
     def test_rejects_retained_raw_log_swap_extra_delete_and_rename(self):
         report = self.make_report("iphone")
@@ -5899,6 +8616,7 @@ class QualificationRecordAssemblyTests(unittest.TestCase):
         )
         for runner in common_release_runners:
             self.add_support_runner(iphone, runner, capture_log=runner != "analyzer")
+        self.validate_report_receipt(iphone, stable_required=True)
         ipad = self.make_report("ipad")
         output = self.root / "qualification" / "per-hardware.json"
         record = assemble_record.assemble(
@@ -5964,6 +8682,7 @@ class QualificationRecordAssemblyTests(unittest.TestCase):
             }
         }
         evidence_path.write_text(json.dumps(evidence))
+        self.validate_report_receipt(iphone, stable_required=True)
 
         output = self.root / "qualification" / "1.1.0.json"
         assemble_record.assemble(
@@ -5995,7 +8714,7 @@ class QualificationRecordAssemblyTests(unittest.TestCase):
             )
         )
         self.matrix_checksum = hashlib.sha256(self.matrix.read_bytes()).hexdigest()
-        report_path = self.make_report("iphone")
+        report_path = self.make_report("iphone", validate_receipt=False)
         report = json.loads(report_path.read_text())
         report["qualificationRows"][0]["scenario"] = scenario
         report_path.write_text(json.dumps(report))
@@ -6110,6 +8829,8 @@ class QualificationRecordAssemblyTests(unittest.TestCase):
             "scenario": scenario,
             "outcome": "pass",
             "durationSeconds": 900,
+            "qualificationSessionBinding": FIXTURE_SESSION_BINDING,
+            "candidateRuntimeBinding": evidence["candidateRuntimeBinding"],
             "profile": evidence["profile"],
             "samples": evidence["samples"],
             "visualObservations": evidence["visualObservations"],
@@ -6140,6 +8861,7 @@ class QualificationRecordAssemblyTests(unittest.TestCase):
             "attachmentSizeBytes"
         ] = attachment_payload.stat().st_size
         evidence_path.write_text(json.dumps(evidence))
+        self.validate_report_receipt(report_path, stable_required=True)
 
         output = self.root / "qualification" / "1.1.0.json"
         assemble_record.assemble(
@@ -6182,7 +8904,7 @@ class QualificationRecordAssemblyTests(unittest.TestCase):
             )
         )
         self.matrix_checksum = hashlib.sha256(self.matrix.read_bytes()).hexdigest()
-        report_path = self.make_report("iphone")
+        report_path = self.make_report("iphone", validate_receipt=False)
         report = json.loads(report_path.read_text())
         report["qualificationRows"][0]["scenario"] = scenario
         report_path.write_text(json.dumps(report))
@@ -6226,6 +8948,7 @@ class QualificationRecordAssemblyTests(unittest.TestCase):
             "samples": [{"elapsedSeconds": elapsed} for elapsed in range(0, 901, 100)],
         }
         evidence_path.write_text(json.dumps(evidence))
+        self.validate_report_receipt(report_path, stable_required=True)
 
         output = self.root / "qualification" / "1.1.0.json"
         assemble_record.assemble(
@@ -6268,7 +8991,7 @@ class QualificationRecordAssemblyTests(unittest.TestCase):
             )
         )
         self.matrix_checksum = hashlib.sha256(self.matrix.read_bytes()).hexdigest()
-        report_path = self.make_report("iphone")
+        report_path = self.make_report("iphone", validate_receipt=False)
         report = json.loads(report_path.read_text())
         report["qualificationRows"][0]["scenario"] = scenario
         report_path.write_text(json.dumps(report))
@@ -6339,6 +9062,7 @@ class QualificationRecordAssemblyTests(unittest.TestCase):
         evidence["driftBudget"] = {"maximumSeconds": 2.1}
         evidence["correctionBudget"] = {"maximumSeconds": 2.1}
         evidence_path.write_text(json.dumps(evidence))
+        self.validate_report_receipt(report_path, stable_required=True)
 
         output = self.root / "qualification" / "1.1.0.json"
         assemble_record.assemble(
@@ -6422,6 +9146,7 @@ class QualificationRecordAssemblyTests(unittest.TestCase):
             )
 
     def test_rejects_candidate_algorithm_mismatch(self):
+        report = self.make_report("iphone")
         payload = json.loads(self.candidate.read_text())
         payload["artifactDigestAlgorithm"] = "sha256-file-only"
         self.candidate.write_text(json.dumps(payload))
@@ -6430,7 +9155,7 @@ class QualificationRecordAssemblyTests(unittest.TestCase):
                 "1.1.0",
                 self.candidate,
                 self.matrix,
-                [self.make_report("iphone")],
+                [report],
                 self.root / "qualification" / "1.1.0.json",
             )
 

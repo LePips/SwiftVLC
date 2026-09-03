@@ -16,6 +16,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import qualification_policy as policy
+import report_validation
 
 
 class AssemblyError(ValueError):
@@ -306,6 +307,26 @@ def assemble(
                 f"output directory may not be inside source report tree {source_root}"
             )
         try:
+            report_bytes = report_validation.regular_file_bytes(
+                canonical_report_path, f"source report {report_path}"
+            )
+        except report_validation.ReportValidationError as error:
+            raise AssemblyError(str(error)) from error
+        if not report_validation.is_valid(
+            source_root, report_bytes=report_bytes
+        ):
+            raise AssemblyError(
+                f"report {report_path} has no matching successful-validation receipt"
+            )
+        if policy.is_release_matrix(matrix) and not (
+            report_validation.is_release_scope_valid(
+                source_root, report_bytes=report_bytes
+            )
+        ):
+            raise AssemblyError(
+                f"report {report_path} is not a canonical full-scope release run"
+            )
+        try:
             report = policy.validate_report(
                 canonical_report_path,
                 matrix,
@@ -315,6 +336,21 @@ def assemble(
             )
         except policy.QualificationPolicyError as error:
             raise AssemblyError(str(error)) from error
+        try:
+            report_unchanged = (
+                report_validation.regular_file_bytes(
+                    canonical_report_path, f"source report {report_path}"
+                )
+                == report_bytes
+            )
+        except report_validation.ReportValidationError as error:
+            raise AssemblyError(str(error)) from error
+        if not report_unchanged or not report_validation.is_valid(
+            source_root, report_bytes=report_bytes
+        ):
+            raise AssemblyError(
+                f"report {report_path} changed while its receipt was consumed"
+            )
         try:
             source_tree_digest = policy.tree_digest(source_root)
             source_tree_size = policy.tree_size_bytes(source_root)

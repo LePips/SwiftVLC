@@ -197,7 +197,7 @@ final class ThumbnailScrubUITests: ShowcaseIOSTestCase {
       for _ in 0..<3 {
         slider.adjust(toNormalizedSliderPosition: CGFloat.random(in: 0.1...0.9))
         app.terminate()
-        app.launch()
+        launchDirectlyHandlingQualificationPermissions()
         _ = slider.waitForExistence(timeout: 5)
       }
     }

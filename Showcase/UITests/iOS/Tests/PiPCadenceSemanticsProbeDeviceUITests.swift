@@ -16,12 +16,6 @@ final class PiPCadenceSemanticsProbeDeviceUITests: ShowcaseIOSTestCase {
         "Set SWIFTVLC_PIP_CADENCE_SEMANTICS_PROBE=YES to run this exploratory probe"
       )
     }
-    addUIInterruptionMonitor(withDescription: "Local network permission") { alert in
-      let allow = alert.buttons["Allow"]
-      guard allow.exists else { return false }
-      allow.tap()
-      return true
-    }
     let encodedBaseURL = try XCTUnwrap(
       ProcessInfo.processInfo.environment[
         "SWIFTVLC_PIP_CADENCE_BASE_URL_BASE64"
@@ -31,8 +25,7 @@ final class PiPCadenceSemanticsProbeDeviceUITests: ShowcaseIOSTestCase {
       LaunchArguments.route, UITestRoute.pipCadenceSemanticsProbe.rawValue,
       LaunchArguments.pipCadenceBaseURLBase64, encodedBaseURL
     ]
-    app.launch()
-    app.tap()
+    launchDirectlyHandlingQualificationPermissions()
 
     let possible = element(AccessibilityID.PiPCadenceSemanticsProbe.possibleLabel)
     let active = element(AccessibilityID.PiPCadenceSemanticsProbe.activeLabel)
@@ -53,14 +46,20 @@ final class PiPCadenceSemanticsProbeDeviceUITests: ShowcaseIOSTestCase {
       retainDiagnostics: false
     )
     var timedFrames: [ProbeTimedFrame] = []
-    let captureDeadline = runStartedSystemUptime + 95
+    // Sample SpringBoard for one fixed, bounded interval. Do not inspect the
+    // background candidate through Accessibility: its snapshot can be stale
+    // or unavailable and must not control the visual evidence cadence.
+    let captureDeadline =
+      runStartedSystemUptime
+        + PiPCadenceSemanticsProbeTiming.springBoardCaptureBudgetSeconds
     while ProcessInfo.processInfo.systemUptime < captureDeadline {
       let captureStarted = ProcessInfo.processInfo.systemUptime
       let frame = try captureSystemPictureInPictureCanonicalFrame(in: region)
       let captureEnded = ProcessInfo.processInfo.systemUptime
       timedFrames.append(
         ProbeTimedFrame(
-          systemUptime: (captureStarted + captureEnded) / 2,
+          captureStartedSystemUptime: captureStarted,
+          captureEndedSystemUptime: captureEnded,
           frame: frame
         )
       )
@@ -68,7 +67,17 @@ final class PiPCadenceSemanticsProbeDeviceUITests: ShowcaseIOSTestCase {
     }
 
     app.activate()
-    waitForPrefix(result, prefix: "report:", timeout: 120)
+    if result.label == "failed" || error.exists {
+      throw ProbeVisualFailure(
+        "Cadence semantics probe failed operationally: "
+          + (error.exists ? error.label : result.label)
+      )
+    }
+    waitForPrefix(
+      result,
+      prefix: "report:",
+      timeout: PiPCadenceSemanticsProbeTiming.reportCollectionBudgetSeconds
+    )
     XCTAssertFalse(error.exists, "Cadence semantics probe failed operationally: \(error.label)")
 
     var report = try decodeReport(result.label)
@@ -93,7 +102,7 @@ final class PiPCadenceSemanticsProbeDeviceUITests: ShowcaseIOSTestCase {
       data: data,
       uniformTypeIdentifier: "public.json"
     )
-    attachment.name = "exploratory-pip-cadence-semantics-probe"
+    attachment.name = "exploratory-pip-cadence-semantics-probe.json"
     attachment.lifetime = .keepAlways
     add(attachment)
     #endif
@@ -116,8 +125,10 @@ final class PiPCadenceSemanticsProbeDeviceUITests: ShowcaseIOSTestCase {
         window["windowEndSystemUptime"],
         name: "window end uptime"
       )
+      let guardSeconds = PiPCadenceSemanticsProbeTiming.captureBoundaryGuardSeconds
       let candidates = timedFrames.filter {
-        $0.systemUptime >= start && $0.systemUptime <= end
+        $0.captureStartedSystemUptime >= start + guardSeconds
+          && $0.captureEndedSystemUptime <= end - guardSeconds
       }
       guard candidates.count >= 3 else {
         throw ProbeVisualFailure(
@@ -138,6 +149,8 @@ final class PiPCadenceSemanticsProbeDeviceUITests: ShowcaseIOSTestCase {
         "requestedRate": requestedRate,
         "windowStartSystemUptime": start,
         "windowEndSystemUptime": end,
+        "captureStartSystemUptimes": selected.map(\.captureStartedSystemUptime),
+        "captureEndSystemUptimes": selected.map(\.captureEndedSystemUptime),
         "captureSystemUptimes": selected.map(\.systemUptime),
         "canonicalRGB8Base64": selected.map {
           Data($0.frame.rgb).base64EncodedString()
@@ -151,6 +164,7 @@ final class PiPCadenceSemanticsProbeDeviceUITests: ShowcaseIOSTestCase {
       "formatVersion": 1,
       "method": VideoSurfaceMotionEvidence.method,
       "framesPerWindow": 3,
+      "captureBoundaryGuardSeconds": PiPCadenceSemanticsProbeTiming.captureBoundaryGuardSeconds,
       "records": records
     ]
   }
@@ -196,8 +210,13 @@ final class PiPCadenceSemanticsProbeDeviceUITests: ShowcaseIOSTestCase {
 }
 
 private struct ProbeTimedFrame {
-  let systemUptime: Double
+  let captureStartedSystemUptime: Double
+  let captureEndedSystemUptime: Double
   let frame: VideoSurfaceCanonicalFrame
+
+  var systemUptime: Double {
+    (captureStartedSystemUptime + captureEndedSystemUptime) / 2
+  }
 }
 
 private struct ProbeVisualFailure: Error, CustomStringConvertible {

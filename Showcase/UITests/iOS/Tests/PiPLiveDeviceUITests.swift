@@ -104,23 +104,12 @@ final class PiPLiveDeviceUITests: ShowcaseIOSTestCase {
       throw XCTSkip("Set SWIFTVLC_PIP_LIVE_URL_BASE64 to an encoded indefinite MPEG-TS stream")
     }
 
-    addUIInterruptionMonitor(withDescription: "Local network permission") { alert in
-      let allow = alert.buttons["Allow"]
-      guard allow.exists else { return false }
-      allow.tap()
-      return true
-    }
-
     let encodedLiveURL = Data(liveURL.absoluteString.utf8).base64EncodedString()
     replaceLaunchArgument(LaunchArguments.pipLiveURLBase64, with: encodedLiveURL)
     app.launchEnvironment[LaunchArguments.pipLiveURLEnvironment] = encodedLiveURL
     replaceLaunchArgument(LaunchArguments.pipRenderingPath, with: renderingPath)
     removeLaunchArgument(LaunchArguments.route)
     launch(route: .pipLiveValidation)
-    // UI interruption monitors run when the test sends an interaction after
-    // presentation. A harmless tap lets a fresh install accept local-network
-    // access before playback's opening timeout expires.
-    app.tap()
 
     // Xcode 26.6 can expose SwiftUI Text with an identifier as either
     // StaticText or Other on a physical iPad. Query by identifier across all

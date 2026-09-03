@@ -17,13 +17,6 @@ final class NativeRendererRecoveryDeviceUITests: ShowcaseIOSTestCase {
       )
     }
 
-    addUIInterruptionMonitor(withDescription: "Local network permission") { alert in
-      let allow = alert.buttons["Allow"]
-      guard allow.exists else { return false }
-      allow.tap()
-      return true
-    }
-
     app.launchArguments += [
       LaunchArguments.route,
       UITestRoute.nativeRendererRecoveryValidation.rawValue,
@@ -36,8 +29,7 @@ final class NativeRendererRecoveryDeviceUITests: ShowcaseIOSTestCase {
       ] {
       app.launchArguments += [LaunchArguments.nativeRendererRecoveryURLBase64, encodedURL]
     }
-    app.launch()
-    app.tap()
+    launchDirectlyHandlingQualificationPermissions()
 
     let state = element(AccessibilityID.NativeRendererRecoveryValidation.stateLabel)
     let possible = element(AccessibilityID.NativeRendererRecoveryValidation.possibleLabel)
@@ -92,7 +84,7 @@ final class NativeRendererRecoveryDeviceUITests: ShowcaseIOSTestCase {
       RunLoop.current.run(until: Date().addingTimeInterval(TimeInterval(backgroundSeconds)))
 
       app.activate()
-      app.tap()
+      handleQualificationLocalNetworkPermissionIfPresent(timeout: 0)
       revealMeasurement(state, swiping: .down)
       waitForAccessibilityValue(state, equals: "paused", timeout: 15)
       revealMeasurement(active, swiping: .down)

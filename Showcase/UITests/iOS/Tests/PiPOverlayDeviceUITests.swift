@@ -261,15 +261,7 @@ final class PiPOverlayDeviceUITests: ShowcaseIOSTestCase {
   }
 
   private func openMatrixH(requiresOverlayComposition: Bool = true) {
-    addUIInterruptionMonitor(withDescription: "Local network permission") { alert in
-      let allow = alert.buttons["Allow"]
-      guard allow.exists else { return false }
-      allow.tap()
-      return true
-    }
-
     launch(route: .harnessHome)
-    app.tap()
 
     let matrix = app.buttons["(h) Native PiP subtitles + OSD"]
     reveal(matrix, swiping: .up)

@@ -21,8 +21,7 @@ final class SeekFrameOracleDeviceUITests: ShowcaseIOSTestCase {
       LaunchArguments.route, UITestRoute.seekFrameOracleValidation.rawValue,
       LaunchArguments.seekFrameOracleBaseURLBase64, encodedBaseURL
     ]
-    app.launch()
-    app.tap()
+    launchDirectlyHandlingQualificationPermissions()
 
     let video = element(AccessibilityID.SeekFrameOracleValidation.videoView)
     let result = element(AccessibilityID.SeekFrameOracleValidation.resultLabel)

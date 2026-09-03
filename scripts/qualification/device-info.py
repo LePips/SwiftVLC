@@ -18,6 +18,10 @@ from report_validation import atomic_write_json
 NON_STABLE_RELEASE_TYPES = ("beta", "seed", "internal", "development", "preview")
 
 
+class DeviceSelectionError(ValueError):
+    pass
+
+
 def release_type(properties: dict) -> str:
     declared = str(properties.get("releaseType", "")).strip().lower()
     build = str(properties.get("osBuildUpdate", ""))
@@ -198,6 +202,41 @@ def normalize(device: dict, hardware_rows: list[dict]) -> dict:
     }
 
 
+def select_explicit_device(devices: list[dict], selector: str) -> dict:
+    """Resolve an explicit selector only when it names one connected device."""
+
+    needle = selector.lower()
+    matches = [
+        device
+        for device in devices
+        if needle
+        in {
+            str(device.get("id", "")).lower(),
+            str(device.get("udid", "")).lower(),
+            str(device.get("name", "")).lower(),
+            str(device.get("ecid", "")).lower(),
+            str(device.get("ecidHex", "")).lower(),
+        }
+    ]
+    if len(matches) != 1:
+        identities = ", ".join(
+            (
+                f"{device.get('name') or device.get('marketingName') or 'unnamed'} "
+                f"({device.get('productType') or 'unknown product'}, "
+                f"id={device.get('id') or 'unknown'}, "
+                f"udid={device.get('udid') or 'unknown'}, "
+                f"ecid={device.get('ecidHex') or 'unknown'})"
+            )
+            for device in matches
+        )
+        raise DeviceSelectionError(
+            f"--device {selector!r} matched {len(matches)} connected physical iOS "
+            "devices; use a unique CoreDevice id, UDID, or ECID"
+            + (f": {identities}" if identities else "")
+        )
+    return matches[0]
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--matrix", type=Path, required=True)
@@ -222,26 +261,21 @@ def main() -> int:
         raw_devices = refresh_live_devices(raw_devices, args.device)
     devices = [normalize(device, matrix.get("hardware", [])) for device in raw_devices]
     connected = [device for device in devices if device["connected"]]
+    selection_error: DeviceSelectionError | None = None
     if args.device:
-        needle = args.device.lower()
-        connected = [
-            device
-            for device in connected
-            if needle
-            in {
-                str(device.get("id", "")).lower(),
-                str(device.get("udid", "")).lower(),
-                str(device.get("name", "")).lower(),
-                str(device.get("ecid", "")).lower(),
-                str(device.get("ecidHex", "")).lower(),
-            }
-        ]
+        try:
+            explicit = select_explicit_device(connected, args.device)
+            connected = [explicit]
+        except DeviceSelectionError as error:
+            selection_error = error
 
-    selected = next(
-        (device for device in connected if device["qualificationEligible"]), None
-    )
-    if selected is None and connected and not args.require_stable:
-        selected = connected[0]
+    selected = None
+    if selection_error is None:
+        selected = next(
+            (device for device in connected if device["qualificationEligible"]), None
+        )
+        if selected is None and connected and not args.require_stable:
+            selected = connected[0]
 
     result = {
         "selected": selected,
@@ -259,6 +293,9 @@ def main() -> int:
         json.dump(result, sys.stdout, indent=2, sort_keys=True)
         sys.stdout.write("\n")
 
+    if selection_error is not None:
+        print(f"Error: {selection_error}", file=sys.stderr)
+        return 2
     if selected is None:
         return 2
     if args.require_stable and not selected["qualificationEligible"]:

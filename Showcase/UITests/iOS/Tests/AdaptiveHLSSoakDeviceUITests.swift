@@ -15,13 +15,6 @@ final class AdaptiveHLSSoakDeviceUITests: ShowcaseIOSTestCase {
       )
     }
 
-    addUIInterruptionMonitor(withDescription: "Local network permission") { alert in
-      let allow = alert.buttons["Allow"]
-      guard allow.exists else { return false }
-      allow.tap()
-      return true
-    }
-
     let duration = max(
       1,
       Int(ProcessInfo.processInfo.environment["SWIFTVLC_ADAPTIVE_SOAK_SECONDS"] ?? "7200")
@@ -34,8 +27,7 @@ final class AdaptiveHLSSoakDeviceUITests: ShowcaseIOSTestCase {
       LaunchArguments.adaptiveSoakDuration, String(duration),
       LaunchArguments.adaptiveSoakToken, token
     ]
-    app.launch()
-    app.tap()
+    launchDirectlyHandlingQualificationPermissions()
 
     let state = element(AccessibilityID.AdaptiveHLSSoakValidation.stateLabel)
     let phase = element(AccessibilityID.AdaptiveHLSSoakValidation.phaseLabel)

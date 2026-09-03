@@ -7,6 +7,11 @@ import Foundation
 /// used to query the resulting `XCUIElement`s). Renaming a constant here is a
 /// compile-time break on both sides, not a runtime test failure.
 enum AccessibilityID {
+  enum Qualification {
+    /// UI-test-only proof read from the candidate's signed Info.plist.
+    static let candidateRuntimeBinding = "qualification.candidateRuntimeBinding"
+  }
+
   enum Root {
     static let navigationStack = "root.nav"
     static func sectionLink(_ title: String) -> String {

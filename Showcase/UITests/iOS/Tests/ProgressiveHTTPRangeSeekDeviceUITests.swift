@@ -76,7 +76,7 @@ final class ProgressiveHTTPRangeSeekDeviceUITests: ShowcaseIOSTestCase {
       encodedBaseURL: encodedBaseURL,
       attemptToken: attemptToken
     )
-    app.launch()
+    launchDirectlyHandlingQualificationPermissions()
 
     let result = element(AccessibilityID.ProgressiveHTTPRangeSeekValidation.resultLabel)
     let error = element(AccessibilityID.ProgressiveHTTPRangeSeekValidation.errorLabel)

@@ -51,19 +51,12 @@ final class PiPLongStallDeviceUITests: ShowcaseIOSTestCase {
   }
 
   private func runStall(renderingPath: String) throws -> [String: Any] {
-    addUIInterruptionMonitor(withDescription: "Local network permission") { alert in
-      let allow = alert.buttons["Allow"]
-      guard allow.exists else { return false }
-      allow.tap()
-      return true
-    }
     let encodedURL = try XCTUnwrap(
       ProcessInfo.processInfo.environment["SWIFTVLC_PIP_LONG_STALL_URL_BASE64"]
     )
     replaceLaunchArgument(LaunchArguments.pipRenderingPath, with: renderingPath)
     replaceLaunchArgument(LaunchArguments.pipLiveURLBase64, with: encodedURL)
     launch(route: .pipLongStallValidation)
-    app.tap()
 
     let state = element(AccessibilityID.PiPLongStallValidation.stateLabel)
     let possible = element(AccessibilityID.PiPLongStallValidation.possibleLabel)

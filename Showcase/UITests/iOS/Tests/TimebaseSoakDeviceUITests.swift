@@ -12,12 +12,6 @@ final class TimebaseSoakDeviceUITests: ShowcaseIOSTestCase {
     guard ProcessInfo.processInfo.environment["SWIFTVLC_TIMEBASE_SOAK_DEVICE"] == "YES" else {
       throw XCTSkip("Set SWIFTVLC_TIMEBASE_SOAK_DEVICE=YES for candidate-bound hardware runs")
     }
-    addUIInterruptionMonitor(withDescription: "Local network permission") { alert in
-      let allow = alert.buttons["Allow"]
-      guard allow.exists else { return false }
-      allow.tap()
-      return true
-    }
     let mode = ProcessInfo.processInfo.environment["SWIFTVLC_TIMEBASE_SOAK_MODE"] ?? "vod"
     XCTAssertTrue(["vod", "live"].contains(mode))
     let duration = Int(ProcessInfo.processInfo.environment["SWIFTVLC_TIMEBASE_SOAK_SECONDS"] ?? "7200") ?? 7200
@@ -30,8 +24,7 @@ final class TimebaseSoakDeviceUITests: ShowcaseIOSTestCase {
       LaunchArguments.timebaseSoakMode, mode,
       LaunchArguments.timebaseSoakToken, token
     ]
-    app.launch()
-    app.tap()
+    launchDirectlyHandlingQualificationPermissions()
 
     let possible = element(AccessibilityID.TimebaseSoakValidation.possibleLabel)
     let active = element(AccessibilityID.TimebaseSoakValidation.activeLabel)

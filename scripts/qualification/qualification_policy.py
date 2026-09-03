@@ -36,6 +36,9 @@ class QualificationPolicyError(ValueError):
 
 MAXIMUM_STABLE_REPORT_AGE_SECONDS = 30 * 24 * 60 * 60
 MAXIMUM_REPORT_CLOCK_SKEW_SECONDS = 5 * 60
+ORDINARY_RELEASE_GATE_REASON = (
+    "automated smoke coverage is not yet the complete required matrix"
+)
 
 
 SHA1 = re.compile(r"[0-9a-f]{40}")
@@ -45,6 +48,35 @@ BUNDLE_IDENTIFIER = re.compile(
     r"[A-Za-z0-9][A-Za-z0-9-]*(?:\.[A-Za-z0-9][A-Za-z0-9-]*)+"
 )
 CANONICAL_TEST_RUNNER_BUNDLE_IDENTIFIER = "com.swiftvlc.showcase.ios.uitests.xctrunner"
+EXPLORATORY_FUTURE_IOS_HARDWARE_ID = "exploratory-future-ios"
+DEVICE_SNAPSHOT_RELATIVE_PATH = "device.json"
+DEVICE_SNAPSHOT_BINDING_FIELDS = frozenset(
+    {"relativePath", "digestAlgorithm", "digest", "sizeBytes"}
+)
+NORMALIZED_DEVICE_FIELDS = frozenset(
+    {
+        "id",
+        "udid",
+        "ecid",
+        "ecidHex",
+        "name",
+        "marketingName",
+        "deviceFamily",
+        "productType",
+        "osVersion",
+        "osMajor",
+        "osBuild",
+        "osReleaseType",
+        "transport",
+        "tunnelIPAddress",
+        "connected",
+        "matchingHardwareRows",
+        "qualificationEligible",
+    }
+)
+DEVICE_SNAPSHOT_FIELDS = frozenset(
+    {"selected", "connected", "allPhysicalIOSDevices", "mode"}
+)
 
 # These are release claims, not tuning knobs.  Exploratory runs may request a
 # shorter duration, but a stable row is always measured against this table even
@@ -96,6 +128,7 @@ CADENCE_RATE_TOLERANCE_FRACTION = 0.15
 CADENCE_VISUAL_MOTION_MINIMUM_SCORE = 0.01
 CADENCE_MINIMUM_SUBMISSION_FRACTION = 0.90
 CADENCE_VFR_REGIME_SECONDS = 2.0
+CADENCE_VFR_MINIMUM_REGIME_SOURCE_FRAME_FRACTION = 0.50
 CADENCE_PROFILE_ORDER = (
     "23.976",
     "24",
@@ -265,6 +298,156 @@ CADENCE_SOURCE_TIMESTAMP_PROVENANCE = "libvlc-picture_t.date-native-callback-v1"
 CADENCE_VMEM_OUTPUT_TIMESTAMP_PROVENANCE = (
     "libvlc-vmem-post-filter-vout-selected-output-attempt-pts-v1"
 )
+CADENCE_SEMANTICS_PROBE_SCENARIO = "cadence-semantics-probe"
+CADENCE_SEMANTICS_PROBE_TEST_IDENTIFIER = (
+    "iOSUITests/PiPCadenceSemanticsProbeDeviceUITests/"
+    "test_reportOnlyVmemCadenceSemanticsProbe"
+)
+CADENCE_SEMANTICS_PROBE_ATTACHMENT_NAME = (
+    "exploratory-pip-cadence-semantics-probe.json"
+)
+CADENCE_SEMANTICS_PROBE_CAPTURE_BOUNDARY_GUARD_SECONDS = 0.1
+CADENCE_SEMANTICS_PROBE_EXPECTED_WINDOWS = (
+    ("24", 0.5),
+    ("60", 1.0),
+    ("30", 2.0),
+    ("50", 2.0),
+    ("59.94", 2.0),
+    ("60", 2.0),
+    ("vfr-24-60", 0.5),
+    ("vfr-24-60", 1.0),
+    ("vfr-24-60", 2.0),
+)
+CADENCE_SEMANTICS_PROBE_REPORT_KEYS = {
+    "formatVersion",
+    "purpose",
+    "releaseCreditEligible",
+    "vmemOutputTimestampProvenance",
+    "targetWindowSeconds",
+    "settlingSeconds",
+    "startedSystemUptime",
+    "endedSystemUptime",
+    "windows",
+    "springBoardFrames",
+}
+CADENCE_SEMANTICS_PROBE_WINDOW_KEYS = {
+    "profile",
+    "requestedRate",
+    "windowStartSystemUptime",
+    "windowEndSystemUptime",
+    "windowDurationSeconds",
+    "effectivePlayerRateStart",
+    "effectivePlayerRateEnd",
+    "controlTimebaseRateStart",
+    "controlTimebaseRateEnd",
+    "controlTimebaseDeltaSeconds",
+    "mediaTimeDeltaSeconds",
+    "nativePTSDeltaSeconds",
+    "nativePTSDeltaMatchesHistogram",
+    "nativePTSDeltaHistogram",
+    "nativePTSClassification",
+    "outputCallbackCount",
+    "validPTSCount",
+    "invalidPTSCount",
+    "submittedFrames",
+    "swiftRejectedFrames",
+    "inFlightStart",
+    "inFlightEnd",
+    "callbackConservationAtStart",
+    "callbackConservationAtEnd",
+    "callbackDeltaConservation",
+    "observedSubmissionFPS",
+    "renderer",
+    "libVLC",
+    "before",
+    "after",
+}
+CADENCE_SEMANTICS_PROBE_CLASSIFICATION_KEYS = {
+    "exactIntervalCount",
+    "multipleIntervalCount",
+    "estimatedSkippedPictureCount",
+    "redisplayCount",
+    "backwardCount",
+    "unclassifiedIntervalCount",
+    "deltaOverflowCount",
+}
+CADENCE_SEMANTICS_PROBE_RENDERER_COUNTERS = {
+    "vmemLockAttempts": "vmemLockAttemptCount",
+    "vmemLockSuccesses": "vmemLockSuccessCount",
+    "vmemPoolUnavailable": "vmemPoolUnavailableCount",
+    "vmemBaseAddressLockFailures": "vmemBaseAddressLockFailureCount",
+    "vmemPendingInstallFailures": "vmemPendingInstallFailureCount",
+    "vmemUnlockCallbacks": "vmemUnlockCallbackCount",
+    "vmemDisplayCallbacks": "vmemDisplayCallbackCount",
+    "vmemDisplayConsumeFailures": "vmemDisplayConsumeFailureCount",
+    "enqueuedFrames": "enqueuedFrameCount",
+    "deliveredFrames": "deliveredFrameCount",
+    "droppedFrames": "droppedFrameCount",
+    "presentationCopyFrames": "presentationCopyFrameCount",
+    "presentationCopyFailures": "presentationCopyFailureCount",
+    "decodePoolAllocationFailures": "decodePoolAllocationFailureCount",
+    "renderPoolAllocationFailures": "renderPoolAllocationFailureCount",
+}
+CADENCE_SEMANTICS_PROBE_LIBVLC_COUNTERS = {
+    "decodedVideo": "libVLCDecodedVideoCount",
+    "displayedPictures": "libVLCDisplayedPictureCount",
+    "lostPictures": "libVLCLostPictureCount",
+    "latePictures": "libVLCLatePictureCount",
+}
+CADENCE_SEMANTICS_PROBE_SPRINGBOARD_RECORD_KEYS = {
+    "profile",
+    "requestedRate",
+    "windowStartSystemUptime",
+    "windowEndSystemUptime",
+    "captureStartSystemUptimes",
+    "captureEndSystemUptimes",
+    "captureSystemUptimes",
+    "canonicalRGB8Base64",
+    "frameHashes",
+    "adjacentChangedPixelRatios",
+    "changedPixelScore",
+}
+CADENCE_SEMANTICS_PROBE_PROOF_FIELDS = {
+    "formatVersion",
+    "authority",
+    "version",
+    "releaseCreditEligible",
+    "sourceAttempt",
+    "sourceXcresultArtifact",
+    "sourceXcresultDigestAlgorithm",
+    "sourceXcresultDigest",
+    "sourceXcresultSizeBytes",
+    "retainedFinalXcresultArtifact",
+    "retainedFinalXcresultDigestAlgorithm",
+    "retainedFinalXcresultDigest",
+    "retainedFinalXcresultSizeBytes",
+    "attachmentName",
+    "attachmentTestIdentifier",
+    "retainedAttachmentRoot",
+    "manifestRelativePath",
+    "manifestDigestAlgorithm",
+    "manifestDigest",
+    "manifestSizeBytes",
+    "attachmentRelativePath",
+    "attachmentDigestAlgorithm",
+    "attachmentDigest",
+    "attachmentSizeBytes",
+}
+CADENCE_SEMANTICS_PROBE_RUNNER_FIELDS = {
+    "scenario",
+    "result",
+    "xcodebuildExitCode",
+    "libraryErrorCount",
+    "appLog",
+    "qualificationEvidence",
+    "durationSeconds",
+    "expectedTestCatalog",
+    "testExecution",
+    "attempts",
+    "attemptArtifactRoot",
+    "hostErrorInventory",
+    "reportOnlyEvidence",
+}
 NATIVE_RENDERER_RECOVERY_SNAPSHOT_KEYS = {
     "abiVersion",
     "rawFlags",
@@ -823,41 +1006,43 @@ REQUIRED_FEATURE_IDS = frozenset(
 
 # Stable release qualification is not only the matrix rows. These support lanes
 # prove analyzer correctness and broad UI/harness integration even though they
-# do not emit a standalone matrix attachment. Keep this set immutable here and
-# require profiles-v1.json to match it in profile validation.
+# do not emit a standalone matrix attachment. Order is part of the immutable
+# contract: destructive media-services reset must be last, and a reordered
+# receipt must not be able to claim that it represents the canonical run.
+REQUIRED_RELEASE_RUNNER_SCENARIO_ORDER = (
+    "analyzer",
+    "ui-suite",
+    "harness-regressions",
+    "live-media",
+    "background-audio",
+    "continuity",
+    "capability-convergence",
+    "vod-controls",
+    "long-stall",
+    "failed-start",
+    "dismissal",
+    "interruptions",
+    "audio-session-ownership",
+    "native-lifecycle",
+    "playback-foreground-displaylayer-recovery",
+    "terminal-outcomes",
+    "adaptive-hls-soak",
+    "deferred-pause-rejection",
+    "hls-seek",
+    "seek-frame-oracles",
+    "progressive-http-range-seek",
+    "local-file-matrix",
+    "audio-only-playback",
+    "pip-render-performance-1080p60",
+    "pip-render-performance-4k60",
+    "cadence-matrix",
+    "native-subtitle-matrix",
+    "timebase-vod-soak",
+    "timebase-live-soak",
+    "audio-media-services-reset",
+)
 REQUIRED_RELEASE_RUNNER_SCENARIOS = frozenset(
-    {
-        "analyzer",
-        "ui-suite",
-        "harness-regressions",
-        "live-media",
-        "background-audio",
-        "continuity",
-        "capability-convergence",
-        "vod-controls",
-        "long-stall",
-        "failed-start",
-        "dismissal",
-        "interruptions",
-        "audio-media-services-reset",
-        "audio-session-ownership",
-        "native-lifecycle",
-        "playback-foreground-displaylayer-recovery",
-        "terminal-outcomes",
-        "adaptive-hls-soak",
-        "deferred-pause-rejection",
-        "hls-seek",
-        "seek-frame-oracles",
-        "progressive-http-range-seek",
-        "local-file-matrix",
-        "audio-only-playback",
-        "pip-render-performance-1080p60",
-        "pip-render-performance-4k60",
-        "cadence-matrix",
-        "native-subtitle-matrix",
-        "timebase-vod-soak",
-        "timebase-live-soak",
-    }
+    REQUIRED_RELEASE_RUNNER_SCENARIO_ORDER
 )
 
 IPHONE_CURRENT_ONLY_RUNNER_SCENARIOS = frozenset(
@@ -947,17 +1132,19 @@ CANONICAL_SCENARIO_CONTRACT_DIGEST = (
     "71a6db675e8b8bc3066060d22d1167aee38638cc1118fde33248e5d4f422d246"
 )
 CANONICAL_RUNNER_CONTRACT_DIGEST = (
-    "557da6622f2d80d3f40e33971ff746840b36c370e96bdbcb00e800aed4903f11"
+    "0b66fdeadda254b382a165d47f9630d4c8e7b839e33424a98ff9c5afe85fd8fa"
 )
 RELEASE_MATRIX_POLICY_IDENTITY = "swiftvlc-1.1.0-physical-qualification-v1"
 
-# These two backend-specific diagnostic leaves are intentionally superseded by
-# the release-significant combined `live-media` qualification. They remain in
-# the candidate bundle for targeted diagnosis but are not release obligations.
+# These backend-specific or report-only diagnostic leaves remain in the
+# candidate bundle for targeted diagnosis but are not release obligations.
+# The cadence semantics probe has its own non-release validation authority and
+# must never leak into an ordinary ui-suite or release runner partition.
 RELEASE_CATALOG_EXCEPTIONS = frozenset(
     {
         "iOSUITests/PiPLiveDeviceUITests/test_nativeLiveMPEGTSRendersMovingFramesInSystemPiP",
         "iOSUITests/PiPLiveDeviceUITests/test_directLiveMPEGTSRendersMovingFramesInSystemPiP",
+        "iOSUITests/PiPCadenceSemanticsProbeDeviceUITests/test_reportOnlyVmemCadenceSemanticsProbe",
     }
 )
 
@@ -1001,6 +1188,9 @@ QUALIFICATION_POLICY_DOCUMENT = {
             "decoded-source cadence"
         ),
         "minimumSubmissionFraction": CADENCE_MINIMUM_SUBMISSION_FRACTION,
+        "vfrMinimumRegimeSourceFrameFraction": (
+            CADENCE_VFR_MINIMUM_REGIME_SOURCE_FRAME_FRACTION
+        ),
         "vfrFixtureTimeline": [
             {"durationSeconds": CADENCE_VFR_REGIME_SECONDS, "framesPerSecond": 24},
             {"durationSeconds": CADENCE_VFR_REGIME_SECONDS, "framesPerSecond": 60},
@@ -1064,6 +1254,9 @@ QUALIFICATION_POLICY_DOCUMENT = {
     },
     "timebaseRawPolicy": "exact-nested-av-progress-and-generation-v2",
     "requiredFeatureIDs": sorted(REQUIRED_FEATURE_IDS),
+    "requiredReleaseRunnerScenarioOrder": list(
+        REQUIRED_RELEASE_RUNNER_SCENARIO_ORDER
+    ),
     "requiredReleaseRunnerScenarios": sorted(REQUIRED_RELEASE_RUNNER_SCENARIOS),
     "iphoneCurrentOnlyRunnerScenarios": sorted(IPHONE_CURRENT_ONLY_RUNNER_SCENARIOS),
     "requiredHardware": {
@@ -1072,6 +1265,43 @@ QUALIFICATION_POLICY_DOCUMENT = {
     },
     "canonicalRequiredRows": sorted(CANONICAL_REQUIRED_ROWS),
     "canonicalRequiredRunnerRuns": sorted(CANONICAL_REQUIRED_RUNNER_RUNS),
+    "releaseCatalogExceptions": sorted(RELEASE_CATALOG_EXCEPTIONS),
+    "deviceReportPolicy": {
+        "deviceSnapshotBinding": "exact-sibling-normalized-device-sha256-v1",
+        "deviceSnapshotRelativePath": DEVICE_SNAPSHOT_RELATIVE_PATH,
+        "deviceSnapshotFields": sorted(DEVICE_SNAPSHOT_FIELDS),
+        "normalizedSelectedDeviceFields": sorted(NORMALIZED_DEVICE_FIELDS),
+        "runnerCatalogAuthority": "matrix-applicable-outputs",
+        "reportResultAuthority": "exact-runner-result-reconciliation",
+        "failedOutputRunnerEvidence": "retained-without-qualification-row",
+        "exploratoryQualificationRows": "forbidden",
+        "exploratoryEvidencePath": "evidence/{scenario}-{evidenceHardware}.json",
+        "futureIOSHardwareEvidenceID": EXPLORATORY_FUTURE_IOS_HARDWARE_ID,
+        "qualificationRowDeviceBindingFields": [
+            "device",
+            "deviceFamily",
+            "productType",
+            "osVersion",
+            "osBuild",
+            "osReleaseType",
+        ],
+    },
+    "reportOnlyCadenceSemanticsPolicy": {
+        "scenario": CADENCE_SEMANTICS_PROBE_SCENARIO,
+        "testIdentifier": CADENCE_SEMANTICS_PROBE_TEST_IDENTIFIER,
+        "attachmentName": CADENCE_SEMANTICS_PROBE_ATTACHMENT_NAME,
+        "expectedWindows": [list(item) for item in CADENCE_SEMANTICS_PROBE_EXPECTED_WINDOWS],
+        "springBoardRecordKeys": sorted(
+            CADENCE_SEMANTICS_PROBE_SPRINGBOARD_RECORD_KEYS
+        ),
+        "captureBoundaryGuardSeconds": (
+            CADENCE_SEMANTICS_PROBE_CAPTURE_BOUNDARY_GUARD_SECONDS
+        ),
+        "captureIntervalBinding": "entire-screenshot-inside-native-window-v1",
+        "releaseCreditEligible": False,
+        "artifactAssociation": "final-attempt-xcresult-copy-and-attachment-v1",
+        "semanticValidation": "native-pts-rate-conservation-libvlc-springboard-v2",
+    },
     "canonicalScenarioContractDigest": CANONICAL_SCENARIO_CONTRACT_DIGEST,
     "canonicalRunnerContractDigest": CANONICAL_RUNNER_CONTRACT_DIGEST,
     "releaseMatrixPolicyIdentity": RELEASE_MATRIX_POLICY_IDENTITY,
@@ -1117,6 +1347,9 @@ QUALIFICATION_POLICY_DOCUMENT = {
         "networkAuthority": "retained-server-transcript-only-v1",
     },
     "requiredCandidateBindings": [
+        "candidateBuildAttestation",
+        "candidateBuildAttestationDigest",
+        "testCatalogAuthorityDigest",
         "candidateAppBundleIdentifier",
         "candidateAppDigest",
         "testRunnerBundleIdentifier",
@@ -1448,6 +1681,230 @@ def _json_same(actual: object, expected: object) -> bool:
     return type(actual) is type(expected) and actual == expected
 
 
+def validate_normalized_selected_device(device: object) -> dict:
+    """Validate the exact selected-device shape emitted by ``device-info.py``.
+
+    This is an internal-consistency check for the retained host snapshot. It is
+    deliberately not described as independent hardware attestation: an actor
+    able to replace the complete evidence tree can replace this JSON too.
+    """
+
+    if not isinstance(device, dict):
+        raise QualificationPolicyError(
+            "retained device snapshot has no normalized selected device"
+        )
+    actual_fields = set(device)
+    if actual_fields != NORMALIZED_DEVICE_FIELDS:
+        missing = sorted(NORMALIZED_DEVICE_FIELDS - actual_fields)
+        extra = sorted(actual_fields - NORMALIZED_DEVICE_FIELDS)
+        raise QualificationPolicyError(
+            "retained selected device fields are not canonical: "
+            f"missing={missing!r}, extra={extra!r}"
+        )
+
+    for field in (
+        "id",
+        "udid",
+        "name",
+        "marketingName",
+        "deviceFamily",
+        "productType",
+        "osVersion",
+        "osBuild",
+    ):
+        if not isinstance(device.get(field), str) or not device[field]:
+            raise QualificationPolicyError(
+                f"retained selected device has invalid {field}"
+            )
+    for field in ("transport", "tunnelIPAddress"):
+        value = device.get(field)
+        if value is not None and (not isinstance(value, str) or not value):
+            raise QualificationPolicyError(
+                f"retained selected device has invalid {field}"
+            )
+
+    family = device["deviceFamily"]
+    if family not in {"iPhone", "iPad"}:
+        raise QualificationPolicyError(
+            "retained selected device is not an iPhone or iPad"
+        )
+    release_type = device.get("osReleaseType")
+    if release_type not in {"stable", "beta", "unknown"}:
+        raise QualificationPolicyError(
+            "retained selected device has invalid OS release type"
+        )
+    os_major = device.get("osMajor")
+    try:
+        version_major = int(str(device["osVersion"]).split(".", 1)[0])
+    except ValueError as error:
+        raise QualificationPolicyError(
+            "retained selected device has invalid OS version"
+        ) from error
+    if (
+        isinstance(os_major, bool)
+        or not isinstance(os_major, int)
+        or os_major <= 0
+        or os_major != version_major
+    ):
+        raise QualificationPolicyError(
+            "retained selected device OS major contradicts its OS version"
+        )
+
+    ecid = device.get("ecid")
+    ecid_hex = device.get("ecidHex")
+    if ecid is None:
+        if ecid_hex is not None:
+            raise QualificationPolicyError(
+                "retained selected device ECID fields disagree"
+            )
+    elif (
+        isinstance(ecid, bool)
+        or not isinstance(ecid, int)
+        or ecid < 0
+        or ecid_hex != f"0x{ecid:X}"
+    ):
+        raise QualificationPolicyError(
+            "retained selected device ECID fields disagree"
+        )
+
+    matching = device.get("matchingHardwareRows")
+    if (
+        not isinstance(matching, list)
+        or any(not isinstance(item, str) or not item for item in matching)
+        or len(set(matching)) != len(matching)
+    ):
+        raise QualificationPolicyError(
+            "retained selected device has invalid matching hardware rows"
+        )
+    if device.get("connected") is not True:
+        raise QualificationPolicyError(
+            "retained selected device is not connected"
+        )
+    eligible = device.get("qualificationEligible")
+    expected_eligible = release_type == "stable" and bool(matching)
+    if not isinstance(eligible, bool) or eligible != expected_eligible:
+        raise QualificationPolicyError(
+            "retained selected device eligibility is inconsistent"
+        )
+    return device
+
+
+def _load_device_snapshot(report_root: Path) -> tuple[bytes, dict]:
+    snapshot_path = safe_relative_file(
+        report_root,
+        DEVICE_SNAPSHOT_RELATIVE_PATH,
+        "retained device snapshot",
+    )
+    try:
+        raw_snapshot = snapshot_path.read_bytes()
+        snapshot = loads_json(
+            raw_snapshot.decode("utf-8"),
+            f"retained device snapshot {snapshot_path}",
+        )
+    except (OSError, UnicodeError) as error:
+        raise QualificationPolicyError(
+            f"cannot read retained device snapshot {snapshot_path}: {error}"
+        ) from error
+    if not isinstance(snapshot, dict):
+        raise QualificationPolicyError(
+            f"retained device snapshot {snapshot_path} must be a JSON object"
+        )
+    actual_fields = set(snapshot)
+    if actual_fields != DEVICE_SNAPSHOT_FIELDS:
+        missing = sorted(DEVICE_SNAPSHOT_FIELDS - actual_fields)
+        extra = sorted(actual_fields - DEVICE_SNAPSHOT_FIELDS)
+        raise QualificationPolicyError(
+            "retained device snapshot fields are not canonical: "
+            f"missing={missing!r}, extra={extra!r}"
+        )
+    selected = validate_normalized_selected_device(snapshot.get("selected"))
+    connected = snapshot.get("connected")
+    all_devices = snapshot.get("allPhysicalIOSDevices")
+    for value, description in (
+        (connected, "connected devices"),
+        (all_devices, "physical iOS devices"),
+    ):
+        if not isinstance(value, list) or any(
+            not isinstance(item, dict) for item in value
+        ):
+            raise QualificationPolicyError(
+                f"retained device snapshot has invalid {description}"
+            )
+        if sum(_json_same(item, selected) for item in value) != 1:
+            raise QualificationPolicyError(
+                f"retained device snapshot selected device is not unique in {description}"
+            )
+    assert isinstance(connected, list)
+    assert isinstance(all_devices, list)
+    for item in connected:
+        if item.get("connected") is not True or not any(
+            _json_same(item, candidate) for candidate in all_devices
+        ):
+            raise QualificationPolicyError(
+                "retained connected-device inventory contradicts the physical inventory"
+            )
+    expected_mode = (
+        "qualification" if selected["qualificationEligible"] else "exploratory"
+    )
+    if snapshot.get("mode") != expected_mode:
+        raise QualificationPolicyError(
+            "retained device snapshot mode contradicts its selected device"
+        )
+    return raw_snapshot, snapshot
+
+
+def device_snapshot_binding(report_root: Path) -> dict:
+    """Return the canonical binding for the sibling normalized device snapshot."""
+
+    raw_snapshot, _ = _load_device_snapshot(report_root)
+    return {
+        "relativePath": DEVICE_SNAPSHOT_RELATIVE_PATH,
+        "digestAlgorithm": "sha256",
+        "digest": hashlib.sha256(raw_snapshot).hexdigest(),
+        "sizeBytes": len(raw_snapshot),
+    }
+
+
+def validate_report_device_snapshot(report_path: Path, report: dict) -> dict:
+    """Bind a strict report to its exact sibling ``device.json`` snapshot."""
+
+    binding = report.get("deviceSnapshot")
+    if not isinstance(binding, dict) or set(binding) != DEVICE_SNAPSHOT_BINDING_FIELDS:
+        raise QualificationPolicyError(
+            "device report has no canonical device snapshot binding"
+        )
+    raw_snapshot, snapshot = _load_device_snapshot(report_path.parent)
+    expected_binding = {
+        "relativePath": DEVICE_SNAPSHOT_RELATIVE_PATH,
+        "digestAlgorithm": "sha256",
+        "digest": hashlib.sha256(raw_snapshot).hexdigest(),
+        "sizeBytes": len(raw_snapshot),
+    }
+    if not _json_same(binding, expected_binding):
+        raise QualificationPolicyError(
+            "device report retained device snapshot binding mismatch"
+        )
+    if snapshot.get("mode") != report.get("mode"):
+        raise QualificationPolicyError(
+            "device report mode differs from retained device snapshot"
+        )
+    if not _json_same(snapshot.get("selected"), report.get("device")):
+        raise QualificationPolicyError(
+            "device report device differs from retained selected device"
+        )
+    report_eligible = report.get("qualificationEligibleEnvironment")
+    selected_eligible = snapshot["selected"]["qualificationEligible"]
+    if (
+        not isinstance(report_eligible, bool)
+        or report_eligible is not selected_eligible
+        or (report.get("mode") == "qualification") is not report_eligible
+    ):
+        raise QualificationPolicyError(
+            "device report mode/eligibility differs from retained selected device"
+        )
+    return snapshot
+
+
 _MISSING = object()
 
 
@@ -1558,6 +2015,117 @@ def required_rows(matrix: dict) -> set[tuple[str, str]]:
     }
 
 
+def report_hardware_context(
+    report: dict, hardware: Mapping[str, dict]
+) -> tuple[set[str], str]:
+    """Return matrix applicability and the hardware id embedded in evidence.
+
+    A beta build on a known OS row uses that row's id in its diagnostic
+    evidence. A future iPhone has no matching row, so it is projected onto the
+    latest same-family matrix row solely to select tests while retaining a
+    sentinel evidence id that can never be mistaken for release credit.
+    """
+
+    mode = report.get("mode")
+    eligible = report.get("qualificationEligibleEnvironment")
+    if mode not in {"qualification", "exploratory"}:
+        raise QualificationPolicyError("device report mode is invalid")
+    if mode == "qualification" and eligible is not True:
+        raise QualificationPolicyError("qualification mode report is not eligible")
+    if mode == "exploratory" and eligible is not False:
+        raise QualificationPolicyError(
+            "exploratory mode report must be qualification-ineligible"
+        )
+
+    device = report.get("device")
+    if not isinstance(device, dict):
+        raise QualificationPolicyError("device report has no device object")
+    if device.get("qualificationEligible") is not eligible:
+        raise QualificationPolicyError(
+            "device report eligibility contradicts its selected device"
+        )
+    if mode == "qualification" and device.get("osReleaseType") != "stable":
+        raise QualificationPolicyError(
+            "qualification mode report is not from a stable OS"
+        )
+    matching = device.get("matchingHardwareRows")
+    if (
+        not isinstance(matching, list)
+        or any(not isinstance(item, str) or item not in hardware for item in matching)
+        or len(set(matching)) != len(matching)
+    ):
+        raise QualificationPolicyError(
+            "device report has invalid matchingHardwareRows"
+        )
+    if len(matching) > 1:
+        raise QualificationPolicyError(
+            "device report matches more than one qualification hardware row"
+        )
+
+    family = device.get("deviceFamily")
+    os_major = device.get("osMajor")
+    if (
+        not isinstance(family, str)
+        or not family
+        or isinstance(os_major, bool)
+        or not isinstance(os_major, int)
+        or os_major <= 0
+    ):
+        raise QualificationPolicyError(
+            "device report has invalid family or OS-major identity"
+        )
+
+    if matching:
+        hardware_id = matching[0]
+        row = hardware[hardware_id]
+        if row.get("deviceFamily") != family or row.get("osMajor") != os_major:
+            raise QualificationPolicyError(
+                "device report matching hardware row contradicts device identity"
+            )
+        return {hardware_id}, hardware_id
+
+    if mode != "exploratory" or family != "iPhone":
+        raise QualificationPolicyError(
+            "device report has no applicable qualification hardware row"
+        )
+    family_rows = [
+        (hardware_id, row)
+        for hardware_id, row in hardware.items()
+        if row.get("deviceFamily") == family
+    ]
+    if not family_rows:
+        raise QualificationPolicyError(
+            "future iPhone report has no same-family qualification row"
+        )
+    latest_major = max(row["osMajor"] for _, row in family_rows)
+    latest_rows = [
+        hardware_id
+        for hardware_id, row in family_rows
+        if row["osMajor"] == latest_major
+    ]
+    if os_major <= latest_major or len(latest_rows) != 1:
+        raise QualificationPolicyError(
+            "exploratory iPhone is not an unambiguous future-OS projection"
+        )
+    return {latest_rows[0]}, EXPLORATORY_FUTURE_IOS_HARDWARE_ID
+
+
+def applicable_runner_outputs(
+    contract: dict,
+    scenarios: Mapping[str, dict],
+    effective_hardware: set[str],
+) -> set[str]:
+    """Return output ids selected by a runner for one device context."""
+
+    selected: set[str] = set()
+    for output in contract.get("outputs", []):
+        scenario_id = output["scenario"]
+        scenario_hardware = set(scenarios[scenario_id].get("hardware", []))
+        if not scenario_hardware or scenario_hardware.intersection(effective_hardware):
+            selected.add(scenario_id)
+    return selected
+
+
 def validate_release_matrix_contract(matrix: dict) -> None:
     """Reject a matrix that weakens the immutable release qualification map."""
 
@@ -1639,6 +2207,19 @@ def is_release_matrix(matrix: dict) -> bool:
         len(scenario_ids & {row[0] for row in CANONICAL_REQUIRED_ROWS}) >= 10
         or len(hardware_ids & set(REQUIRED_HARDWARE)) >= 3
     )
+
+
+def validate_release_qualification_row_evidence_path(
+    row: dict, index: int
+) -> str:
+    """Require the one release-evidence location owned by a scenario/hardware row."""
+
+    expected = f"evidence/{row.get('scenario')}-{row.get('hardware')}.json"
+    if row.get("evidence") != expected:
+        raise QualificationPolicyError(
+            f"release qualification row {index} evidence path must be {expected!r}"
+        )
+    return expected
 
 
 def validate_runner_contracts(
@@ -5778,6 +6359,90 @@ def _cadence_vfr_frame_integral(media_seconds: float) -> float:
     )
 
 
+def _cadence_exact_single_frame_deltas(
+    numerator: int, denominator: int
+) -> set[int]:
+    quotient, remainder = divmod(1_000_000 * denominator, numerator)
+    return {quotient, quotient + (1 if remainder else 0)}
+
+
+def _cadence_vfr_expected_exact_regime_counts(
+    start_pts_us: int, end_pts_us: int
+) -> dict[int, int]:
+    """Count 24/60 source intervals inside an absolute fixture PTS span."""
+
+    if start_pts_us < 0 or end_pts_us <= start_pts_us:
+        raise QualificationPolicyError(
+            "cadence semantics probe VFR PTS span is invalid"
+        )
+    segment_us = round(CADENCE_VFR_REGIME_SECONDS * 1_000_000)
+    first_segment = max(0, start_pts_us // segment_us - 1)
+    final_segment = end_pts_us // segment_us + 1
+    timestamps: set[int] = set()
+    for segment in range(first_segment, final_segment + 1):
+        fps = 24 if segment % 2 == 0 else 60
+        segment_start = segment * segment_us
+        frame_count = round(fps * CADENCE_VFR_REGIME_SECONDS)
+        for frame in range(frame_count):
+            timestamp = segment_start + frame * 1_000_000 // fps
+            if start_pts_us - 50_000 <= timestamp <= end_pts_us + 50_000:
+                timestamps.add(timestamp)
+
+    interval_sets = {
+        fps: _cadence_exact_single_frame_deltas(fps, 1) for fps in (24, 60)
+    }
+    counts = {24: 0, 60: 0}
+    ordered = sorted(timestamps)
+    for previous, current in zip(ordered, ordered[1:]):
+        if previous < start_pts_us or current > end_pts_us:
+            continue
+        delta = current - previous
+        matching = [fps for fps, values in interval_sets.items() if delta in values]
+        if len(matching) == 1:
+            counts[matching[0]] += 1
+    return counts
+
+
+def _validate_cadence_vfr_regimes(
+    histogram: dict[int, int], start_pts_us: int, end_pts_us: int, description: str
+) -> None:
+    expected = _cadence_vfr_expected_exact_regime_counts(
+        start_pts_us, end_pts_us
+    )
+    observed = {24: 0, 60: 0}
+    for delta, count in histogram.items():
+        if delta <= 0:
+            continue
+        matches = {
+            fps: multiple
+            for fps in (24, 60)
+            if (
+                multiple := _cadence_exact_frame_multiple(delta, fps, 1)
+            )
+            is not None
+        }
+        # An interval such as 1/12s is compatible with both regimes and
+        # therefore cannot prove either one without ordered per-frame PTS.
+        if len(matches) == 1:
+            fps, source_frames = next(iter(matches.items()))
+            observed[fps] += source_frames * count
+    minimum = {
+        fps: max(
+            3,
+            math.floor(
+                count * CADENCE_VFR_MINIMUM_REGIME_SOURCE_FRAME_FRACTION
+            ),
+        )
+        for fps, count in expected.items()
+    }
+    if any(expected[fps] < 3 or observed[fps] < minimum[fps] for fps in (24, 60)):
+        raise QualificationPolicyError(
+            f"{description} does not prove both material 24fps and 60fps VFR "
+            f"regimes: observed={observed!r}, minimum={minimum!r}, "
+            f"expected={expected!r}"
+        )
+
+
 def _cadence_minimum_submission_fps(
     *,
     profile: str,
@@ -5787,15 +6452,16 @@ def _cadence_minimum_submission_fps(
     end_pts_us: int,
 ) -> float:
     if profile == "vfr-24-60":
-        # The fixture is a verified continuous 2s@24 + 2s@60 timeline whose
-        # PTS origin is retained by the remux.  VLC may skip pictures before
-        # the first vout callback, so integrating relative to the first
-        # observed callback would silently shift the VFR regime phase.
-        start_media = start_pts_us / 1_000_000
-        end_media = end_pts_us / 1_000_000
-        expected_output_fps = (
-            _cadence_vfr_frame_integral(end_media)
-            - _cadence_vfr_frame_integral(start_media)
+        # Cap each absolute-PTS fixture regime independently. At 2x, 24fps
+        # remains 48fps while 60fps is selected at roughly every other source
+        # frame; globally capping their weighted average would overstate the
+        # number of selected-output callbacks a correct vout can produce.
+        regime_frames = _cadence_vfr_expected_exact_regime_counts(
+            start_pts_us, end_pts_us
+        )
+        expected_output_fps = sum(
+            count * min(1.0, 60.0 / (fps * applied_rate))
+            for fps, count in regime_frames.items()
         ) / window_duration
     else:
         expected_output_fps = CADENCE_CFR_SOURCE_RATES[profile] * applied_rate
@@ -6431,6 +7097,719 @@ def validate_cadence_oracle(evidence: dict) -> None:
         raise QualificationPolicyError(
             "cadence-matrix did not prove 0.5x/1x/2x for every CFR/VFR fixture"
         )
+
+
+def validate_cadence_semantics_probe_payload(payload: object) -> dict:
+    """Validate the short non-release cadence probe from its raw measurements."""
+
+    report = _exact_object(
+        payload,
+        CADENCE_SEMANTICS_PROBE_REPORT_KEYS,
+        "cadence semantics probe payload",
+    )
+    started = _finite_number(
+        report["startedSystemUptime"], "cadence semantics probe start uptime"
+    )
+    ended = _finite_number(
+        report["endedSystemUptime"], "cadence semantics probe end uptime"
+    )
+    if (
+        report["formatVersion"] != 1
+        or report["purpose"]
+        != "exploratory-vmem-output-attempt-cadence-semantics"
+        or report["releaseCreditEligible"] is not False
+        or report["vmemOutputTimestampProvenance"]
+        != CADENCE_VMEM_OUTPUT_TIMESTAMP_PROVENANCE
+        or report["targetWindowSeconds"] != CADENCE_WINDOW_SECONDS
+        or report["settlingSeconds"] != 2
+        or started <= 0
+        or ended <= started
+    ):
+        raise QualificationPolicyError(
+            "cadence semantics probe top-level contract changed"
+        )
+    windows = report["windows"]
+    if not isinstance(windows, list) or len(windows) != len(
+        CADENCE_SEMANTICS_PROBE_EXPECTED_WINDOWS
+    ):
+        raise QualificationPolicyError(
+            "cadence semantics probe must contain exactly nine windows"
+        )
+
+    raw_window_values: list[dict] = []
+    prior_window_end: float | None = None
+    raw_counter_fields = {
+        "vmemOutputCallbackCount",
+        "vmemOutputValidPTSCount",
+        "vmemOutputInvalidPTSCount",
+        "vmemOutputDuplicatePTSCount",
+        "vmemOutputBackwardPTSCount",
+        "vmemOutputDeltaOverflowCount",
+        "vmemOutputSubmittedCount",
+        "vmemOutputSwiftRejectedCount",
+        "vmemOutputInFlightCount",
+        *CADENCE_SEMANTICS_PROBE_RENDERER_COUNTERS.values(),
+        *CADENCE_SEMANTICS_PROBE_LIBVLC_COUNTERS.values(),
+    }
+    for index, (raw_window, expected) in enumerate(
+        zip(windows, CADENCE_SEMANTICS_PROBE_EXPECTED_WINDOWS)
+    ):
+        window = _exact_object(
+            raw_window,
+            CADENCE_SEMANTICS_PROBE_WINDOW_KEYS,
+            f"cadence semantics probe window {index}",
+        )
+        profile, expected_rate = expected
+        requested_rate = _finite_number(
+            window["requestedRate"],
+            f"cadence semantics probe window {index} requested rate",
+        )
+        window_start = _finite_number(
+            window["windowStartSystemUptime"],
+            f"cadence semantics probe window {index} start uptime",
+        )
+        window_end = _finite_number(
+            window["windowEndSystemUptime"],
+            f"cadence semantics probe window {index} end uptime",
+        )
+        duration = _finite_number(
+            window["windowDurationSeconds"],
+            f"cadence semantics probe window {index} duration",
+        )
+        if (
+            window["profile"] != profile
+            or abs(requested_rate - expected_rate) > 0.000001
+            or duration < CADENCE_WINDOW_SECONDS
+            or duration > CADENCE_WINDOW_SECONDS + 1
+            or abs((window_end - window_start) - duration) > 0.000001
+            or window_start < started
+            or window_end > ended
+            or (prior_window_end is not None and window_start <= prior_window_end)
+        ):
+            raise QualificationPolicyError(
+                f"cadence semantics probe window {index} identity/timing changed"
+            )
+        prior_window_end = window_end
+
+        before = window["before"]
+        after = window["after"]
+        if not isinstance(before, dict) or not isinstance(after, dict):
+            raise QualificationPolicyError(
+                f"cadence semantics probe window {index} has no raw boundaries"
+            )
+        required_snapshot_fields = {
+            "systemUptime",
+            "playbackGeneration",
+            "isPlaybackActive",
+            "isPictureInPictureActive",
+            "requestedRate",
+            "effectivePlayerRate",
+            "mediaTimeSeconds",
+            "controlTimebaseSeconds",
+            "controlTimebaseRate",
+            "vmemOutputTimestampProvenance",
+            "vmemOutputPlaybackGeneration",
+            "vmemOutputVoutGeneration",
+            "vmemOutputLastValidPTSUS",
+            "vmemOutputDeltaHistogram",
+            *raw_counter_fields,
+        }
+        if not required_snapshot_fields.issubset(before) or not (
+            required_snapshot_fields.issubset(after)
+        ):
+            raise QualificationPolicyError(
+                f"cadence semantics probe window {index} raw boundaries are incomplete"
+            )
+
+        snapshot_counters: list[dict[str, int]] = []
+        snapshot_histograms: list[dict[int, int]] = []
+        for label, snapshot, expected_uptime in (
+            ("before", before, window_start),
+            ("after", after, window_end),
+        ):
+            uptime = _finite_number(
+                snapshot["systemUptime"],
+                f"cadence semantics probe window {index} {label} uptime",
+            )
+            effective = _finite_number(
+                snapshot["effectivePlayerRate"],
+                f"cadence semantics probe window {index} {label} effective rate",
+            )
+            compatible_rate = _finite_number(
+                snapshot["requestedRate"],
+                f"cadence semantics probe window {index} {label} compatibility rate",
+            )
+            control_rate = _finite_number(
+                snapshot["controlTimebaseRate"],
+                f"cadence semantics probe window {index} {label} timebase rate",
+            )
+            playback_generation = _integer(
+                snapshot["playbackGeneration"],
+                f"cadence semantics probe window {index} {label} generation",
+            )
+            output_generation = _integer(
+                snapshot["vmemOutputPlaybackGeneration"],
+                f"cadence semantics probe window {index} {label} output generation",
+            )
+            vout_generation = _integer(
+                snapshot["vmemOutputVoutGeneration"],
+                f"cadence semantics probe window {index} {label} vout generation",
+            )
+            counters = {
+                field: _integer(
+                    snapshot[field],
+                    f"cadence semantics probe window {index} {label} {field}",
+                )
+                for field in raw_counter_fields
+            }
+            if any(value < 0 for value in counters.values()):
+                raise QualificationPolicyError(
+                    f"cadence semantics probe window {index} has a negative counter"
+                )
+            histogram = _cadence_delta_histogram(
+                snapshot["vmemOutputDeltaHistogram"],
+                f"cadence semantics probe window {index} {label} PTS histogram",
+            )
+            callbacks = counters["vmemOutputCallbackCount"]
+            valid = counters["vmemOutputValidPTSCount"]
+            invalid = counters["vmemOutputInvalidPTSCount"]
+            submitted = counters["vmemOutputSubmittedCount"]
+            rejected = counters["vmemOutputSwiftRejectedCount"]
+            in_flight = counters["vmemOutputInFlightCount"]
+            if (
+                abs(uptime - expected_uptime) > 0.000001
+                or snapshot["isPlaybackActive"] is not True
+                or snapshot["isPictureInPictureActive"] is not True
+                or abs(effective - requested_rate) > 0.001
+                or abs(compatible_rate - requested_rate) > 0.001
+                or abs(control_rate - requested_rate) > 0.001
+                or playback_generation <= 0
+                or output_generation != playback_generation
+                or vout_generation <= 0
+                or snapshot["vmemOutputTimestampProvenance"]
+                != CADENCE_VMEM_OUTPUT_TIMESTAMP_PROVENANCE
+                or valid + invalid != callbacks
+                or submitted + rejected + in_flight != callbacks
+                or in_flight != 0
+                or histogram.get(0, 0)
+                != counters["vmemOutputDuplicatePTSCount"]
+                or sum(count for delta, count in histogram.items() if delta < 0)
+                != counters["vmemOutputBackwardPTSCount"]
+                or sum(histogram.values()) != max(0, valid - 1)
+            ):
+                raise QualificationPolicyError(
+                    f"cadence semantics probe window {index} {label} raw boundary "
+                    "violates native callback conservation"
+                )
+            snapshot_counters.append(counters)
+            snapshot_histograms.append(histogram)
+
+        if any(
+            before[field] != after[field]
+            for field in (
+                "playbackGeneration",
+                "vmemOutputPlaybackGeneration",
+                "vmemOutputVoutGeneration",
+            )
+        ):
+            raise QualificationPolicyError(
+                f"cadence semantics probe window {index} changed generation"
+            )
+        first_counters, last_counters = snapshot_counters
+        histogram_delta = _cadence_histogram_delta(
+            snapshot_histograms[0],
+            snapshot_histograms[1],
+            f"cadence semantics probe window {index} PTS histogram",
+        )
+
+        def raw_delta(field: str) -> int:
+            value = last_counters[field] - first_counters[field]
+            if value < 0:
+                raise QualificationPolicyError(
+                    f"cadence semantics probe window {index} {field} moved backwards"
+                )
+            return value
+
+        if (
+            histogram_delta.get(0, 0)
+            != raw_delta("vmemOutputDuplicatePTSCount")
+            or sum(
+                count for delta, count in histogram_delta.items() if delta < 0
+            )
+            != raw_delta("vmemOutputBackwardPTSCount")
+        ):
+            raise QualificationPolicyError(
+                f"cadence semantics probe window {index} PTS anomaly counters "
+                "differ from the lossless histogram"
+            )
+
+        callbacks = _integer(
+            window["outputCallbackCount"],
+            f"cadence semantics probe window {index} callbacks",
+        )
+        valid = _integer(
+            window["validPTSCount"],
+            f"cadence semantics probe window {index} valid PTS",
+        )
+        invalid = _integer(
+            window["invalidPTSCount"],
+            f"cadence semantics probe window {index} invalid PTS",
+        )
+        submitted = _integer(
+            window["submittedFrames"],
+            f"cadence semantics probe window {index} submitted frames",
+        )
+        rejected = _integer(
+            window["swiftRejectedFrames"],
+            f"cadence semantics probe window {index} rejected frames",
+        )
+        in_flight_start = _integer(
+            window["inFlightStart"],
+            f"cadence semantics probe window {index} start in-flight callbacks",
+        )
+        in_flight_end = _integer(
+            window["inFlightEnd"],
+            f"cadence semantics probe window {index} end in-flight callbacks",
+        )
+        summarized_boundary_rates = (
+            (
+                "effectivePlayerRateStart",
+                before["effectivePlayerRate"],
+            ),
+            (
+                "effectivePlayerRateEnd",
+                after["effectivePlayerRate"],
+            ),
+            (
+                "controlTimebaseRateStart",
+                before["controlTimebaseRate"],
+            ),
+            (
+                "controlTimebaseRateEnd",
+                after["controlTimebaseRate"],
+            ),
+        )
+        if any(
+            abs(
+                _finite_number(
+                    window[field],
+                    f"cadence semantics probe window {index} {field}",
+                )
+                - _finite_number(
+                    raw,
+                    f"cadence semantics probe window {index} raw {field}",
+                )
+            )
+            > 0.000001
+            for field, raw in summarized_boundary_rates
+        ):
+            raise QualificationPolicyError(
+                f"cadence semantics probe window {index} rate summary differs "
+                "from raw boundaries"
+            )
+        expected_histogram = [
+            {"deltaMicroseconds": delta, "count": count}
+            for delta, count in histogram_delta.items()
+        ]
+        if (
+            callbacks != raw_delta("vmemOutputCallbackCount")
+            or valid != raw_delta("vmemOutputValidPTSCount")
+            or invalid != raw_delta("vmemOutputInvalidPTSCount")
+            or submitted != raw_delta("vmemOutputSubmittedCount")
+            or rejected != raw_delta("vmemOutputSwiftRejectedCount")
+            or callbacks <= 0
+            or callbacks != valid + invalid
+            or callbacks != submitted + rejected
+            or callbacks != sum(histogram_delta.values())
+            or invalid != 0
+            or submitted <= 0
+            or in_flight_start != first_counters["vmemOutputInFlightCount"]
+            or in_flight_end != last_counters["vmemOutputInFlightCount"]
+            or in_flight_start != 0
+            or in_flight_end != 0
+            or window["callbackConservationAtStart"] is not True
+            or window["callbackConservationAtEnd"] is not True
+            or window["callbackDeltaConservation"] is not True
+            or not _json_same(window["nativePTSDeltaHistogram"], expected_histogram)
+        ):
+            raise QualificationPolicyError(
+                f"cadence semantics probe window {index} summarized callback "
+                "conservation differs from raw boundaries"
+            )
+
+        start_pts = _cadence_int64(
+            before["vmemOutputLastValidPTSUS"],
+            f"cadence semantics probe window {index} start PTS",
+        )
+        end_pts = _cadence_int64(
+            after["vmemOutputLastValidPTSUS"],
+            f"cadence semantics probe window {index} end PTS",
+        )
+        native_delta_us = end_pts - start_pts
+        histogram_span = sum(
+            delta * count for delta, count in histogram_delta.items()
+        )
+        native_delta = _finite_number(
+            window["nativePTSDeltaSeconds"],
+            f"cadence semantics probe window {index} native PTS delta",
+        )
+        media_delta = _finite_number(
+            window["mediaTimeDeltaSeconds"],
+            f"cadence semantics probe window {index} media delta",
+        )
+        control_delta = _finite_number(
+            window["controlTimebaseDeltaSeconds"],
+            f"cadence semantics probe window {index} timebase delta",
+        )
+        raw_media_delta = _finite_number(
+            after["mediaTimeSeconds"],
+            f"cadence semantics probe window {index} ending media time",
+        ) - _finite_number(
+            before["mediaTimeSeconds"],
+            f"cadence semantics probe window {index} starting media time",
+        )
+        raw_control_delta = _finite_number(
+            after["controlTimebaseSeconds"],
+            f"cadence semantics probe window {index} ending timebase",
+        ) - _finite_number(
+            before["controlTimebaseSeconds"],
+            f"cadence semantics probe window {index} starting timebase",
+        )
+        for value, description in (
+            (native_delta, "native PTS"),
+            (media_delta, "media clock"),
+            (control_delta, "control timebase"),
+        ):
+            if (
+                value <= 0
+                or abs(value / duration - requested_rate) / requested_rate
+                > CADENCE_RATE_TOLERANCE_FRACTION
+            ):
+                raise QualificationPolicyError(
+                    f"cadence semantics probe window {index} {description} rate "
+                    "does not match the request"
+                )
+        if (
+            native_delta_us <= 0
+            or native_delta_us != histogram_span
+            or window["nativePTSDeltaMatchesHistogram"] is not True
+            or abs(native_delta - native_delta_us / 1_000_000) > 0.000001
+            or abs(media_delta - raw_media_delta) > 0.000001
+            or abs(control_delta - raw_control_delta) > 0.000001
+        ):
+            raise QualificationPolicyError(
+                f"cadence semantics probe window {index} clock/PTS summary "
+                "differs from raw boundaries"
+        )
+        if profile == "vfr-24-60":
+            _validate_cadence_vfr_regimes(
+                histogram_delta,
+                start_pts,
+                end_pts,
+                f"cadence semantics probe window {index}",
+            )
+
+        classification = _exact_object(
+            window["nativePTSClassification"],
+            CADENCE_SEMANTICS_PROBE_CLASSIFICATION_KEYS,
+            f"cadence semantics probe window {index} PTS classification",
+        )
+        classified = _classify_cadence_window_histogram(profile, histogram_delta)
+        overflow = raw_delta("vmemOutputDeltaOverflowCount")
+        expected_classification = {
+            "exactIntervalCount": classified["nativePTSExactIntervalCount"],
+            "multipleIntervalCount": classified["nativePTSMultipleIntervalCount"],
+            "estimatedSkippedPictureCount": classified[
+                "nativePTSEstimatedSkippedPictureCount"
+            ],
+            "redisplayCount": classified["nativePTSRedisplayCount"],
+            "backwardCount": classified["nativePTSBackwardCount"],
+            "unclassifiedIntervalCount": classified[
+                "nativePTSUnclassifiedIntervalCount"
+            ],
+            "deltaOverflowCount": overflow,
+        }
+        if (
+            not _json_same(classification, expected_classification)
+            or classification["backwardCount"] != 0
+            or classification["unclassifiedIntervalCount"] != 0
+            or classification["deltaOverflowCount"] != 0
+        ):
+            raise QualificationPolicyError(
+                f"cadence semantics probe window {index} PTS classification "
+                "differs from its lossless histogram"
+            )
+
+        observed_fps = _finite_number(
+            window["observedSubmissionFPS"],
+            f"cadence semantics probe window {index} submission FPS",
+        )
+        minimum_fps = _cadence_minimum_submission_fps(
+            profile=profile,
+            applied_rate=requested_rate,
+            window_duration=duration,
+            start_pts_us=start_pts,
+            end_pts_us=end_pts,
+        )
+        if (
+            abs(observed_fps - submitted / duration) > 0.000001
+            or observed_fps + 1e-9 < minimum_fps
+        ):
+            raise QualificationPolicyError(
+                f"cadence semantics probe window {index} undersubmitted frames"
+            )
+
+        renderer = _exact_object(
+            window["renderer"],
+            set(CADENCE_SEMANTICS_PROBE_RENDERER_COUNTERS),
+            f"cadence semantics probe window {index} renderer deltas",
+        )
+        renderer_values = {
+            output: _integer(
+                renderer[output],
+                f"cadence semantics probe window {index} renderer {output}",
+            )
+            for output in CADENCE_SEMANTICS_PROBE_RENDERER_COUNTERS
+        }
+        if any(value < 0 for value in renderer_values.values()) or any(
+            renderer_values[output] != raw_delta(snapshot_field)
+            for output, snapshot_field in (
+                CADENCE_SEMANTICS_PROBE_RENDERER_COUNTERS.items()
+            )
+        ):
+            raise QualificationPolicyError(
+                f"cadence semantics probe window {index} renderer summary "
+                "differs from raw boundaries"
+            )
+        if (
+            renderer_values["vmemLockAttempts"] <= 0
+            or renderer_values["vmemLockSuccesses"] <= 0
+            or renderer_values["vmemDisplayCallbacks"] <= 0
+            or renderer_values["deliveredFrames"] <= 0
+            or any(
+                renderer_values[field] != 0
+                for field in (
+                    "vmemPoolUnavailable",
+                    "vmemBaseAddressLockFailures",
+                    "vmemPendingInstallFailures",
+                    "vmemDisplayConsumeFailures",
+                    "presentationCopyFailures",
+                    "decodePoolAllocationFailures",
+                    "renderPoolAllocationFailures",
+                )
+            )
+        ):
+            raise QualificationPolicyError(
+                f"cadence semantics probe window {index} renderer did not "
+                "deliver cleanly"
+            )
+
+        libvlc = _exact_object(
+            window["libVLC"],
+            set(CADENCE_SEMANTICS_PROBE_LIBVLC_COUNTERS),
+            f"cadence semantics probe window {index} libVLC deltas",
+        )
+        libvlc_values = {
+            output: _integer(
+                libvlc[output],
+                f"cadence semantics probe window {index} libVLC {output}",
+            )
+            for output in CADENCE_SEMANTICS_PROBE_LIBVLC_COUNTERS
+        }
+        if (
+            any(value < 0 for value in libvlc_values.values())
+            or any(
+                libvlc_values[output] != raw_delta(snapshot_field)
+                for output, snapshot_field in (
+                    CADENCE_SEMANTICS_PROBE_LIBVLC_COUNTERS.items()
+                )
+            )
+            or libvlc_values["decodedVideo"] <= 0
+            or libvlc_values["displayedPictures"] <= 0
+        ):
+            raise QualificationPolicyError(
+                f"cadence semantics probe window {index} has no independent "
+                "libVLC progress"
+            )
+        raw_window_values.append(window)
+
+    springboard = _exact_object(
+        report["springBoardFrames"],
+        {
+            "formatVersion",
+            "method",
+            "framesPerWindow",
+            "captureBoundaryGuardSeconds",
+            "records",
+        },
+        "cadence semantics probe SpringBoard frames",
+    )
+    records = springboard["records"]
+    capture_guard = _finite_number(
+        springboard["captureBoundaryGuardSeconds"],
+        "cadence semantics probe SpringBoard capture boundary guard",
+    )
+    if (
+        springboard["formatVersion"] != 1
+        or springboard["method"] != VISUAL_OBSERVATION_METHOD
+        or springboard["framesPerWindow"] != 3
+        or abs(
+            capture_guard
+            - CADENCE_SEMANTICS_PROBE_CAPTURE_BOUNDARY_GUARD_SECONDS
+        )
+        > 0.000001
+        or not isinstance(records, list)
+        or len(records) != len(raw_window_values)
+    ):
+        raise QualificationPolicyError(
+            "cadence semantics probe SpringBoard frame contract changed"
+        )
+    prior_capture_end: float | None = None
+    for index, (raw_record, window) in enumerate(zip(records, raw_window_values)):
+        record = _exact_object(
+            raw_record,
+            CADENCE_SEMANTICS_PROBE_SPRINGBOARD_RECORD_KEYS,
+            f"cadence semantics probe SpringBoard record {index}",
+        )
+        for field in ("profile", "requestedRate"):
+            if not _json_same(record[field], window[field]):
+                raise QualificationPolicyError(
+                    f"cadence semantics probe SpringBoard record {index} "
+                    f"{field} differs from its native window"
+                )
+        window_start = _finite_number(
+            record["windowStartSystemUptime"],
+            f"cadence semantics probe SpringBoard record {index} start",
+        )
+        window_end = _finite_number(
+            record["windowEndSystemUptime"],
+            f"cadence semantics probe SpringBoard record {index} end",
+        )
+        if (
+            abs(window_start - float(window["windowStartSystemUptime"])) > 0.000001
+            or abs(window_end - float(window["windowEndSystemUptime"])) > 0.000001
+        ):
+            raise QualificationPolicyError(
+                f"cadence semantics probe SpringBoard record {index} window drifted"
+            )
+        capture_start_values = record["captureStartSystemUptimes"]
+        capture_end_values = record["captureEndSystemUptimes"]
+        capture_values = record["captureSystemUptimes"]
+        encoded_frames = record["canonicalRGB8Base64"]
+        if (
+            not isinstance(capture_start_values, list)
+            or len(capture_start_values) != 3
+            or not isinstance(capture_end_values, list)
+            or len(capture_end_values) != 3
+            or not isinstance(capture_values, list)
+            or len(capture_values) != 3
+            or not isinstance(encoded_frames, list)
+            or len(encoded_frames) != 3
+        ):
+            raise QualificationPolicyError(
+                f"cadence semantics probe SpringBoard record {index} must retain "
+                "three raw frames"
+            )
+        capture_starts = [
+            _finite_number(
+                value,
+                f"cadence semantics probe SpringBoard record {index} "
+                f"capture {offset} start",
+            )
+            for offset, value in enumerate(capture_start_values)
+        ]
+        capture_ends = [
+            _finite_number(
+                value,
+                f"cadence semantics probe SpringBoard record {index} "
+                f"capture {offset} end",
+            )
+            for offset, value in enumerate(capture_end_values)
+        ]
+        capture_midpoints = [
+            _finite_number(
+                value,
+                f"cadence semantics probe SpringBoard record {index} capture {offset}",
+            )
+            for offset, value in enumerate(capture_values)
+        ]
+        if (
+            any(end <= start for start, end in zip(capture_starts, capture_ends))
+            or any(
+                abs(midpoint - ((start + end) / 2)) > 0.000001
+                for start, end, midpoint in zip(
+                    capture_starts, capture_ends, capture_midpoints
+                )
+            )
+            or any(
+                start < window_start + capture_guard
+                or end > window_end - capture_guard
+                for start, end in zip(capture_starts, capture_ends)
+            )
+            or any(
+                current_start <= previous_end
+                for previous_end, current_start in zip(
+                    capture_ends, capture_starts[1:]
+                )
+            )
+            or (
+                prior_capture_end is not None
+                and capture_starts[0] <= prior_capture_end
+            )
+        ):
+            raise QualificationPolicyError(
+                f"cadence semantics probe SpringBoard record {index} captures "
+                "are outside its native window"
+            )
+        prior_capture_end = capture_ends[-1]
+        frames = [
+            _decode_canonical_visual_frame(
+                value,
+                f"cadence semantics probe SpringBoard record {index} frame {offset}",
+            )
+            for offset, value in enumerate(encoded_frames)
+        ]
+        hashes = [_canonical_visual_frame_hash(frame) for frame in frames]
+        ratios = [
+            _canonical_visual_changed_pixel_ratio(first, second)
+            for first, second in zip(frames, frames[1:])
+        ]
+        score = min(ratios)
+        reported_ratios = record["adjacentChangedPixelRatios"]
+        if not isinstance(reported_ratios, list) or len(reported_ratios) != 2:
+            raise QualificationPolicyError(
+                f"cadence semantics probe SpringBoard record {index} has "
+                "malformed motion ratios"
+            )
+        normalized_reported_ratios = [
+            _finite_number(
+                value,
+                f"cadence semantics probe SpringBoard record {index} ratio {offset}",
+            )
+            for offset, value in enumerate(reported_ratios)
+        ]
+        if (
+            record["frameHashes"] != hashes
+            or len(set(hashes)) != 3
+            or any(
+                abs(float(observed) - expected) > 1e-12
+                for observed, expected in zip(normalized_reported_ratios, ratios)
+            )
+            or abs(
+                _finite_number(
+                    record["changedPixelScore"],
+                    f"cadence semantics probe SpringBoard record {index} motion",
+                )
+                - score
+            )
+            > 1e-12
+            or score < CADENCE_VISUAL_MOTION_MINIMUM_SCORE
+        ):
+            raise QualificationPolicyError(
+                f"cadence semantics probe SpringBoard record {index} raw-frame "
+                "motion did not replay"
+            )
+    return report
 
 
 def validate_vod_controls_evidence(evidence: dict) -> None:
@@ -10027,6 +11406,10 @@ def validate_expected_error_evidence(
 
 
 PROVENANCE_FIELDS = (
+    "candidateBuildAttestation",
+    "candidateBuildAttestationDigestAlgorithm",
+    "candidateBuildAttestationDigest",
+    "candidateRuntimeBinding",
     "candidateAppBundleIdentifier",
     "candidateAppDigestAlgorithm",
     "candidateAppDigest",
@@ -10043,6 +11426,8 @@ PROVENANCE_FIELDS = (
     "testCatalogDigest",
     "testCatalogCount",
     "testCatalog",
+    "testCatalogAuthorityDigestAlgorithm",
+    "testCatalogAuthorityDigest",
     "qualificationMatrixChecksum",
     "featureManifestChecksum",
     "qualificationProfilesChecksum",
@@ -10061,9 +11446,595 @@ CORE_IDENTITY_FIELDS = (
     *PROVENANCE_FIELDS,
 )
 
+QUALIFICATION_RUNTIME_BINDING_FIELDS = frozenset(
+    {"qualificationSessionBinding", "candidateRuntimeBinding"}
+)
+
+
+def validate_and_strip_qualification_runtime_bindings(
+    payload: dict,
+    *,
+    expected_session_binding: str,
+    expected_candidate_binding: str,
+) -> dict:
+    """Validate device/test-origin bindings before ordinary evidence semantics.
+
+    The raw XCTest attachment owns these two values. They are deliberately
+    stripped from the semantic payload after validation so every scenario's
+    existing exact key schema remains closed rather than gaining optional
+    envelope fields. The retained attachment and final xcresult keep the full
+    original bytes and are independently revalidated at report assembly.
+    """
+
+    if not isinstance(payload, dict):
+        raise QualificationPolicyError(
+            "qualification runtime-bound attachment must be a JSON object"
+        )
+    for description, field, expected in (
+        (
+            "qualification session",
+            "qualificationSessionBinding",
+            expected_session_binding,
+        ),
+        ("candidate runtime", "candidateRuntimeBinding", expected_candidate_binding),
+    ):
+        if not isinstance(expected, str) or SHA256.fullmatch(expected) is None:
+            raise QualificationPolicyError(
+                f"expected {description} binding must be 64 lowercase hex characters"
+            )
+        observed = payload.get(field)
+        if not isinstance(observed, str) or SHA256.fullmatch(observed) is None:
+            raise QualificationPolicyError(
+                f"raw attachment has no valid {description} binding"
+            )
+        if observed != expected:
+            raise QualificationPolicyError(
+                f"raw attachment {description} binding mismatch"
+            )
+    return {
+        key: value
+        for key, value in payload.items()
+        if key not in QUALIFICATION_RUNTIME_BINDING_FIELDS
+    }
+
+
+CANDIDATE_BUILD_ATTESTATION_KEYS = {
+    "formatVersion",
+    "authority",
+    "version",
+    "candidateRuntimeBinding",
+    "sourceCommit",
+    "releaseSourceDigestAlgorithm",
+    "releaseSourceDigest",
+    "artifactRelativePath",
+    "artifactBindingMode",
+    "artifactDigestAlgorithm",
+    "artifactDigest",
+    "workspaceStateRelativePath",
+    "workspaceStateDigestAlgorithm",
+    "workspaceStateDigest",
+    "workspaceBinding",
+    "buildConfiguration",
+    "buildPlatform",
+    "swiftSourceRoot",
+    "swiftSourceSetDigestAlgorithm",
+    "swiftSourceSetDigest",
+    "swiftSourceCount",
+    "swiftSourceRelativePaths",
+    "swiftSourceFiles",
+    "showcaseSourceRoot",
+    "showcaseSourceSetDigestAlgorithm",
+    "showcaseSourceSetDigest",
+    "showcaseSourceCount",
+    "showcaseSourceRelativePaths",
+    "showcaseSourceFiles",
+    "sourceAuthorityBuildInputSetDigestAlgorithm",
+    "sourceAuthorityBuildInputSetDigest",
+    "sourceAuthorityBuildInputCount",
+    "sourceAuthorityBuildInputFiles",
+    "effectiveBuildInputSetDigestAlgorithm",
+    "effectiveBuildInputSetDigest",
+    "effectiveBuildInputCount",
+    "effectiveBuildInputFiles",
+    "authorizedBuildInputTransforms",
+    "developmentTeam",
+    "bundlePrefix",
+    "effectiveBuildSettingsDigestAlgorithm",
+    "effectiveBuildSettingsDigest",
+    "effectiveBuildSettings",
+    "swiftFileLists",
+    "showcaseTargetFileLists",
+    "candidateAppRelativePath",
+    "candidateAppDigestAlgorithm",
+    "candidateAppDigest",
+    "testRunnerRelativePath",
+    "testRunnerDigestAlgorithm",
+    "testRunnerDigest",
+    "testBundleRelativePath",
+    "testBundleDigestAlgorithm",
+    "testBundleDigest",
+    "baseXCTestRunName",
+    "baseXCTestRunDigestAlgorithm",
+    "baseXCTestRunDigest",
+    "testCatalogDigestAlgorithm",
+    "testCatalogDigest",
+    "testCatalogCount",
+    "testCatalog",
+}
+
+CANDIDATE_WORKSPACE_BINDING = {
+    "dependencyKind": "fileSystem",
+    "dependencyLocation": "$BUILD_SOURCE_ROOT",
+    "dependencyStateName": "fileSystem",
+    "dependencyStatePath": "$BUILD_SOURCE_ROOT",
+    "artifactKind": "xcframework",
+    "artifactPath": "$BUILD_SOURCE_ROOT/Vendor/libvlc.xcframework",
+    "artifactSourceType": "local",
+    "artifactTargetName": "libvlc",
+}
+
+
+def compiled_source_set_digest(records: list[dict]) -> str:
+    if not isinstance(records, list) or not records:
+        raise QualificationPolicyError("compiled source inventory must be non-empty")
+    normalized: list[tuple[str, int, str]] = []
+    for record in records:
+        if not isinstance(record, dict) or set(record) != {
+            "relativePath",
+            "mode",
+            "digestAlgorithm",
+            "digest",
+        }:
+            raise QualificationPolicyError("compiled source inventory record is malformed")
+        relative = record.get("relativePath")
+        mode = record.get("mode")
+        content_digest = record.get("digest")
+        if (
+            not isinstance(relative, str)
+            or not relative.endswith(".swift")
+            or Path(relative).is_absolute()
+            or ".." in Path(relative).parts
+            or not isinstance(mode, int)
+            or isinstance(mode, bool)
+            or mode < 0
+            or mode > 0o7777
+            or record.get("digestAlgorithm") != "sha256"
+            or SHA256.fullmatch(str(content_digest or "")) is None
+        ):
+            raise QualificationPolicyError("compiled source inventory record is invalid")
+        normalized.append((relative, mode, content_digest))
+    if normalized != sorted(set(normalized)):
+        raise QualificationPolicyError("compiled source inventory is not canonical")
+    digest = hashlib.sha256(b"SwiftVLC compiled source set v2\0")
+    for relative, mode, content_digest in normalized:
+        for value in (
+            b"file",
+            relative.encode("utf-8"),
+            mode.to_bytes(4, "big"),
+            bytes.fromhex(content_digest),
+        ):
+            digest.update(len(value).to_bytes(8, "big"))
+            digest.update(value)
+    return digest.hexdigest()
+
+
+def build_input_set_digest(records: list[dict]) -> str:
+    if not isinstance(records, list) or not records:
+        raise QualificationPolicyError("build input inventory must be non-empty")
+    normalized: list[tuple[str, int, str]] = []
+    for record in records:
+        if not isinstance(record, dict) or set(record) != {
+            "relativePath",
+            "mode",
+            "digestAlgorithm",
+            "digest",
+        }:
+            raise QualificationPolicyError("build input inventory record is malformed")
+        relative = record.get("relativePath")
+        mode = record.get("mode")
+        content_digest = record.get("digest")
+        if (
+            not isinstance(relative, str)
+            or not relative
+            or Path(relative).is_absolute()
+            or ".." in Path(relative).parts
+            or not isinstance(mode, int)
+            or isinstance(mode, bool)
+            or mode < 0
+            or mode > 0o7777
+            or record.get("digestAlgorithm") != "sha256"
+            or SHA256.fullmatch(str(content_digest or "")) is None
+        ):
+            raise QualificationPolicyError("build input inventory record is invalid")
+        normalized.append((relative, mode, content_digest))
+    if normalized != sorted(set(normalized)):
+        raise QualificationPolicyError("build input inventory is not canonical")
+    return hashlib.sha256(
+        b"SwiftVLC qualification build input set v1\0"
+        + canonical_json_bytes(normalized)
+    ).hexdigest()
+
+
+def effective_build_settings_digest(records: list[dict]) -> str:
+    if not isinstance(records, list) or not records:
+        raise QualificationPolicyError("effective build settings must be non-empty")
+    targets: list[str] = []
+    for record in records:
+        if not isinstance(record, dict) or set(record) != {"target", "settings"}:
+            raise QualificationPolicyError(
+                "effective build-settings record is malformed"
+            )
+        target = record.get("target")
+        settings = record.get("settings")
+        if (
+            not isinstance(target, str)
+            or not target
+            or not isinstance(settings, dict)
+            or not settings
+            or list(settings) != sorted(settings)
+            or any(
+                not isinstance(key, str) or not isinstance(value, str)
+                for key, value in settings.items()
+            )
+        ):
+            raise QualificationPolicyError(
+                "effective build-settings record is invalid"
+            )
+        targets.append(target)
+    if targets != sorted(set(targets)) or not {"iOS", "iOSUITests"}.issubset(targets):
+        raise QualificationPolicyError(
+            "effective build settings are non-canonical or omit required targets"
+        )
+    return hashlib.sha256(
+        b"SwiftVLC effective Xcode build settings v1\0"
+        + canonical_json_bytes(records)
+    ).hexdigest()
+
+
+def validate_candidate_build_attestation(
+    attestation: object, *, candidate: dict | None = None
+) -> dict:
+    if not isinstance(attestation, dict):
+        raise QualificationPolicyError(
+            "candidate metadata has no candidateBuildAttestation"
+        )
+    if set(attestation) != CANDIDATE_BUILD_ATTESTATION_KEYS:
+        missing = sorted(CANDIDATE_BUILD_ATTESTATION_KEYS - set(attestation))
+        extra = sorted(set(attestation) - CANDIDATE_BUILD_ATTESTATION_KEYS)
+        raise QualificationPolicyError(
+            "candidate build attestation schema mismatch: "
+            f"missing={missing!r}, extra={extra!r}"
+        )
+    expected_scalars = {
+        "formatVersion": 1,
+        "authority": "swiftvlc-candidate-build-binding-v1",
+        "releaseSourceDigestAlgorithm": "swiftvlc-git-tree-v1",
+        "artifactRelativePath": "Vendor/libvlc.xcframework",
+        "artifactDigestAlgorithm": "swiftvlc-tree-v1",
+        "workspaceStateRelativePath": "SourcePackages/workspace-state.json",
+        "workspaceStateDigestAlgorithm": "sha256",
+        "buildConfiguration": "Release",
+        "buildPlatform": "iphoneos",
+        "swiftSourceRoot": "Sources/SwiftVLC",
+        "swiftSourceSetDigestAlgorithm": "swiftvlc-compiled-source-set-v2",
+        "showcaseSourceRoot": "Showcase",
+        "showcaseSourceSetDigestAlgorithm": "swiftvlc-compiled-source-set-v2",
+        "sourceAuthorityBuildInputSetDigestAlgorithm": (
+            "swiftvlc-build-input-set-v1"
+        ),
+        "effectiveBuildInputSetDigestAlgorithm": "swiftvlc-build-input-set-v1",
+        "effectiveBuildSettingsDigestAlgorithm": (
+            "swiftvlc-effective-build-settings-v1"
+        ),
+        "candidateAppRelativePath": "Release-iphoneos/iOS.app",
+        "candidateAppDigestAlgorithm": "swiftvlc-tree-v1",
+        "testRunnerRelativePath": "Release-iphoneos/iOSUITests-Runner.app",
+        "testRunnerDigestAlgorithm": "swiftvlc-tree-v1",
+        "testBundleRelativePath": "PlugIns/iOSUITests.xctest",
+        "testBundleDigestAlgorithm": "swiftvlc-tree-v1",
+        "baseXCTestRunDigestAlgorithm": "sha256",
+        "testCatalogDigestAlgorithm": "swiftvlc-test-catalog-v1",
+    }
+    for field, expected in expected_scalars.items():
+        if attestation.get(field) != expected:
+            raise QualificationPolicyError(
+                f"candidate build attestation {field} must be {expected!r}"
+            )
+    if not isinstance(attestation.get("version"), str) or not attestation["version"]:
+        raise QualificationPolicyError(
+            "candidate build attestation has no version"
+        )
+    if attestation.get("artifactBindingMode") not in {
+        "direct",
+        "vendor-symlink-to-authority-root",
+    }:
+        raise QualificationPolicyError(
+            "candidate build attestation artifactBindingMode is invalid"
+        )
+    if (
+        re.fullmatch(r"[A-Z0-9]{10}", str(attestation.get("developmentTeam", "")))
+        is None
+        or re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9-]*(?:\.[A-Za-z0-9][A-Za-z0-9-]*)+",
+            str(attestation.get("bundlePrefix", "")),
+        )
+        is None
+    ):
+        raise QualificationPolicyError(
+            "candidate build attestation signing transform inputs are invalid"
+        )
+    if attestation.get("workspaceBinding") != CANDIDATE_WORKSPACE_BINDING:
+        raise QualificationPolicyError(
+            "candidate build attestation workspace binding is not exact local SwiftVLC"
+        )
+    for field, pattern in (
+        ("sourceCommit", SHA1),
+        ("candidateRuntimeBinding", SHA256),
+        ("releaseSourceDigest", SHA256),
+        ("artifactDigest", SHA256),
+        ("workspaceStateDigest", SHA256),
+        ("swiftSourceSetDigest", SHA256),
+        ("sourceAuthorityBuildInputSetDigest", SHA256),
+        ("effectiveBuildInputSetDigest", SHA256),
+        ("effectiveBuildSettingsDigest", SHA256),
+        ("candidateAppDigest", SHA256),
+        ("testRunnerDigest", SHA256),
+        ("testBundleDigest", SHA256),
+        ("baseXCTestRunDigest", SHA256),
+        ("testCatalogDigest", SHA256),
+    ):
+        if pattern.fullmatch(str(attestation.get(field, ""))) is None:
+            raise QualificationPolicyError(
+                f"candidate build attestation has no valid {field}"
+            )
+    for prefix, description in (
+        ("swift", "SwiftVLC"),
+        ("showcase", "Showcase"),
+    ):
+        sources = attestation.get(f"{prefix}SourceRelativePaths")
+        records = attestation.get(f"{prefix}SourceFiles")
+        if (
+            not isinstance(sources, list)
+            or not sources
+            or not isinstance(records, list)
+            or [item.get("relativePath") for item in records if isinstance(item, dict)]
+            != sources
+            or sources != sorted(set(sources))
+            or attestation.get(f"{prefix}SourceCount") != len(sources)
+        ):
+            raise QualificationPolicyError(
+                f"candidate build attestation {description} source inventory is invalid"
+            )
+        if attestation.get(f"{prefix}SourceSetDigest") != compiled_source_set_digest(
+            records
+        ):
+            raise QualificationPolicyError(
+                f"candidate build attestation {description} source set digest mismatch"
+            )
+    for prefix, description in (
+        ("sourceAuthority", "source authority"),
+        ("effective", "effective"),
+    ):
+        records = attestation.get(f"{prefix}BuildInputFiles")
+        if (
+            not isinstance(records, list)
+            or attestation.get(f"{prefix}BuildInputCount") != len(records)
+            or attestation.get(f"{prefix}BuildInputSetDigest")
+            != build_input_set_digest(records)
+        ):
+            raise QualificationPolicyError(
+                f"candidate build attestation {description} build input inventory is invalid"
+            )
+    transforms = attestation.get("authorizedBuildInputTransforms")
+    allowed_transforms = {
+        "Package.swift",
+        "Showcase/SwiftVLCShowcase.xcodeproj/project.pbxproj",
+        (
+            "Showcase/SwiftVLCShowcase.xcodeproj/project.xcworkspace/"
+            "xcshareddata/swiftpm/Package.resolved"
+        ),
+    }
+    if (
+        not isinstance(transforms, list)
+        or transforms != sorted(set(transforms))
+        or not set(transforms).issubset(allowed_transforms)
+    ):
+        raise QualificationPolicyError(
+            "candidate build attestation authorized build input transforms are invalid"
+        )
+    settings = attestation.get("effectiveBuildSettings")
+    if (
+        not isinstance(settings, list)
+        or attestation.get("effectiveBuildSettingsDigest")
+        != effective_build_settings_digest(settings)
+    ):
+        raise QualificationPolicyError(
+            "candidate build attestation effective build settings are invalid"
+        )
+    file_lists = attestation.get("swiftFileLists")
+    if not isinstance(file_lists, list) or not file_lists:
+        raise QualificationPolicyError(
+            "candidate build attestation has no Swift file-list verification"
+        )
+    architectures: set[str] = set()
+    for record in file_lists:
+        if not isinstance(record, dict) or set(record) != {
+            "architecture",
+            "digestAlgorithm",
+            "digest",
+            "relativePath",
+            "sourceCount",
+        }:
+            raise QualificationPolicyError(
+                "candidate build attestation has malformed Swift file-list evidence"
+            )
+        architecture = record.get("architecture")
+        relative = record.get("relativePath")
+        expected_suffix = (
+            "/SwiftVLC.build/Release-iphoneos/SwiftVLC.build/Objects-normal/"
+            f"{architecture}/SwiftVLC.SwiftFileList"
+        )
+        if (
+            not isinstance(architecture, str)
+            or not architecture
+            or architecture in architectures
+            or record.get("digestAlgorithm") != "sha256"
+            or SHA256.fullmatch(str(record.get("digest", ""))) is None
+            or not isinstance(relative, str)
+            or Path(relative).is_absolute()
+            or ".." in Path(relative).parts
+            or not relative.endswith(expected_suffix)
+            or record.get("sourceCount")
+            != attestation.get("swiftSourceCount")
+        ):
+            raise QualificationPolicyError(
+                "candidate build attestation Swift file-list evidence is invalid"
+            )
+        architectures.add(architecture)
+    if file_lists != sorted(
+        file_lists, key=lambda item: (item["architecture"], item["relativePath"])
+    ):
+        raise QualificationPolicyError(
+            "candidate build attestation Swift file-list evidence is not canonical"
+        )
+    showcase_file_lists = attestation.get("showcaseTargetFileLists")
+    if not isinstance(showcase_file_lists, list) or not showcase_file_lists:
+        raise QualificationPolicyError(
+            "candidate build attestation has no Showcase target file-list verification"
+        )
+    expected_sources_by_target = {
+        "iOS": sum(
+            1
+            for path in attestation["showcaseSourceRelativePaths"]
+            if path.startswith("Shared/") or path.startswith("iOS/")
+        ),
+        "iOSUITests": sum(
+            1
+            for path in attestation["showcaseSourceRelativePaths"]
+            if path.startswith("Shared/") or path.startswith("UITests/iOS/")
+        ),
+    }
+    observed_target_architectures: set[tuple[str, str]] = set()
+    observed_targets: set[str] = set()
+    for record in showcase_file_lists:
+        if not isinstance(record, dict) or set(record) != {
+            "target",
+            "architecture",
+            "digestAlgorithm",
+            "digest",
+            "relativePath",
+            "sourceCount",
+            "generatedSourceCount",
+            "generatedSourceDigestAlgorithm",
+            "generatedSourceDigest",
+        }:
+            raise QualificationPolicyError(
+                "candidate build attestation has malformed Showcase file-list evidence"
+            )
+        target = record.get("target")
+        architecture = record.get("architecture")
+        relative = record.get("relativePath")
+        expected_suffix = (
+            f"/SwiftVLCShowcase.build/Release-iphoneos/{target}.build/"
+            f"Objects-normal/{architecture}/{target}.SwiftFileList"
+        )
+        target_architecture = (target, architecture)
+        if (
+            target not in expected_sources_by_target
+            or not isinstance(architecture, str)
+            or not architecture
+            or target_architecture in observed_target_architectures
+            or record.get("digestAlgorithm") != "sha256"
+            or SHA256.fullmatch(str(record.get("digest", ""))) is None
+            or not isinstance(relative, str)
+            or Path(relative).is_absolute()
+            or ".." in Path(relative).parts
+            or not relative.endswith(expected_suffix)
+            or record.get("sourceCount") != expected_sources_by_target[target]
+            or record.get("generatedSourceCount") != 1
+            or record.get("generatedSourceDigestAlgorithm") != "sha256"
+            or SHA256.fullmatch(str(record.get("generatedSourceDigest", "")))
+            is None
+        ):
+            raise QualificationPolicyError(
+                "candidate build attestation Showcase file-list evidence is invalid"
+            )
+        observed_target_architectures.add(target_architecture)
+        observed_targets.add(target)
+    if observed_targets != set(expected_sources_by_target):
+        raise QualificationPolicyError(
+            "candidate build attestation is missing an iOS or iOSUITests file list"
+        )
+    if showcase_file_lists != sorted(
+        showcase_file_lists,
+        key=lambda item: (
+            item["target"],
+            item["architecture"],
+            item["relativePath"],
+        ),
+    ):
+        raise QualificationPolicyError(
+            "candidate build attestation Showcase file-list evidence is not canonical"
+        )
+    xctestrun_name = attestation.get("baseXCTestRunName")
+    if (
+        not isinstance(xctestrun_name, str)
+        or xctestrun_name != Path(xctestrun_name).name
+        or not xctestrun_name.endswith(".xctestrun")
+    ):
+        raise QualificationPolicyError(
+            "candidate build attestation baseXCTestRunName is unsafe"
+        )
+    catalog = attestation.get("testCatalog")
+    if not isinstance(catalog, list) or any(
+        not isinstance(identifier, str) for identifier in catalog
+    ):
+        raise QualificationPolicyError(
+            "candidate build attestation has no exact test catalog"
+        )
+    canonical_catalog = catalog_record(catalog)
+    if (
+        catalog != canonical_catalog["testIdentifiers"]
+        or attestation.get("testCatalogCount") != canonical_catalog["testCount"]
+        or attestation.get("testCatalogDigest") != canonical_catalog["digest"]
+    ):
+        raise QualificationPolicyError(
+            "candidate build attestation test catalog is not canonical"
+        )
+    if candidate is not None:
+        for field in (
+            "version",
+            "candidateRuntimeBinding",
+            "sourceCommit",
+            "releaseSourceDigest",
+            "artifactDigest",
+        ):
+            if attestation.get(field) != candidate.get(field):
+                raise QualificationPolicyError(
+                    f"candidate build attestation {field} does not match candidate metadata"
+                )
+        for attestation_field, candidate_field in (
+            ("candidateAppDigest", "candidateAppDigest"),
+            ("testRunnerDigest", "testRunnerDigest"),
+            ("testBundleRelativePath", "testBundleRelativePath"),
+            ("testBundleDigest", "testBundleDigest"),
+            ("baseXCTestRunName", "baseXCTestRunName"),
+            ("baseXCTestRunDigest", "baseXCTestRunDigest"),
+            ("testCatalogDigest", "testCatalogDigest"),
+            ("testCatalogCount", "testCatalogCount"),
+            ("testCatalog", "testCatalog"),
+        ):
+            if attestation.get(attestation_field) != candidate.get(candidate_field):
+                raise QualificationPolicyError(
+                    "candidate build attestation "
+                    f"{attestation_field} does not match candidate metadata"
+                )
+    return attestation
+
 
 def validate_candidate_identity(candidate: dict, *, strict: bool = True) -> dict:
     expected_algorithms = {
+        "candidateBuildAttestationDigestAlgorithm": "sha256",
         "releaseSourceDigestAlgorithm": "swiftvlc-git-tree-v1",
         "artifactDigestAlgorithm": "swiftvlc-tree-v1",
         "candidateAppDigestAlgorithm": "swiftvlc-tree-v1",
@@ -10071,6 +12042,7 @@ def validate_candidate_identity(candidate: dict, *, strict: bool = True) -> dict
         "testBundleDigestAlgorithm": "swiftvlc-tree-v1",
         "baseXCTestRunDigestAlgorithm": "sha256",
         "testCatalogDigestAlgorithm": "swiftvlc-test-catalog-v1",
+        "testCatalogAuthorityDigestAlgorithm": "sha256",
         "qualificationPolicyDigestAlgorithm": "swiftvlc-qualification-policy-v1",
     }
     if strict and candidate.get("formatVersion") != 2:
@@ -10080,6 +12052,8 @@ def validate_candidate_identity(candidate: dict, *, strict: bool = True) -> dict
     if not SHA1.fullmatch(str(candidate.get("sourceCommit", ""))):
         raise QualificationPolicyError("candidate metadata has no valid sourceCommit")
     for field in (
+        "candidateBuildAttestationDigest",
+        "candidateRuntimeBinding",
         "releaseSourceDigest",
         "artifactDigest",
         "candidateAppDigest",
@@ -10087,6 +12061,7 @@ def validate_candidate_identity(candidate: dict, *, strict: bool = True) -> dict
         "testBundleDigest",
         "baseXCTestRunDigest",
         "testCatalogDigest",
+        "testCatalogAuthorityDigest",
         "qualificationMatrixChecksum",
         "featureManifestChecksum",
         "qualificationProfilesChecksum",
@@ -10104,6 +12079,17 @@ def validate_candidate_identity(candidate: dict, *, strict: bool = True) -> dict
                 raise QualificationPolicyError(
                     f"candidate metadata {field} must be {expected!r}"
                 )
+    if strict or "candidateBuildAttestation" in candidate:
+        attestation = validate_candidate_build_attestation(
+            candidate.get("candidateBuildAttestation"), candidate=candidate
+        )
+        expected_attestation_digest = hashlib.sha256(
+            canonical_json_bytes(attestation)
+        ).hexdigest()
+        if candidate.get("candidateBuildAttestationDigest") != expected_attestation_digest:
+            raise QualificationPolicyError(
+                "candidate build attestation digest mismatch"
+            )
     for field in (
         "candidateAppBundleIdentifier",
         "testRunnerBundleIdentifier",
@@ -10276,6 +12262,63 @@ def attachment_name_matches(actual_name: object, expected_name: str) -> bool:
     )
 
 
+def _reconciled_test_identifier(
+    raw_identifier: object,
+    raw_url: object,
+    *,
+    description: str,
+    identifier_field: str,
+    url_field: str,
+) -> str:
+    """Strictly reconcile Xcode's short identifier with its canonical URL."""
+
+    if raw_identifier is None and raw_url is None:
+        raise QualificationPolicyError(
+            f"{description} has no XCTest owner"
+        )
+
+    canonical_url: str | None = None
+    if raw_url is not None:
+        if not isinstance(raw_url, str) or not raw_url.strip():
+            raise QualificationPolicyError(
+                f"{description} has malformed {url_field}"
+            )
+        canonical_url = normalize_test_identifier(raw_url)
+
+    canonical_identifier: str | None = None
+    if raw_identifier is not None:
+        if not isinstance(raw_identifier, str) or not raw_identifier.strip():
+            raise QualificationPolicyError(
+                f"{description} has malformed {identifier_field}"
+            )
+        try:
+            canonical_identifier = normalize_test_identifier(raw_identifier)
+        except QualificationPolicyError as error:
+            short = unquote(raw_identifier.strip()).split("?", 1)[0].strip("/")
+            short = short.replace("\\", "/")
+            components = [component for component in short.split("/") if component]
+            if len(components) != 2 or canonical_url is None:
+                raise QualificationPolicyError(
+                    f"{description} {identifier_field} is not canonical"
+                ) from error
+            components[-1] = components[-1].removesuffix("()")
+            suffix = "/".join(components)
+            if not all(components) or not canonical_url.endswith("/" + suffix):
+                raise QualificationPolicyError(
+                    f"{description} owner fields disagree"
+                ) from error
+            canonical_identifier = canonical_url
+
+    canonical = canonical_identifier or canonical_url
+    assert canonical is not None
+    if canonical_identifier is not None and canonical_url is not None:
+        if canonical_identifier != canonical_url:
+            raise QualificationPolicyError(
+                f"{description} owner fields disagree"
+            )
+    return canonical
+
+
 def attachment_test_identifier(test_record: dict) -> str:
     """Return the canonical XCTest leaf that owns one manifest test record.
 
@@ -10286,53 +12329,13 @@ def attachment_test_identifier(test_record: dict) -> str:
     and the two values agree exactly.
     """
 
-    raw_identifier = test_record.get("testIdentifier")
-    raw_url = test_record.get("testIdentifierURL")
-    if raw_identifier is None and raw_url is None:
-        raise QualificationPolicyError(
-            "xcresult attachment manifest test record has no XCTest owner"
-        )
-
-    canonical_url: str | None = None
-    if raw_url is not None:
-        if not isinstance(raw_url, str) or not raw_url.strip():
-            raise QualificationPolicyError(
-                "xcresult attachment manifest has malformed testIdentifierURL"
-            )
-        canonical_url = normalize_test_identifier(raw_url)
-
-    canonical_identifier: str | None = None
-    if raw_identifier is not None:
-        if not isinstance(raw_identifier, str) or not raw_identifier.strip():
-            raise QualificationPolicyError(
-                "xcresult attachment manifest has malformed testIdentifier"
-            )
-        try:
-            canonical_identifier = normalize_test_identifier(raw_identifier)
-        except QualificationPolicyError as error:
-            short = unquote(raw_identifier.strip()).split("?", 1)[0].strip("/")
-            short = short.replace("\\", "/")
-            components = [component for component in short.split("/") if component]
-            if len(components) != 2 or canonical_url is None:
-                raise QualificationPolicyError(
-                    "xcresult attachment manifest testIdentifier is not canonical"
-                ) from error
-            components[-1] = components[-1].removesuffix("()")
-            suffix = "/".join(components)
-            if not all(components) or not canonical_url.endswith("/" + suffix):
-                raise QualificationPolicyError(
-                    "xcresult attachment manifest owner fields disagree"
-                ) from error
-            canonical_identifier = canonical_url
-
-    canonical = canonical_identifier or canonical_url
-    assert canonical is not None
-    if canonical_identifier is not None and canonical_url is not None:
-        if canonical_identifier != canonical_url:
-            raise QualificationPolicyError(
-                "xcresult attachment manifest owner fields disagree"
-            )
-    return canonical
+    return _reconciled_test_identifier(
+        test_record.get("testIdentifier"),
+        test_record.get("testIdentifierURL"),
+        description="xcresult attachment manifest test record",
+        identifier_field="testIdentifier",
+        url_field="testIdentifierURL",
+    )
 
 
 def normalize_attachment_expectations(
@@ -10488,6 +12491,138 @@ def inspect_xcresult_qualification_attachments(
         }
 
 
+def exported_cadence_semantics_probe_attachment(export_root: Path) -> dict:
+    """Load the probe's one exact XCTest-owned JSON attachment export."""
+
+    reject_tree_symlinks(export_root, "cadence semantics attachment export")
+    manifest_path = safe_relative_file(
+        export_root, "manifest.json", "cadence semantics attachment manifest"
+    )
+    manifest = load_json(
+        manifest_path,
+        "cadence semantics attachment manifest",
+        object_required=False,
+    )
+    if not isinstance(manifest, list):
+        raise QualificationPolicyError(
+            "cadence semantics attachment manifest must be an array"
+        )
+    expected_stem = Path(CADENCE_SEMANTICS_PROBE_ATTACHMENT_NAME).stem
+    matches: list[dict] = []
+    for test in manifest:
+        if not isinstance(test, dict):
+            raise QualificationPolicyError(
+                "cadence semantics attachment manifest has a malformed test record"
+            )
+        attachments = test.get("attachments", [])
+        if not isinstance(attachments, list):
+            raise QualificationPolicyError(
+                "cadence semantics attachment manifest has malformed attachments"
+            )
+        for attachment in attachments:
+            if not isinstance(attachment, dict):
+                raise QualificationPolicyError(
+                    "cadence semantics attachment manifest has a malformed attachment"
+                )
+            suggested = attachment.get("suggestedHumanReadableName")
+            name_matches = attachment_name_matches(
+                suggested, CADENCE_SEMANTICS_PROBE_ATTACHMENT_NAME
+            )
+            if (
+                isinstance(suggested, str)
+                and suggested.startswith(expected_stem)
+                and not name_matches
+            ):
+                raise QualificationPolicyError(
+                    "cadence semantics attachment name is not canonical: "
+                    f"{suggested!r}"
+                )
+            if not name_matches:
+                continue
+            owner = attachment_test_identifier(test)
+            if owner != CADENCE_SEMANTICS_PROBE_TEST_IDENTIFIER:
+                raise QualificationPolicyError(
+                    "cadence semantics attachment has unauthorized XCTest owner "
+                    f"{owner!r}"
+                )
+            path = safe_relative_file(
+                export_root,
+                attachment.get("exportedFileName"),
+                "cadence semantics exported attachment",
+            )
+            try:
+                raw = path.read_bytes()
+                text = raw.decode("utf-8")
+            except (OSError, UnicodeError) as error:
+                raise QualificationPolicyError(
+                    "cadence semantics attachment is not readable UTF-8"
+                ) from error
+            payload = loads_json(text, "cadence semantics exported attachment")
+            if not isinstance(payload, dict):
+                raise QualificationPolicyError(
+                    "cadence semantics attachment must be a JSON object"
+                )
+            matches.append(
+                {
+                    "path": path,
+                    "payload": payload,
+                    "sha256": hashlib.sha256(raw).hexdigest(),
+                    "sizeBytes": len(raw),
+                    "testIdentifier": owner,
+                }
+            )
+    if len(matches) != 1:
+        raise QualificationPolicyError(
+            "cadence semantics attachment count mismatch: "
+            f"expected 1, observed {len(matches)}"
+        )
+    return {
+        **matches[0],
+        "manifestPath": manifest_path,
+        "manifestSHA256": sha256_file(manifest_path),
+        "manifestSizeBytes": manifest_path.stat().st_size,
+    }
+
+
+def inspect_xcresult_cadence_semantics_probe_attachment(xcresult: Path) -> dict:
+    """Re-export and inspect the exact probe attachment from an xcresult."""
+
+    with tempfile.TemporaryDirectory(prefix="swiftvlc-cadence-semantics-") as value:
+        output = Path(value) / "export"
+        try:
+            result = subprocess.run(
+                [
+                    "xcrun",
+                    "xcresulttool",
+                    "export",
+                    "attachments",
+                    "--path",
+                    str(xcresult),
+                    "--output-path",
+                    str(output),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        except OSError as error:
+            raise QualificationPolicyError(
+                f"cannot export cadence semantics attachment from {xcresult}: {error}"
+            ) from error
+        if result.returncode != 0:
+            raise QualificationPolicyError(
+                f"cannot export cadence semantics attachment from {xcresult}: "
+                f"{result.stderr.strip()}"
+            )
+        exported = exported_cadence_semantics_probe_attachment(output)
+        return {
+            "payload": exported["payload"],
+            "sha256": exported["sha256"],
+            "sizeBytes": exported["sizeBytes"],
+            "testIdentifier": exported["testIdentifier"],
+        }
+
+
 def xcresult_test_document(path: Path) -> dict:
     try:
         result = subprocess.run(
@@ -10533,14 +12668,18 @@ def _test_case_observations(document: dict) -> tuple[list[str], list[str], bool]
             has_failure_message = True
         if node_type != "Test Case":
             continue
-        identifier = (
-            node.get("nodeIdentifier")
-            or node.get("nodeIdentifierURL")
-            or node.get("name")
+        raw_identifier = node.get("nodeIdentifier")
+        raw_url = node.get("nodeIdentifierURL")
+        if raw_identifier is None and raw_url is None:
+            raw_identifier = node.get("name")
+        identifier = _reconciled_test_identifier(
+            raw_identifier,
+            raw_url,
+            description="xcresult Test Case",
+            identifier_field="nodeIdentifier",
+            url_field="nodeIdentifierURL",
         )
-        if not isinstance(identifier, str):
-            raise QualificationPolicyError("xcresult Test Case has no identifier")
-        identifiers.append(normalize_test_identifier(identifier))
+        identifiers.append(identifier)
         result = node.get("result")
         if not isinstance(result, str):
             raise QualificationPolicyError(
@@ -11001,12 +13140,12 @@ def validate_attempt_history(
                     f"runner attempt {index} log is not readable UTF-8: {error}"
                 ) from error
             log_product_signals = product_failure_signals(log_text)
-            if log_product_signals:
-                raise QualificationPolicyError(
-                    f"runner attempt {index} log contains immutable product-failure "
-                    f"signals: {log_product_signals!r}"
-                )
             if classification == "passed":
+                if log_product_signals:
+                    raise QualificationPolicyError(
+                        f"passing runner attempt {index} log contains immutable "
+                        f"product-failure signals: {log_product_signals!r}"
+                    )
                 if xcresult_path is None:
                     raise QualificationPolicyError(
                         f"passing runner attempt {index} has no retained xcresult"
@@ -11035,6 +13174,232 @@ def validate_attempt_history(
                         "retry attempt has no retained readable xcresult"
                     )
     return value
+
+
+def validate_cadence_semantics_probe_artifacts(
+    report_root: Path,
+    runner_row: dict,
+    *,
+    expected_version: str,
+    require_proof: bool,
+) -> dict:
+    """Bind the report-only marker to one exact passing retained probe run."""
+
+    if not isinstance(expected_version, str) or not expected_version:
+        raise QualificationPolicyError(
+            "cadence semantics proof requires an exact candidate version"
+        )
+    expected_runner_fields = set(CADENCE_SEMANTICS_PROBE_RUNNER_FIELDS)
+    if not require_proof:
+        expected_runner_fields.remove("reportOnlyEvidence")
+    if not isinstance(runner_row, dict) or set(runner_row) != expected_runner_fields:
+        raise QualificationPolicyError(
+            "cadence semantics runner schema differs from report-only policy"
+        )
+    expected_catalog = catalog_record([CADENCE_SEMANTICS_PROBE_TEST_IDENTIFIER])
+    execution = validate_test_execution(runner_row.get("testExecution"))
+    duration = runner_row.get("durationSeconds")
+    if (
+        runner_row.get("scenario") != CADENCE_SEMANTICS_PROBE_SCENARIO
+        or runner_row.get("result") != "pass"
+        or type(runner_row.get("xcodebuildExitCode")) is not int
+        or runner_row.get("xcodebuildExitCode") != 0
+        or type(runner_row.get("libraryErrorCount")) is not int
+        or runner_row.get("libraryErrorCount") != 0
+        or runner_row.get("appLog") != "captured"
+        or runner_row.get("qualificationEvidence") != "report-only"
+        or isinstance(duration, bool)
+        or not isinstance(duration, int)
+        or duration <= 0
+        or not _json_same(
+            runner_row.get("expectedTestCatalog"), expected_catalog
+        )
+        or not _json_same(execution["expected"], expected_catalog)
+        or not _json_same(execution["executed"], expected_catalog)
+        or runner_row.get("attemptArtifactRoot")
+        != f"{CADENCE_SEMANTICS_PROBE_SCENARIO}-attempt-artifacts"
+    ):
+        raise QualificationPolicyError(
+            "cadence semantics runner is not one exact clean passing execution"
+        )
+    if require_proof:
+        inventory = validate_error_inventory(
+            runner_row.get("hostErrorInventory"),
+            retained_base=report_root,
+            require_retained=True,
+            expected_test_catalog=expected_catalog,
+        )
+        if (
+            inventory.get("scenario") != CADENCE_SEMANTICS_PROBE_SCENARIO
+            or inventory.get("errorCount") != 0
+        ):
+            raise QualificationPolicyError(
+                "cadence semantics runner contains unexpected raw diagnostics"
+            )
+    attempts = validate_attempt_history(
+        runner_row.get("attempts"),
+        runner_result="pass",
+        final_execution=execution,
+        expected_catalog=expected_catalog,
+        artifact_root=report_root,
+        artifact_scope=runner_row.get("attemptArtifactRoot"),
+        require_artifacts=True,
+    )
+    final_attempt = attempts[-1]
+    if (
+        type(final_attempt.get("attempt")) is not int
+        or type(final_attempt.get("xcodebuildExitCode")) is not int
+        or final_attempt.get("xcodebuildExitCode") != 0
+    ):
+        raise QualificationPolicyError(
+            "cadence semantics final attempt has non-canonical success fields"
+        )
+    source_xcresult = safe_relative_directory(
+        report_root,
+        final_attempt.get("xcresultArtifact"),
+        "cadence semantics final attempt xcresult",
+    )
+    retained_final_relative = f"{CADENCE_SEMANTICS_PROBE_SCENARIO}.xcresult"
+    retained_final = safe_relative_directory(
+        report_root,
+        retained_final_relative,
+        "cadence semantics retained final xcresult",
+    )
+    reject_tree_symlinks(
+        retained_final, "cadence semantics retained final xcresult"
+    )
+    retained_digest = tree_digest(retained_final)
+    retained_size = tree_size_bytes(retained_final)
+    if (
+        final_attempt.get("xcresultArtifactType") != "xcresult-directory"
+        or final_attempt.get("xcresultDigestAlgorithm") != "swiftvlc-tree-v1"
+        or final_attempt.get("xcresultDigest") != tree_digest(source_xcresult)
+        or final_attempt.get("xcresultSizeBytes") != tree_size_bytes(source_xcresult)
+        or retained_digest != final_attempt.get("xcresultDigest")
+        or retained_size != final_attempt.get("xcresultSizeBytes")
+    ):
+        raise QualificationPolicyError(
+            "cadence semantics retained final xcresult differs from its passing attempt"
+        )
+    observed_execution = verify_xcresult_execution(retained_final, expected_catalog)
+    if not _json_same(observed_execution, execution):
+        raise QualificationPolicyError(
+            "cadence semantics retained final xcresult execution drifted"
+        )
+
+    retained_root_relative = f"{CADENCE_SEMANTICS_PROBE_SCENARIO}-attachments"
+    retained_root = safe_relative_directory(
+        report_root,
+        retained_root_relative,
+        "cadence semantics retained attachment export",
+    )
+    retained_attachment = exported_cadence_semantics_probe_attachment(retained_root)
+    inspected_attachment = inspect_xcresult_cadence_semantics_probe_attachment(
+        retained_final
+    )
+    if (
+        retained_attachment["testIdentifier"]
+        != inspected_attachment.get("testIdentifier")
+        or retained_attachment["sha256"] != inspected_attachment.get("sha256")
+        or retained_attachment["sizeBytes"] != inspected_attachment.get("sizeBytes")
+        or not _json_same(
+            retained_attachment["payload"], inspected_attachment.get("payload")
+        )
+    ):
+        raise QualificationPolicyError(
+            "cadence semantics retained export differs from its final xcresult"
+        )
+    validate_cadence_semantics_probe_payload(retained_attachment["payload"])
+
+    manifest_path = retained_attachment["manifestPath"]
+    attachment_path = retained_attachment["path"]
+    proof = {
+        "formatVersion": 1,
+        "authority": "report-only-cadence-semantics-v1",
+        "version": expected_version,
+        "releaseCreditEligible": False,
+        "sourceAttempt": final_attempt["attempt"],
+        "sourceXcresultArtifact": final_attempt["xcresultArtifact"],
+        "sourceXcresultDigestAlgorithm": final_attempt["xcresultDigestAlgorithm"],
+        "sourceXcresultDigest": final_attempt["xcresultDigest"],
+        "sourceXcresultSizeBytes": final_attempt["xcresultSizeBytes"],
+        "retainedFinalXcresultArtifact": retained_final_relative,
+        "retainedFinalXcresultDigestAlgorithm": "swiftvlc-tree-v1",
+        "retainedFinalXcresultDigest": retained_digest,
+        "retainedFinalXcresultSizeBytes": retained_size,
+        "attachmentName": CADENCE_SEMANTICS_PROBE_ATTACHMENT_NAME,
+        "attachmentTestIdentifier": retained_attachment["testIdentifier"],
+        "retainedAttachmentRoot": retained_root_relative,
+        "manifestRelativePath": manifest_path.relative_to(
+            report_root.resolve()
+        ).as_posix(),
+        "manifestDigestAlgorithm": "sha256",
+        "manifestDigest": retained_attachment["manifestSHA256"],
+        "manifestSizeBytes": retained_attachment["manifestSizeBytes"],
+        "attachmentRelativePath": attachment_path.relative_to(
+            report_root.resolve()
+        ).as_posix(),
+        "attachmentDigestAlgorithm": "sha256",
+        "attachmentDigest": retained_attachment["sha256"],
+        "attachmentSizeBytes": retained_attachment["sizeBytes"],
+    }
+    if set(proof) != CADENCE_SEMANTICS_PROBE_PROOF_FIELDS:
+        raise QualificationPolicyError(
+            "internal cadence semantics proof schema is incomplete"
+        )
+    if require_proof:
+        reported_proof = runner_row.get("reportOnlyEvidence")
+        if not isinstance(reported_proof, dict) or not _json_same(
+            reported_proof, proof
+        ):
+            raise QualificationPolicyError(
+                "cadence semantics report-only proof differs from retained artifacts"
+            )
+    return proof
+
+
+def validate_report_only_cadence_report(report_path: Path, report: dict) -> dict:
+    """Validate the only authorized non-release report-only report."""
+
+    validate_report_timing(report, stable=False)
+    scenarios = report.get("scenarios")
+    if (
+        report.get("formatVersion") != 2
+        or report.get("mode") not in {"exploratory", "qualification"}
+        or report.get("reportOnly") is not True
+        or report.get("releaseGateSatisfied") is not False
+        or report.get("releaseGateReason")
+        != "exploratory cadence semantics probe cannot produce release credit"
+        or report.get("result") != "pass"
+        or report.get("qualificationRows") != []
+        or not isinstance(scenarios, list)
+        or len(scenarios) != 1
+        or not isinstance(scenarios[0], dict)
+    ):
+        raise QualificationPolicyError(
+            "cadence semantics report-only document contract failed"
+        )
+    validate_cadence_semantics_probe_artifacts(
+        report_path.parent,
+        scenarios[0],
+        expected_version=report.get("version"),
+        require_proof=True,
+    )
+    return report
+
+
+def validate_ordinary_report_contract(report: dict) -> None:
+    """Require the non-report-only device report's fail-closed gate marker."""
+
+    if (
+        not isinstance(report, dict)
+        or report.get("reportOnly") is not False
+        or report.get("releaseGateSatisfied") is not False
+        or report.get("releaseGateReason") != ORDINARY_RELEASE_GATE_REASON
+    ):
+        raise QualificationPolicyError(
+            "ordinary device report release-gate contract failed"
+        )
 
 
 def validate_evidence(
@@ -11339,24 +13704,29 @@ def _validate_qualification_producer(
         raise QualificationPolicyError(
             f"{scenario_id} retained/final-xcresult attachment mismatch"
         )
-    forged = sorted(_ATTACHMENT_HOST_FIELDS.intersection(raw_payload))
+    semantic_raw_payload = validate_and_strip_qualification_runtime_bindings(
+        raw_payload,
+        expected_session_binding=report.get("orchestratorSessionBinding"),
+        expected_candidate_binding=report.get("candidateRuntimeBinding"),
+    )
+    forged = sorted(_ATTACHMENT_HOST_FIELDS.intersection(semantic_raw_payload))
     if forged:
         raise QualificationPolicyError(
             f"{scenario_id} raw attachment forged host fields: {forged!r}"
         )
-    if raw_payload.get("scenario") != scenario_id:
+    if semantic_raw_payload.get("scenario") != scenario_id:
         raise QualificationPolicyError(
             f"{scenario_id} raw attachment scenario mismatch"
         )
     expected_trace_requirements = RAW_HOST_TRACE_REQUIREMENTS.get(scenario_id)
     if expected_trace_requirements is not None and not _json_same(
-        raw_payload.get("hostTraceRequirements"), expected_trace_requirements
+        semantic_raw_payload.get("hostTraceRequirements"), expected_trace_requirements
     ):
         raise QualificationPolicyError(
             f"{scenario_id} raw host-trace requirements differ from policy"
         )
     if scenario_id in {"timebase-vod-soak", "timebase-live-soak"}:
-        raw_reference = raw_payload.get("rawCapture")
+        raw_reference = semantic_raw_payload.get("rawCapture")
         retained_raw = evidence.get("rawCapture")
         mode = "vod" if scenario_id == "timebase-vod-soak" else "live"
         expected_name_pattern = re.compile(
@@ -11397,7 +13767,7 @@ def _validate_qualification_producer(
         )
     endurance = scenario_id in STABLE_MINIMUM_DURATION_SECONDS
     if endurance:
-        raw_duration = raw_payload.get("durationSeconds")
+        raw_duration = semantic_raw_payload.get("durationSeconds")
         if (
             evidence.get("durationSeconds") != raw_duration
             or evidence.get("deviceObservedDurationSeconds") != raw_duration
@@ -11420,7 +13790,7 @@ def _validate_qualification_producer(
             f"{scenario_id} raw error inventory differs from producing runner"
         )
     reconstructed = {
-        **raw_payload,
+        **semantic_raw_payload,
         **{field: report[field] for field in CORE_IDENTITY_FIELDS},
         "hardware": row["hardware"],
         "deviceIdentifier": expected_device_identifier,
@@ -11434,7 +13804,9 @@ def _validate_qualification_producer(
         ),
         **(
             {
-                "deviceObservedDurationSeconds": raw_payload.get("durationSeconds"),
+                "deviceObservedDurationSeconds": semantic_raw_payload.get(
+                    "durationSeconds"
+                ),
                 "hostAttemptDurationSeconds": runner_row.get("durationSeconds"),
             }
             if endurance
@@ -11454,7 +13826,7 @@ def _validate_qualification_producer(
     )
     excluded = set(_AUGMENTED_ATTACHMENT_PATHS.get(scenario_id, set()))
     if not _attachment_payload_is_preserved(
-        raw_payload, evidence, excluded_paths=excluded
+        semantic_raw_payload, evidence, excluded_paths=excluded
     ):
         raise QualificationPolicyError(
             f"{scenario_id} enriched evidence contradicts its xcresult attachment"
@@ -11510,9 +13882,13 @@ def validate_report(
     strict_provenance: bool = True,
 ) -> dict:
     report = load_json(report_path, "device report")
+    validate_ordinary_report_contract(report)
     scenarios, hardware = validate_matrix(matrix)
-    if strict_provenance and is_release_matrix(matrix):
+    release_matrix = is_release_matrix(matrix)
+    if strict_provenance and release_matrix:
         validate_release_matrix_contract(matrix)
+    if strict_provenance:
+        validate_report_device_snapshot(report_path, report)
     runner_contracts: dict[str, dict] = {}
     output_contracts: dict[str, tuple[dict, dict]] = {}
     if strict_provenance:
@@ -11536,8 +13912,15 @@ def validate_report(
         not stable or report.get("qualificationEligibleEnvironment") is not True
     ):
         raise QualificationPolicyError("report is not from a qualifying environment")
-    if stable and report.get("qualificationEligibleEnvironment") is not True:
-        raise QualificationPolicyError("qualification mode report is not eligible")
+    if strict_provenance:
+        effective_hardware, exploratory_evidence_hardware = report_hardware_context(
+            report, hardware
+        )
+        report_device = report["device"]
+    else:
+        effective_hardware = set(hardware)
+        exploratory_evidence_hardware = ""
+        report_device = {}
 
     runner_rows = report.get("scenarios")
     if not isinstance(runner_rows, list) or not runner_rows:
@@ -11578,14 +13961,29 @@ def validate_report(
             raise QualificationPolicyError(
                 f"runner scenario {runner_id} expected catalog is not canonical"
             )
-        if runner_row.get("result") == "pass":
+        runner_result = runner_row.get("result")
+        if runner_result not in {"pass", "fail"}:
+            raise QualificationPolicyError(
+                f"runner scenario {runner_id} has invalid result"
+            )
+        reported_exit_code = runner_row.get("xcodebuildExitCode")
+        if type(reported_exit_code) is not int:
+            raise QualificationPolicyError(
+                f"runner scenario {runner_id} has non-integer xcodebuild exit code"
+            )
+        validated_attempts: list[dict] | None = None
+        if runner_result == "pass":
+            if reported_exit_code != 0:
+                raise QualificationPolicyError(
+                    f"passing runner scenario {runner_id} has nonzero xcodebuild exit code"
+                )
             execution = validate_test_execution(runner_row.get("testExecution"))
             if execution["expected"] != canonical_expected:
                 raise QualificationPolicyError(
                     f"runner scenario {runner_id} execution differs from preflight"
                 )
             if strict_provenance:
-                validate_attempt_history(
+                validated_attempts = validate_attempt_history(
                     runner_row.get("attempts"),
                     runner_result="pass",
                     final_execution=execution,
@@ -11605,7 +14003,7 @@ def validate_report(
                 f"passing report contains failed runner scenario {runner_id}"
             )
         elif strict_provenance:
-            validate_attempt_history(
+            validated_attempts = validate_attempt_history(
                 runner_row.get("attempts"),
                 runner_result=runner_row.get("result"),
                 final_execution=runner_row.get("testExecution"),
@@ -11615,6 +14013,20 @@ def validate_report(
                 require_artifacts=True,
             )
         if strict_provenance:
+            assert validated_attempts is not None
+            final_attempt_exit_code = validated_attempts[-1].get(
+                "xcodebuildExitCode"
+            )
+            if type(final_attempt_exit_code) is not int:
+                raise QualificationPolicyError(
+                    f"runner scenario {runner_id} final attempt has non-integer "
+                    "xcodebuild exit code"
+                )
+            if reported_exit_code != final_attempt_exit_code:
+                raise QualificationPolicyError(
+                    f"runner scenario {runner_id} xcodebuild exit code differs "
+                    "from its final retained attempt"
+                )
             inventory_value = runner_row.get("hostErrorInventory")
             if runner_row.get("appLog") == "captured":
                 inventory = validate_error_inventory(
@@ -11650,14 +14062,21 @@ def validate_report(
                 raise QualificationPolicyError(
                     f"runner scenario {runner_id} has no captured raw device log inventory"
                 )
-    if report.get("result") == "pass" and any(
-        row.get("result") != "pass" for row in runner_rows
-    ):
-        raise QualificationPolicyError("passing report contains runner failures")
+    expected_report_result = (
+        "pass" if all(row.get("result") == "pass" for row in runner_rows) else "fail"
+    )
+    if report.get("result") != expected_report_result:
+        raise QualificationPolicyError(
+            "device report result does not reconcile with runner scenarios"
+        )
 
     report_rows = report.get("qualificationRows")
     if not isinstance(report_rows, list):
         raise QualificationPolicyError("report has no qualificationRows array")
+    if not stable and report_rows:
+        raise QualificationPolicyError(
+            "exploratory report cannot contain qualification rows"
+        )
     output_scenarios_by_runner: dict[str, set[str]] = {
         runner_id: set() for runner_id in runner_ids
     }
@@ -11688,30 +14107,58 @@ def validate_report(
 
     inspected_by_runner: dict[str, dict[str, dict]] = {}
     retained_by_runner: dict[str, dict[str, tuple[Path, dict, str]]] = {}
+    evidence_scenarios_by_runner: dict[str, set[str]] = {}
     if strict_provenance:
         candidate_catalog = report.get("testCatalog")
         assert isinstance(candidate_catalog, list)
         for runner_id, runner_row in runner_rows_by_id.items():
             contract = runner_contracts[runner_id]
             produced = output_scenarios_by_runner.get(runner_id, set())
+            applicable = applicable_runner_outputs(
+                contract, scenarios, effective_hardware
+            )
+            if not produced.issubset(applicable):
+                raise QualificationPolicyError(
+                    f"runner scenario {runner_id} produced an inapplicable qualification row"
+                )
             authorized = authorized_runner_catalog(
-                contract, produced, candidate_catalog
+                contract, applicable, candidate_catalog
             )
             if runner_row.get("expectedTestCatalog") != authorized:
                 raise QualificationPolicyError(
                     f"runner scenario {runner_id} catalog differs from matrix authority"
                 )
-            if (
-                report.get("result") == "pass"
-                and contract.get("outputs")
-                and not produced
-            ):
+            runner_passed = runner_row.get("result") == "pass"
+            expected_evidence_status = (
+                "captured"
+                if runner_passed and applicable
+                else "missing" if applicable else "not-applicable"
+            )
+            if runner_row.get("qualificationEvidence") != expected_evidence_status:
                 raise QualificationPolicyError(
-                    f"passing runner scenario {runner_id} produced no qualification row"
+                    f"runner scenario {runner_id} qualification-evidence status "
+                    "does not match its result and applicable outputs"
                 )
-            if not produced:
+            if runner_passed and applicable:
+                if stable and produced != applicable:
+                    missing = sorted(applicable - produced)
+                    raise QualificationPolicyError(
+                        f"passing runner scenario {runner_id} produced incomplete "
+                        f"qualification rows: {missing!r}"
+                    )
+            elif produced:
+                raise QualificationPolicyError(
+                    f"non-passing runner scenario {runner_id} produced qualification rows"
+                )
+            evidence_scenarios = (
+                produced if stable else (applicable if runner_passed else set())
+            )
+            evidence_scenarios_by_runner[runner_id] = evidence_scenarios
+            if not evidence_scenarios:
                 continue
-            expected_owners = runner_attachment_expectations(contract, produced)
+            expected_owners = runner_attachment_expectations(
+                contract, evidence_scenarios
+            )
             final_xcresult = runner_xcresults.get(runner_id)
             if final_xcresult is None:
                 raise QualificationPolicyError(
@@ -11741,6 +14188,33 @@ def validate_report(
             raise QualificationPolicyError(
                 f"qualification row {index} is unknown: {key!r}"
             )
+        if key[1] not in effective_hardware:
+            raise QualificationPolicyError(
+                f"qualification row {index} does not belong to the report device: {key!r}"
+            )
+        if strict_provenance and release_matrix:
+            validate_release_qualification_row_evidence_path(row, index)
+        if strict_provenance:
+            expected_device_fields = {
+                "device": report_device.get("marketingName"),
+                "deviceFamily": report_device.get("deviceFamily"),
+                "productType": report_device.get("productType"),
+                "osVersion": report_device.get("osVersion"),
+                "osBuild": report_device.get("osBuild"),
+                "osReleaseType": report_device.get("osReleaseType"),
+            }
+            contradicted = sorted(
+                field
+                for field, expected in expected_device_fields.items()
+                if not isinstance(expected, str)
+                or not expected
+                or row.get(field) != expected
+            )
+            if contradicted:
+                raise QualificationPolicyError(
+                    f"qualification row {index} contradicts report device fields: "
+                    f"{contradicted!r}"
+                )
         if key in seen:
             raise QualificationPolicyError(f"duplicate qualification row {key!r}")
         seen.add(key)  # type: ignore[arg-type]
@@ -11804,6 +14278,63 @@ def validate_report(
             raise QualificationPolicyError(
                 f"row/evidence duration mismatch for {key!r}"
             )
+    if strict_provenance and not stable:
+        for runner_id, evidence_scenarios in evidence_scenarios_by_runner.items():
+            runner_row = runner_rows_by_id[runner_id]
+            for scenario_id in sorted(evidence_scenarios):
+                contract, output = output_contracts[scenario_id]
+                evidence_path = safe_relative_file(
+                    report_path.parent,
+                    (
+                        f"evidence/{scenario_id}-"
+                        f"{exploratory_evidence_hardware}.json"
+                    ),
+                    f"exploratory {scenario_id!r} evidence",
+                )
+                evidence = load_json(evidence_path, "exploratory qualification evidence")
+                host_artifact_fingerprints = validate_evidence(
+                    evidence,
+                    scenarios[scenario_id],
+                    report,
+                    exploratory_evidence_hardware,
+                    stable=False,
+                    retained_base=report_path.parent,
+                    require_retained=True,
+                    artifact_base=evidence_path.parent,
+                    artifact_stem=evidence_path.stem,
+                    require_host_artifacts=True,
+                )
+                reused_artifacts = (
+                    seen_host_artifact_fingerprints & host_artifact_fingerprints
+                )
+                if reused_artifacts:
+                    raise QualificationPolicyError(
+                        "exploratory evidence reuses retained host artifacts: "
+                        f"{sorted(reused_artifacts)!r}"
+                    )
+                seen_host_artifact_fingerprints.update(host_artifact_fingerprints)
+                synthetic_row = {
+                    "scenario": scenario_id,
+                    "runnerScenario": runner_id,
+                    "hardware": exploratory_evidence_hardware,
+                    "durationSeconds": evidence.get("durationSeconds"),
+                }
+                _validate_qualification_producer(
+                    evidence=evidence,
+                    row=synthetic_row,
+                    scenario=scenarios[scenario_id],
+                    output_contract=output,
+                    runner_row=runner_row,
+                    report=report,
+                    report_root=report_path.parent,
+                    retained_attachment=retained_by_runner[runner_id][
+                        output["attachmentName"]
+                    ],
+                    inspected_attachment=inspected_by_runner[runner_id][
+                        output["attachmentName"]
+                    ],
+                    stable=False,
+                )
     if require_complete:
         missing = sorted(required_rows(matrix) - seen)
         if missing:
@@ -11873,6 +14404,33 @@ def validate_record(
                 raise QualificationPolicyError(
                     f"retained source report {index} document binding mismatch"
                 )
+            # Import lazily: report_validation imports this module while issuing
+            # receipts, whereas records consume those receipts only here.
+            import report_validation
+
+            try:
+                retained_report_bytes = report_validation.regular_file_bytes(
+                    retained_report_path,
+                    f"retained source report {index} document",
+                )
+            except report_validation.ReportValidationError as error:
+                raise QualificationPolicyError(str(error)) from error
+            if not report_validation.is_valid(
+                root, report_bytes=retained_report_bytes
+            ):
+                raise QualificationPolicyError(
+                    f"retained source report {index} has no matching "
+                    "successful-validation receipt"
+                )
+            if is_release_matrix(matrix) and not (
+                report_validation.is_release_scope_valid(
+                    root, report_bytes=retained_report_bytes
+                )
+            ):
+                raise QualificationPolicyError(
+                    f"retained source report {index} is not a canonical "
+                    "full-scope release run"
+                )
             source_report = validate_report(
                 retained_report_path,
                 matrix,
@@ -11880,6 +14438,23 @@ def validate_record(
                 stable_required=True,
                 strict_provenance=True,
             )
+            try:
+                retained_report_unchanged = (
+                    report_validation.regular_file_bytes(
+                        retained_report_path,
+                        f"retained source report {index} document",
+                    )
+                    == retained_report_bytes
+                )
+            except report_validation.ReportValidationError as error:
+                raise QualificationPolicyError(str(error)) from error
+            if not retained_report_unchanged or not report_validation.is_valid(
+                root, report_bytes=retained_report_bytes
+            ):
+                raise QualificationPolicyError(
+                    f"retained source report {index} changed while its receipt "
+                    "was consumed"
+                )
             if (
                 source_report.get("result") != "pass"
                 or source_report.get("mode") != "qualification"
@@ -12065,6 +14640,16 @@ def main() -> int:
     bind_attempts_parser.add_argument("--artifact-root", type=Path, required=True)
     bind_attempts_parser.add_argument("--output", type=Path, required=True)
 
+    cadence_probe_parser = subparsers.add_parser(
+        "validate-cadence-semantics-probe"
+    )
+    cadence_probe_parser.add_argument("--artifact-root", type=Path, required=True)
+    cadence_probe_parser.add_argument("--expected-catalog", type=Path, required=True)
+    cadence_probe_parser.add_argument("--test-execution", type=Path, required=True)
+    cadence_probe_parser.add_argument("--attempts", type=Path, required=True)
+    cadence_probe_parser.add_argument("--version", required=True)
+    cadence_probe_parser.add_argument("--output", type=Path, required=True)
+
     inventory_parser = subparsers.add_parser("build-error-inventory")
     inventory_parser.add_argument("--log-root", type=Path, required=True)
     inventory_parser.add_argument("--log-prefix", required=True)
@@ -12149,6 +14734,41 @@ def main() -> int:
         elif args.command == "bind-attempt-artifacts":
             attempts = load_json(args.input, "runner attempts", object_required=False)
             result = bind_attempt_artifacts(attempts, args.artifact_root)
+            _write_json(args.output, result)
+        elif args.command == "validate-cadence-semantics-probe":
+            expected_catalog = load_json(
+                args.expected_catalog, "cadence semantics expected test catalog"
+            )
+            execution = load_json(
+                args.test_execution, "cadence semantics test execution"
+            )
+            attempts = load_json(
+                args.attempts,
+                "cadence semantics runner attempts",
+                object_required=False,
+            )
+            runner_row = {
+                "scenario": CADENCE_SEMANTICS_PROBE_SCENARIO,
+                "result": "pass",
+                "xcodebuildExitCode": 0,
+                "libraryErrorCount": 0,
+                "appLog": "captured",
+                "qualificationEvidence": "report-only",
+                "durationSeconds": 1,
+                "expectedTestCatalog": expected_catalog,
+                "testExecution": execution,
+                "attempts": attempts,
+                "attemptArtifactRoot": (
+                    f"{CADENCE_SEMANTICS_PROBE_SCENARIO}-attempt-artifacts"
+                ),
+                "hostErrorInventory": None,
+            }
+            result = validate_cadence_semantics_probe_artifacts(
+                args.artifact_root,
+                runner_row,
+                expected_version=args.version,
+                require_proof=False,
+            )
             _write_json(args.output, result)
         elif args.command == "build-error-inventory":
             if not ID.fullmatch(args.scenario):

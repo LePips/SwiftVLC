@@ -88,7 +88,6 @@
         "failed-start",
         "dismissal",
         "interruptions",
-        "audio-media-services-reset",
         "audio-session-ownership",
         "native-lifecycle",
         "playback-foreground-displaylayer-recovery",
@@ -98,7 +97,8 @@
         "seek-frame-oracles",
         "progressive-http-range-seek",
         "local-file-matrix",
-        "audio-only-playback"
+        "audio-only-playback",
+        "audio-media-services-reset"
       ]
     },
     "release": {
@@ -118,7 +118,6 @@
         "failed-start",
         "dismissal",
         "interruptions",
-        "audio-media-services-reset",
         "audio-session-ownership",
         "native-lifecycle",
         "playback-foreground-displaylayer-recovery",
@@ -135,7 +134,8 @@
         "cadence-matrix",
         "native-subtitle-matrix",
         "timebase-vod-soak",
-        "timebase-live-soak"
+        "timebase-live-soak",
+        "audio-media-services-reset"
       ]
     }
   }

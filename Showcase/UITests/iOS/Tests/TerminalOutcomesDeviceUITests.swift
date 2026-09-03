@@ -26,12 +26,6 @@ final class TerminalOutcomesDeviceUITests: ShowcaseIOSTestCase {
       )
     }
 
-    addUIInterruptionMonitor(withDescription: "Local network permission") { alert in
-      let allow = alert.buttons["Allow"]
-      guard allow.exists else { return false }
-      allow.tap()
-      return true
-    }
     let baseLogPath = try XCTUnwrap(
       launchArgumentValue(for: LaunchArguments.logPath),
       "Missing qualification log launch argument"
@@ -117,8 +111,7 @@ final class TerminalOutcomesDeviceUITests: ShowcaseIOSTestCase {
       LaunchArguments.logPath,
       with: perCaseLogPath(action, baseLogPath: baseLogPath)
     )
-    app.launch()
-    app.tap()
+    launchDirectlyHandlingQualificationPermissions()
 
     let actionLabel = element(AccessibilityID.TerminalOutcomesValidation.actionLabel)
     let result = element(AccessibilityID.TerminalOutcomesValidation.resultLabel)

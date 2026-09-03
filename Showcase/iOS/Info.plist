@@ -27,5 +27,9 @@
 	<string>$(SWIFTVLC_RELEASE_SOURCE_DIGEST)</string>
 	<key>SwiftVLCArtifactDigest</key>
 	<string>$(SWIFTVLC_ARTIFACT_DIGEST)</string>
+	<key>SwiftVLCCandidateVersion</key>
+	<string>$(SWIFTVLC_CANDIDATE_VERSION)</string>
+	<key>SwiftVLCCandidateRuntimeBinding</key>
+	<string>$(SWIFTVLC_CANDIDATE_RUNTIME_BINDING)</string>
 </dict>
 </plist>

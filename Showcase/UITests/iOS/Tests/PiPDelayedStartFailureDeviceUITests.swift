@@ -14,14 +14,7 @@ final class PiPDelayedStartFailureDeviceUITests: ShowcaseIOSTestCase {
       )
     }
 
-    addUIInterruptionMonitor(withDescription: "Local network permission") { alert in
-      let allow = alert.buttons["Allow"]
-      guard allow.exists else { return false }
-      allow.tap()
-      return true
-    }
     launch(route: .pipDelayedStartFailureValidation)
-    app.tap()
 
     let state = element(AccessibilityID.PiPDelayedStartFailureValidation.stateLabel)
     let possible = element(AccessibilityID.PiPDelayedStartFailureValidation.possibleLabel)

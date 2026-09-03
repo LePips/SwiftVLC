@@ -45,7 +45,7 @@ final class TestStreamSettingsUITests: ShowcaseIOSTestCase {
     app.buttons[AccessibilityID.TestStream.applyButton].tap()
 
     app.terminate()
-    app.launch()
+    launchDirectlyHandlingQualificationPermissions()
     openSettings()
     XCTAssertNotEqual(
       app.textFields[AccessibilityID.TestStream.urlField].value as? String,

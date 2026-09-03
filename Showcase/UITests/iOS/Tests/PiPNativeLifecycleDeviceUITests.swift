@@ -27,12 +27,6 @@ final class PiPNativeLifecycleDeviceUITests: ShowcaseIOSTestCase {
       )
     }
 
-    addUIInterruptionMonitor(withDescription: "Local network permission") { alert in
-      let allow = alert.buttons["Allow"]
-      guard allow.exists else { return false }
-      allow.tap()
-      return true
-    }
     let baseLogPath = try XCTUnwrap(
       launchArgumentValue(for: LaunchArguments.logPath),
       "Missing qualification log launch argument"
@@ -113,8 +107,7 @@ final class PiPNativeLifecycleDeviceUITests: ShowcaseIOSTestCase {
       LaunchArguments.logPath,
       with: perCaseLogPath(action, baseLogPath: baseLogPath)
     )
-    app.launch()
-    app.tap()
+    launchDirectlyHandlingQualificationPermissions()
 
     let state = element(AccessibilityID.PiPNativeLifecycleValidation.stateLabel)
     let possible = element(AccessibilityID.PiPNativeLifecycleValidation.possibleLabel)
@@ -162,8 +155,7 @@ final class PiPNativeLifecycleDeviceUITests: ShowcaseIOSTestCase {
       LaunchArguments.logPath,
       with: perCaseLogPath(affordance.rawValue, baseLogPath: baseLogPath)
     )
-    app.launch()
-    app.tap()
+    launchDirectlyHandlingQualificationPermissions()
 
     let state = element(AccessibilityID.PiPDismissalValidation.stateLabel)
     let possible = element(AccessibilityID.PiPDismissalValidation.possibleLabel)

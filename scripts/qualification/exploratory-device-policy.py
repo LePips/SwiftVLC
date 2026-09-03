@@ -8,7 +8,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import qualification_policy as policy
 
-EXPLORATORY_HARDWARE_ID = "exploratory-future-ios"
+EXPLORATORY_HARDWARE_ID = policy.EXPLORATORY_FUTURE_IOS_HARDWARE_ID
 
 
 def evidence_hardware_id(device_info: dict, matrix: dict) -> str | None:

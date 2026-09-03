@@ -12,12 +12,6 @@ final class NativeSubtitleMatrixDeviceUITests: ShowcaseIOSTestCase {
     else {
       throw XCTSkip("Set SWIFTVLC_NATIVE_SUBTITLE_DEVICE=YES for candidate-bound hardware runs")
     }
-    addUIInterruptionMonitor(withDescription: "Local network permission") { alert in
-      let allow = alert.buttons["Allow"]
-      guard allow.exists else { return false }
-      allow.tap()
-      return true
-    }
     let duration = max(
       1,
       Int(ProcessInfo.processInfo.environment["SWIFTVLC_NATIVE_SUBTITLE_SECONDS"] ?? "900")
@@ -34,8 +28,7 @@ final class NativeSubtitleMatrixDeviceUITests: ShowcaseIOSTestCase {
       LaunchArguments.nativeSubtitleDuration, String(duration),
       LaunchArguments.nativeSubtitleToken, token
     ]
-    app.launch()
-    app.tap()
+    launchDirectlyHandlingQualificationPermissions()
 
     let possible = element(AccessibilityID.NativeSubtitleMatrixValidation.possibleLabel)
     let active = element(AccessibilityID.NativeSubtitleMatrixValidation.activeLabel)

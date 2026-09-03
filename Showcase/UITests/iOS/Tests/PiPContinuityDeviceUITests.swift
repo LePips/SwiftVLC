@@ -112,15 +112,7 @@ final class PiPContinuityDeviceUITests: ShowcaseIOSTestCase {
   }
 
   private func openMatrixA() {
-    addUIInterruptionMonitor(withDescription: "Local network permission") { alert in
-      let allow = alert.buttons["Allow"]
-      guard allow.exists else { return false }
-      allow.tap()
-      return true
-    }
-
     launch(route: .harnessHome)
-    app.tap()
     let matrix = app.buttons["(a) PiP survival across load()"]
     XCTAssertTrue(matrix.waitForExistence(timeout: 5))
     matrix.tap()

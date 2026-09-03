@@ -152,6 +152,8 @@ def materialize(
     attempts: list[dict] | None = None,
     expected_test_identifiers: list[str] | None = None,
     device_identifier: str | None = None,
+    expected_qualification_session_binding: str | None = None,
+    expected_candidate_runtime_binding: str | None = None,
     progressive_transcripts: Path | None = None,
     adaptive_source_metrics: Path | None = None,
 ) -> dict:
@@ -207,16 +209,32 @@ def materialize(
         raise EvidenceError(
             f"attachment scenario is {payload.get('scenario')!r}, expected {scenario!r}"
         )
+    identity = candidate_identity or {
+        "artifactDigest": artifact_digest,
+        "releaseSourceDigest": source_digest,
+    }
+    if (
+        candidate_identity is not None
+        and identity.get("candidateRuntimeBinding")
+        != expected_candidate_runtime_binding
+    ):
+        raise EvidenceError(
+            "expected candidate runtime binding differs from candidate metadata"
+        )
+    try:
+        payload = policy.validate_and_strip_qualification_runtime_bindings(
+            payload,
+            expected_session_binding=expected_qualification_session_binding,
+            expected_candidate_binding=expected_candidate_runtime_binding,
+        )
+    except policy.QualificationPolicyError as error:
+        raise EvidenceError(str(error)) from error
     forged = sorted(HOST_IDENTITY_FIELDS.intersection(payload))
     if forged:
         raise EvidenceError(
             "test attachment may not supply host identity fields: " + ", ".join(forged)
         )
 
-    identity = candidate_identity or {
-        "artifactDigest": artifact_digest,
-        "releaseSourceDigest": source_digest,
-    }
     observed_duration = payload.get("durationSeconds")
     duration_measurements: dict[str, int | float] = {}
     if scenario in policy.STABLE_MINIMUM_DURATION_SECONDS:
@@ -435,6 +453,8 @@ def main() -> int:
     parser.add_argument("--scenario", required=True)
     parser.add_argument("--hardware", required=True)
     parser.add_argument("--device-identifier", required=True)
+    parser.add_argument("--qualification-session-binding", required=True)
+    parser.add_argument("--candidate-runtime-binding", required=True)
     parser.add_argument("--artifact-digest", required=True)
     parser.add_argument("--source-digest", required=True)
     parser.add_argument("--candidate-metadata", type=Path, required=True)
@@ -477,6 +497,10 @@ def main() -> int:
             runner_scenario=args.runner_scenario,
             attempts=attempts,
             device_identifier=args.device_identifier,
+            expected_qualification_session_binding=(
+                args.qualification_session_binding
+            ),
+            expected_candidate_runtime_binding=args.candidate_runtime_binding,
             progressive_transcripts=args.progressive_transcripts,
             adaptive_source_metrics=args.adaptive_source_metrics,
         )

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import plistlib
 import re
@@ -40,6 +41,174 @@ def app_bundle_identifier(app: Path, description: str) -> str:
             f"cannot read {description} Info.plist: {error}"
         ) from error
     return validated_bundle_identifier(info.get("CFBundleIdentifier"), description)
+
+
+def _resolve_xctestrun_product_path(
+    value: object,
+    *,
+    xctestrun: Path,
+    test_host: Path | None = None,
+    description: str,
+) -> Path:
+    if not isinstance(value, str) or not value:
+        raise CandidateMetadataError(f"base xctestrun has no {description}")
+    expanded = value.replace("__TESTROOT__", str(xctestrun.resolve().parent))
+    if "__TESTHOST__" in expanded:
+        if test_host is None:
+            raise CandidateMetadataError(
+                f"base xctestrun {description} uses __TESTHOST__ without a test host"
+            )
+        expanded = expanded.replace("__TESTHOST__", str(test_host))
+    if "__" in expanded or "$" in expanded:
+        raise CandidateMetadataError(
+            f"base xctestrun {description} contains an unsupported path placeholder"
+        )
+    try:
+        return Path(expanded).resolve(strict=True)
+    except OSError as error:
+        raise CandidateMetadataError(
+            f"base xctestrun {description} does not resolve: {value!r}: {error}"
+        ) from error
+
+
+def validate_xctestrun_products(
+    xctestrun: Path,
+    *,
+    candidate_app: Path,
+    test_runner: Path,
+    test_bundle: Path,
+) -> None:
+    try:
+        with xctestrun.open("rb") as source:
+            document = plistlib.load(source)
+    except (OSError, plistlib.InvalidFileException) as error:
+        raise CandidateMetadataError(f"cannot read base xctestrun: {error}") from error
+    configurations = document.get("TestConfigurations")
+    if not isinstance(configurations, list):
+        raise CandidateMetadataError("base xctestrun has no TestConfigurations")
+    targets = [
+        target
+        for configuration in configurations
+        if isinstance(configuration, dict)
+        for target in configuration.get("TestTargets", [])
+        if isinstance(target, dict) and target.get("IsUITestBundle") is True
+    ]
+    if len(targets) != 1:
+        raise CandidateMetadataError(
+            "base xctestrun must contain exactly one UI-test target; "
+            f"found {len(targets)}"
+        )
+    target = targets[0]
+    forbidden_selection_keys = {
+        "OnlyTestIdentifiers",
+        "SkipTestIdentifiers",
+        "TestIdentifiersToRun",
+        "TestIdentifiersToSkip",
+    }
+    present_filters = sorted(forbidden_selection_keys & set(target))
+    if present_filters:
+        raise CandidateMetadataError(
+            "base xctestrun contains preexisting test-selection filters: "
+            + ", ".join(present_filters)
+        )
+    for argument_field in ("CommandLineArguments", "UITargetAppCommandLineArguments"):
+        arguments = target.get(argument_field, [])
+        if not isinstance(arguments, list) or any(
+            not isinstance(argument, str) for argument in arguments
+        ):
+            raise CandidateMetadataError(
+                f"base xctestrun {argument_field} is malformed"
+            )
+        if arguments:
+            raise CandidateMetadataError(
+                f"base xctestrun contains preexisting {argument_field}"
+            )
+    for environment_field in (
+        "EnvironmentVariables",
+        "TestingEnvironmentVariables",
+        "UITargetAppEnvironmentVariables",
+    ):
+        environment = target.get(environment_field, {})
+        if not isinstance(environment, dict) or any(
+            not isinstance(key, str) or not isinstance(value, str)
+            for key, value in environment.items()
+        ):
+            raise CandidateMetadataError(
+                f"base xctestrun {environment_field} is malformed"
+            )
+        forbidden = sorted(
+            key
+            for key, value in environment.items()
+            if key.startswith("SWIFTVLC_") or "SWIFTVLC_" in value
+        )
+        if forbidden:
+            raise CandidateMetadataError(
+                "base xctestrun contains preexisting SwiftVLC control environment: "
+                + ", ".join(forbidden)
+            )
+    runner = _resolve_xctestrun_product_path(
+        target.get("TestHostPath"),
+        xctestrun=xctestrun,
+        description="TestHostPath",
+    )
+    bundle = _resolve_xctestrun_product_path(
+        target.get("TestBundlePath"),
+        xctestrun=xctestrun,
+        test_host=runner,
+        description="TestBundlePath",
+    )
+    app = _resolve_xctestrun_product_path(
+        target.get("UITargetAppPath"),
+        xctestrun=xctestrun,
+        description="UITargetAppPath",
+    )
+    expected = {
+        "TestHostPath": (runner, test_runner.resolve()),
+        "TestBundlePath": (bundle, test_bundle.resolve()),
+        "UITargetAppPath": (app, candidate_app.resolve()),
+    }
+    for field, (actual, wanted) in expected.items():
+        if actual != wanted:
+            raise CandidateMetadataError(
+                f"base xctestrun {field} does not reference the exact hashed product: "
+                f"{actual} != {wanted}"
+            )
+    dependent = target.get("DependentProductPaths")
+    if not isinstance(dependent, list) or not dependent:
+        raise CandidateMetadataError(
+            "base xctestrun has no exact dependent product paths"
+        )
+    resolved_dependents = [
+        _resolve_xctestrun_product_path(
+            value,
+            xctestrun=xctestrun,
+            description="DependentProductPaths entry",
+        )
+        for value in dependent
+    ]
+    expected_dependents = {
+        candidate_app.resolve(),
+        test_runner.resolve(),
+        test_bundle.resolve(),
+    }
+    if len(resolved_dependents) != len(expected_dependents) or set(
+        resolved_dependents
+    ) != expected_dependents:
+        raise CandidateMetadataError(
+            "base xctestrun dependent products do not exactly reference the hashed "
+            "candidate, runner, and test bundle"
+        )
+    runner_identifier = app_bundle_identifier(test_runner, "signed UI-test runner")
+    candidate_identifier = app_bundle_identifier(candidate_app, "candidate application")
+    if target.get("TestHostBundleIdentifier") != runner_identifier:
+        raise CandidateMetadataError(
+            "base xctestrun TestHostBundleIdentifier does not match the signed runner"
+        )
+    target_identifier = target.get("UITargetAppBundleIdentifier")
+    if target_identifier is not None and target_identifier != candidate_identifier:
+        raise CandidateMetadataError(
+            "base xctestrun UITargetAppBundleIdentifier does not match the candidate"
+        )
 
 
 def command_output(arguments: list[str]) -> str:
@@ -134,6 +303,7 @@ def create(
     version: str,
     digest_script: Path,
     bindings: dict | None = None,
+    build_attestation: dict | None = None,
 ) -> dict:
     try:
         with (app / "Info.plist").open("rb") as source:
@@ -150,19 +320,84 @@ def create(
             "candidate embedded artifact digest mismatch: "
             f"{embedded_artifact_digest!r} != {artifact_digest!r}"
         )
+    if bindings is not None and build_attestation is None:
+        raise CandidateMetadataError(
+            "strict candidate metadata requires a verified candidate build attestation; "
+            "Info.plist identity stamps alone are not accepted"
+        )
+    attestation_bindings: dict = {}
+    if build_attestation is not None:
+        try:
+            attestation = policy.validate_candidate_build_attestation(
+                build_attestation
+            )
+        except policy.QualificationPolicyError as error:
+            raise CandidateMetadataError(str(error)) from error
+        if attestation["version"] != version:
+            raise CandidateMetadataError(
+                "candidate build attestation version does not match --version"
+            )
+        if info.get("SwiftVLCCandidateVersion") != version:
+            raise CandidateMetadataError(
+                "candidate signed SwiftVLCCandidateVersion does not match --version"
+            )
+        if (
+            info.get("SwiftVLCCandidateRuntimeBinding")
+            != attestation["candidateRuntimeBinding"]
+        ):
+            raise CandidateMetadataError(
+                "candidate signed runtime binding does not match the verified "
+                "build attestation"
+            )
+        for field, embedded_field in (
+            ("sourceCommit", "SwiftVLCSourceCommit"),
+            ("releaseSourceDigest", "SwiftVLCReleaseSourceDigest"),
+            ("artifactDigest", "SwiftVLCArtifactDigest"),
+        ):
+            if info.get(embedded_field) != attestation[field]:
+                raise CandidateMetadataError(
+                    f"candidate embedded {field} does not match the verified build "
+                    "attestation"
+                )
+        if attestation["artifactDigest"] != artifact_digest:
+            raise CandidateMetadataError(
+                "candidate build attestation artifact digest does not match the "
+                "candidate artifact"
+            )
+        attestation_bindings = {
+            "candidateBuildAttestation": attestation,
+            "candidateBuildAttestationDigestAlgorithm": "sha256",
+            "candidateBuildAttestationDigest": hashlib.sha256(
+                policy.canonical_json_bytes(attestation)
+            ).hexdigest(),
+        }
     metadata = {
         "formatVersion": 2 if bindings is not None else 1,
         "version": version,
+        **(
+            {"candidateRuntimeBinding": build_attestation["candidateRuntimeBinding"]}
+            if build_attestation is not None
+            else {}
+        ),
         "candidateAppBundleIdentifier": validated_bundle_identifier(
             info.get("CFBundleIdentifier"), "candidate application"
         ),
-        "sourceCommit": info.get("SwiftVLCSourceCommit"),
+        "sourceCommit": (
+            build_attestation["sourceCommit"]
+            if build_attestation is not None
+            else info.get("SwiftVLCSourceCommit")
+        ),
         "releaseSourceDigestAlgorithm": "swiftvlc-git-tree-v1",
-        "releaseSourceDigest": info.get("SwiftVLCReleaseSourceDigest"),
+        "releaseSourceDigest": (
+            build_attestation["releaseSourceDigest"]
+            if build_attestation is not None
+            else info.get("SwiftVLCReleaseSourceDigest")
+        ),
         "candidateAppDigestAlgorithm": "swiftvlc-tree-v1",
         "candidateAppDigest": app_digest,
         "artifactDigestAlgorithm": "swiftvlc-tree-v1",
         "artifactDigest": embedded_artifact_digest,
+        **attestation_bindings,
         **(bindings or {}),
     }
     return validate(metadata, version, app_digest, artifact_digest)
@@ -176,7 +411,14 @@ def verify(
     digest_script: Path,
     bindings: dict | None = None,
 ) -> dict:
-    embedded = create(app, xcframework, version, digest_script, bindings)
+    embedded = create(
+        app,
+        xcframework,
+        version,
+        digest_script,
+        bindings,
+        metadata.get("candidateBuildAttestation"),
+    )
     validated = validate(
         metadata,
         version,
@@ -207,10 +449,12 @@ def verify(
 
 def qualification_bindings(
     *,
+    candidate_app: Path,
     test_runner: Path,
     test_bundle: Path,
     xctestrun: Path,
     test_catalog: Path,
+    test_catalog_authority: Path,
     matrix: Path,
     feature_manifest: Path,
     profiles: Path,
@@ -233,13 +477,34 @@ def qualification_bindings(
         raise CandidateMetadataError(
             "selected base xctestrun is missing or does not end in .xctestrun"
         )
+    validate_xctestrun_products(
+        xctestrun,
+        candidate_app=candidate_app,
+        test_runner=runner,
+        test_bundle=bundle,
+    )
     try:
         catalog = policy.load_json(test_catalog, "XCTest catalog")
         canonical_catalog = policy.catalog_record(catalog.get("testIdentifiers", []))
+        catalog_authority = policy.load_json(
+            test_catalog_authority, "reviewed XCTest catalog authority"
+        )
     except policy.QualificationPolicyError as error:
         raise CandidateMetadataError(str(error)) from error
     if catalog != canonical_catalog:
         raise CandidateMetadataError("XCTest catalog is not canonical")
+    expected_catalog_authority = {
+        "formatVersion": 1,
+        "authority": "swiftvlc-reviewed-ios-test-catalog-v1",
+        "testCatalogDigestAlgorithm": "swiftvlc-test-catalog-v1",
+        "testCatalogDigest": canonical_catalog["digest"],
+        "testCatalogCount": canonical_catalog["testCount"],
+        "testIdentifiers": canonical_catalog["testIdentifiers"],
+    }
+    if catalog_authority != expected_catalog_authority:
+        raise CandidateMetadataError(
+            "enumerated XCTest catalog does not exactly match the reviewed authority"
+        )
     try:
         for document, description in (
             (matrix, "qualification matrix"),
@@ -272,6 +537,8 @@ def qualification_bindings(
         "testCatalogDigest": canonical_catalog["digest"],
         "testCatalogCount": canonical_catalog["testCount"],
         "testCatalog": canonical_catalog["testIdentifiers"],
+        "testCatalogAuthorityDigestAlgorithm": "sha256",
+        "testCatalogAuthorityDigest": policy.sha256_file(test_catalog_authority),
         "qualificationMatrixChecksum": policy.sha256_file(matrix),
         "featureManifestChecksum": policy.sha256_file(feature_manifest),
         "qualificationProfilesChecksum": policy.sha256_file(profiles),
@@ -291,6 +558,7 @@ def main() -> None:
     create_parser.add_argument("--version", required=True)
     create_parser.add_argument("--digest-script", type=Path, required=True)
     create_parser.add_argument("--output", type=Path, required=True)
+    create_parser.add_argument("--build-attestation", type=Path, required=True)
 
     source_parser = subparsers.add_parser("source")
     source_parser.add_argument("--source-root", type=Path, required=True)
@@ -308,6 +576,9 @@ def main() -> None:
         operation_parser.add_argument("--test-bundle", type=Path, required=True)
         operation_parser.add_argument("--xctestrun", type=Path, required=True)
         operation_parser.add_argument("--test-catalog", type=Path, required=True)
+        operation_parser.add_argument(
+            "--test-catalog-authority", type=Path, required=True
+        )
         operation_parser.add_argument("--matrix", type=Path, required=True)
         operation_parser.add_argument("--feature-manifest", type=Path, required=True)
         operation_parser.add_argument("--profiles", type=Path, required=True)
@@ -316,11 +587,16 @@ def main() -> None:
     args = parser.parse_args()
     try:
         if args.command == "create":
+            build_attestation = policy.load_json(
+                args.build_attestation, "candidate build attestation"
+            )
             bindings = qualification_bindings(
+                candidate_app=args.candidate_app,
                 test_runner=args.test_runner,
                 test_bundle=args.test_bundle,
                 xctestrun=args.xctestrun,
                 test_catalog=args.test_catalog,
+                test_catalog_authority=args.test_catalog_authority,
                 matrix=args.matrix,
                 feature_manifest=args.feature_manifest,
                 profiles=args.profiles,
@@ -333,6 +609,7 @@ def main() -> None:
                 args.version,
                 args.digest_script,
                 bindings,
+                build_attestation,
             )
             args.output.parent.mkdir(parents=True, exist_ok=True)
             args.output.write_text(
@@ -342,10 +619,12 @@ def main() -> None:
             metadata = source_identity(args.source_root.resolve(), args.version)
         else:
             bindings = qualification_bindings(
+                candidate_app=args.candidate_app,
                 test_runner=args.test_runner,
                 test_bundle=args.test_bundle,
                 xctestrun=args.xctestrun,
                 test_catalog=args.test_catalog,
+                test_catalog_authority=args.test_catalog_authority,
                 matrix=args.matrix,
                 feature_manifest=args.feature_manifest,
                 profiles=args.profiles,

@@ -199,7 +199,8 @@ with Developer Mode enabled and run the human-facing device checklist:
 
 ```bash
 export SWIFTVLC_DEVELOPMENT_TEAM=ABCDE12345  # team shown in Xcode Settings
-./scripts/qualification/qualify.sh full --device "My iPhone" --require-stable
+./scripts/qualification/qualify.sh full --version 1.1.0 \
+  --device "My iPhone" --require-stable
 ```
 
 The approximately one-hour `full` profile reports broad functional confidence

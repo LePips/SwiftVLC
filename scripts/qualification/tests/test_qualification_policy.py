@@ -31,6 +31,234 @@ assemble_record = load_script("assemble-record.py")
 
 
 class QualificationPolicyTests(unittest.TestCase):
+    def test_release_report_rejects_noncanonical_qualification_evidence_path(self):
+        harness_path = QUALIFICATION / "tests" / "test_qualification_harness.py"
+        harness_spec = importlib.util.spec_from_file_location(
+            "qualification_harness_release_evidence_fixture", harness_path
+        )
+        harness = importlib.util.module_from_spec(harness_spec)
+        assert harness_spec.loader is not None
+        harness_spec.loader.exec_module(harness)
+
+        fixture = harness.QualificationRecordAssemblyTests(
+            methodName="test_report_result_must_reconcile_with_runner_results"
+        )
+        fixture.setUp()
+        try:
+            report_path = fixture.make_report("iphone", validate_receipt=False)
+            matrix = json.loads(fixture.matrix.read_text())
+            matrix["releasePolicyIdentity"] = policy.RELEASE_MATRIX_POLICY_IDENTITY
+
+            with mock.patch.object(
+                harness.assemble_record.policy,
+                "validate_release_matrix_contract",
+            ):
+                with self.assertRaisesRegex(
+                    harness.assemble_record.policy.QualificationPolicyError,
+                    "release qualification row 0 evidence path must be "
+                    "'evidence/seek-iphone.json'",
+                ):
+                    harness.assemble_record.policy.validate_report(
+                        report_path,
+                        matrix,
+                        candidate=json.loads(fixture.candidate.read_text()),
+                        stable_required=True,
+                        strict_provenance=True,
+                    )
+        finally:
+            fixture.tearDown()
+
+    def test_ordinary_report_rejects_release_gate_contract_tampering(self):
+        harness_path = QUALIFICATION / "tests" / "test_qualification_harness.py"
+        harness_spec = importlib.util.spec_from_file_location(
+            "qualification_harness_fixture", harness_path
+        )
+        harness = importlib.util.module_from_spec(harness_spec)
+        assert harness_spec.loader is not None
+        harness_spec.loader.exec_module(harness)
+
+        fixture = harness.QualificationRecordAssemblyTests(
+            methodName="test_report_result_must_reconcile_with_runner_results"
+        )
+        fixture.setUp()
+        try:
+            report_path = fixture.make_report("iphone")
+            canonical = json.loads(report_path.read_text())
+            canonical["releaseGateReason"] = policy.ORDINARY_RELEASE_GATE_REASON
+            report_path.write_text(json.dumps(canonical))
+
+            harness.assemble_record.policy.validate_report(
+                report_path,
+                json.loads(fixture.matrix.read_text()),
+                candidate=json.loads(fixture.candidate.read_text()),
+                stable_required=True,
+                strict_provenance=True,
+            )
+
+            mutations = {
+                "report-only": {"reportOnly": True},
+                "release-gate-satisfied": {"releaseGateSatisfied": True},
+                "release-gate-reason": {"releaseGateReason": "complete release gate"},
+            }
+            for label, mutation in mutations.items():
+                with self.subTest(label=label):
+                    tampered = self.clone(canonical)
+                    tampered.update(mutation)
+                    report_path.write_text(json.dumps(tampered))
+                    with self.assertRaisesRegex(
+                        harness.assemble_record.policy.QualificationPolicyError,
+                        "ordinary device report release-gate contract failed",
+                    ):
+                        harness.assemble_record.policy.validate_report(
+                            report_path,
+                            json.loads(fixture.matrix.read_text()),
+                            candidate=json.loads(fixture.candidate.read_text()),
+                            stable_required=True,
+                            strict_provenance=True,
+                        )
+        finally:
+            fixture.tearDown()
+
+    def test_ordinary_report_binds_runner_exit_code_to_final_attempt(self):
+        harness_path = QUALIFICATION / "tests" / "test_qualification_harness.py"
+        harness_spec = importlib.util.spec_from_file_location(
+            "qualification_harness_exit_fixture", harness_path
+        )
+        harness = importlib.util.module_from_spec(harness_spec)
+        assert harness_spec.loader is not None
+        harness_spec.loader.exec_module(harness)
+
+        def validate(fixture, report_path):
+            return harness.assemble_record.policy.validate_report(
+                report_path,
+                json.loads(fixture.matrix.read_text()),
+                candidate=json.loads(fixture.candidate.read_text()),
+                stable_required=True,
+                strict_provenance=True,
+            )
+
+        passing_fixture = harness.QualificationRecordAssemblyTests(
+            methodName="test_report_result_must_reconcile_with_runner_results"
+        )
+        passing_fixture.setUp()
+        try:
+            passing_report = passing_fixture.make_report("iphone")
+            canonical_pass = json.loads(passing_report.read_text())
+            validate(passing_fixture, passing_report)
+            pass_mutations = {
+                "top-level-type": lambda payload: payload["scenarios"][0].update(
+                    {"xcodebuildExitCode": False}
+                ),
+                "top-level-nonzero": lambda payload: payload["scenarios"][0].update(
+                    {"xcodebuildExitCode": 65}
+                ),
+                "final-attempt-type": lambda payload: payload["scenarios"][0][
+                    "attempts"
+                ][-1].update({"xcodebuildExitCode": False}),
+            }
+            for label, mutate in pass_mutations.items():
+                with self.subTest(result="pass", label=label):
+                    tampered = self.clone(canonical_pass)
+                    mutate(tampered)
+                    passing_report.write_text(json.dumps(tampered))
+                    with self.assertRaises(
+                        harness.assemble_record.policy.QualificationPolicyError
+                    ):
+                        validate(passing_fixture, passing_report)
+        finally:
+            passing_fixture.tearDown()
+
+        failed_fixture = harness.QualificationRecordAssemblyTests(
+            methodName="test_failed_output_runner_validates_without_a_qualification_row"
+        )
+        failed_fixture.setUp()
+        try:
+            failed_report = failed_fixture.make_report("iphone")
+            failed_payload = json.loads(failed_report.read_text())
+            runner = failed_payload["scenarios"][0]
+            attempt_root = failed_report.parent / runner["attemptArtifactRoot"]
+            attempt_log = attempt_root / "attempt-1.log"
+            attempt_bundle = attempt_root / "attempt-1.xcresult"
+            attempt_log.write_text(
+                "** TEST EXECUTE FAILED **\n"
+                "Test Case '-[iOSUITests.FixtureQualificationTests test_fixture]' failed.\n"
+            )
+            failed_document = {
+                "testNodes": [
+                    {
+                        "nodeType": "Test Case",
+                        "nodeIdentifier": failed_fixture.catalog[0],
+                        "result": "Failed",
+                    },
+                    {
+                        "nodeType": "Failure Message",
+                        "name": "XCTAssertTrue failed",
+                    },
+                ]
+            }
+            with mock.patch.object(
+                harness.assemble_record.policy,
+                "xcresult_test_document",
+                return_value=failed_document,
+            ):
+                classification = harness.assemble_record.policy.classify_retry(
+                    attempt_bundle,
+                    attempt_log.read_text(),
+                    runner["expectedTestCatalog"],
+                )
+                runner.update(
+                    {
+                        "result": "fail",
+                        "xcodebuildExitCode": 65,
+                        "qualificationEvidence": "missing",
+                        "testExecution": None,
+                        "attempts": harness.assemble_record.policy.bind_attempt_artifacts(
+                            [
+                                {
+                                    **classification,
+                                    "attempt": 1,
+                                    "xcodebuildExitCode": 65,
+                                    "terminalReason": "XCTest failed",
+                                    "logArtifact": attempt_log.relative_to(
+                                        failed_report.parent
+                                    ).as_posix(),
+                                    "xcresultArtifact": attempt_bundle.relative_to(
+                                        failed_report.parent
+                                    ).as_posix(),
+                                }
+                            ],
+                            failed_report.parent,
+                        ),
+                    }
+                )
+                failed_payload["result"] = "fail"
+                failed_payload["qualificationRows"] = []
+                failed_report.write_text(json.dumps(failed_payload))
+                validate(failed_fixture, failed_report)
+
+                fail_mutations = {
+                    "top-level-type": lambda payload: payload["scenarios"][0].update(
+                        {"xcodebuildExitCode": "65"}
+                    ),
+                    "final-attempt-mismatch": lambda payload: payload["scenarios"][0].update(
+                        {"xcodebuildExitCode": 0}
+                    ),
+                    "final-attempt-type": lambda payload: payload["scenarios"][0][
+                        "attempts"
+                    ][-1].update({"xcodebuildExitCode": True}),
+                }
+                for label, mutate in fail_mutations.items():
+                    with self.subTest(result="fail", label=label):
+                        tampered = self.clone(failed_payload)
+                        mutate(tampered)
+                        failed_report.write_text(json.dumps(tampered))
+                        with self.assertRaises(
+                            harness.assemble_record.policy.QualificationPolicyError
+                        ):
+                            validate(failed_fixture, failed_report)
+        finally:
+            failed_fixture.tearDown()
+
     def test_report_timing_enforces_exact_duration_and_stable_freshness(self):
         now = datetime(2026, 9, 2, 12, 0, tzinfo=timezone.utc)
         completed = now - timedelta(
@@ -1010,6 +1238,251 @@ class QualificationPolicyTests(unittest.TestCase):
             },
             "springboardResizeGestures": 6,
             "fabricatedDurationCount": 0,
+        }
+
+    @staticmethod
+    def cadence_semantics_probe_payload() -> dict:
+        def histogram_from_deltas(deltas: list[int]) -> dict[int, int]:
+            result: dict[int, int] = {}
+            for delta in deltas:
+                result[delta] = result.get(delta, 0) + 1
+            return dict(sorted(result.items()))
+
+        def deltas_for(profile: str, requested_rate: float) -> list[int]:
+            target = round(
+                requested_rate * policy.CADENCE_WINDOW_SECONDS * 1_000_000
+            )
+            if profile == "vfr-24-60":
+                timestamps = {0, target}
+                segment = 0
+                while segment * 2_000_000 <= target:
+                    start = segment * 2_000_000
+                    fps = 24 if segment % 2 == 0 else 60
+                    for frame in range(fps * 2):
+                        timestamp = start + frame * 1_000_000 // fps
+                        if timestamp <= target:
+                            timestamps.add(timestamp)
+                    segment += 1
+                ordered = sorted(timestamps)
+            else:
+                numerator, denominator = (
+                    policy.CADENCE_CFR_SOURCE_RATE_RATIONALS[profile]
+                )
+                source_frames = round(
+                    (numerator / denominator)
+                    * requested_rate
+                    * policy.CADENCE_WINDOW_SECONDS
+                )
+                ordered = [
+                    frame * 1_000_000 * denominator // numerator
+                    for frame in range(source_frames + 1)
+                ]
+            return [
+                current - previous
+                for previous, current in zip(ordered, ordered[1:])
+            ]
+
+        renderer_fields = policy.CADENCE_SEMANTICS_PROBE_RENDERER_COUNTERS
+        renderer_progress = {
+            "vmemLockAttempts",
+            "vmemLockSuccesses",
+            "vmemUnlockCallbacks",
+            "vmemDisplayCallbacks",
+            "enqueuedFrames",
+            "deliveredFrames",
+            "presentationCopyFrames",
+        }
+        windows = []
+        visual_records = []
+        first_start = 1005.0
+        for index, (profile, requested_rate) in enumerate(
+            policy.CADENCE_SEMANTICS_PROBE_EXPECTED_WINDOWS
+        ):
+            duration = float(policy.CADENCE_WINDOW_SECONDS)
+            window_start = first_start + index * (duration + 3)
+            window_end = window_start + duration
+            deltas = deltas_for(profile, requested_rate)
+            histogram = histogram_from_deltas(deltas)
+            callbacks = len(deltas)
+            native_span = sum(deltas)
+            generation = index + 1
+
+            before = {
+                "systemUptime": window_start,
+                "playbackGeneration": generation,
+                "isPlaybackActive": True,
+                "isPictureInPictureActive": True,
+                "requestedRate": requested_rate,
+                "effectivePlayerRate": requested_rate,
+                "mediaTimeSeconds": 10.0,
+                "controlTimebaseSeconds": 20.0,
+                "controlTimebaseRate": requested_rate,
+                "vmemOutputTimestampProvenance": (
+                    policy.CADENCE_VMEM_OUTPUT_TIMESTAMP_PROVENANCE
+                ),
+                "vmemOutputPlaybackGeneration": generation,
+                "vmemOutputVoutGeneration": generation,
+                "vmemOutputLastValidPTSUS": 0,
+                "vmemOutputDeltaHistogram": [],
+                "vmemOutputCallbackCount": 1,
+                "vmemOutputValidPTSCount": 1,
+                "vmemOutputInvalidPTSCount": 0,
+                "vmemOutputDuplicatePTSCount": 0,
+                "vmemOutputBackwardPTSCount": 0,
+                "vmemOutputDeltaOverflowCount": 0,
+                "vmemOutputSubmittedCount": 1,
+                "vmemOutputSwiftRejectedCount": 0,
+                "vmemOutputInFlightCount": 0,
+                "libVLCDecodedVideoCount": 1,
+                "libVLCDisplayedPictureCount": 1,
+                "libVLCLostPictureCount": 0,
+                "libVLCLatePictureCount": 0,
+            }
+            renderer_deltas = {}
+            for output, snapshot_field in renderer_fields.items():
+                progressing = output in renderer_progress
+                before[snapshot_field] = 1 if progressing else 0
+                renderer_deltas[output] = callbacks if progressing else 0
+            after = {
+                **before,
+                "systemUptime": window_end,
+                "mediaTimeSeconds": 10.0 + requested_rate * duration,
+                "controlTimebaseSeconds": 20.0 + requested_rate * duration,
+                "vmemOutputLastValidPTSUS": native_span,
+                "vmemOutputDeltaHistogram": [
+                    {"deltaMicroseconds": delta, "count": count}
+                    for delta, count in histogram.items()
+                ],
+                "vmemOutputCallbackCount": 1 + callbacks,
+                "vmemOutputValidPTSCount": 1 + callbacks,
+                "vmemOutputSubmittedCount": 1 + callbacks,
+                "libVLCDecodedVideoCount": 1 + callbacks,
+                "libVLCDisplayedPictureCount": 1 + callbacks,
+            }
+            for output, snapshot_field in renderer_fields.items():
+                after[snapshot_field] = before[snapshot_field] + renderer_deltas[output]
+            classified = policy._classify_cadence_window_histogram(
+                profile, histogram
+            )
+            classification = {
+                "exactIntervalCount": classified["nativePTSExactIntervalCount"],
+                "multipleIntervalCount": classified[
+                    "nativePTSMultipleIntervalCount"
+                ],
+                "estimatedSkippedPictureCount": classified[
+                    "nativePTSEstimatedSkippedPictureCount"
+                ],
+                "redisplayCount": classified["nativePTSRedisplayCount"],
+                "backwardCount": classified["nativePTSBackwardCount"],
+                "unclassifiedIntervalCount": classified[
+                    "nativePTSUnclassifiedIntervalCount"
+                ],
+                "deltaOverflowCount": 0,
+            }
+            histogram_items = [
+                {"deltaMicroseconds": delta, "count": count}
+                for delta, count in histogram.items()
+            ]
+            windows.append(
+                {
+                    "profile": profile,
+                    "requestedRate": requested_rate,
+                    "windowStartSystemUptime": window_start,
+                    "windowEndSystemUptime": window_end,
+                    "windowDurationSeconds": duration,
+                    "effectivePlayerRateStart": requested_rate,
+                    "effectivePlayerRateEnd": requested_rate,
+                    "controlTimebaseRateStart": requested_rate,
+                    "controlTimebaseRateEnd": requested_rate,
+                    "controlTimebaseDeltaSeconds": requested_rate * duration,
+                    "mediaTimeDeltaSeconds": requested_rate * duration,
+                    "nativePTSDeltaSeconds": native_span / 1_000_000,
+                    "nativePTSDeltaMatchesHistogram": True,
+                    "nativePTSDeltaHistogram": histogram_items,
+                    "nativePTSClassification": classification,
+                    "outputCallbackCount": callbacks,
+                    "validPTSCount": callbacks,
+                    "invalidPTSCount": 0,
+                    "submittedFrames": callbacks,
+                    "swiftRejectedFrames": 0,
+                    "inFlightStart": 0,
+                    "inFlightEnd": 0,
+                    "callbackConservationAtStart": True,
+                    "callbackConservationAtEnd": True,
+                    "callbackDeltaConservation": True,
+                    "observedSubmissionFPS": callbacks / duration,
+                    "renderer": renderer_deltas,
+                    "libVLC": {
+                        "decodedVideo": callbacks,
+                        "displayedPictures": callbacks,
+                        "lostPictures": 0,
+                        "latePictures": 0,
+                    },
+                    "before": before,
+                    "after": after,
+                }
+            )
+            frames = [
+                bytes([channel]) * policy._VISUAL_FRAME_BYTE_COUNT
+                for channel in (0, 64, 128)
+            ]
+            hashes = [
+                policy._canonical_visual_frame_hash(frame) for frame in frames
+            ]
+            ratios = [
+                policy._canonical_visual_changed_pixel_ratio(first, second)
+                for first, second in zip(frames, frames[1:])
+            ]
+            visual_records.append(
+                {
+                    "profile": profile,
+                    "requestedRate": requested_rate,
+                    "windowStartSystemUptime": window_start,
+                    "windowEndSystemUptime": window_end,
+                    "captureStartSystemUptimes": [
+                        window_start + 0.95,
+                        window_start + 2.45,
+                        window_start + 3.95,
+                    ],
+                    "captureEndSystemUptimes": [
+                        window_start + 1.05,
+                        window_start + 2.55,
+                        window_start + 4.05,
+                    ],
+                    "captureSystemUptimes": [
+                        window_start + 1,
+                        window_start + 2.5,
+                        window_start + 4,
+                    ],
+                    "canonicalRGB8Base64": [
+                        base64.b64encode(frame).decode("ascii") for frame in frames
+                    ],
+                    "frameHashes": hashes,
+                    "adjacentChangedPixelRatios": ratios,
+                    "changedPixelScore": min(ratios),
+                }
+            )
+        return {
+            "formatVersion": 1,
+            "purpose": "exploratory-vmem-output-attempt-cadence-semantics",
+            "releaseCreditEligible": False,
+            "vmemOutputTimestampProvenance": (
+                policy.CADENCE_VMEM_OUTPUT_TIMESTAMP_PROVENANCE
+            ),
+            "targetWindowSeconds": policy.CADENCE_WINDOW_SECONDS,
+            "settlingSeconds": 2.0,
+            "startedSystemUptime": 1000.0,
+            "endedSystemUptime": windows[-1]["windowEndSystemUptime"] + 1,
+            "windows": windows,
+            "springBoardFrames": {
+                "formatVersion": 1,
+                "method": policy.VISUAL_OBSERVATION_METHOD,
+                "framesPerWindow": 3,
+                "captureBoundaryGuardSeconds": (
+                    policy.CADENCE_SEMANTICS_PROBE_CAPTURE_BOUNDARY_GUARD_SECONDS
+                ),
+                "records": visual_records,
+            },
         }
 
     @staticmethod
@@ -2164,6 +2637,461 @@ class QualificationPolicyTests(unittest.TestCase):
                 with self.assertRaises(policy.QualificationPolicyError):
                     policy.validate_cadence_oracle(mutated)
 
+    def test_cadence_semantics_probe_replays_raw_native_and_visual_semantics(self):
+        payload = self.cadence_semantics_probe_payload()
+        policy.validate_cadence_semantics_probe_payload(payload)
+
+        mutations = {}
+        callback_drift = self.clone(payload)
+        callback_drift["windows"][0]["outputCallbackCount"] += 1
+        mutations["callback-summary"] = callback_drift
+
+        rate_drift = self.clone(payload)
+        rate_drift["windows"][1]["controlTimebaseRateEnd"] = 0.5
+        mutations["rate-summary"] = rate_drift
+
+        classification_drift = self.clone(payload)
+        classification_drift["windows"][2]["nativePTSClassification"][
+            "exactIntervalCount"
+        ] += 1
+        mutations["pts-classification"] = classification_drift
+
+        renderer_drift = self.clone(payload)
+        renderer_drift["windows"][3]["renderer"]["deliveredFrames"] -= 1
+        mutations["renderer-summary"] = renderer_drift
+
+        libvlc_drift = self.clone(payload)
+        libvlc_drift["windows"][4]["libVLC"]["displayedPictures"] = 0
+        mutations["libvlc-summary"] = libvlc_drift
+
+        owner_window_drift = self.clone(payload)
+        owner_window_drift["springBoardFrames"]["records"][5]["profile"] = "24"
+        mutations["springboard-window-binding"] = owner_window_drift
+
+        raw_motion_drift = self.clone(payload)
+        raw_motion_drift["springBoardFrames"]["records"][6][
+            "canonicalRGB8Base64"
+        ][1] = base64.b64encode(
+            bytes([255]) * policy._VISUAL_FRAME_BYTE_COUNT
+        ).decode("ascii")
+        mutations["springboard-raw-frame"] = raw_motion_drift
+
+        motion_summary_drift = self.clone(payload)
+        motion_summary_drift["springBoardFrames"]["records"][7][
+            "changedPixelScore"
+        ] = 0.99
+        mutations["springboard-motion-summary"] = motion_summary_drift
+
+        boundary_overlap = self.clone(payload)
+        boundary_record = boundary_overlap["springBoardFrames"]["records"][0]
+        boundary_start = boundary_record["windowStartSystemUptime"] + 0.05
+        boundary_end = boundary_record["windowStartSystemUptime"] + 0.20
+        boundary_record["captureStartSystemUptimes"][0] = boundary_start
+        boundary_record["captureEndSystemUptimes"][0] = boundary_end
+        boundary_record["captureSystemUptimes"][0] = (
+            boundary_start + boundary_end
+        ) / 2
+        mutations["springboard-capture-overlaps-guarded-start"] = boundary_overlap
+
+        midpoint_drift = self.clone(payload)
+        midpoint_drift["springBoardFrames"]["records"][1][
+            "captureSystemUptimes"
+        ][1] += 0.01
+        mutations["springboard-capture-midpoint-not-derived"] = midpoint_drift
+
+        unrecognized_guard = self.clone(payload)
+        unrecognized_guard["springBoardFrames"]["captureBoundaryGuardSeconds"] = 0
+        mutations["springboard-unrecognized-boundary-guard"] = unrecognized_guard
+
+        for label, mutated in mutations.items():
+            with self.subTest(label=label):
+                with self.assertRaises(policy.QualificationPolicyError):
+                    policy.validate_cadence_semantics_probe_payload(mutated)
+
+    def test_cadence_semantics_probe_requires_both_vfr_regime_footprints(self):
+        def replace_histogram(
+            payload: dict, index: int, histogram: dict[int, int]
+        ) -> None:
+            window = payload["windows"][index]
+            duration = float(window["windowDurationSeconds"])
+            histogram_items = [
+                {"deltaMicroseconds": delta, "count": count}
+                for delta, count in sorted(histogram.items())
+            ]
+            before = window["before"]
+            after = window["after"]
+            callbacks = sum(histogram.values())
+            native_span = sum(
+                delta * count for delta, count in histogram.items()
+            )
+            after["vmemOutputLastValidPTSUS"] = (
+                before["vmemOutputLastValidPTSUS"] + native_span
+            )
+            after["vmemOutputDeltaHistogram"] = histogram_items
+            for field in (
+                "vmemOutputCallbackCount",
+                "vmemOutputValidPTSCount",
+                "vmemOutputSubmittedCount",
+            ):
+                after[field] = before[field] + callbacks
+
+            renderer_progress = {
+                "vmemLockAttempts",
+                "vmemLockSuccesses",
+                "vmemUnlockCallbacks",
+                "vmemDisplayCallbacks",
+                "enqueuedFrames",
+                "deliveredFrames",
+                "presentationCopyFrames",
+            }
+            for output, snapshot_field in (
+                policy.CADENCE_SEMANTICS_PROBE_RENDERER_COUNTERS.items()
+            ):
+                delta = callbacks if output in renderer_progress else 0
+                window["renderer"][output] = delta
+                after[snapshot_field] = before[snapshot_field] + delta
+            for output, snapshot_field in (
+                policy.CADENCE_SEMANTICS_PROBE_LIBVLC_COUNTERS.items()
+            ):
+                delta = callbacks if output in {"decodedVideo", "displayedPictures"} else 0
+                window["libVLC"][output] = delta
+                after[snapshot_field] = before[snapshot_field] + delta
+
+            classified = policy._classify_cadence_window_histogram(
+                "vfr-24-60", histogram
+            )
+            window["nativePTSClassification"] = {
+                "exactIntervalCount": classified["nativePTSExactIntervalCount"],
+                "multipleIntervalCount": classified[
+                    "nativePTSMultipleIntervalCount"
+                ],
+                "estimatedSkippedPictureCount": classified[
+                    "nativePTSEstimatedSkippedPictureCount"
+                ],
+                "redisplayCount": classified["nativePTSRedisplayCount"],
+                "backwardCount": classified["nativePTSBackwardCount"],
+                "unclassifiedIntervalCount": classified[
+                    "nativePTSUnclassifiedIntervalCount"
+                ],
+                "deltaOverflowCount": 0,
+            }
+            window["nativePTSDeltaHistogram"] = histogram_items
+            window["nativePTSDeltaSeconds"] = native_span / 1_000_000
+            window["outputCallbackCount"] = callbacks
+            window["validPTSCount"] = callbacks
+            window["submittedFrames"] = callbacks
+            window["observedSubmissionFPS"] = callbacks / duration
+
+        def replace_with_cfr(payload: dict, index: int, fps: int) -> None:
+            window = payload["windows"][index]
+            target_us = round(
+                float(window["requestedRate"])
+                * float(window["windowDurationSeconds"])
+                * 1_000_000
+            )
+            frame_count = round(target_us * fps / 1_000_000)
+            timestamps = [
+                frame * 1_000_000 // fps for frame in range(frame_count + 1)
+            ]
+            histogram: dict[int, int] = {}
+            for previous, current in zip(timestamps, timestamps[1:]):
+                delta = current - previous
+                histogram[delta] = histogram.get(delta, 0) + 1
+            replace_histogram(payload, index, histogram)
+
+        realistic_two_x = self.cadence_semantics_probe_payload()
+        replace_histogram(
+            realistic_two_x,
+            8,
+            {41666: 48, 41667: 96, 33333: 80, 33334: 40},
+        )
+        policy.validate_cadence_semantics_probe_payload(realistic_two_x)
+
+        for fps in (24, 60):
+            for index in range(6, 9):
+                with self.subTest(fps=fps, window=index):
+                    payload = self.cadence_semantics_probe_payload()
+                    replace_with_cfr(payload, index, fps)
+                    with self.assertRaisesRegex(
+                        policy.QualificationPolicyError,
+                        "does not prove both material 24fps and 60fps VFR regimes",
+                    ):
+                        policy.validate_cadence_semantics_probe_payload(payload)
+
+    def test_cadence_semantics_probe_binds_exact_xcresult_owner_and_export(self):
+        expected_catalog = policy.catalog_record(
+            [policy.CADENCE_SEMANTICS_PROBE_TEST_IDENTIFIER]
+        )
+        execution = {
+            "expected": expected_catalog,
+            "executed": expected_catalog,
+            "identityAndCountMatch": True,
+            "allPassed": True,
+        }
+        xctest_document = {
+            "testNodes": [
+                {
+                    "nodeType": "Test Case",
+                    "nodeIdentifier": (
+                        policy.CADENCE_SEMANTICS_PROBE_TEST_IDENTIFIER
+                    ),
+                    "result": "Passed",
+                }
+            ]
+        }
+
+        def fixture(root: Path) -> tuple[dict, dict, Path, Path, Path]:
+            attempt_root = root / "cadence-semantics-probe-attempt-artifacts"
+            attempt_root.mkdir()
+            (attempt_root / "attempt-1.log").write_text("** TEST SUCCEEDED **\n")
+            attempt_xcresult = attempt_root / "attempt-1.xcresult"
+            attempt_xcresult.mkdir()
+            (attempt_xcresult / "result.bin").write_bytes(b"exact-result")
+            retained_xcresult = root / "cadence-semantics-probe.xcresult"
+            retained_xcresult.mkdir()
+            (retained_xcresult / "result.bin").write_bytes(b"exact-result")
+            attempts = policy.bind_attempt_artifacts(
+                [
+                    {
+                        "attempt": 1,
+                        "classification": "passed",
+                        "retryable": False,
+                        "intendedTestBegan": True,
+                        "xcodebuildExitCode": 0,
+                        "logArtifact": (
+                            "cadence-semantics-probe-attempt-artifacts/attempt-1.log"
+                        ),
+                        "xcresultArtifact": (
+                            "cadence-semantics-probe-attempt-artifacts/"
+                            "attempt-1.xcresult"
+                        ),
+                        "testExecution": execution,
+                    }
+                ],
+                root,
+            )
+            attachment_root = root / "cadence-semantics-probe-attachments"
+            attachment_root.mkdir()
+            attachment_path = attachment_root / "probe.json"
+            attachment_path.write_text(
+                json.dumps(self.cadence_semantics_probe_payload(), sort_keys=True)
+            )
+            manifest_path = attachment_root / "manifest.json"
+            manifest_path.write_text(
+                json.dumps(
+                    [
+                        {
+                            "testIdentifier": (
+                                policy.CADENCE_SEMANTICS_PROBE_TEST_IDENTIFIER
+                            ),
+                            "testIdentifierURL": (
+                                policy.CADENCE_SEMANTICS_PROBE_TEST_IDENTIFIER
+                            ),
+                            "attachments": [
+                                {
+                                    "suggestedHumanReadableName": (
+                                        "exploratory-pip-cadence-semantics-probe_0_"
+                                        "00000000-0000-4000-8000-000000000001.json"
+                                    ),
+                                    "exportedFileName": attachment_path.name,
+                                }
+                            ],
+                        }
+                    ],
+                    sort_keys=True,
+                )
+            )
+            inspector = {
+                "payload": json.loads(attachment_path.read_text()),
+                "sha256": policy.sha256_file(attachment_path),
+                "sizeBytes": attachment_path.stat().st_size,
+                "testIdentifier": policy.CADENCE_SEMANTICS_PROBE_TEST_IDENTIFIER,
+            }
+            raw_log_root = root / "cadence-semantics-probe-raw-jsonl"
+            raw_log_root.mkdir()
+            raw_log_name = policy.test_log_filename(
+                "run",
+                policy.CADENCE_SEMANTICS_PROBE_TEST_IDENTIFIER,
+                "00000000-0000-4000-8000-000000000001",
+            )
+            (raw_log_root / raw_log_name).write_text(
+                json.dumps(
+                    {
+                        "ts": "2026-09-03T12:00:00Z",
+                        "level": "debug",
+                        "module": policy.LOG_MIRROR_HEALTH_MODULE,
+                        "message": policy.LOG_MIRROR_HEALTH_MESSAGE,
+                    }
+                )
+                + "\n"
+            )
+            inventory = policy.build_error_inventory(
+                raw_log_root,
+                "run",
+                policy.CADENCE_SEMANTICS_PROBE_SCENARIO,
+                retained_root=raw_log_root.name,
+                expected_test_catalog=expected_catalog,
+            )
+            runner = {
+                "scenario": policy.CADENCE_SEMANTICS_PROBE_SCENARIO,
+                "result": "pass",
+                "xcodebuildExitCode": 0,
+                "libraryErrorCount": 0,
+                "appLog": "captured",
+                "qualificationEvidence": "report-only",
+                "durationSeconds": 90,
+                "expectedTestCatalog": expected_catalog,
+                "testExecution": execution,
+                "attempts": attempts,
+                "attemptArtifactRoot": (
+                    "cadence-semantics-probe-attempt-artifacts"
+                ),
+                "hostErrorInventory": inventory,
+            }
+            return runner, inspector, manifest_path, attachment_path, retained_xcresult
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runner, inspector, _, _, _ = fixture(root)
+            with mock.patch.object(
+                policy, "xcresult_test_document", return_value=xctest_document
+            ), mock.patch.object(
+                policy,
+                "inspect_xcresult_cadence_semantics_probe_attachment",
+                return_value=inspector,
+            ):
+                proof = policy.validate_cadence_semantics_probe_artifacts(
+                    root,
+                    runner,
+                    expected_version="1.1.0-beta.9",
+                    require_proof=False,
+                )
+                runner["reportOnlyEvidence"] = proof
+                policy.validate_cadence_semantics_probe_artifacts(
+                    root,
+                    runner,
+                    expected_version="1.1.0-beta.9",
+                    require_proof=True,
+                )
+                completed = datetime.now(timezone.utc).replace(microsecond=0)
+                started = completed - timedelta(seconds=90)
+                policy.validate_report_only_cadence_report(
+                    root / "report.json",
+                    {
+                        "formatVersion": 2,
+                        "version": "1.1.0-beta.9",
+                        "mode": "exploratory",
+                        "reportOnly": True,
+                        "releaseGateSatisfied": False,
+                        "releaseGateReason": (
+                            "exploratory cadence semantics probe cannot produce "
+                            "release credit"
+                        ),
+                        "result": "pass",
+                        "qualificationRows": [],
+                        "startedAtUTC": started.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        "completedAtUTC": completed.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        "wallDurationSeconds": 90,
+                        "scenarios": [runner],
+                    },
+                )
+
+        def mutate_owner(
+            _runner: dict, manifest: Path, _payload: Path, _xcresult: Path
+        ) -> None:
+            value = json.loads(manifest.read_text())
+            value[0]["testIdentifier"] = (
+                "iOSUITests/OtherTests/test_fabricatedProbe"
+            )
+            value[0]["testIdentifierURL"] = value[0]["testIdentifier"]
+            manifest.write_text(json.dumps(value))
+
+        def mutate_malformed_suffix(
+            _runner: dict, manifest: Path, _payload: Path, _xcresult: Path
+        ) -> None:
+            value = json.loads(manifest.read_text())
+            value[0]["attachments"][0]["suggestedHumanReadableName"] = (
+                "exploratory-pip-cadence-semantics-probe_0_not-a-uuid.json"
+            )
+            manifest.write_text(json.dumps(value))
+
+        def mutate_extension(
+            _runner: dict, manifest: Path, _payload: Path, _xcresult: Path
+        ) -> None:
+            value = json.loads(manifest.read_text())
+            value[0]["attachments"][0]["suggestedHumanReadableName"] = (
+                "exploratory-pip-cadence-semantics-probe_0_"
+                "00000000-0000-4000-8000-000000000001.txt"
+            )
+            manifest.write_text(json.dumps(value))
+
+        def mutate_count(
+            _runner: dict, manifest: Path, _payload: Path, _xcresult: Path
+        ) -> None:
+            value = json.loads(manifest.read_text())
+            value[0]["attachments"].append(dict(value[0]["attachments"][0]))
+            manifest.write_text(json.dumps(value))
+
+        def mutate_payload(
+            _runner: dict, _manifest: Path, payload: Path, _xcresult: Path
+        ) -> None:
+            value = json.loads(payload.read_text())
+            value["windows"][0]["outputCallbackCount"] += 1
+            payload.write_text(json.dumps(value))
+
+        def mutate_final_xcresult(
+            _runner: dict, _manifest: Path, _payload: Path, xcresult: Path
+        ) -> None:
+            (xcresult / "result.bin").write_bytes(b"different-result")
+
+        def mutate_proof(
+            runner: dict, _manifest: Path, _payload: Path, _xcresult: Path
+        ) -> None:
+            runner["reportOnlyEvidence"]["attachmentDigest"] = "0" * 64
+
+        def mutate_proof_version(
+            runner: dict, _manifest: Path, _payload: Path, _xcresult: Path
+        ) -> None:
+            runner["reportOnlyEvidence"]["version"] = "1.1.0"
+
+        mutations = {
+            "attachment-owner": mutate_owner,
+            "attachment-malformed-suffix": mutate_malformed_suffix,
+            "attachment-wrong-extension": mutate_extension,
+            "attachment-count": mutate_count,
+            "attachment-payload": mutate_payload,
+            "retained-final-xcresult": mutate_final_xcresult,
+            "reported-proof": mutate_proof,
+            "reported-proof-version": mutate_proof_version,
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                runner, inspector, manifest, payload, retained_xcresult = fixture(root)
+                with mock.patch.object(
+                    policy, "xcresult_test_document", return_value=xctest_document
+                ), mock.patch.object(
+                    policy,
+                    "inspect_xcresult_cadence_semantics_probe_attachment",
+                    return_value=inspector,
+                ):
+                    runner["reportOnlyEvidence"] = (
+                        policy.validate_cadence_semantics_probe_artifacts(
+                            root,
+                            runner,
+                            expected_version="1.1.0-beta.9",
+                            require_proof=False,
+                        )
+                    )
+                    mutate(runner, manifest, payload, retained_xcresult)
+                    with self.assertRaises(policy.QualificationPolicyError):
+                        policy.validate_cadence_semantics_probe_artifacts(
+                            root,
+                            runner,
+                            expected_version="1.1.0-beta.9",
+                            require_proof=True,
+                        )
+
     def test_cadence_high_rate_output_uses_callback_conservation_not_a_false_cap(self):
         evidence = self.cadence_oracle_evidence()
         policy.validate_cadence_oracle(evidence)
@@ -3203,6 +4131,48 @@ class QualificationPolicyTests(unittest.TestCase):
         identifiers, _, _ = policy.executed_catalog_from_xcresult(document)
         self.assertNotEqual(identifiers, expected["testIdentifiers"])
 
+    def test_xcode26_xcresult_short_node_identifier_reconciles_with_url(self):
+        # Captured from the archived 2026-08-31 physical vod-controls xcresult.
+        document = {
+            "testNodes": [
+                {
+                    "name": "test_vodControlsAcrossNativeAndDirectBackends()",
+                    "nodeIdentifier": (
+                        "PiPVODControlsDeviceUITests/"
+                        "test_vodControlsAcrossNativeAndDirectBackends()"
+                    ),
+                    "nodeIdentifierURL": (
+                        "test://com.apple.xcode/SwiftVLCShowcase/iOSUITests/"
+                        "PiPVODControlsDeviceUITests/"
+                        "test_vodControlsAcrossNativeAndDirectBackends"
+                    ),
+                    "nodeType": "Test Case",
+                    "result": "Passed",
+                }
+            ]
+        }
+        identifiers, results, failure = policy.executed_catalog_from_xcresult(
+            document
+        )
+        self.assertEqual(
+            identifiers,
+            [
+                "iOSUITests/PiPVODControlsDeviceUITests/"
+                "test_vodControlsAcrossNativeAndDirectBackends"
+            ],
+        )
+        self.assertEqual(results, ["Passed"])
+        self.assertFalse(failure)
+
+        mismatched = self.clone(document)
+        mismatched["testNodes"][0]["nodeIdentifier"] = (
+            "PiPVODControlsDeviceUITests/test_anotherMethod()"
+        )
+        with self.assertRaisesRegex(
+            policy.QualificationPolicyError, "owner fields disagree"
+        ):
+            policy.executed_catalog_from_xcresult(mismatched)
+
     def test_busy_phrase_never_retries_an_xctest_failure(self):
         expected = policy.catalog_record(["iOSUITests/PlayerTests/test_product"])
         with tempfile.TemporaryDirectory() as temporary:
@@ -3255,6 +4225,31 @@ class QualificationPolicyTests(unittest.TestCase):
                 policy.xcresult_test_document = original
         self.assertFalse(classification["retryable"])
         self.assertEqual(classification["classification"], "productFailure")
+
+    def test_xcresult_verifier_rejects_a_skipped_selected_test(self):
+        expected = policy.catalog_record(["iOSUITests/PlayerTests/test_product"])
+        with tempfile.TemporaryDirectory() as temporary:
+            bundle = Path(temporary) / "skipped.xcresult"
+            bundle.mkdir()
+            original = policy.xcresult_test_document
+            policy.xcresult_test_document = lambda _: {
+                "testNodes": [
+                    {
+                        "nodeType": "Test Case",
+                        "nodeIdentifier": "iOSUITests/PlayerTests/test_product()",
+                        "result": "Skipped",
+                        "name": "test_product()",
+                    }
+                ]
+            }
+            try:
+                with self.assertRaisesRegex(
+                    policy.QualificationPolicyError,
+                    "did not all pass",
+                ):
+                    policy.verify_xcresult_execution(bundle, expected)
+            finally:
+                policy.xcresult_test_document = original
 
     def test_fatal_product_signal_with_busy_and_no_readable_xcresult_is_terminal(self):
         expected = policy.catalog_record(["iOSUITests/PlayerTests/test_product"])

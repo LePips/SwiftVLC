@@ -43,12 +43,6 @@ final class PiPInterruptionDeviceUITests: ShowcaseIOSTestCase {
       throw XCTSkip("Set SWIFTVLC_PIP_INTERRUPTION_DEVICE=YES for candidate-bound hardware runs")
     }
 
-    addUIInterruptionMonitor(withDescription: "Local network permission") { alert in
-      let allow = alert.buttons["Allow"]
-      guard allow.exists else { return false }
-      allow.tap()
-      return true
-    }
     let baseLogPath = try XCTUnwrap(
       launchArgumentValue(for: LaunchArguments.logPath),
       "Missing qualification log launch argument"
@@ -100,8 +94,7 @@ final class PiPInterruptionDeviceUITests: ShowcaseIOSTestCase {
     let cycleLogPath =
       (baseLogPath as NSString).deletingPathExtension + "-\(backend).jsonl"
     replaceLaunchArgument(LaunchArguments.logPath, with: cycleLogPath)
-    app.launch()
-    app.tap()
+    launchDirectlyHandlingQualificationPermissions()
 
     let state = element(AccessibilityID.PiPInterruptionValidation.stateLabel)
     let possible = element(AccessibilityID.PiPInterruptionValidation.possibleLabel)

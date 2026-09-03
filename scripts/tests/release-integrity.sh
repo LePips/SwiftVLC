@@ -3481,6 +3481,36 @@ row = {
     "result": "pass",
 }
 (retained_root / "evidence.json").write_text(json.dumps(evidence, sort_keys=True))
+selected_device = {
+    "id": "fixture-coredevice",
+    "udid": "fixture-device",
+    "ecid": 42,
+    "ecidHex": "0x2A",
+    "name": "Test phone",
+    "marketingName": "Test phone",
+    "productType": "iPhone16,1",
+    "deviceFamily": "iPhone",
+    "osVersion": "26.6",
+    "osMajor": 26,
+    "osBuild": "23G80",
+    "osReleaseType": "stable",
+    "transport": "wired",
+    "tunnelIPAddress": "fd00::1",
+    "connected": True,
+    "qualificationEligible": True,
+    "matchingHardwareRows": ["iphone-current"],
+}
+(retained_root / policy.DEVICE_SNAPSHOT_RELATIVE_PATH).write_text(
+    json.dumps(
+        {
+            "selected": selected_device,
+            "connected": [selected_device],
+            "allPhysicalIOSDevices": [selected_device],
+            "mode": "qualification",
+        },
+        sort_keys=True,
+    )
+)
 report_path = retained_root / "report.json"
 completed_at = datetime.now(timezone.utc).replace(microsecond=0)
 started_at = completed_at - timedelta(seconds=120)
@@ -3493,7 +3523,11 @@ report_path.write_text(
             "wallDurationSeconds": 120,
             "mode": "qualification",
             "qualificationEligibleEnvironment": True,
-            "device": {"udid": "fixture-device"},
+            "reportOnly": False,
+            "releaseGateSatisfied": False,
+            "releaseGateReason": policy.ORDINARY_RELEASE_GATE_REASON,
+            "device": selected_device,
+            "deviceSnapshot": policy.device_snapshot_binding(retained_root),
             "result": "pass",
             "scenarios": runner_rows,
             "qualificationRows": [row],

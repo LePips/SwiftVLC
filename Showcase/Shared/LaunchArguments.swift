@@ -8,6 +8,7 @@ import Foundation
 enum LaunchArguments {
   static let fixtureURLEnvironment = "SWIFTVLC_APP_FIXTURE_URL"
   static let pipLiveURLEnvironment = "SWIFTVLC_APP_PIP_LIVE_URL"
+  static let candidateRuntimeBindingInfoKey = "SwiftVLCCandidateRuntimeBinding"
 
   /// `YES` when running under XCUITest. Gates showcase behavior that should
   /// only run in UI tests.
@@ -117,6 +118,26 @@ enum LaunchArguments {
 
   static var isUITestMode: Bool {
     UserDefaults.standard.bool(forKey: key(uiTestMode))
+  }
+
+  /// Signed, per-build runtime identity exposed to the UI-test process only.
+  /// The value lives in the candidate's sealed Info.plist; it is not supplied
+  /// as a launch argument that any concurrently installed candidate could echo.
+  static var qualificationCandidateRuntimeBindingValue: String? {
+    guard
+      isUITestMode,
+      let value = Bundle.main.object(
+        forInfoDictionaryKey: candidateRuntimeBindingInfoKey
+      ) as? String,
+      isLowercaseSHA256(value)
+    else { return nil }
+    return value
+  }
+
+  static func isLowercaseSHA256(_ value: String) -> Bool {
+    value.utf8.count == 64 && value.utf8.allSatisfy { byte in
+      (48...57).contains(byte) || (97...102).contains(byte)
+    }
   }
 
   static var fixtureURLValue: URL? {
