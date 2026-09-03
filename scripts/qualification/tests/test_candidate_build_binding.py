@@ -995,6 +995,16 @@ class RunnerBuildBindingIntegrationTests(unittest.TestCase):
 
 
 class TestCatalogAuthorityTests(unittest.TestCase):
+    def test_tracked_reviewed_catalog_is_canonical(self):
+        authority_path = QUALIFICATION / "ios-test-catalog-authority-v1.json"
+        authority = json.loads(authority_path.read_text())
+
+        self.assertEqual(
+            test_catalog_authority.validate_authority(authority),
+            authority,
+        )
+        self.assertEqual(authority["testCatalogCount"], 223)
+
     def test_reviewed_catalog_requires_exact_enumerated_leaf_set(self):
         reviewed_catalog = policy.catalog_record(
             [
