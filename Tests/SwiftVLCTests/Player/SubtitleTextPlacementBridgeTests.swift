@@ -156,6 +156,39 @@ extension Logic {
     }
 
     @Test
+    func `WebVTT vertical center anchor maps explicitly`() async throws {
+      let harness = SubtitleTextCallbackHarness()
+      let lifetime = makeLifetime(24)
+      let bridge = SubtitleTextBridge()
+      try #require(bridge.attach(to: lifetime, using: harness.register))
+      var values = bridge.subscribe(policy: .unbounded).makeAsyncIterator()
+      _ = await values.next()
+
+      harness.send([
+        .webVTT(
+          "centered",
+          horizontalPosition: 0.5,
+          verticalPosition: 0.5,
+          verticalAnchor: swiftvlc_webvtt_vertical_anchor_center
+        )
+      ])
+
+      let snapshot = try #require(await values.next())
+      #expect(
+        snapshot.regions.first?.placement
+          == .webVTT(
+            WebVTTPlacement(
+              horizontalPosition: 0.5,
+              verticalPosition: 0.5,
+              verticalAnchor: .center
+            )
+          )
+      )
+
+      lifetime.initialOwnerDidRelease()
+    }
+
+    @Test
     func `Non-WebVTT semantic formats always map to automatic`() async throws {
       let harness = SubtitleTextCallbackHarness()
       let lifetime = makeLifetime(19)
@@ -224,6 +257,12 @@ extension Logic {
       nonfinite.horizontal_position = .nan
       var invalidAnchor = NativeSubtitleRegionInput.defaultWebVTTPayload
       invalidAnchor.horizontal_anchor = UInt32.max
+      var invalidVerticalAnchor = NativeSubtitleRegionInput.defaultWebVTTPayload
+      invalidVerticalAnchor.vertical_anchor = UInt32.max
+      var invalidTextAlignment = NativeSubtitleRegionInput.defaultWebVTTPayload
+      invalidTextAlignment.text_alignment = UInt32.max
+      var invalidWritingDirection = NativeSubtitleRegionInput.defaultWebVTTPayload
+      invalidWritingDirection.writing_direction = UInt32.max
       var invalidFlags = NativeSubtitleRegionInput.defaultWebVTTPayload
       invalidFlags.flags = UInt32.max
       harness.send([
@@ -243,6 +282,21 @@ extension Logic {
           webVTT: invalidAnchor
         ),
         NativeSubtitleRegionInput(
+          text: "invalid vertical anchor",
+          placement: nativeUInt32(swiftvlc_subtitle_text_placement_webvtt),
+          webVTT: invalidVerticalAnchor
+        ),
+        NativeSubtitleRegionInput(
+          text: "invalid text alignment",
+          placement: nativeUInt32(swiftvlc_subtitle_text_placement_webvtt),
+          webVTT: invalidTextAlignment
+        ),
+        NativeSubtitleRegionInput(
+          text: "invalid writing direction",
+          placement: nativeUInt32(swiftvlc_subtitle_text_placement_webvtt),
+          webVTT: invalidWritingDirection
+        ),
+        NativeSubtitleRegionInput(
           text: "invalid flags",
           placement: nativeUInt32(swiftvlc_subtitle_text_placement_webvtt),
           webVTT: invalidFlags
@@ -256,7 +310,7 @@ extension Logic {
       ])
 
       let snapshot = try #require(await values.next())
-      #expect(snapshot.regions.count == 5)
+      #expect(snapshot.regions.count == 8)
       #expect(snapshot.regions.allSatisfy { $0.placement == .automatic })
 
       lifetime.initialOwnerDidRelease()

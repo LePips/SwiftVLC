@@ -62,29 +62,49 @@ public enum TextSubtitlePlacement: Sendable, Hashable {
 public struct WebVTTPlacement: Sendable, Hashable {
   /// The point on the cue box selected along the horizontal axis.
   public enum HorizontalAnchor: Sendable, Hashable {
+    /// The horizontal center of the cue box.
     case center
+
+    /// The left edge of the cue box.
     case left
+
+    /// The right edge of the cue box.
     case right
   }
 
   /// The point on the cue box selected along the vertical axis.
   public enum VerticalAnchor: Sendable, Hashable {
+    /// The vertical center of the cue box.
     case center
+
+    /// The top edge of the cue box.
     case top
+
+    /// The bottom edge of the cue box.
     case bottom
   }
 
   /// The resolved physical alignment of text inside the cue box.
   public enum TextAlignment: Sendable, Hashable {
+    /// Text is centered within the cue box.
     case center
+
+    /// Text is aligned with the left edge of the cue box.
     case left
+
+    /// Text is aligned with the right edge of the cue box.
     case right
   }
 
   /// The direction in which lines are laid out.
   public enum WritingDirection: Sendable, Hashable {
+    /// Lines are laid out horizontally from top to bottom.
     case horizontal
+
+    /// Lines are vertical and successive lines grow toward the left.
     case verticalGrowingLeft
+
+    /// Lines are vertical and successive lines grow toward the right.
     case verticalGrowingRight
   }
 

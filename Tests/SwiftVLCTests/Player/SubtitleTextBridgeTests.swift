@@ -260,15 +260,6 @@ extension Integration {
   @Suite(.tags(.mainActor, .async))
   @MainActor struct PlayerTextSubtitleStreamTests {
     @Test
-    func `Public API exposes subtitle snapshot streams`() {
-      let player = Player(instance: TestInstance.makeAudioOnly())
-      let streamFactory: () throws(VLCError) -> AsyncStream<TextSubtitleSnapshot> =
-        player.textSubtitleStream
-
-      _ = streamFactory
-    }
-
-    @Test
     func `First call opts in and later calls only add subscribers`() async throws {
       let harness = SubtitleTextCallbackHarness()
       let native = makeNativeOperations(harness: harness)

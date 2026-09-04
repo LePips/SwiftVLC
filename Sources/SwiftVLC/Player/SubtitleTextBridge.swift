@@ -121,9 +121,10 @@ final class SubtitleTextBridge: Sendable {
         state.pendingSnapshots.removeValue(forKey: generation)
         return false
       }
-      guard let pendingSnapshot = state.pendingSnapshots.removeValue(forKey: generation) else {
-        return false
-      }
+      let pendingSnapshot = state.pendingSnapshots.removeValue(forKey: generation)
+      // Termination is the only operation that can remove a pending entry,
+      // and that state was handled above while holding this same lock.
+      precondition(pendingSnapshot != nil)
       if let currentGeneration = state.currentGeneration {
         guard generation > currentGeneration else { return false }
       }
@@ -133,7 +134,7 @@ final class SubtitleTextBridge: Sendable {
         state.latest = TextSubtitleSnapshot()
         broadcaster.broadcast(TextSubtitleSnapshot())
       }
-      if let snapshot = pendingSnapshot.latest, state.latest != snapshot {
+      if let snapshot = pendingSnapshot?.latest, state.latest != snapshot {
         state.latest = snapshot
         broadcaster.broadcast(snapshot)
       }
