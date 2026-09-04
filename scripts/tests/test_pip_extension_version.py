@@ -548,7 +548,7 @@ class PiPExtensionVersionTests(unittest.TestCase):
             ("apple-audio-session-leases",),
         )
 
-    def test_checked_in_v9_weak_compatibility_fails_closed(self) -> None:
+    def test_checked_in_v9_v10_weak_compatibility_fails_closed(self) -> None:
         shim = (REPOSITORY_ROOT / "Sources/CLibVLC/shim.c").read_text(
             encoding="utf-8"
         )
@@ -592,6 +592,53 @@ class PiPExtensionVersionTests(unittest.TestCase):
                 "    return swiftvlc_libvlc_pip_extensions_version() >= 9;",
                 "    return true;\n"
                 "    return swiftvlc_libvlc_pip_extensions_version() >= 9;",
+                1,
+            ),
+            "strong-v10-fallback": shim.replace(
+                "__attribute__((weak))\n"
+                "bool swiftvlc_libvlc_media_player_"
+                "set_subtitle_text_snapshot_callback",
+                "bool swiftvlc_libvlc_media_player_"
+                "set_subtitle_text_snapshot_callback",
+                1,
+            ),
+            "successful-v10-fallback": shim.replace(
+                "    (void)opaque;\n"
+                "    return false;\n"
+                "}\n\n"
+                "__attribute__((weak))\n"
+                "bool swiftvlc_libvlc_media_player_"
+                "get_sample_buffer_renderer_snapshot",
+                "    (void)opaque;\n"
+                "    return true;\n"
+                "}\n\n"
+                "__attribute__((weak))\n"
+                "bool swiftvlc_libvlc_media_player_"
+                "get_sample_buffer_renderer_snapshot",
+                1,
+            ),
+            "version-nine-subtitle-wrapper": shim.replace(
+                "swiftvlc_libvlc_pip_extensions_version() < 10",
+                "swiftvlc_libvlc_pip_extensions_version() < 9",
+                1,
+            ),
+            "version-nine-subtitle-availability": shim.replace(
+                "swiftvlc_libvlc_pip_extensions_version() >= 10",
+                "swiftvlc_libvlc_pip_extensions_version() >= 9",
+                1,
+            ),
+            "subtitle-native-call-before-gate": shim.replace(
+                "    if (swiftvlc_libvlc_pip_extensions_version() < 10) {",
+                "    swiftvlc_libvlc_media_player_"
+                "set_subtitle_text_snapshot_callback("
+                "player, callback, opaque);\n"
+                "    if (swiftvlc_libvlc_pip_extensions_version() < 10) {",
+                1,
+            ),
+            "early-true-subtitle-availability": shim.replace(
+                "    return swiftvlc_libvlc_pip_extensions_version() >= 10;",
+                "    return true;\n"
+                "    return swiftvlc_libvlc_pip_extensions_version() >= 10;",
                 1,
             ),
         }

@@ -217,6 +217,15 @@ section "Validating exact integrated extension version 10"
     --require-apple-audio-session-leases \
     --run-mutations
 
+section "Validating ordered semantic subtitle-text snapshots"
+subtitle_snapshot_compiler="${CC:-cc}"
+command -v "$subtitle_snapshot_compiler" >/dev/null 2>&1 \
+    || fail "C compiler not found for subtitle-text snapshot proof: $subtitle_snapshot_compiler"
+"$subtitle_snapshot_compiler" -std=c11 -O2 -Wall -Wextra -Werror \
+    "$SCRIPT_DIR/patches/validation/subtitle-text-snapshot.c" \
+    -o "$REPLAY_DIR/subtitle-text-snapshot"
+"$REPLAY_DIR/subtitle-text-snapshot"
+
 section "Validating native PiP output identity and race semantics"
 python3 -B \
     "$SCRIPT_DIR/patches/validation/native-pip-output-identity-source-check.py" \

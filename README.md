@@ -417,10 +417,11 @@ Releases advance `main`, but stable releases can only consume an immutable,
 previously prepared and device-qualified candidate. `setup-dev.sh` flips a
 working checkout back to local sources for day-to-day development.
 
-The 1.1.0 release line now requires native extension v9 together with the v8
-Apple audio-session lease refinement. `1.1.0-beta.9` is therefore the first
-eligible candidate; the published beta.8 archive remains usable through the
-fail-closed weak compatibility path but cannot pass the current release gate.
+The 1.1.0 release line now requires native extension v10 together with the v8
+Apple audio-session lease refinement. The published `1.1.0-beta.9` archive
+carries v9 and remains usable through the fail-closed weak compatibility path,
+but it cannot pass the current release gate. The first eligible candidate must
+be rebuilt from the current patch manifest.
 
 ```bash
 ./scripts/build-libvlc.sh \

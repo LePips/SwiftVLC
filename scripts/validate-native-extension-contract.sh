@@ -17,7 +17,7 @@ RUN_MUTATIONS=no
 
 usage() {
     cat >&2 <<EOF
-Usage: $0 --expected-version <1..9> [--source-root <patched-vlc>] \\
+Usage: $0 --expected-version <1..10> [--source-root <patched-vlc>] \\
   [--xcframework <candidate>] [--require-apple-audio-session-leases] \\
   [--run-mutations]
 EOF
@@ -80,7 +80,7 @@ fi
 
 # SwiftVLC deliberately keeps weak definitions so an older released static
 # archive remains linkable. Prove those compatibility paths cannot advertise
-# v9 or mutate identity before evaluating either a source tree or an archive.
+# v9/v10 or mutate native state before evaluating a source tree or an archive.
 python3 -B - "$RESOLVER" "$REPO_ROOT/Sources/CLibVLC/shim.c" <<'PY'
 import importlib.util
 from pathlib import Path
